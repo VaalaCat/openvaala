@@ -1,0 +1,10 @@
+› /new        命令 · 开始新对话
+  /resume     命令 · 恢复最近的对话
+  /model      命令 · 选择模型和推理强度
+  /provider   命令 · 模型服务
+  /reload     命令 · 重新加载配置
+  /cd <目录>  命令 · 切换工作目录
+  /executor   命令 · 选择默认 Executor 和可用范围
+  /expand     命令 · 展开视图
+› /
+连接中 · 默认模型

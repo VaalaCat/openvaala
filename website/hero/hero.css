@@ -1,0 +1,191 @@
+/* 卷首图画布 1200×630，按 2 倍像素渲染。整张图共用一条斜线：顶边 x=760，底边 x=600。 */
+@font-face {
+  font-family: "JetBrains Mono Variable";
+  src: url("../node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 100 800;
+}
+
+@font-face {
+  font-family: "Noto Serif Variable";
+  src: url("../node_modules/@fontsource-variable/noto-serif/files/noto-serif-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 100 900;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: #faf9f6;
+}
+
+.hero {
+  position: relative;
+  width: 1200px;
+  height: 630px;
+  overflow: hidden;
+  background-color: #faf9f6;
+  background-image:
+    linear-gradient(rgba(28, 25, 23, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(28, 25, 23, 0.05) 1px, transparent 1px);
+  background-position: -1px -1px;
+  background-size: 24px 24px;
+}
+
+/* 斜线右侧的墨色底：同样的细网格，线条换成浅色。 */
+.field--ink {
+  position: absolute;
+  inset: 0;
+  clip-path: polygon(760px 0, 100% 0, 100% 100%, 600px 100%);
+  background-color: #1c1917;
+  background-image:
+    linear-gradient(rgba(250, 249, 246, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(250, 249, 246, 0.05) 1px, transparent 1px);
+  background-position: -1px -1px;
+  background-size: 24px 24px;
+}
+
+.masthead {
+  position: absolute;
+  top: 26px;
+  left: 36px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mark {
+  width: 26px;
+  height: 26px;
+}
+
+.wordmark {
+  color: #1c1917;
+  font-family: "Noto Serif Variable", serif;
+  font-size: 19px;
+  font-weight: 500;
+}
+
+/* 标签轨：入口名称之间用细线隔开，末尾是信号蓝光标块。 */
+.rail {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-left: 26px;
+  color: #6f6964;
+  font-family: "JetBrains Mono Variable", monospace;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.rail i {
+  width: 12px;
+  height: 1px;
+  background: #d6d3d1;
+}
+
+.rail .cursor {
+  width: 8px;
+  height: 13px;
+  margin-left: 2px;
+  background: #60a5fa;
+}
+
+/* 完整窗口：统一圆角、细边框和柔和阴影。 */
+.window {
+  position: absolute;
+  margin: 0;
+  overflow: hidden;
+  border-radius: 12px;
+  /* 细边框用中性灰，压在纸色和墨色两边都看得见。 */
+  box-shadow:
+    0 0 0 1px rgba(120, 113, 108, 0.42),
+    0 28px 56px -24px rgba(12, 10, 9, 0.5),
+    0 2px 6px rgba(12, 10, 9, 0.1);
+}
+
+.window img {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+}
+
+/* 主窗口：完整 Web 界面 744×465；深色截图按同一条斜线裁出右半边。 */
+.window--web {
+  top: 96px;
+  left: 300px;
+  width: 744px;
+  height: 465px;
+  background: #fff;
+}
+
+.window--web img {
+  width: 744px;
+  height: 465px;
+}
+
+.web-dark {
+  clip-path: polygon(435.62px 0, 100% 0, 100% 100%, 317.52px 100%);
+}
+
+/* 桌面端：完整小窗口叠在主窗口右上角。 */
+.window--desktop {
+  z-index: 1;
+  top: 54px;
+  left: 840px;
+  width: 324px;
+  height: 202.5px;
+  background: #fafaf9;
+  box-shadow:
+    0 0 0 1px rgba(250, 249, 246, 0.16),
+    0 28px 56px -24px rgba(0, 0, 0, 0.6);
+}
+
+.window--desktop img {
+  width: 324px;
+  height: 202.5px;
+}
+
+/* 终端：只取截图里的终端窗口本身（1204×780），压住主窗口左下角。 */
+.window--terminal {
+  top: 336px;
+  left: 96px;
+  width: 404px;
+  height: 262px;
+  background: #121214;
+}
+
+.window--terminal img {
+  width: 537px;
+  transform: translate(-66.4px, -36.9px);
+}
+
+/* 手机：墨色边框压在主窗口右下角。 */
+.phone {
+  position: absolute;
+  top: 262px;
+  left: 990px;
+  width: 172px;
+  height: 352px;
+  margin: 0;
+  padding: 6px;
+  border-radius: 30px;
+  background: #0c0a09;
+  box-shadow:
+    0 0 0 1px rgba(250, 249, 246, 0.14),
+    0 30px 60px -20px rgba(0, 0, 0, 0.7);
+}
+
+.phone img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 24px;
+  object-fit: cover;
+  object-position: top;
+}

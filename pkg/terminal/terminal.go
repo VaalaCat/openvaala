@@ -1,0 +1,544 @@
+package terminal
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"slices"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/VaalaCat/openvaala/pkg/telemetry"
+	"github.com/VaalaCat/openvaala/pkg/workspace"
+)
+
+// Terminal 是一次命令执行：持有进程、输出、PTY 输入、总时限和退出结果，可以跨 Turn 存活。
+type Terminal interface {
+	// GetInfo 返回命令信息；结束前只有启动时的字段和 running。
+	GetInfo() TerminalInfo
+	// ReadOutput 返回 cursor 之后的输出：已有就立即返回，否则等新输出、命令结束或 wait 到期；只取消这次等待，不影响命令。
+	ReadOutput(ctx context.Context, cursor uint64, wait time.Duration) (TerminalOutput, error)
+	// WriteInput 把 chars 原样写进 PTY，返回实际写入的字节数；非 PTY 命令返回 ErrInputUnavailable，命令已结束返回 ErrTerminalFinished。
+	// PTY 里的程序不读输入且 chars 超出 PTY 缓冲时，一直等到程序读走或写入失败；ctx 结束时立即返回 ctx 错误，
+	// 已开始的写入留在后台，到程序读走或命令结束关闭终端时结束。
+	WriteInput(ctx context.Context, chars string) (int, error)
+	// Stop 终止进程组并等到收尾完成，返回最终信息；已结束时直接返回。调用方取消等待不撤回已接受的停止。
+	Stop(ctx context.Context) (TerminalInfo, error)
+}
+
+// terminalImpl 保存一条命令的进程、输出缓冲和退出结果：run 的事件循环是输出、停止和退出结果的唯一修改者。命令结束前 ReadOutput、Stop、
+// WriteInput 经 terminalEvents 交给它，结束后直接读只读数据；写入可能一直阻塞，事件循环只在 tasks 里启动它、不等它。
+type terminalImpl struct {
+	id        string
+	request   *TerminalRequest
+	opt       *TerminalManagerOpt
+	createdAt time.Time
+	// started 在进程启动成功或失败后关闭，startErr、process 在关闭前写入。
+	started  chan struct{}
+	startErr error
+	process  workspace.Process
+	// terminalEvents 承载读取、停止、写入请求，以及各任务报告的事实，只由 run 的事件循环读取。
+	terminalEvents chan terminalEvent
+	// tasks 是 run 启动的读输出、等待进程、后台 Terminate 和写入任务，run 写最终信息前等待。
+	tasks sync.WaitGroup
+
+	// 以下只由事件循环修改；finished 关闭后只读。
+	output terminalOutputBuffer
+	// outputChanged 每追加一次输出就关闭并换新，唤醒等待读取的调用方。
+	outputChanged chan struct{}
+	// info 结束前是启动时的字段和 running，结束时写入最终状态、退出码、停止原因和错误。
+	info TerminalInfo
+	// finishedAt 由 time.Now 取得，带单调时钟读数；管理器按它淘汰。
+	finishedAt time.Time
+	finished   chan struct{}
+	// openOutputStreams 是还没结束的输出流数。
+	openOutputStreams int
+	// outputReadErr 是第一个读取失败的输出流的错误。
+	outputReadErr error
+	// processExit 是 Process.Wait 的结果；进程还没退出时为 nil。
+	processExit *terminalProcessExited
+	// stopReason 是 Terminate 已确认成功的停止原因，结束时写进 info；为空表示没有确认过停止。
+	stopReason TerminalStopReason
+	// terminatingReason 是正在后台进行的 Terminate 的停止原因；为空表示没有，同一时间最多一个。
+	terminatingReason TerminalStopReason
+	// stopResults 是等正在进行的 Terminate 的 Stop 回复通道（容量 1），它返回时统一回复。
+	stopResults []chan error
+	// isSessionStopRequested Session 是否已经关闭、要求停止这条命令？
+	isSessionStopRequested bool
+}
+
+// maxOutputPageBytes 是一次读取最多返回的输出字节数。
+const maxOutputPageBytes = 64 << 10
+
+// newTerminal 创建尚未启动的命令记录。
+func newTerminal(id string, request *TerminalRequest, opt *TerminalManagerOpt) *terminalImpl {
+	// 1. 保存请求和配置，记录创建时间并创建启动、事件、输出变化和结束通道。
+	return &terminalImpl{
+		id:             id,
+		request:        request,
+		opt:            opt,
+		createdAt:      time.Now(),
+		started:        make(chan struct{}),
+		terminalEvents: make(chan terminalEvent),
+		outputChanged:  make(chan struct{}),
+		info:           newTerminalInfo(id, request),
+		finished:       make(chan struct{}),
+	}
+}
+
+// run 启动命令并处理事件，收齐退出和输出结果后结束。
+func (t *terminalImpl) run(ctx context.Context, stopping <-chan struct{}) {
+	// 1. 启动进程并公布启动结果；失败时写入失败信息并关闭结束信号。
+	process, outputPipes, err := t.startProcess(ctx)
+	t.process, t.startErr = process, err
+	close(t.started)
+	if err != nil {
+		t.info.Status, t.info.Err = TerminalStatusFailed, err
+		t.finishedAt = time.Now()
+		close(t.finished)
+		return
+	}
+
+	// 2. 启动输出读取和进程等待任务，按请求配置总时限。
+	t.openOutputStreams = len(outputPipes)
+	for _, outputPipe := range outputPipes {
+		t.tasks.Go(func() { readTerminalOutput(outputPipe, t.terminalEvents) })
+	}
+	t.tasks.Go(func() { t.waitProcess(outputPipes) })
+	var timeout <-chan time.Time
+	if t.request.Timeout > 0 {
+		timer := time.NewTimer(t.request.Timeout)
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	// 3. 串行处理读写、停止和退出事件；Session 关闭或超时时请求停止命令。
+	for t.processExit == nil || t.openOutputStreams > 0 || t.terminatingReason != "" {
+		select {
+		case event := <-t.terminalEvents:
+			switch event := event.(type) {
+			case terminalOutputRead:
+				t.handleOutputRead(event)
+			case terminalOutputClosed:
+				t.handleOutputClosed(event)
+			case terminalProcessExited:
+				t.processExit = &event
+			case terminalReadRequested:
+				t.handleReadRequested(event)
+			case terminalStopRequested:
+				t.handleStopRequested(ctx, event)
+			case terminalInputRequested:
+				t.handleInputRequested(event)
+			case terminalStopFinished:
+				t.handleStopFinished(ctx, event)
+			default:
+				panic(fmt.Sprintf("unsupported terminal event %T", event))
+			}
+		case <-stopping:
+			stopping = nil
+			t.handleStopRequested(ctx, terminalStopRequested{reason: TerminalStoppedBySession})
+		case <-timeout:
+			timeout = nil
+			t.handleStopRequested(ctx, terminalStopRequested{reason: TerminalStoppedByTimeout})
+		}
+	}
+	// 4. 等进程退出、输出流关闭和 Terminate 返回，再等全部任务并关闭输出读端。
+	t.tasks.Wait()
+	closeTerminalOutputReaders(outputPipes)
+
+	// 5. 优先记录进程等待错误，再记录输出错误，否则写退出码；记录已确认的停止原因后关闭结束信号。
+	switch {
+	case t.processExit.err != nil:
+		t.info.Status = TerminalStatusFailed
+		t.info.Err = fmt.Errorf("wait for command: %w; remote command termination was not confirmed", t.processExit.err)
+	case t.outputReadErr != nil:
+		t.info.Status = TerminalStatusFailed
+		t.info.Err = fmt.Errorf("read command output: %w", t.outputReadErr)
+	default:
+		exitCode := t.processExit.exitCode
+		t.info.Status, t.info.ExitCode = TerminalStatusExited, &exitCode
+	}
+	t.info.StopReason = t.stopReason
+	t.finishedAt = time.Now()
+	close(t.finished)
+}
+
+// handleOutputRead 追加输出并通知等待读取的调用方。
+func (t *terminalImpl) handleOutputRead(event terminalOutputRead) {
+	// 1. 追加输出，超限时丢弃最早字节，关闭旧通知通道并创建新通道。
+	t.output.append(event.data, t.opt.MaxOutputBytes)
+	close(t.outputChanged)
+	t.outputChanged = make(chan struct{})
+}
+
+// handleOutputClosed 记录输出流关闭及读取错误。
+func (t *terminalImpl) handleOutputClosed(event terminalOutputClosed) {
+	// 1. 减少未关闭流数，保留首个非空读取错误。
+	t.openOutputStreams--
+	if t.outputReadErr == nil {
+		t.outputReadErr = event.err
+	}
+}
+
+// handleReadRequested 回复指定游标的一页输出。
+func (t *terminalImpl) handleReadRequested(request terminalReadRequested) {
+	// 1. 读取当前输出，连同当前输出变化信号和错误回复调用方。
+	output, err := t.readOutput(request.cursor)
+	request.reply <- terminalOutputPage{
+		output:        output,
+		outputChanged: t.outputChanged,
+		err:           err,
+	}
+}
+
+// handleStopRequested 接收停止请求并安排进程终止。
+func (t *terminalImpl) handleStopRequested(ctx context.Context, request terminalStopRequested) {
+	// 1. 记录 Session 停止请求及需要回复的调用方。
+	if request.reason == TerminalStoppedBySession {
+		t.isSessionStopRequested = true
+	}
+	if request.stopResult != nil {
+		t.stopResults = append(t.stopResults, request.stopResult)
+	}
+	// 2. 已退出或已确认停止时回复成功；已有终止任务时等待，否则启动终止任务。
+	switch {
+	case t.processExit != nil || t.stopReason != "":
+		t.replyStopResults(nil)
+	case t.terminatingReason == "":
+		t.startTerminate(ctx, request.reason)
+	}
+}
+
+// handleStopFinished 记录终止结果并回复停止调用方。
+func (t *terminalImpl) handleStopFinished(ctx context.Context, event terminalStopFinished) {
+	// 1. 清除正在终止的原因，成功时记录已确认停止原因，再回复等待的调用方。
+	t.terminatingReason = ""
+	if event.err == nil {
+		t.stopReason = event.reason
+	}
+	t.replyStopResults(event.err)
+	// 2. 其他终止失败且 Session 已要求关闭时，按 Session 关闭再终止一次。
+	if event.err != nil && t.isSessionStopRequested && event.reason != TerminalStoppedBySession && t.processExit == nil {
+		t.startTerminate(ctx, TerminalStoppedBySession)
+	}
+}
+
+// handleInputRequested 启动一次后台终端输入任务。
+func (t *terminalImpl) handleInputRequested(request terminalInputRequested) {
+	// 1. 把写入加入任务组，由任务直接回复写入结果，事件循环继续处理事件。
+	t.tasks.Go(func() { t.writeInput(request) })
+}
+
+// startTerminate 启动后台进程终止任务。
+func (t *terminalImpl) startTerminate(ctx context.Context, reason TerminalStopReason) {
+	// 1. 记录本次终止原因，并把 Terminate 加入任务组。
+	t.terminatingReason = reason
+	t.tasks.Go(func() { t.terminateProcess(ctx, reason) })
+}
+
+// replyStopResults 回复全部等待中的停止调用方。
+func (t *terminalImpl) replyStopResults(err error) {
+	// 1. 向每个回复通道写入结果，再清空等待列表。
+	for _, stopResult := range t.stopResults {
+		stopResult <- err
+	}
+	t.stopResults = nil
+}
+
+// terminateProcess 终止进程组并向事件循环报告结果。
+func (t *terminalImpl) terminateProcess(ctx context.Context, reason TerminalStopReason) {
+	// 1. 调用 Terminate；超时或 Session 关闭发起的失败记警告，Session 关闭失败时再调用 Close。
+	err := t.process.Terminate()
+	if err != nil && reason != TerminalStoppedByTool {
+		logger := telemetry.GetLogger(ctx)
+		logger.Warn("terminate command failed", "command_id", t.id, "stop_reason", reason, "error", err)
+		if reason == TerminalStoppedBySession {
+			if closeErr := t.process.Close(); closeErr != nil {
+				logger.Warn("close command failed", "command_id", t.id, "error", closeErr)
+			}
+		}
+	}
+	// 2. 把停止原因和终止错误交给事件循环。
+	t.terminalEvents <- terminalStopFinished{
+		reason: reason,
+		err:    err,
+	}
+}
+
+// writeInput 写入进程终端并回复结果。
+func (t *terminalImpl) writeInput(request terminalInputRequested) {
+	// 1. 等进程读取输入或写入失败，再回复实际写入字节数和错误。
+	count, err := t.process.WriteTerminalInput(request.data)
+	request.inputWritten <- terminalInputWritten{
+		count: count,
+		err:   err,
+	}
+}
+
+// waitProcess 等待进程结束并报告退出结果。
+func (t *terminalImpl) waitProcess(outputPipes []*terminalOutputPipe) {
+	// 1. 等 Wait 返回后关闭输出写端，再把退出码和错误交给事件循环。
+	exitCode, err := t.process.Wait()
+	closeTerminalOutputWriters(outputPipes)
+	t.terminalEvents <- terminalProcessExited{
+		exitCode: exitCode,
+		err:      err,
+	}
+}
+
+// readTerminalOutput 读取输出流并发送输出与关闭事件。
+func readTerminalOutput(outputPipe *terminalOutputPipe, terminalEvents chan<- terminalEvent) {
+	// 1. 创建读取缓冲和待补齐字符的字节区。
+	buffer := make([]byte, 16*1024)
+	var pending []byte
+	for {
+		// 2. 读取字节并发送完整 UTF-8 前缀；遇到非法字节或流结束时原样发送剩余字节。
+		count, err := outputPipe.reader.Read(buffer)
+		if count > 0 {
+			pending = append(pending, buffer[:count]...)
+		}
+		if len(pending) > 0 {
+			complete, incomplete, invalid := completeUTF8Prefix(pending)
+			if invalid || err != nil || !incomplete {
+				complete = len(pending)
+			}
+			if complete > 0 {
+				terminalEvents <- terminalOutputRead{data: slices.Clone(pending[:complete])}
+				pending = slices.Clone(pending[complete:])
+			}
+		}
+		// 3. 流结束时把 EOF 视为正常关闭，发送一次关闭事件后返回。
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			terminalEvents <- terminalOutputClosed{err: err}
+			return
+		}
+	}
+}
+
+// GetInfo 返回命令信息。
+func (t *terminalImpl) GetInfo() TerminalInfo {
+	// 1. 已结束时返回最终信息，否则返回启动字段和 running 状态。
+	if isChannelClosed(t.finished) {
+		return t.info
+	}
+	return newTerminalInfo(t.id, t.request)
+}
+
+// ReadOutput 读取指定游标后的输出，必要时等待变化。
+func (t *terminalImpl) ReadOutput(ctx context.Context, cursor uint64, wait time.Duration) (TerminalOutput, error) {
+	// 1. 创建本次等待时限。
+	waitTimer := time.NewTimer(wait)
+	defer waitTimer.Stop()
+	for {
+		// 2. 向事件循环请求一页；已结束时直接读，ctx 结束时只取消本次等待。
+		reply := make(chan terminalOutputPage, 1)
+		select {
+		case t.terminalEvents <- terminalReadRequested{
+			cursor: cursor,
+			reply:  reply,
+		}:
+		case <-t.finished:
+			return t.readOutput(cursor)
+		case <-ctx.Done():
+			return TerminalOutput{}, ctx.Err()
+		}
+		// 3. 有输出或错误时立即返回，否则等输出变化、命令结束、时限或 ctx 结束。
+		page := <-reply
+		if page.err != nil || page.output.Text != "" {
+			return page.output, page.err
+		}
+		select {
+		case <-page.outputChanged:
+		case <-t.finished:
+		case <-waitTimer.C:
+			return page.output, nil
+		case <-ctx.Done():
+			return TerminalOutput{}, ctx.Err()
+		}
+	}
+}
+
+// WriteInput 提交 PTY 输入并等待写入结果。
+func (t *terminalImpl) WriteInput(ctx context.Context, chars string) (int, error) {
+	// 1. 非交互命令返回 ErrInputUnavailable，已结束命令返回 ErrTerminalFinished。
+	if !t.request.Interactive {
+		return 0, ErrInputUnavailable
+	}
+	if isChannelClosed(t.finished) {
+		return 0, ErrTerminalFinished
+	}
+	// 2. 向事件循环提交原始输入字节，结束或取消时返回对应错误。
+	inputWritten := make(chan terminalInputWritten, 1)
+	select {
+	case t.terminalEvents <- terminalInputRequested{
+		data:         []byte(chars),
+		inputWritten: inputWritten,
+	}:
+	case <-t.finished:
+		return 0, ErrTerminalFinished
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	// 3. 等待写入结果；ctx 结束时返回错误，已开始的写入继续由任务组等待。
+	select {
+	case written := <-inputWritten:
+		return written.count, written.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// Stop 请求终止命令并等待最终结果。
+func (t *terminalImpl) Stop(ctx context.Context) (TerminalInfo, error) {
+	// 1. 向事件循环提交工具停止请求；已结束时返回最终信息，ctx 结束时返回当前信息和错误。
+	stopResult := make(chan error, 1)
+	select {
+	case t.terminalEvents <- terminalStopRequested{
+		reason:     TerminalStoppedByTool,
+		stopResult: stopResult,
+	}:
+	case <-t.finished:
+		return t.info, nil
+	case <-ctx.Done():
+		return t.GetInfo(), ctx.Err()
+	}
+	// 2. 等 Terminate 结果；失败时返回错误和当前信息，命令继续受管。
+	select {
+	case err := <-stopResult:
+		if err != nil {
+			return t.GetInfo(), err
+		}
+	case <-ctx.Done():
+		return t.GetInfo(), ctx.Err()
+	}
+	// 3. 终止成功后等命令收尾；ctx 结束只取消等待，不撤回停止请求。
+	select {
+	case <-t.finished:
+		return t.info, nil
+	case <-ctx.Done():
+		return t.GetInfo(), ctx.Err()
+	}
+}
+
+// readOutput 读取一页输出并附上同一时刻的命令信息。
+func (t *terminalImpl) readOutput(cursor uint64) (TerminalOutput, error) {
+	// 1. 从缓冲读取最多 64 KiB，游标错误直接返回，否则组装页面和命令信息。
+	text, nextCursor, hasMore, truncated, err := t.output.read(cursor, maxOutputPageBytes)
+	if err != nil {
+		return TerminalOutput{}, err
+	}
+	return TerminalOutput{
+		Info:       t.info,
+		Text:       text,
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
+		Truncated:  truncated,
+	}, nil
+}
+
+// isStartSucceeded 进程是否已成功启动？
+func (t *terminalImpl) isStartSucceeded() bool {
+	// 1. 检查启动结果已公布且启动错误为空。
+	return isChannelClosed(t.started) && t.startErr == nil
+}
+
+// startProcess 通过请求的工作区启动进程并连接输出管道。
+func (t *terminalImpl) startProcess(ctx context.Context) (workspace.Process, []*terminalOutputPipe, error) {
+	// 1. 组装命令和工作目录；交互命令使用一条输出流，普通命令分别连接 stdout 和 stderr。
+	processRequest := &workspace.ProcessRequest{
+		Command:   t.request.Command,
+		Directory: t.request.Directory,
+		TTY:       t.request.Interactive,
+	}
+	var outputPipes []*terminalOutputPipe
+	if t.request.Interactive {
+		outputPipes = []*terminalOutputPipe{newTerminalOutputPipe()}
+		processRequest.Stdout = outputPipes[0].writer
+	} else {
+		outputPipes = []*terminalOutputPipe{newTerminalOutputPipe(), newTerminalOutputPipe()}
+		processRequest.Stdout = outputPipes[0].writer
+		processRequest.Stderr = outputPipes[1].writer
+	}
+	// 2. 由工作区检查目录并启动进程；失败时关闭管道两端。
+	process, err := t.request.Workspace.StartProcess(ctx, processRequest)
+	if err != nil {
+		closeTerminalOutputWriters(outputPipes)
+		closeTerminalOutputReaders(outputPipes)
+		return nil, nil, err
+	}
+	return process, outputPipes, nil
+}
+
+// newTerminalOutputPipe 创建命令输出管道。
+func newTerminalOutputPipe() *terminalOutputPipe {
+	// 1. 创建管道并保存读写两端。
+	reader, writer := io.Pipe()
+	return &terminalOutputPipe{
+		reader: reader,
+		writer: writer,
+	}
+}
+
+// closeTerminalOutputWriters 关闭全部命令输出写端。
+func closeTerminalOutputWriters(outputPipes []*terminalOutputPipe) {
+	// 1. 逐条关闭写端，忽略关闭错误。
+	for _, outputPipe := range outputPipes {
+		_ = outputPipe.writer.Close()
+	}
+}
+
+// closeTerminalOutputReaders 关闭全部命令输出读端。
+func closeTerminalOutputReaders(outputPipes []*terminalOutputPipe) {
+	// 1. 逐条关闭读端，忽略关闭错误。
+	for _, outputPipe := range outputPipes {
+		_ = outputPipe.reader.Close()
+	}
+}
+
+// append 追加输出并按容量裁剪最早的字节。
+func (b *terminalOutputBuffer) append(data []byte, maxBytes int) {
+	// 1. 追加字节，未超容量时直接返回。
+	b.retained = append(b.retained, data...)
+	overflow := len(b.retained) - maxBytes
+	if overflow <= 0 {
+		return
+	}
+	// 2. 从溢出位置向后最多查 UTFMax-1 字节，找到字符起点就从此保留，找不到时按字节丢弃。
+	dropped := overflow
+	for dropped < len(b.retained) && dropped-overflow < utf8.UTFMax-1 && !utf8.RuneStart(b.retained[dropped]) {
+		dropped++
+	}
+	if dropped == len(b.retained) || !utf8.RuneStart(b.retained[dropped]) {
+		dropped = overflow
+	}
+	// 3. 裁剪已丢弃部分，并累计输出起始偏移。
+	b.retained = b.retained[dropped:]
+	b.startOffset += uint64(dropped)
+}
+
+// read 按游标读取缓冲中的一页。
+func (b *terminalOutputBuffer) read(cursor uint64, maxBytes int) (text string, nextCursor uint64, hasMore, truncated bool, err error) {
+	// 1. 计算总输出长度，游标超出时返回 ErrInvalidCursor。
+	end := b.startOffset + uint64(len(b.retained))
+	if cursor > end {
+		return "", 0, false, false, &invalidCursorError{
+			cursor: cursor,
+			end:    end,
+		}
+	}
+	// 2. 游标已被丢弃时从最早保留处读取，并标记 truncated。
+	if cursor < b.startOffset {
+		cursor, truncated = b.startOffset, true
+	}
+	// 3. 最多取 maxBytes，页尾回退至字符起点；非法 UTF-8 按字节切，返回下一游标和剩余标记。
+	page := b.retained[cursor-b.startOffset:]
+	if len(page) > maxBytes {
+		page = page[:getPageEnd(page, maxBytes)]
+	}
+	nextCursor = cursor + uint64(len(page))
+	return string(page), nextCursor, nextCursor < end, truncated, nil
+}

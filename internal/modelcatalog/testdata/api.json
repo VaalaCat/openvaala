@@ -1,0 +1,389 @@
+{
+  "compat": {
+    "id": "compat",
+    "name": "Compat Gateway",
+    "npm": "@ai-sdk/openai-compatible",
+    "api": "https://compat.example/v1",
+    "env": [
+      "COMPAT_API_KEY"
+    ],
+    "models": {
+      "plain": {
+        "id": "plain",
+        "name": "Plain Model",
+        "reasoning": false,
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "limit": {
+          "context": 128000,
+          "output": 8192
+        }
+      },
+      "think-medium": {
+        "id": "think-medium",
+        "name": "Think Medium",
+        "reasoning": true,
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "pdf"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "reasoning_options": [
+          {
+            "type": "toggle"
+          },
+          {
+            "type": "effort",
+            "values": [
+              "minimal",
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        ],
+        "limit": {
+          "context": 200000,
+          "output": 64000,
+          "input": 150000
+        }
+      },
+      "think-no-medium": {
+        "id": "think-no-medium",
+        "name": "Think No Medium",
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "budget_tokens",
+            "min": 1024,
+            "max": 32000
+          },
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              null,
+              "high",
+              "max"
+            ]
+          }
+        ],
+        "limit": {
+          "context": 256000,
+          "output": 32000
+        }
+      },
+      "only-null-efforts": {
+        "id": "only-null-efforts",
+        "name": "Only Null Efforts",
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              null
+            ]
+          }
+        ],
+        "limit": {
+          "context": 64000,
+          "output": 4096
+        }
+      },
+      "no-limit": {
+        "id": "no-limit",
+        "name": "No Limit",
+        "reasoning": false
+      },
+      "a/b:c": {
+        "id": "a/b:c",
+        "name": "Slash Colon",
+        "reasoning": false,
+        "limit": {
+          "context": 1000,
+          "output": 100
+        }
+      },
+      "a:b:c": {
+        "id": "a:b:c",
+        "name": "Colon Colon",
+        "reasoning": false,
+        "limit": {
+          "context": 2000,
+          "output": 200
+        }
+      },
+      "claude-style": {
+        "id": "claude-style",
+        "name": "Claude Style",
+        "reasoning": false,
+        "provider": {
+          "npm": "@ai-sdk/anthropic"
+        },
+        "limit": {
+          "context": 300000,
+          "output": 16000
+        }
+      },
+      "same-sdk": {
+        "id": "same-sdk",
+        "name": "Same SDK",
+        "reasoning": false,
+        "modalities": {
+          "input": [
+            "image",
+            "hologram",
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "provider": {
+          "npm": "@ai-sdk/openai-compatible"
+        },
+        "limit": {
+          "context": 4000,
+          "output": 400
+        }
+      },
+      "unknown-sdk": {
+        "id": "unknown-sdk",
+        "name": "Unknown SDK",
+        "reasoning": false,
+        "provider": {
+          "npm": "@ai-sdk/google"
+        },
+        "limit": {
+          "context": 5000,
+          "output": 500
+        }
+      }
+    }
+  },
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "npm": "@ai-sdk/openai",
+    "env": [
+      "OPENAI_API_KEY"
+    ],
+    "models": {
+      "gpt-test": {
+        "id": "gpt-test",
+        "name": "GPT Test",
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        ],
+        "limit": {
+          "context": 400000,
+          "output": 128000
+        }
+      }
+    }
+  },
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "npm": "@ai-sdk/anthropic",
+    "env": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "models": {
+      "claude-test": {
+        "id": "claude-test",
+        "name": "Claude Test",
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "budget_tokens",
+            "min": 1024,
+            "max": 64000
+          }
+        ],
+        "limit": {
+          "context": 200000,
+          "output": 64000
+        }
+      }
+    }
+  },
+  "googly": {
+    "id": "googly",
+    "name": "Googly",
+    "npm": "@ai-sdk/google",
+    "api": "https://googly.example/v1",
+    "models": {
+      "googly-model": {
+        "id": "googly-model",
+        "name": "Googly Model",
+        "reasoning": false,
+        "limit": {
+          "context": 100,
+          "output": 10
+        }
+      }
+    }
+  },
+  "no-api": {
+    "id": "no-api",
+    "name": "No API",
+    "npm": "@ai-sdk/openai-compatible",
+    "models": {
+      "no-api-model": {
+        "id": "no-api-model",
+        "name": "No API Model",
+        "reasoning": false,
+        "limit": {
+          "context": 100,
+          "output": 10
+        }
+      }
+    }
+  },
+  "vote-a": {
+    "id": "vote-a",
+    "name": "Vote A",
+    "npm": "@ai-sdk/google",
+    "models": {
+      "shared-majority": {
+        "id": "shared-majority",
+        "name": "Odd One From A",
+        "reasoning": false,
+        "limit": {
+          "context": 2000,
+          "output": 200
+        }
+      },
+      "shared-tie": {
+        "id": "shared-tie",
+        "name": "Tie Large From A",
+        "reasoning": false,
+        "limit": {
+          "context": 2000,
+          "output": 200
+        }
+      },
+      "shared-no-limit": {
+        "id": "shared-no-limit",
+        "name": "No Limit From A",
+        "reasoning": false
+      },
+      "known-id": {
+        "id": "known-id",
+        "name": "Known ID",
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        ],
+        "limit": {
+          "context": 3000,
+          "output": 300
+        }
+      }
+    }
+  },
+  "vote-b": {
+    "id": "vote-b",
+    "name": "Vote B",
+    "npm": "@ai-sdk/google",
+    "models": {
+      "shared-majority": {
+        "id": "shared-majority",
+        "name": "Majority From B",
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        ],
+        "limit": {
+          "context": 1000,
+          "output": 100
+        }
+      },
+      "shared-tie": {
+        "id": "shared-tie",
+        "name": "Tie Small From B",
+        "reasoning": false,
+        "limit": {
+          "context": 1000,
+          "output": 100
+        }
+      },
+      "shared-no-limit": {
+        "id": "shared-no-limit",
+        "name": "Limit From B",
+        "reasoning": false,
+        "limit": {
+          "context": 500,
+          "output": 50
+        }
+      }
+    }
+  },
+  "vote-c": {
+    "id": "vote-c",
+    "name": "Vote C",
+    "npm": "@ai-sdk/google",
+    "models": {
+      "shared-majority": {
+        "id": "shared-majority",
+        "name": "Majority From C",
+        "reasoning": false,
+        "limit": {
+          "context": 1000,
+          "output": 100
+        }
+      }
+    }
+  },
+  "templated": {
+    "id": "templated",
+    "name": "Templated Host",
+    "npm": "@ai-sdk/openai-compatible",
+    "api": "https://${HOST}/v1",
+    "models": {
+      "templated-model": {
+        "id": "templated-model",
+        "name": "Templated Model",
+        "reasoning": false,
+        "limit": {
+          "context": 100,
+          "output": 10
+        }
+      }
+    }
+  }
+}

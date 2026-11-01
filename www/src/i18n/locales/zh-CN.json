@@ -1,0 +1,658 @@
+{
+  "common": {
+    "loading": "正在加载…",
+    "language": "语言",
+    "breadcrumb": "当前位置",
+    "dangerZone": "危险操作",
+    "actions": {
+      "cancel": "取消",
+      "clearFilters": "清除筛选",
+      "clearSearch": "清除搜索",
+      "copy": "复制",
+      "hide": "隐藏",
+      "reveal": "显示",
+      "search": "搜索",
+      "toggleSidebar": "切换侧栏",
+      "reload": "重新加载",
+      "rename": "改名",
+      "retry": "重试"
+    },
+    "copy": {
+      "success": "已复制",
+      "failed": "复制失败：{{message}}",
+      "manual": "复制失败，请手动选择并复制"
+    },
+    "theme": {
+      "title": "主题",
+      "light": "浅色",
+      "dark": "深色",
+      "system": "跟随系统"
+    },
+    "toast": {
+      "close": "关闭通知",
+      "region": "通知"
+    },
+    "unsavedChanges": {
+      "title": "离开此页面？",
+      "stay": "继续编辑",
+      "leave": "离开"
+    },
+    "errors": {
+      "title": "操作未完成",
+      "detail": "详情",
+      "requestFailed": "请求失败，请稍后重试",
+      "connectionLost": "连接已断开",
+      "sessionBusy": "当前有任务在执行，稍后再试",
+      "conversationNotFound": "对话不存在或已被删除",
+      "sessionNotFound": "Session 不存在",
+      "invalidParams": "参数不合法",
+      "pageLoadFailed": "页面没有加载出来，可能刚升级过。",
+      "pageFailed": "页面出错了。"
+    },
+    "notFound": {
+      "title": "{{entity}}不存在",
+      "description": "它可能已被删除，或者链接有误。"
+    },
+    "selection": {
+      "empty": "无匹配结果",
+      "clear": "清空",
+      "more": "更多"
+    }
+  },
+  "tokenNumberValue": {
+    "fullValue": "完整数值：{{value}}"
+  },
+  "numberUnitInput": {
+    "errors": {
+      "negative": "请输入非负数",
+      "invalid": "请输入整数或带 K、M 的小数",
+      "fractional": "换算后的数值必须是整数",
+      "unsafe": "数值超出安全整数范围"
+    }
+  },
+  "connection": {
+    "reconnect": "重连",
+    "reconnectPending": "正在重连",
+    "connecting": {
+      "title": "正在连接…",
+      "retrying": "无法连接 {{host}}，正在重试。请确认 openvaala serve 正在运行。"
+    },
+    "incompatible": {
+      "title": "版本不一致",
+      "description": "页面和 serve 版本不一致，请用同一个版本的 openvaala"
+    },
+    "tokenEntry": {
+      "title": "输入 token",
+      "description": "运行 openvaala web 获取带 token 的地址",
+      "label": "Token",
+      "submit": "连接",
+      "invalid": "token 无效，请重新运行 openvaala web 获取地址"
+    },
+    "state": {
+      "connected": "已连接",
+      "connecting": "连接中",
+      "reconnecting": "已断开，正在重连",
+      "unauthorized": "token 无效",
+      "incompatible": "版本不一致"
+    }
+  },
+  "jsonView": {
+    "childCount_other": "{{count}} 项",
+    "fold": "折叠",
+    "unfold": "展开",
+    "expandNested": "按 JSON 展开",
+    "collapseNested": "按字符串显示",
+    "expandString": "展开",
+    "collapseString": "收起",
+    "copyNode": "复制这个节点",
+    "showAllRows": "显示全部 {{total}} 行"
+  },
+  "conversation": {
+    "entity": "对话",
+    "backToNewConversation": "回到新对话",
+    "messages": "消息",
+    "empty": "还没有消息",
+    "loadingEarlier": "正在加载更早的消息",
+    "scrollToBottom": "回到底部",
+    "pending": {
+      "title": "待处理",
+      "steer": "补充",
+      "message": "消息",
+      "images": "图片 × {{count}}",
+      "retrieve": "取回修改",
+      "join": "加入当前轮",
+      "more": "待处理消息的更多操作",
+      "prioritize": "插队",
+      "withdraw": "撤回",
+      "withdrawTitle": "撤回消息「{{name}}」？",
+      "withdrawDescription": "消息和附件将被丢弃。确认期间仍可能被执行。"
+    },
+    "context": {
+      "label": "上下文占用：{{summary}}",
+      "ratio": "{{tokens}} / {{window}} token（{{percent}}%）",
+      "tokensOnly": "{{tokens}} token，模型窗口未知",
+      "percent": "已用 {{percent}}%",
+      "source": {
+        "actual": "基于上次实际用量，结合内容变化估算",
+        "estimated": "按全部内容估算",
+        "unknown": "还没有测量"
+      },
+      "compact": "压缩上下文",
+      "compactWhileRunning": "当前有任务在执行，结束后才能压缩"
+    },
+    "item": {
+      "renderFailed": "这条记录无法显示",
+      "expand": "展开",
+      "collapse": "收起"
+    },
+    "rewind": {
+      "action": "从这里重来",
+      "success": "已分叉出新对话，这条消息放回了输入框"
+    },
+    "session": {
+      "root": "主 Agent",
+      "entity": "子 Agent 会话",
+      "backToRoot": "回到主 Agent"
+    },
+    "message": {
+      "copy": "复制消息",
+      "from": "来自",
+      "context": "附带材料",
+      "subagent": {
+        "failed": "失败",
+        "interrupted": "已中断",
+        "running": "运行中"
+      }
+    },
+    "reasoning": {
+      "title": "思考",
+      "thinking": "思考中",
+      "completed": "思考完成",
+      "interrupted": "思考已中断"
+    },
+    "modelError": {
+      "title": "模型调用失败"
+    },
+    "notice": {
+      "contextSummary": "上下文已压缩",
+      "forkedConversation": "从<source>来源对话</source>分叉",
+      "spawnedFrom": "子 Agent 从这里开始，之前的历史继承自",
+      "modelChange": "模型从 {{previous}} 换成 {{model}}",
+      "executorsChange": "Executor 从 {{previous}} 换成 {{executors}}",
+      "previousExecutors": "之前",
+      "currentExecutors": "现在",
+      "file": "文件",
+      "skillInstruction": "加载技能",
+      "agentsInstruction": "加载目录规则",
+      "turnInterrupted": "这一轮已中断",
+      "toolResult": "工具结果（调用在更早的记录里）",
+      "unknownItem": "未知类型的记录：{{kind}}",
+      "compacting": "正在压缩上下文"
+    },
+    "hook": {
+      "event": "Hook {{event}}",
+      "status": {
+        "running": "运行中",
+        "blocked": "已拦截",
+        "stopped": "已停止",
+        "failed": "失败"
+      },
+      "blockReason": "拦截原因",
+      "stopReason": "停止原因",
+      "systemMessage": "提示",
+      "additionalContext": "给模型的补充内容",
+      "updatedArguments": "改写后的参数",
+      "error": "出错原因",
+      "source": "定义位置"
+    },
+    "turn": {
+      "status": {
+        "running": "运行中",
+        "completed": "已完成",
+        "failed": "失败",
+        "interrupted": "已中断"
+      },
+      "rawData": "这一轮的原始数据",
+      "partialRawData": "仅显示本轮已加载的记录，仍有历史未加载。",
+      "copyResult": "复制结果"
+    },
+    "tool": {
+      "arguments": "参数",
+      "result": "结果",
+      "state": {
+        "generating": "生成参数中",
+        "running": "执行中",
+        "failed": "失败",
+        "interrupted": "已中断"
+      },
+      "command": {
+        "status": {
+          "running": "仍在运行",
+          "exited": "已退出",
+          "failed": "执行失败"
+        },
+        "stopReason": {
+          "stopped": "已被 stop_command 停止",
+          "timedOut": "超时停止",
+          "sessionClosed": "Session 关闭时停止"
+        },
+        "background": "仍在后台运行（{{id}}）",
+        "exitCode": "退出码 {{code}}",
+        "hasMore": "输出还没读完",
+        "truncated": "输出过长，已截断",
+        "cwd": "目录 {{cwd}}",
+        "writtenBytes_other": "已写入 {{count}} 字节",
+        "listed_other": "{{count}} 个命令"
+      },
+      "patch": {
+        "deleted": "删除 {{path}}",
+        "partiallyApplied": "只应用了一部分：已改 {{paths}}；原因 {{problem}}"
+      },
+      "readFile": {
+        "empty": "没有内容",
+        "lines": "第 {{first}}–{{last}} 行",
+        "more": "后面还有",
+        "truncated": "达到单次读取上限",
+        "compressed": "已压缩后交给模型"
+      },
+      "agent": {
+        "forkTurns": "继承历史：{{turns}}",
+        "mode": {
+          "normal": "排队为新一轮",
+          "steer": "补充到当前一轮"
+        },
+        "waitReason": {
+          "userSteer": "收到用户补充",
+          "subagentResult": "子 Agent 有结果",
+          "agentMessage": "收到 Agent 消息",
+          "timeout": "等待超时"
+        },
+        "interrupt": {
+          "cancelRequested": "已请求取消",
+          "noActiveTurn": "目标没有在执行"
+        },
+        "listed_other": "{{count}} 个子 Agent",
+        "historyItems_other": "{{count}} 条记录",
+        "sessionState": {
+          "idle": "空闲",
+          "running": "运行中",
+          "stopping": "停止中",
+          "stopped": "已停止"
+        },
+        "pendingInputs_other": "排队 {{count}} 条"
+      }
+    },
+    "panel": {
+      "title": "对话详情",
+      "toggle": "切换对话详情",
+      "tabs": {
+        "agents": "Agent",
+        "context": "上下文",
+        "turns": "Turn",
+        "rpc": "RPC",
+        "debug": "调试"
+      },
+      "noSubAgents": "还没有子 Agent",
+      "refresh": "刷新",
+      "context": {
+        "nextRequest": "下一次请求",
+        "threshold": "自动压缩阈值",
+        "systemTokens": "系统提示词",
+        "toolTokens": "工具定义",
+        "lastRequest": "最近一次请求",
+        "noLastRequest": "还没有上报过用量的请求",
+        "estimate": "预计占用",
+        "occupancy": "占用比例",
+        "input": "输入",
+        "cacheRead": "缓存读取",
+        "output": "输出"
+      },
+      "details": {
+        "title": "Session 详情",
+        "agent": "Agent",
+        "model": "模型",
+        "compactModel": "压缩模型",
+        "executors": "Executor",
+        "skills_other": "Skill（{{count}}）",
+        "tools_other": "工具（{{count}}）"
+      },
+      "turns": {
+        "empty": "还没有 Turn",
+        "inputShare": "输入量是已加载轮次里最多一轮的 {{percent}}%"
+      },
+      "close": "关闭对话详情",
+      "rawData": "原始数据"
+    },
+    "process": {
+      "actions": {
+        "bash": "执行",
+        "read_command_output": "读取输出",
+        "write_stdin": "写入输入",
+        "stop_command": "停止命令",
+        "list_commands": "查看命令",
+        "apply_patch": "修改",
+        "read_file": "读取",
+        "spawn_agent": "委派任务",
+        "send_message": "发送消息",
+        "wait_agent": "等待消息",
+        "interrupt_agent": "中断任务",
+        "list_agents": "查看子 Agent",
+        "read_session_history": "读取历史"
+      },
+      "earlierFailure": "此组中有工具调用失败",
+      "updates": "中途回复",
+      "tools_other": "执行 {{count}} 次工具",
+      "reasoning_other": "思考 {{count}} 次",
+      "countsSeparator": "，",
+      "preview": "{{action}} {{detail}}",
+      "preparing": "准备{{action}}",
+      "preparingTool": "准备工具调用中",
+      "sendTo": "发送给 {{recipient}}",
+      "delegateTo": "委派给 {{agent}}"
+    },
+    "debug": {
+      "inspect": "调试信息",
+      "empty": "选择一条记录查看调试数据",
+      "unavailable": "这条记录尚未加载",
+      "item": "记录数据"
+    }
+  },
+  "conversationList": {
+    "status": {
+      "unknown": "状态待同步",
+      "running": "运行中",
+      "completed": "上次收到的结果：已完成",
+      "failed": "上次收到的结果：失败",
+      "interrupted": "上次收到的结果：已中断",
+      "idle": "暂无已知结果"
+    },
+    "newConversation": "新对话",
+    "untitled": "新对话",
+    "search": "搜索对话",
+    "empty": {
+      "title": "还没有对话",
+      "archivedTitle": "没有已归档的对话",
+      "noMatchTitle": "没有匹配的对话"
+    },
+    "actions": {
+      "more": "「{{name}}」的更多操作",
+      "fork": "分叉",
+      "archive": "归档",
+      "unarchive": "取消归档",
+      "delete": "删除"
+    },
+    "rename": {
+      "title": "改名",
+      "label": "标题",
+      "save": "保存",
+      "success": "已改名"
+    },
+    "fork": {
+      "success": "已分叉「{{name}}」"
+    },
+    "archive": {
+      "success": "已归档「{{name}}」"
+    },
+    "unarchive": {
+      "success": "已取消归档「{{name}}」"
+    },
+    "delete": {
+      "title": "删除对话「{{name}}」？",
+      "description": "对话和它的全部消息会被永久删除，无法恢复。",
+      "confirm": "删除",
+      "success": "已删除「{{name}}」"
+    }
+  },
+  "composer": {
+    "label": "消息",
+    "placeholder": "输入消息，/ 选择 skill",
+    "send": "发送",
+    "interrupt": "中断",
+    "addImage": "添加图片",
+    "removeImage": "移除图片「{{name}}」",
+    "attachmentsTooLarge": "附件合计不能超过 10MB",
+    "imageReadFailed": "有图片读取失败，没有加入",
+    "disconnected": "已断开，正在重连",
+    "skills": "Skill",
+    "queue": "排队",
+    "image": "图片",
+    "contextMaterial": "附带材料",
+    "removeMaterial": "移除附带材料"
+  },
+  "modelPicker": {
+    "model": "模型",
+    "search": "搜索模型",
+    "placeholder": "选择模型",
+    "noModels": "还没有可用的模型",
+    "agentDefault": "默认",
+    "reasoningEffort": "推理强度：{{effort}}",
+    "defaultEffort": "默认强度",
+    "close": "关闭模型选择"
+  },
+  "workLocation": {
+    "executor": "Executor",
+    "searchExecutors": "搜索 Executor",
+    "closeExecutors": "关闭 Executor 选择",
+    "directory": "工作目录",
+    "directoryPlaceholder": "默认目录",
+    "directorySuggestions": "目录候选",
+    "noDirectories": "没有匹配的子目录",
+    "directoryInvalid": "工作目录不可用：{{detail}}"
+  },
+  "conversationSettings": {
+    "title": "对话设置",
+    "tabs": {
+      "executor": "Executor",
+      "mcp": "MCP",
+      "skills": "Skill"
+    },
+    "executor": {
+      "location": "默认 Executor 和工作目录",
+      "available": "可用的 Executor",
+      "default": "默认"
+    },
+    "save": "保存",
+    "saved": "Executor 设置已保存",
+    "mcp": {
+      "connected": "已连接",
+      "connecting": "连接中",
+      "failed": "连接失败",
+      "tools_other": "{{count}} 个工具",
+      "required": "必需",
+      "plugin": "来自插件 {{name}}",
+      "empty": "这个对话没有 MCP 服务",
+      "emptyDescription": "在配置里给 Executor 加上 MCP 服务后会显示在这里"
+    },
+    "skills": {
+      "empty": "这个对话没有可用的 Skill",
+      "emptyDescription": "在工作目录或用户主目录里放上 Skill 后会显示在这里"
+    }
+  },
+  "rpcLog": {
+    "title": "RPC 记录",
+    "searchPlaceholder": "按方法名筛选",
+    "pause": "暂停记录",
+    "resume": "继续记录",
+    "clear": "清空记录",
+    "download": "下载全部帧（JSONL）",
+    "direction": {
+      "label": "方向",
+      "all": "全部",
+      "sent": "发出",
+      "received": "收到"
+    },
+    "currentConversationOnly": "只看当前对话",
+    "empty": "还没有记录",
+    "pausedEmpty": "记录已暂停",
+    "noMatch": "没有匹配的帧",
+    "count": "显示 {{visible}} / 共 {{total}} 帧",
+    "latency": "{{latency}} ms",
+    "closeDetail": "关闭详情"
+  },
+  "settings": {
+    "title": "设置",
+    "appearance": {
+      "color": "主题配色",
+      "stone": "石色",
+      "blue": "蓝色",
+      "bodyFont": "正文字体",
+      "headingFont": "标题字体",
+      "systemFont": "系统字体",
+      "reset": "恢复默认外观"
+    },
+    "sections": {
+      "general": "通用",
+      "providers": "模型服务",
+      "executors": "Executor",
+      "hooks": "Hook",
+      "skills": "Skill",
+      "archived": "归档对话"
+    },
+    "archived": {
+      "search": "搜索归档对话"
+    },
+    "reload": {
+      "action": "重新加载配置",
+      "done": "已重新加载配置"
+    },
+    "busyConversations_other": "{{count}} 个对话正在执行，没换上新配置；等它们空闲后再重新加载配置才会生效",
+    "providers": {
+      "add": "新增模型服务",
+      "empty": "还没有模型服务",
+      "defaultModel": "默认模型",
+      "defaultModelChanged": "默认模型改成了 {{model}}",
+      "agentModel": "{{agent}} Agent 自己指定了 {{model}}，新对话仍然用它",
+      "defaultBadge": "默认",
+      "modelCount_other": "{{count}} 个模型",
+      "backToList": "返回模型服务",
+      "entity": "模型服务",
+      "missingID": "地址里缺少模型服务 ID。"
+    },
+    "providerEditor": {
+      "connection": "连接",
+      "catalog": "模型目录",
+      "catalogPlaceholder": "手动填写",
+      "catalogFailed": "拿不到模型目录，请手动填写协议和 base_url：{{detail}}",
+      "catalogEmpty": "模型目录是空的，请手动填写协议和 base_url。",
+      "id": "ID",
+      "idPlaceholder": "deepseek",
+      "idInvalid": "ID 只能用字母、数字、-、_ 和 .",
+      "idDuplicate": "已有模型服务「{{name}}」，换一个 ID，或者回到列表编辑它",
+      "protocol": "协议",
+      "protocols": {
+        "openaiChat": "OpenAI Chat Completions",
+        "openaiResponses": "OpenAI Responses",
+        "claude": "Claude Messages"
+      },
+      "baseURL": "base_url",
+      "apiKey": "API key",
+      "models": "模型",
+      "modelIDs": "模型 ID",
+      "modelIDsPlaceholder": "模型 ID，多个用逗号分隔",
+      "addModels": "添加",
+      "fetchModels": "拉取模型",
+      "catalogModels": "从目录选择模型",
+      "contextWindow": "上下文窗口",
+      "removeModel": "移除模型 {{name}}",
+      "modelsRequired": "至少要有一个模型",
+      "noDefault": "未设置",
+      "defaultModelRemoved": "现在的默认模型 {{model}} 已被移除，请另选一个默认模型",
+      "create": "创建",
+      "revert": "撤销",
+      "apply": "应用",
+      "created": "已新增模型服务「{{name}}」",
+      "saved": "已保存模型服务「{{name}}」",
+      "savedChanged": "配置已在其他位置更新。撤销会载入最新配置，当前修改会丢失。",
+      "delete": "删除",
+      "deleteTitle": "删除模型服务「{{name}}」？",
+      "deleteConfirmDescription": "会删除配置目录里的 models/{{name}}.yaml；默认模型属于它时一起清掉。",
+      "deleted": "已删除模型服务「{{name}}」",
+      "dirtyActions": "先应用或撤销未提交的修改。",
+      "endpoints": "协议地址覆盖",
+      "editModel": "编辑模型 {{name}}",
+      "inherited": "继承（{{value}}）",
+      "aliasRequired": "请填写模型别名",
+      "aliasDuplicate": "模型别名不能重复",
+      "inherit": "继承",
+      "custom": "自定义",
+      "effortEmpty": "推理强度列表不能含空项",
+      "effortDuplicate": "推理强度不能重复",
+      "basic": "基本",
+      "alias": "本地别名",
+      "upstreamID": "上游模型 ID",
+      "displayName": "显示名",
+      "capacity": "容量",
+      "maxOutputTokens": "最大输出 Token",
+      "reasoning": "推理",
+      "thinking": "思考",
+      "on": "开启",
+      "off": "关闭",
+      "reasoningEfforts": "推理强度列表",
+      "effortValues": "强度（逗号分隔）",
+      "emptyList": "空列表",
+      "defaultEffort": "默认推理强度",
+      "effortUnavailable": "请选择当前列表中的强度或自动",
+      "automatic": "自动（{{value}}）",
+      "none": "无",
+      "inputCapabilities": "输入能力",
+      "inputMode": "输入类型",
+      "textFallback": "按文本输入处理",
+      "messageMerge": "消息合并",
+      "mergeMode": "合并角色",
+      "noMerge": "不合并",
+      "inputs": {
+        "text": "文本",
+        "image": "图片",
+        "audio": "音频",
+        "video": "视频",
+        "pdf": "PDF"
+      },
+      "roles": {
+        "system": "系统",
+        "developer": "开发者",
+        "user": "用户",
+        "assistant": "助手"
+      }
+    },
+    "fetchModels": {
+      "title": "拉取模型",
+      "catalogTitle": "从目录选择模型",
+      "loading": "正在获取模型列表…",
+      "empty": "没有拿到模型",
+      "search": "搜索模型",
+      "noMatch": "没有匹配的模型",
+      "other": "其他",
+      "selectGroup": "勾选整组 {{name}}",
+      "added_other": "新增 {{count}} 个",
+      "removed_other": "移除 {{count}} 个",
+      "confirm": "确定"
+    },
+    "executors": {
+      "empty": "没有 Executor",
+      "workspaceDirectory": "默认根目录 {{directory}}",
+      "noWorkspaceDirectory": "没有默认根目录"
+    },
+    "hooks": {
+      "empty": "还没有配置 hook",
+      "emptyDescription": "在 config.yaml 的 hooks 段或插件里配置 hook 后，点「重新加载配置」",
+      "plugin": "来自插件 {{name}}",
+      "timeout": "超时 {{timeout}} 秒"
+    },
+    "skills": {
+      "empty": "default Agent 没有可用的 Skill",
+      "emptyDescription": "在工作目录或用户主目录里放上 Skill 后会显示在这里"
+    }
+  },
+  "outputBlock": {
+    "expand": "展开输出",
+    "collapse": "收起输出"
+  },
+  "imagePreview": {
+    "title": "图片预览",
+    "open": "预览图片 {{name}}",
+    "fit": "适应窗口",
+    "actualSize": "100%",
+    "close": "关闭图片预览",
+    "failed": "图片加载失败"
+  }
+}

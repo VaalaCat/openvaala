@@ -1,0 +1,26 @@
+{
+  "name": "OpenVaala",
+  "slug": "openvaala",
+  "identifier": "cloud.vaala.openvaala.desktop",
+  "version": "0.2.0",
+  "main": "./cmd/openvaala-desktop",
+  "out": "dist/desktop",
+  "resources": [
+    "internal/desktop/fonts/NotoSerif-OFL.txt",
+    "resources/licenses/IBM-Plex-Sans.txt",
+    "resources/licenses/Lilex.txt",
+    "resources/licenses/Lucide.txt",
+    "resources/licenses/MyGo.txt",
+    "resources/licenses/Zed-One.txt",
+    "resources/licenses/go-text-typesetting.txt",
+    "resources/licenses/purego.txt"
+  ],
+  "macos": {
+    "minimumSystemVersion": "12.0"
+  },
+  "linux": {
+    "webview": true,
+    "comment": "AI agent workbench with WebView, native UI and the complete OpenVaala CLI",
+    "categories": ["Development", "Utility"]
+  }
+}

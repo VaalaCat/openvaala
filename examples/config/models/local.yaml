@@ -1,0 +1,13 @@
+id: local
+protocol: openai_chat
+base_url: http://127.0.0.1:8080/v1
+api_key: ""
+models:
+  default:
+    upstream_model: your-model-name
+    # context_window 填写模型的实际上下文窗口；省略时使用 models.defaults，内置值为 256000。
+    # 每次请求携带 max_tokens，默认值为 32000；模型的输出上限更小时，设置 max_output_tokens。
+    # max_output_tokens: 8192
+    # capabilities.input 填写模型能接收的输入类型；支持图片时写 [text, image]。省略时使用 models.defaults.capabilities.input，内置值为 [text]，请求里的图片会换成占位文字。
+    # capabilities:
+    #   input: [text, image]

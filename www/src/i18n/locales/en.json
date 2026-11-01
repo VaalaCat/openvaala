@@ -1,0 +1,673 @@
+{
+  "common": {
+    "loading": "Loading…",
+    "language": "Language",
+    "breadcrumb": "Current location",
+    "dangerZone": "Danger zone",
+    "actions": {
+      "cancel": "Cancel",
+      "clearFilters": "Clear filters",
+      "clearSearch": "Clear search",
+      "copy": "Copy",
+      "hide": "Hide",
+      "reveal": "Show",
+      "search": "Search",
+      "toggleSidebar": "Toggle sidebar",
+      "reload": "Reload",
+      "rename": "Rename",
+      "retry": "Retry"
+    },
+    "copy": {
+      "success": "Copied",
+      "failed": "Copy failed: {{message}}",
+      "manual": "Copy failed. Select and copy the text manually."
+    },
+    "theme": {
+      "title": "Theme",
+      "light": "Light",
+      "dark": "Dark",
+      "system": "System"
+    },
+    "toast": {
+      "close": "Close notification",
+      "region": "Notifications"
+    },
+    "unsavedChanges": {
+      "title": "Leave this page?",
+      "stay": "Keep editing",
+      "leave": "Leave"
+    },
+    "errors": {
+      "title": "Operation failed",
+      "detail": "Details",
+      "requestFailed": "Request failed. Please try again.",
+      "connectionLost": "Connection lost",
+      "sessionBusy": "A task is running. Try again shortly.",
+      "conversationNotFound": "The conversation does not exist or was deleted.",
+      "sessionNotFound": "The session does not exist.",
+      "invalidParams": "Invalid parameters",
+      "pageLoadFailed": "The page didn’t load. It may have just been upgraded.",
+      "pageFailed": "Something went wrong on this page."
+    },
+    "notFound": {
+      "title": "{{entity}} not found",
+      "description": "It may have been deleted, or the link is wrong."
+    },
+    "selection": {
+      "empty": "No matches",
+      "clear": "Clear",
+      "more": "More"
+    }
+  },
+  "tokenNumberValue": {
+    "fullValue": "Full value: {{value}}"
+  },
+  "numberUnitInput": {
+    "errors": {
+      "negative": "Enter a non-negative number",
+      "invalid": "Enter an integer or a decimal with K or M",
+      "fractional": "The converted value must be an integer",
+      "unsafe": "The value exceeds the safe integer range"
+    }
+  },
+  "connection": {
+    "reconnect": "Reconnect",
+    "reconnectPending": "Reconnecting",
+    "connecting": {
+      "title": "Connecting…",
+      "retrying": "Can’t reach {{host}}. Retrying. Make sure openvaala serve is running."
+    },
+    "incompatible": {
+      "title": "Version mismatch",
+      "description": "The page and serve versions differ. Use the same version of openvaala."
+    },
+    "tokenEntry": {
+      "title": "Enter token",
+      "description": "Run openvaala web to get an address that includes the token",
+      "label": "Token",
+      "submit": "Connect",
+      "invalid": "The token is invalid. Run openvaala web again to get a new address."
+    },
+    "state": {
+      "connected": "Connected",
+      "connecting": "Connecting",
+      "reconnecting": "Disconnected, reconnecting",
+      "unauthorized": "Invalid token",
+      "incompatible": "Version mismatch"
+    }
+  },
+  "jsonView": {
+    "childCount_one": "{{count}} item",
+    "childCount_other": "{{count}} items",
+    "fold": "Collapse",
+    "unfold": "Expand",
+    "expandNested": "Expand as JSON",
+    "collapseNested": "Show as string",
+    "expandString": "Show all",
+    "collapseString": "Show less",
+    "copyNode": "Copy this node",
+    "showAllRows": "Show all {{total}} lines"
+  },
+  "conversation": {
+    "entity": "Conversation",
+    "backToNewConversation": "Back to new conversation",
+    "messages": "Messages",
+    "empty": "No messages yet",
+    "loadingEarlier": "Loading earlier messages",
+    "scrollToBottom": "Back to bottom",
+    "pending": {
+      "title": "Pending",
+      "steer": "Steer",
+      "message": "Message",
+      "images": "Images × {{count}}",
+      "retrieve": "Retrieve to edit",
+      "join": "Add to this turn",
+      "more": "More pending input actions",
+      "prioritize": "Jump the queue",
+      "withdraw": "Withdraw",
+      "withdrawTitle": "Withdraw message “{{name}}”?",
+      "withdrawDescription": "The message and attachments will be discarded. It may still be consumed while you confirm."
+    },
+    "context": {
+      "label": "Context usage: {{summary}}",
+      "ratio": "{{tokens}} / {{window}} tokens ({{percent}}%)",
+      "tokensOnly": "{{tokens}} tokens, model window unknown",
+      "percent": "{{percent}}% used",
+      "source": {
+        "actual": "Estimated from the last actual usage and changes to the content",
+        "estimated": "Estimated from the whole context",
+        "unknown": "Not measured yet"
+      },
+      "compact": "Compact context",
+      "compactWhileRunning": "A turn is running; compact after it finishes"
+    },
+    "item": {
+      "renderFailed": "This record can't be displayed",
+      "expand": "Expand",
+      "collapse": "Collapse"
+    },
+    "rewind": {
+      "action": "Restart from here",
+      "success": "Forked a new conversation; the message is back in the composer"
+    },
+    "session": {
+      "root": "Main agent",
+      "entity": "Sub-agent session",
+      "backToRoot": "Back to main agent"
+    },
+    "message": {
+      "copy": "Copy message",
+      "from": "From",
+      "context": "Attached context",
+      "subagent": {
+        "failed": "failed",
+        "interrupted": "interrupted",
+        "running": "running"
+      }
+    },
+    "reasoning": {
+      "title": "Reasoning",
+      "thinking": "Thinking",
+      "completed": "Thinking complete",
+      "interrupted": "Thinking interrupted"
+    },
+    "modelError": {
+      "title": "Model call failed"
+    },
+    "notice": {
+      "contextSummary": "Context compacted",
+      "forkedConversation": "Forked from the <source>source conversation</source>",
+      "spawnedFrom": "Sub-agent starts here; earlier history is inherited from",
+      "modelChange": "Model changed from {{previous}} to {{model}}",
+      "executorsChange": "Executors changed from {{previous}} to {{executors}}",
+      "previousExecutors": "Before",
+      "currentExecutors": "Now",
+      "file": "File",
+      "skillInstruction": "Load skill",
+      "agentsInstruction": "Load directory rules",
+      "turnInterrupted": "This turn was interrupted",
+      "toolResult": "Tool result (the call is in earlier history)",
+      "unknownItem": "Unknown record kind: {{kind}}",
+      "compacting": "Compacting context"
+    },
+    "hook": {
+      "event": "Hook {{event}}",
+      "status": {
+        "running": "running",
+        "blocked": "blocked",
+        "stopped": "stopped",
+        "failed": "failed"
+      },
+      "blockReason": "Block reason",
+      "stopReason": "Stop reason",
+      "systemMessage": "Message",
+      "additionalContext": "Context added for the model",
+      "updatedArguments": "Rewritten arguments",
+      "error": "Error",
+      "source": "Defined in"
+    },
+    "turn": {
+      "status": {
+        "running": "Running",
+        "completed": "Completed",
+        "failed": "Failed",
+        "interrupted": "Interrupted"
+      },
+      "rawData": "Raw data of this turn",
+      "partialRawData": "Only loaded records from this turn are shown; some history is not loaded.",
+      "copyResult": "Copy result"
+    },
+    "tool": {
+      "arguments": "Arguments",
+      "result": "Result",
+      "state": {
+        "generating": "Writing arguments",
+        "running": "Running",
+        "failed": "Failed",
+        "interrupted": "Interrupted"
+      },
+      "command": {
+        "status": {
+          "running": "Still running",
+          "exited": "Exited",
+          "failed": "Failed"
+        },
+        "stopReason": {
+          "stopped": "Stopped by stop_command",
+          "timedOut": "Stopped on timeout",
+          "sessionClosed": "Stopped when the session closed"
+        },
+        "background": "Still running in the background ({{id}})",
+        "exitCode": "Exit code {{code}}",
+        "hasMore": "More output not read yet",
+        "truncated": "Output too long, truncated",
+        "cwd": "Directory {{cwd}}",
+        "writtenBytes_one": "Wrote {{count}} byte",
+        "writtenBytes_other": "Wrote {{count}} bytes",
+        "listed_one": "{{count}} command",
+        "listed_other": "{{count}} commands"
+      },
+      "patch": {
+        "deleted": "deleted {{path}}",
+        "partiallyApplied": "Only partly applied: changed {{paths}}; reason {{problem}}"
+      },
+      "readFile": {
+        "empty": "No content",
+        "lines": "Lines {{first}}–{{last}}",
+        "more": "More below",
+        "truncated": "Hit the per-read limit",
+        "compressed": "Compressed before sending to the model"
+      },
+      "agent": {
+        "forkTurns": "Inherited history: {{turns}}",
+        "mode": {
+          "normal": "Queued as a new turn",
+          "steer": "Added to the current turn"
+        },
+        "waitReason": {
+          "userSteer": "User added input",
+          "subagentResult": "Sub-agent has a result",
+          "agentMessage": "Agent message arrived",
+          "timeout": "Wait timed out"
+        },
+        "interrupt": {
+          "cancelRequested": "Cancel requested",
+          "noActiveTurn": "Target was not running"
+        },
+        "listed_one": "{{count}} sub-agent",
+        "listed_other": "{{count}} sub-agents",
+        "historyItems_one": "{{count}} record",
+        "historyItems_other": "{{count}} records",
+        "sessionState": {
+          "idle": "idle",
+          "running": "running",
+          "stopping": "stopping",
+          "stopped": "stopped"
+        },
+        "pendingInputs_one": "{{count}} queued input",
+        "pendingInputs_other": "{{count}} queued inputs"
+      }
+    },
+    "panel": {
+      "title": "Conversation details",
+      "toggle": "Toggle conversation details",
+      "tabs": {
+        "agents": "Agents",
+        "context": "Context",
+        "turns": "Turns",
+        "rpc": "RPC",
+        "debug": "Debug"
+      },
+      "noSubAgents": "No sub-agents yet",
+      "refresh": "Refresh",
+      "context": {
+        "nextRequest": "Next request",
+        "threshold": "Auto-compact threshold",
+        "systemTokens": "System prompt",
+        "toolTokens": "Tool definitions",
+        "lastRequest": "Last request",
+        "noLastRequest": "No request has reported usage yet",
+        "estimate": "Estimated usage",
+        "occupancy": "Occupancy",
+        "input": "Input",
+        "cacheRead": "Cache read",
+        "output": "Output"
+      },
+      "details": {
+        "title": "Session details",
+        "agent": "Agent",
+        "model": "Model",
+        "compactModel": "Compaction model",
+        "executors": "Executors",
+        "skills_one": "Skill ({{count}})",
+        "skills_other": "Skills ({{count}})",
+        "tools_one": "Tool ({{count}})",
+        "tools_other": "Tools ({{count}})"
+      },
+      "turns": {
+        "empty": "No turns yet",
+        "inputShare": "Input is {{percent}}% of the largest loaded turn"
+      },
+      "close": "Close conversation details",
+      "rawData": "Raw data"
+    },
+    "process": {
+      "actions": {
+        "bash": "Run",
+        "read_command_output": "Read output",
+        "write_stdin": "Write input",
+        "stop_command": "Stop command",
+        "list_commands": "List commands",
+        "apply_patch": "Edit",
+        "read_file": "Read",
+        "spawn_agent": "Delegate task",
+        "send_message": "Send message",
+        "wait_agent": "Wait for message",
+        "interrupt_agent": "Interrupt task",
+        "list_agents": "List agents",
+        "read_session_history": "Read history"
+      },
+      "earlierFailure": "A tool call in this group failed",
+      "updates": "Progress replies",
+      "tools_one": "{{count}} tool call",
+      "tools_other": "{{count}} tool calls",
+      "reasoning_one": "{{count}} reasoning step",
+      "reasoning_other": "{{count}} reasoning steps",
+      "countsSeparator": ", ",
+      "preview": "{{action}} {{detail}}",
+      "preparing": "Preparing: {{action}}",
+      "preparingTool": "Preparing tool call",
+      "sendTo": "Send to {{recipient}}",
+      "delegateTo": "Delegate to {{agent}}"
+    },
+    "debug": {
+      "inspect": "Debug information",
+      "empty": "Select a record to inspect",
+      "unavailable": "This record is not loaded",
+      "item": "Record data"
+    }
+  },
+  "conversationList": {
+    "status": {
+      "unknown": "Waiting for status",
+      "running": "Running",
+      "completed": "Last received result: completed",
+      "failed": "Last received result: failed",
+      "interrupted": "Last received result: interrupted",
+      "idle": "No known result"
+    },
+    "newConversation": "New conversation",
+    "untitled": "New conversation",
+    "search": "Search conversations",
+    "empty": {
+      "title": "No conversations yet",
+      "archivedTitle": "No archived conversations",
+      "noMatchTitle": "No matching conversations"
+    },
+    "actions": {
+      "more": "More actions for “{{name}}”",
+      "fork": "Fork",
+      "archive": "Archive",
+      "unarchive": "Unarchive",
+      "delete": "Delete"
+    },
+    "rename": {
+      "title": "Rename conversation",
+      "label": "Title",
+      "save": "Save",
+      "success": "Conversation renamed"
+    },
+    "fork": {
+      "success": "Forked “{{name}}”"
+    },
+    "archive": {
+      "success": "Archived “{{name}}”"
+    },
+    "unarchive": {
+      "success": "Unarchived “{{name}}”"
+    },
+    "delete": {
+      "title": "Delete conversation “{{name}}”?",
+      "description": "The conversation and all its messages will be permanently deleted. This cannot be undone.",
+      "confirm": "Delete",
+      "success": "Deleted “{{name}}”"
+    }
+  },
+  "composer": {
+    "label": "Message",
+    "placeholder": "Message… / for skills",
+    "send": "Send",
+    "interrupt": "Stop",
+    "addImage": "Add images",
+    "removeImage": "Remove image “{{name}}”",
+    "attachmentsTooLarge": "Attachments can't exceed 10MB in total",
+    "imageReadFailed": "Some images couldn't be read and weren't added",
+    "disconnected": "Disconnected, reconnecting",
+    "skills": "Skills",
+    "queue": "Queue",
+    "image": "Image",
+    "contextMaterial": "Attached context",
+    "removeMaterial": "Remove attached context"
+  },
+  "modelPicker": {
+    "model": "Model",
+    "search": "Search models",
+    "placeholder": "Choose a model",
+    "noModels": "No models available",
+    "agentDefault": "Default",
+    "reasoningEffort": "Reasoning effort: {{effort}}",
+    "defaultEffort": "Default effort",
+    "close": "Close model selection"
+  },
+  "workLocation": {
+    "executor": "Executor",
+    "searchExecutors": "Search executors",
+    "closeExecutors": "Close executor selection",
+    "directory": "Working directory",
+    "directoryPlaceholder": "Default directory",
+    "directorySuggestions": "Directory suggestions",
+    "noDirectories": "No matching subdirectories",
+    "directoryInvalid": "Working directory unavailable: {{detail}}"
+  },
+  "conversationSettings": {
+    "title": "Conversation settings",
+    "tabs": {
+      "executor": "Executor",
+      "mcp": "MCP",
+      "skills": "Skills"
+    },
+    "executor": {
+      "location": "Default executor and work directory",
+      "available": "Available executors",
+      "default": "Default"
+    },
+    "save": "Save",
+    "saved": "Executor settings saved",
+    "mcp": {
+      "connected": "Connected",
+      "connecting": "Connecting",
+      "failed": "Failed",
+      "tools_one": "{{count}} tool",
+      "tools_other": "{{count}} tools",
+      "required": "Required",
+      "plugin": "From plugin {{name}}",
+      "empty": "No MCP servers in this conversation",
+      "emptyDescription": "MCP servers configured for an executor show up here"
+    },
+    "skills": {
+      "empty": "No skills available in this conversation",
+      "emptyDescription": "Skills in the work directory or your home directory show up here"
+    }
+  },
+  "rpcLog": {
+    "title": "RPC log",
+    "searchPlaceholder": "Filter by method",
+    "pause": "Pause recording",
+    "resume": "Resume recording",
+    "clear": "Clear log",
+    "download": "Download all frames (JSONL)",
+    "direction": {
+      "label": "Direction",
+      "all": "All",
+      "sent": "Sent",
+      "received": "Received"
+    },
+    "currentConversationOnly": "Current conversation only",
+    "empty": "Nothing recorded yet",
+    "pausedEmpty": "Recording is paused",
+    "noMatch": "No matching frames",
+    "count": "Showing {{visible}} of {{total}} frames",
+    "latency": "{{latency}} ms",
+    "closeDetail": "Close details"
+  },
+  "settings": {
+    "title": "Settings",
+    "appearance": {
+      "color": "Theme color",
+      "stone": "Stone",
+      "blue": "Blue",
+      "bodyFont": "Body font",
+      "headingFont": "Heading font",
+      "systemFont": "System font",
+      "reset": "Reset appearance"
+    },
+    "sections": {
+      "general": "General",
+      "providers": "Model providers",
+      "executors": "Executors",
+      "hooks": "Hooks",
+      "skills": "Skills",
+      "archived": "Archived conversations"
+    },
+    "archived": {
+      "search": "Search archived conversations"
+    },
+    "reload": {
+      "action": "Reload config",
+      "done": "Config reloaded"
+    },
+    "busyConversations_one": "{{count}} conversation is running and still uses the old config; reload again once it is idle",
+    "busyConversations_other": "{{count}} conversations are running and still use the old config; reload again once they are idle",
+    "providers": {
+      "add": "Add model provider",
+      "empty": "No model providers yet",
+      "defaultModel": "Default model",
+      "defaultModelChanged": "Default model is now {{model}}",
+      "agentModel": "The {{agent}} agent sets its own model {{model}}; new conversations still use it",
+      "defaultBadge": "Default",
+      "modelCount_one": "{{count}} model",
+      "modelCount_other": "{{count}} models",
+      "backToList": "Back to model providers",
+      "entity": "Model provider",
+      "missingID": "The address is missing a model provider ID."
+    },
+    "providerEditor": {
+      "connection": "Connection",
+      "catalog": "Model catalog",
+      "catalogPlaceholder": "Enter manually",
+      "catalogFailed": "The model catalog is unavailable; fill in the protocol and base_url by hand: {{detail}}",
+      "catalogEmpty": "The model catalog is empty; fill in the protocol and base_url by hand.",
+      "id": "ID",
+      "idPlaceholder": "deepseek",
+      "idInvalid": "The ID may only contain letters, digits, -, _ and .",
+      "idDuplicate": "Model provider “{{name}}” already exists; pick another ID or edit it from the list",
+      "protocol": "Protocol",
+      "protocols": {
+        "openaiChat": "OpenAI Chat Completions",
+        "openaiResponses": "OpenAI Responses",
+        "claude": "Claude Messages"
+      },
+      "baseURL": "base_url",
+      "apiKey": "API key",
+      "models": "Models",
+      "modelIDs": "Model IDs",
+      "modelIDsPlaceholder": "Model IDs, separated by commas",
+      "addModels": "Add",
+      "fetchModels": "Fetch models",
+      "catalogModels": "Pick models from catalog",
+      "contextWindow": "Context window",
+      "removeModel": "Remove model {{name}}",
+      "modelsRequired": "Add at least one model",
+      "noDefault": "Not set",
+      "defaultModelRemoved": "The current default model {{model}} was removed; choose another default model",
+      "create": "Create",
+      "revert": "Revert",
+      "apply": "Apply",
+      "created": "Added model provider “{{name}}”",
+      "saved": "Saved model provider “{{name}}”",
+      "savedChanged": "The config changed elsewhere. Revert loads the latest config and discards your changes.",
+      "delete": "Delete",
+      "deleteTitle": "Delete model provider “{{name}}”?",
+      "deleteConfirmDescription": "Deletes models/{{name}}.yaml from the config directory; the default model is cleared too if it belongs to it.",
+      "deleted": "Deleted model provider “{{name}}”",
+      "dirtyActions": "Apply or revert your unsaved changes first.",
+      "endpoints": "Protocol endpoint overrides",
+      "editModel": "Edit model {{name}}",
+      "inherited": "Inherit ({{value}})",
+      "aliasRequired": "Enter a model alias",
+      "aliasDuplicate": "Model aliases must be unique",
+      "inherit": "Inherit",
+      "custom": "Custom",
+      "effortEmpty": "Reasoning efforts must not contain empty entries",
+      "effortDuplicate": "Reasoning efforts must be unique",
+      "basic": "Basic",
+      "alias": "Local alias",
+      "upstreamID": "Upstream model ID",
+      "displayName": "Display name",
+      "capacity": "Capacity",
+      "maxOutputTokens": "Maximum output tokens",
+      "reasoning": "Reasoning",
+      "thinking": "Thinking",
+      "on": "On",
+      "off": "Off",
+      "reasoningEfforts": "Reasoning efforts",
+      "effortValues": "Efforts (comma-separated)",
+      "emptyList": "Empty list",
+      "defaultEffort": "Default reasoning effort",
+      "effortUnavailable": "Choose an effort from the current list or Automatic",
+      "automatic": "Automatic ({{value}})",
+      "none": "None",
+      "inputCapabilities": "Input capabilities",
+      "inputMode": "Input types",
+      "textFallback": "Handled as text input",
+      "messageMerge": "Message merging",
+      "mergeMode": "Merge roles",
+      "noMerge": "No merging",
+      "inputs": {
+        "text": "Text",
+        "image": "Image",
+        "audio": "Audio",
+        "video": "Video",
+        "pdf": "PDF"
+      },
+      "roles": {
+        "system": "System",
+        "developer": "Developer",
+        "user": "User",
+        "assistant": "Assistant"
+      }
+    },
+    "fetchModels": {
+      "title": "Fetch models",
+      "catalogTitle": "Pick models from catalog",
+      "loading": "Fetching models…",
+      "empty": "No models returned",
+      "search": "Search models",
+      "noMatch": "No matching models",
+      "other": "Other",
+      "selectGroup": "Select all in {{name}}",
+      "added_one": "Add {{count}}",
+      "added_other": "Add {{count}}",
+      "removed_one": "Remove {{count}}",
+      "removed_other": "Remove {{count}}",
+      "confirm": "Done"
+    },
+    "executors": {
+      "empty": "No executors",
+      "workspaceDirectory": "Default root {{directory}}",
+      "noWorkspaceDirectory": "No default root"
+    },
+    "hooks": {
+      "empty": "No hooks configured",
+      "emptyDescription": "Configure hooks in the hooks section of config.yaml or in a plugin, then click Reload config",
+      "plugin": "From plugin {{name}}",
+      "timeout": "Timeout {{timeout}}s"
+    },
+    "skills": {
+      "empty": "The default agent has no skills",
+      "emptyDescription": "Skills placed in the working directory or your home directory show up here"
+    }
+  },
+  "outputBlock": {
+    "expand": "Expand output",
+    "collapse": "Collapse output"
+  },
+  "imagePreview": {
+    "title": "Image preview",
+    "open": "Preview image {{name}}",
+    "fit": "Fit",
+    "actualSize": "100%",
+    "close": "Close image preview",
+    "failed": "Image failed to load"
+  }
+}

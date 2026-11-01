@@ -1,0 +1,491 @@
+/* ---------- 正文排版 ---------- */
+
+.prose {
+  color: var(--ink-soft);
+  font-size: 1rem;
+  line-height: 1.7;
+  overflow-wrap: break-word;
+}
+
+.prose > div > :first-child {
+  margin-top: 0;
+}
+
+.prose h1,
+.prose h2 {
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-weight: 400;
+  text-wrap: balance;
+}
+
+.prose h1 {
+  margin: 0 0 20px;
+  font-size: 2.375rem;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+.prose h2 {
+  margin: 56px 0 16px;
+  font-size: 1.625rem;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+.prose h3,
+.prose h4 {
+  color: var(--ink);
+  font-family: var(--font-text);
+  font-weight: 600;
+}
+
+.prose h3 {
+  margin: 36px 0 10px;
+  font-size: 1.125rem;
+  line-height: 1.4;
+}
+
+.prose h4 {
+  margin: 28px 0 8px;
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+.prose :is(h1, h2, h3, h4) {
+  scroll-margin-top: calc(var(--top-bar-height) + 56px);
+}
+
+/* 首段导语略大一号。 */
+.prose h1 + p {
+  color: var(--ink-soft);
+  font-size: 1.1875rem;
+  line-height: 1.6;
+}
+
+.prose p,
+.prose ul,
+.prose ol,
+.prose table,
+.prose blockquote,
+.prose details {
+  margin: 16px 0;
+}
+
+.prose strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* 标题永久链接：悬停标题时显示等宽 #。 */
+.prose .header-anchor {
+  margin-left: 0.35em;
+  color: var(--ink-muted);
+  font-family: var(--font-code);
+  font-size: 0.8em;
+  font-weight: 400;
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+
+.prose .header-anchor::before {
+  content: "#";
+}
+
+.prose :is(h1, h2, h3, h4):hover .header-anchor,
+.prose .header-anchor:focus-visible {
+  opacity: 1;
+}
+
+.prose ul,
+.prose ol {
+  padding-left: 1.4em;
+}
+
+.prose li + li {
+  margin-top: 6px;
+}
+
+.prose li > ul,
+.prose li > ol {
+  margin: 6px 0 0;
+}
+
+.prose ul > li::marker {
+  color: var(--ink-muted);
+}
+
+.prose ol > li::marker {
+  color: var(--ink-muted);
+  font-family: var(--font-code);
+  font-size: 0.875em;
+}
+
+.prose hr {
+  height: 1px;
+  margin: 48px 0;
+  border: 0;
+  background: var(--rule);
+}
+
+.prose blockquote {
+  padding: 2px 0 2px 18px;
+  border-left: 2px solid var(--rule-strong);
+  color: var(--ink-muted);
+}
+
+.prose blockquote > p {
+  margin: 8px 0;
+}
+
+.prose img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 28px 0;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+}
+
+.prose kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: 0 6px;
+  border: 1px solid var(--rule-strong);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  background: var(--paper-raised);
+  color: var(--ink);
+  font-family: var(--font-code);
+  font-size: 0.75rem;
+  line-height: 1.7;
+  text-align: center;
+}
+
+/* ---------- 表格 ---------- */
+
+.prose table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+  line-height: 1.55;
+}
+
+.prose th,
+.prose td {
+  padding: 10px 16px 10px 0;
+  border-bottom: 1px solid var(--rule);
+  text-align: left;
+  vertical-align: top;
+}
+
+.prose th {
+  border-bottom-color: var(--rule-strong);
+  color: var(--ink);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.prose tr:last-child td {
+  border-bottom: 0;
+}
+
+/* ---------- 代码 ---------- */
+
+.prose :not(pre) > code {
+  padding: 0.12em 0.4em;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper-raised);
+  color: var(--ink);
+  font-family: var(--font-code);
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+.prose a > code {
+  font-weight: 500;
+}
+
+/* 表格里的命令和事件名保持完整，窄屏通过表格横向滚动阅读。 */
+.prose table code {
+  white-space: nowrap;
+}
+
+.prose div[class*="language-"] {
+  position: relative;
+  margin: 20px 0;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  background: var(--paper-raised);
+}
+
+.prose pre {
+  margin: 0;
+  padding: 18px 20px;
+  overflow-x: auto;
+  background: transparent !important;
+  font-family: var(--font-code);
+  font-size: 0.8125rem;
+  line-height: 1.75;
+  tab-size: 4;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-strong) transparent;
+}
+
+.prose pre code {
+  display: block;
+  width: fit-content;
+  min-width: 100%;
+  font-family: inherit;
+  font-feature-settings: "calt" 0;
+}
+
+.prose .vp-code span {
+  color: var(--shiki-light, inherit);
+  font-style: var(--shiki-light-font-style, inherit);
+  font-weight: var(--shiki-light-font-weight, inherit);
+}
+
+.dark .prose .vp-code span {
+  color: var(--shiki-dark, inherit);
+  font-style: var(--shiki-dark-font-style, inherit);
+  font-weight: var(--shiki-dark-font-weight, inherit);
+}
+
+/* 语言标签：右上角小号等宽大写，悬停代码块时让位给复制按钮。 */
+.prose div[class*="language-"] > span.lang {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 1;
+  color: var(--ink-muted);
+  font-family: var(--font-code);
+  font-size: 0.625rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  pointer-events: none;
+  transition: opacity 150ms ease-out;
+}
+
+.prose div[class*="language-"] > button.copy {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 2;
+  padding: 2px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  color: var(--ink-soft);
+  font-family: var(--font-code);
+  font-size: 0.625rem;
+  letter-spacing: 0.1em;
+  line-height: 1.8;
+  text-transform: uppercase;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+
+.prose div[class*="language-"] > button.copy::before {
+  content: "Copy";
+}
+
+.prose div[class*="language-"] > button.copy.copied::before {
+  content: "Copied";
+}
+
+.prose:lang(zh) div[class*="language-"] > button.copy::before {
+  content: "复制";
+}
+
+.prose:lang(zh) div[class*="language-"] > button.copy.copied::before {
+  content: "已复制";
+}
+
+.prose div[class*="language-"]:hover > button.copy,
+.prose div[class*="language-"] > button.copy:focus-visible,
+.prose div[class*="language-"] > button.copy.copied {
+  opacity: 1;
+}
+
+.prose div[class*="language-"]:hover > span.lang,
+.prose div[class*="language-"]:has(> button.copy:focus-visible) > span.lang {
+  opacity: 0;
+}
+
+.prose div[class*="language-"] > button.copy:hover {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+}
+
+@media (hover: none) {
+  .prose div[class*="language-"] > button.copy {
+    opacity: 1;
+  }
+
+  .prose div[class*="language-"] > span.lang {
+    display: none;
+  }
+}
+
+.prose .vp-code .line.highlighted {
+  display: inline-block;
+  width: calc(100% + 40px);
+  margin: 0 -20px;
+  padding: 0 20px;
+  background: var(--paper-sunken);
+}
+
+.prose .vp-code .diff.remove {
+  opacity: 0.6;
+  text-decoration: line-through;
+}
+
+.prose .vp-code.has-focused-lines .line:not(.has-focus) {
+  opacity: 0.45;
+}
+
+/* 代码组：页签用等宽小号字，当前页签下方是 ink 细线。 */
+.prose .vp-code-group {
+  margin: 20px 0;
+}
+
+.prose .vp-code-group .tabs {
+  display: flex;
+  gap: 18px;
+  padding: 0 16px;
+  overflow-x: auto;
+  border: 1px solid var(--rule);
+  border-bottom: 0;
+  border-radius: 12px 12px 0 0;
+  background: var(--paper-raised);
+}
+
+.prose .vp-code-group .tabs input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.prose .vp-code-group .tabs label {
+  position: relative;
+  padding: 10px 0 9px;
+  color: var(--ink-muted);
+  font-family: var(--font-code);
+  font-size: 0.75rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.prose .vp-code-group .tabs label::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--ink);
+  transform: scaleX(0);
+  transition: transform 200ms var(--ease-out);
+}
+
+.prose .vp-code-group input:checked + label {
+  color: var(--ink);
+}
+
+.prose .vp-code-group input:checked + label::after {
+  transform: scaleX(1);
+}
+
+.prose .vp-code-group input:focus-visible + label {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.prose .vp-code-group .blocks > div[class*="language-"] {
+  display: none;
+  margin: 0;
+  border-radius: 0 0 12px 12px;
+}
+
+.prose .vp-code-group .blocks > div[class*="language-"].active {
+  display: block;
+}
+
+/* ---------- 提示块 ---------- */
+
+.prose .custom-block {
+  --alert-mark: var(--ink);
+  margin: 24px 0;
+  padding: 14px 18px 14px 20px;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  background: var(--paper-raised);
+  font-size: 0.9375rem;
+  line-height: 1.65;
+}
+
+.prose .custom-block.warning {
+  --alert-mark: var(--warning);
+}
+
+.prose .custom-block:is(.caution, .danger) {
+  --alert-mark: var(--caution);
+}
+
+.prose .custom-block.warning {
+  border-color: color-mix(in srgb, var(--warning) 32%, var(--rule));
+}
+
+.prose .custom-block:is(.caution, .danger) {
+  border-color: color-mix(in srgb, var(--caution) 32%, var(--rule));
+}
+
+.prose .custom-block-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 4px;
+  color: var(--alert-mark);
+  font-family: var(--font-code);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* 提示块标题前的 ▍ 光标条沿用站点的光标语汇，颜色表示提示的轻重。 */
+.prose .custom-block-title::before {
+  content: "";
+  width: 3px;
+  height: 12px;
+  background: var(--alert-mark);
+}
+
+.prose .custom-block > :last-child {
+  margin-bottom: 0;
+}
+
+.prose .custom-block p {
+  margin: 6px 0;
+}
+
+.prose .custom-block div[class*="language-"] {
+  background: var(--paper);
+}
+
+.prose details.custom-block > summary {
+  color: var(--ink);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.prose details.custom-block[open] > summary {
+  margin-bottom: 8px;
+}

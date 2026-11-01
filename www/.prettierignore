@@ -1,0 +1,5 @@
+node_modules/
+out/
+src/components/ui/
+src/hooks/use-mobile.ts
+src/lib/api/protocol.gen.ts

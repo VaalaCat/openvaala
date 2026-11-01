@@ -1,0 +1,53 @@
+<!doctype html>
+<!--
+  首页与 README 的卷首图：一条斜线把画面分成纸色和墨色两半，主窗口是完整的 Web 界面，
+  斜线左边是浅色主题、右边是深色主题；终端、桌面端和手机作为较小的完整窗口压在主窗口四周。
+  重新生成：
+    1. agent-browser --session hero --allow-file-access set viewport 1200 630 2
+    2. agent-browser --session hero --allow-file-access open file://<仓库>/website/hero/hero.html
+    3. agent-browser --session hero screenshot /tmp/hero.png，写到 docs/images/hero.png
+       （超过 900 KB 时用 sharp 量化成调色板 PNG），最后 agent-browser --session hero close。
+  素材来自 docs/images/raw/；浅色和深色 Web 截图必须同尺寸、逐像素对齐，斜切才看得出是同一界面。
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>OpenVaala hero</title>
+    <link rel="stylesheet" href="./hero.css" />
+  </head>
+  <body>
+    <main class="hero">
+      <div class="field field--ink"></div>
+
+      <header class="masthead">
+        <svg class="mark" viewBox="0 0 1024 1024" aria-hidden="true">
+          <rect width="1024" height="1024" rx="256" fill="#1c1917" />
+          <path fill="#fafaf9" d="M192 256h96l224 384 224-384h96L512 800z" />
+          <path fill="#60a5fa" d="M640 720h192v80H640z" />
+        </svg>
+        <span class="wordmark">OpenVaala</span>
+        <span class="rail">
+          <span>Terminal</span><i></i><span>Web</span><i></i><span>Desktop</span><i></i><span>Mobile</span><i></i
+          ><span>ACP</span><i></i><span>Codex</span><b class="cursor"></b>
+        </span>
+      </header>
+
+      <figure class="window window--desktop">
+        <img src="../../docs/images/raw/desktop-native-1440x900.png" alt="" />
+      </figure>
+
+      <figure class="window window--web">
+        <img src="../../docs/images/raw/web-conversation-light-1600x1000.png" alt="" />
+        <img class="web-dark" src="../../docs/images/raw/web-conversation-dark-1600x1000.png" alt="" />
+      </figure>
+
+      <figure class="window window--terminal">
+        <img src="../../docs/images/raw/terminal-tui-1600x1000.png" alt="" />
+      </figure>
+
+      <figure class="phone">
+        <img src="../../docs/images/raw/web-mobile-light-390x844.png" alt="" />
+      </figure>
+    </main>
+  </body>
+</html>

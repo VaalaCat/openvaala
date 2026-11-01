@@ -1,0 +1,9 @@
+/artifacts/
+.codegraph
+.vscode
+/tmp
+/data
+*.db
+/dist
+__debug*
+/node_modules

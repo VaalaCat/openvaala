@@ -1,0 +1,7 @@
+◐ 思考 2 次 · 工具 1 次 · 运行中 0s
+  ├─ bash 1 次
+  │  └─ ◐ go test -race ./...  ▏ok  internal/tui  1.2s
+  └─ ◐ 思考中：so the field is description
+◐ 思考中 0s · esc esc 中断
+›
+连接中 · gpt-x·high · ctx ≈42K/128K 33%

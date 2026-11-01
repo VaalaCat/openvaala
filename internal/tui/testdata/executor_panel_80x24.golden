@@ -1,0 +1,9 @@
+┌ Executor ───────────── 打字过滤 · enter 设为默认 · space 切换可用 · esc 取消 ┐
+│ 搜索：▏                                                                      │
+│   ● local      Agent 本机当前目录  /work/project  默认                       │
+│   ● openvaala  内置内存虚拟环境    /workspace                                │
+│ › ○ gpu        GPU 训练机          /data/proj                                │
+│ ● 可用  ○ 不可用；全部可用时，以后新加的 Executor 也自动可用                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+›
+默认模型 · local:/work/project

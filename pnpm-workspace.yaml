@@ -1,0 +1,6 @@
+packages:
+  - www
+  - website
+
+allowBuilds:
+  esbuild: true

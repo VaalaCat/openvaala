@@ -1,0 +1,256 @@
+# 推送 release/v0.1.0 发起发布；CI 为包含 WebUI 的提交创建 v0.1.0 和 Release。
+# 正式 tag 只创建一次，发布提交不合回 main。
+name: release
+
+on:
+  push:
+    tags: ["release/v*"]
+
+permissions:
+  contents: read
+
+env:
+  GOWORK: "off"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version and source
+        id: release
+        run: |
+          version="${GITHUB_REF_NAME#release/}"
+          number='(0|[1-9][0-9]*)'
+          identifier='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          # 当前模块路径没有主版本后缀，只发布 v0 和 v1。
+          if [[ "$GITHUB_REF_NAME" != release/* || ! "$version" =~ ^v[01]\.$number\.$number(-$identifier(\.$identifier)*)?$ ]]; then
+            echo 'Expected release/v0.x.y or release/v1.x.y, optionally with a SemVer prerelease suffix.' >&2
+            exit 1
+          fi
+          source_commit=$(git rev-parse HEAD)
+          printf 'version=%s\nsource_commit=%s\n' "$version" "$source_commit" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then
+            echo 'prerelease=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'prerelease=false' >> "$GITHUB_OUTPUT"
+          fi
+
+          # 重跑时复用已发布的提交，拒绝覆盖其他来源的正式 tag。
+          if git show-ref --verify --quiet "refs/tags/$version"; then
+            release_commit=$(git rev-parse "$version^{commit}")
+            if [[ "$(git show -s --format=%P "$release_commit")" != "$source_commit" ]]; then
+              echo "Release tag $version does not have the requested source as its sole parent." >&2
+              exit 1
+            fi
+            git diff --exit-code "$source_commit" "$release_commit" -- . ':!www/out/web'
+            git cat-file -e "$release_commit:www/out/web/index.html"
+            git checkout --detach "$release_commit"
+            echo 'reuse=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'reuse=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v4
+        if: steps.release.outputs.reuse != 'true'
+      - uses: actions/setup-node@v4
+        if: steps.release.outputs.reuse != 'true'
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Build WebUI
+        if: steps.release.outputs.reuse != 'true'
+        run: |
+          pnpm install --frozen-lockfile --filter openvaala-web
+          pnpm --filter openvaala-web build
+
+      - name: Create release commit and tag locally
+        if: steps.release.outputs.reuse != 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          test -s www/out/web/index.html
+          git add --force -- www/out/web
+          git commit -m "build: bundle WebUI for $VERSION" -m "Source: $SOURCE_COMMIT"
+          git tag -a "$VERSION" -m "Release $VERSION" -m "Source: $SOURCE_COMMIT"
+
+      # bundle 只携带源码提交之后的产物提交；后续任务先检出相同源码。
+      - name: Bundle release commit
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+        run: git bundle create "$RUNNER_TEMP/release.bundle" "refs/tags/$VERSION" "^$SOURCE_COMMIT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release.bundle
+          overwrite: true
+          compression-level: 0
+          if-no-files-found: error
+
+  build-cli:
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release-source
+      - name: Check out release commit
+        run: |
+          git fetch "$RUNNER_TEMP/release-source/release.bundle" "refs/tags/$VERSION:refs/tags/$VERSION"
+          git checkout --detach "$VERSION"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify runtime and build release binaries
+        run: |
+          go test ./internal/config ./pkg/skill
+          go test -run TestServeRuntimeAssembly ./internal/cli
+          script/build.sh --matrix --skip-frontend --version "$VERSION"
+          dist/openvaala-linux-amd64 --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-cli
+          path: dist/openvaala-*
+          overwrite: true
+          if-no-files-found: error
+
+  build-desktop:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            name: linux
+            platforms: linux/amd64,linux/arm64
+          - runner: macos-15
+            name: macos
+            platforms: darwin/universal
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PLATFORMS: ${{ matrix.platforms }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release-source
+      - name: Check out release commit
+        run: |
+          git fetch "$RUNNER_TEMP/release-source/release.bundle" "refs/tags/$VERSION:refs/tags/$VERSION"
+          git checkout --detach "$VERSION"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Set desktop package version
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("mygo.json")
+          config = json.loads(path.read_text())
+          config["version"] = os.environ["VERSION"].removeprefix("v")
+          path.write_text(json.dumps(config, indent=2) + "\n")
+          PY
+      # macOS 使用本地签名；本流程没有 Apple Developer ID 和公证凭据。
+      - name: Build desktop packages
+        run: script/build-desktop.sh --platform "$PLATFORMS" --skip-frontend --skip-notarize
+      - name: Collect Linux desktop packages
+        if: matrix.name == 'linux'
+        run: |
+          mkdir -p dist/release
+          cp dist/desktop/linux-*/*.deb dist/desktop/linux-*/*.tar.gz dist/release/
+          cmp dist/desktop/linux-amd64/install.sh dist/desktop/linux-arm64/install.sh
+          cp dist/desktop/linux-amd64/install.sh dist/release/install.sh
+      - name: Collect macOS desktop package
+        if: matrix.name == 'macos'
+        run: |
+          mkdir -p dist/release
+          cp dist/desktop/darwin-universal/*.dmg dist/release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-desktop-${{ matrix.name }}
+          path: dist/release/*
+          overwrite: true
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build-cli, build-desktop]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release-source
+      - name: Check out release commit
+        run: |
+          git fetch "$RUNNER_TEMP/release-source/release.bundle" "refs/tags/$VERSION:refs/tags/$VERSION"
+          git checkout --detach "$VERSION"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: dist/release
+      - name: Checksum release assets
+        working-directory: dist/release
+        run: sha256sum * > SHA256SUMS
+
+      # GITHUB_TOKEN 推送的 tag 不会触发另一轮 workflow，直接在本轮发布。
+      - name: Publish tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push origin "refs/tags/$VERSION:refs/tags/$VERSION"
+          if is_draft=$(gh release view "$VERSION" --json isDraft --jq '.isDraft'); then
+            if [[ "$is_draft" == false ]]; then
+              echo "Release $VERSION is already published."
+              exit 0
+            fi
+          else
+            flags=()
+            if [[ "$PRERELEASE" == true ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$VERSION" --verify-tag --draft --generate-notes --title "$VERSION" "${flags[@]}"
+          fi
+          gh release upload "$VERSION" dist/release/* --clobber
+          gh release edit "$VERSION" --draft=false

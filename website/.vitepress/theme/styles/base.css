@@ -1,0 +1,254 @@
+/* ---------- 设计令牌 ---------- */
+
+:root {
+  --paper: #faf9f6;
+  --paper-raised: #ffffff;
+  --paper-sunken: #f0eeea;
+  --ink: #1c1917;
+  --ink-soft: #44403c;
+  --ink-muted: #6f6964;
+  --rule: #e7e5e4;
+  --rule-strong: #d6d3d1;
+  --signal: #2563eb;
+  --warning: #9a5b13;
+  --caution: #b42318;
+
+  --font-display: "Noto Serif Variable", "Songti SC", "Noto Serif CJK SC", serif;
+  --font-text: "IBM Plex Sans", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-code: "JetBrains Mono Variable", ui-monospace, monospace;
+
+  --top-bar-height: 60px;
+  --site-max-width: 1360px;
+  --site-gutter: 32px;
+  --sidebar-width: 256px;
+  --content-width: 680px;
+  --outline-width: 208px;
+  --home-width: 1184px;
+
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  color-scheme: light;
+}
+
+.dark {
+  --paper: #1c1917;
+  --paper-raised: #22201e;
+  --paper-sunken: #2a2725;
+  --ink: #fafaf9;
+  --ink-soft: #d6d3d1;
+  --ink-muted: #a8a29e;
+  --rule: #322e2b;
+  --rule-strong: #46413d;
+  --signal: #60a5fa;
+  --warning: #e0b25a;
+  --caution: #f48c84;
+
+  color-scheme: dark;
+}
+
+/* ---------- 基础 ---------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scrollbar-gutter: stable;
+  -webkit-text-size-adjust: 100%;
+}
+
+html.is-search-open {
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink-soft);
+  font-family: var(--font-text);
+  font-size: 1rem;
+  line-height: 1.65;
+  font-synthesis-weight: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--ink) 14%, transparent);
+  color: var(--ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+button,
+input {
+  color: inherit;
+}
+
+img,
+svg {
+  max-width: 100%;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.skip-link {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  z-index: 200;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 0.875rem;
+  text-decoration: none;
+  transform: translateY(-160%);
+  transition: transform 160ms var(--ease-out);
+}
+
+.skip-link:focus-visible {
+  transform: none;
+}
+
+/* 小号等宽大写标签：分组名、页眉分组、键位提示、代码语言。 */
+.eyebrow {
+  margin: 0 0 14px;
+  color: var(--ink-muted);
+  font-family: var(--font-code);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.09em;
+  line-height: 1.6;
+  text-transform: uppercase;
+}
+
+/* 文字链接：常态是浅色细下划线，悬停和聚焦时信号蓝下划线从左向右画出。 */
+.text-link,
+.prose a:not(.header-anchor) {
+  color: var(--ink);
+  font-weight: 600;
+  text-decoration: none;
+  background-image: linear-gradient(var(--signal), var(--signal)), linear-gradient(var(--rule-strong), var(--rule-strong));
+  background-position: 0 100%, 0 100%;
+  background-repeat: no-repeat;
+  background-size: 0% 2px, 100% 1px;
+  padding-bottom: 2px;
+}
+
+.text-link:hover,
+.text-link:focus-visible,
+.prose a:not(.header-anchor):hover,
+.prose a:not(.header-anchor):focus-visible {
+  background-size: 100% 2px, 100% 1px;
+}
+
+@keyframes caret-blink {
+  0%,
+  55% {
+    opacity: 1;
+  }
+  56%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* ---------- 页面框架 ---------- */
+
+.site-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+}
+
+.site-body {
+  flex: 1;
+  width: 100%;
+}
+
+.site-body--doc {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  gap: 64px;
+  max-width: var(--site-max-width);
+  margin: 0 auto;
+  padding: 0 var(--site-gutter);
+}
+
+.site-main {
+  min-width: 0;
+  outline: none;
+}
+
+.not-found {
+  max-width: var(--content-width);
+  padding: 96px 0 160px;
+}
+
+.not-found h1 {
+  margin: 0 0 16px;
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 2.5rem;
+  font-weight: 400;
+  line-height: 1.15;
+}
+
+.site-footer {
+  border-top: 1px solid var(--rule);
+}
+
+.site-footer p {
+  max-width: var(--site-max-width);
+  margin: 0 auto;
+  padding: 28px var(--site-gutter) 36px;
+  color: var(--ink-muted);
+  font-family: var(--font-code);
+  font-size: 0.6875rem;
+  letter-spacing: 0.06em;
+}
+
+@media (max-width: 1279px) {
+  .site-body--doc {
+    gap: 48px;
+  }
+}
+
+@media (max-width: 959px) {
+  .site-body--doc {
+    display: block;
+  }
+}
+
+@media (max-width: 719px) {
+  :root {
+    --site-gutter: 20px;
+  }
+}
+
+/* 用户要求减少动效时关闭全部过渡和动画，只保留最终状态。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

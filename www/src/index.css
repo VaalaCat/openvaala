@@ -1,0 +1,780 @@
+@import "tailwindcss" source(".");
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/noto-serif";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* streamdown 自带组件（列表、表格、引用）用到的工具类，需要 Tailwind 扫描到它的产物。 */
+@source "../node_modules/streamdown/dist/*.js";
+
+@custom-variant dark (&:is(.dark *));
+
+/* Datatype 用连字把 {r:42} 这样的写法画成指标字形。 */
+@font-face {
+  font-family: "Datatype";
+  src: url("./assets/fonts/datatype-vf.woff2") format("woff2");
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.147 0.004 49.25);
+  --foreground-subtle: rgb(113 113 113);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.147 0.004 49.25);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.147 0.004 49.25);
+  --primary: oklch(0.216 0.006 56.043);
+  --primary-foreground: oklch(0.985 0.001 106.423);
+  --secondary: oklch(0.97 0.001 106.424);
+  --secondary-foreground: oklch(0.216 0.006 56.043);
+  --muted: oklch(0.97 0.001 106.424);
+  --muted-foreground: rgb(135 135 135);
+  --accent: oklch(0.955 0.002 106.424);
+  --accent-foreground: oklch(0.216 0.006 56.043);
+  --destructive: oklch(0.54 0.22 27.325);
+  --success: oklch(0.5 0.14 150);
+  --warning: oklch(0.5 0.115 80);
+  --info: oklch(0.48 0.17 260);
+  --rpc-sent: oklch(0.48 0.17 260);
+  --rpc-received: oklch(0.5 0.19 300);
+  --scrollbar-thumb: oklch(0.65 0.01 58);
+  --scrollbar-thumb-hover: oklch(0.52 0.013 58);
+  --scrollbar-thumb-active: oklch(0.44 0.011 58);
+  --ansi-magenta: oklch(0.5 0.16 320);
+  --ansi-cyan: oklch(0.48 0.085 210);
+  --border: oklch(0.923 0.003 48.717);
+  --input: oklch(0.923 0.003 48.717);
+  --ring: oklch(0.709 0.01 56.259);
+  --chart-1: oklch(0.869 0.005 56.366);
+  --chart-2: oklch(0.553 0.013 58.071);
+  --chart-3: oklch(0.444 0.011 73.639);
+  --chart-4: oklch(0.374 0.01 67.558);
+  --chart-5: oklch(0.268 0.007 34.298);
+  --radius: 0rem;
+  --sidebar: oklch(0.97 0.001 106.423);
+  --sidebar-foreground: oklch(0.147 0.004 49.25);
+  --sidebar-primary: oklch(0.216 0.006 56.043);
+  --sidebar-primary-foreground: oklch(0.985 0.001 106.423);
+  --sidebar-accent: oklch(0.935 0.003 58);
+  --sidebar-accent-foreground: oklch(0.216 0.006 56.043);
+  --sidebar-border: oklch(0.923 0.003 48.717);
+  --sidebar-ring: oklch(0.709 0.01 56.259);
+}
+
+.dark {
+  color-scheme: dark;
+  --background: oklch(0.147 0.004 49.25);
+  --foreground: oklch(0.985 0.001 106.423);
+  --foreground-subtle: rgb(161 161 161);
+  --card: oklch(0.216 0.006 56.043);
+  --card-foreground: oklch(0.985 0.001 106.423);
+  --popover: oklch(0.24 0.006 56.043);
+  --popover-foreground: oklch(0.985 0.001 106.423);
+  --primary: oklch(0.923 0.003 48.717);
+  --primary-foreground: oklch(0.216 0.006 56.043);
+  --secondary: oklch(0.268 0.007 34.298);
+  --secondary-foreground: oklch(0.985 0.001 106.423);
+  --muted: oklch(0.268 0.007 34.298);
+  --muted-foreground: rgb(135 135 135);
+  --accent: oklch(0.29 0.007 56.043);
+  --accent-foreground: oklch(0.985 0.001 106.423);
+  --destructive: oklch(0.704 0.191 22.216);
+  --success: oklch(0.75 0.15 150);
+  --warning: oklch(0.8 0.14 80);
+  --info: oklch(0.75 0.13 260);
+  --rpc-sent: oklch(0.75 0.13 260);
+  --rpc-received: oklch(0.78 0.14 300);
+  --scrollbar-thumb: oklch(0.48 0.01 58);
+  --scrollbar-thumb-hover: oklch(0.62 0.01 58);
+  --scrollbar-thumb-active: oklch(0.71 0.01 58);
+  --ansi-magenta: oklch(0.78 0.14 320);
+  --ansi-cyan: oklch(0.78 0.11 210);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.553 0.013 58.071);
+  --chart-1: oklch(0.869 0.005 56.366);
+  --chart-2: oklch(0.553 0.013 58.071);
+  --chart-3: oklch(0.444 0.011 73.639);
+  --chart-4: oklch(0.374 0.01 67.558);
+  --chart-5: oklch(0.268 0.007 34.298);
+  --sidebar: oklch(0.19 0.006 56.043);
+  --sidebar-foreground: oklch(0.985 0.001 106.423);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0.001 106.423);
+  --sidebar-accent: oklch(0.268 0.007 34.298);
+  --sidebar-accent-foreground: oklch(0.985 0.001 106.423);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.553 0.013 58.071);
+}
+
+@theme inline {
+  --font-mono: "JetBrains Mono Variable", monospace;
+  --font-serif: "Noto Serif Variable", serif;
+  --font-heading: var(--appearance-heading);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-rpc-sent: var(--rpc-sent);
+  --color-rpc-received: var(--rpc-received);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-serif;
+  }
+}
+:root {
+  --appearance-body: "Noto Serif Variable", serif;
+  --appearance-heading: "JetBrains Mono Variable", monospace;
+}
+:root[data-body-font="jetbrains-mono"] {
+  --appearance-body: "JetBrains Mono Variable", monospace;
+}
+:root[data-body-font="system"] {
+  --appearance-body: system-ui, sans-serif;
+}
+:root[data-heading-font="noto-serif"] {
+  --appearance-heading: "Noto Serif Variable", serif;
+}
+:root[data-heading-font="system"] {
+  --appearance-heading: system-ui, sans-serif;
+}
+
+/* 配色沿用语义变量，正文、状态与代码保留各自的颜色。 */
+:root[data-theme="blue"] {
+  --primary: oklch(0.488 0.243 264.376);
+  --primary-foreground: oklch(0.97 0.014 254.604);
+  --ring: oklch(0.623 0.214 259.815);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-ring: var(--ring);
+}
+:root.dark[data-theme="blue"] {
+  --primary: oklch(0.707 0.165 254.624);
+  --primary-foreground: oklch(0.282 0.091 267.935);
+  --ring: oklch(0.488 0.243 264.376);
+}
+@layer base {
+  body {
+    font-family: var(--appearance-body);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1 {
+    @apply text-title;
+  }
+  h2,
+  h3 {
+    @apply text-section;
+  }
+}
+
+/* 业务只选择文字角色和语义颜色，具体尺度在这里统一维护。 */
+@utility text-body {
+  font-family: var(--appearance-body);
+  font-size: 0.875rem;
+  line-height: 1.5rem;
+}
+@utility text-ui {
+  font-family: var(--appearance-body);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+@utility text-table {
+  @apply text-ui;
+}
+@utility text-caption {
+  font-family: var(--appearance-body);
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+@utility text-token {
+  font-family: var(--appearance-body);
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+  font-variant-numeric: tabular-nums;
+}
+@utility text-link {
+  @apply underline decoration-solid decoration-1 underline-offset-2;
+  @variant hover {
+    color: var(--link-interaction-color, var(--primary));
+  }
+  @variant focus-visible {
+    color: var(--link-interaction-color, var(--primary));
+  }
+}
+@utility text-help {
+  @apply text-link decoration-dotted;
+}
+@utility text-title {
+  font-family: var(--appearance-heading);
+  font-size: 1rem;
+  line-height: 1.5rem;
+  font-weight: 500;
+}
+@utility text-section {
+  @apply text-title;
+  font-size: 0.875rem;
+}
+/* 代码按原字符显示，不用 JetBrains Mono 的连字（=> 不画成箭头）。 */
+@utility text-code {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.25rem;
+  font-variant-ligatures: none;
+}
+@utility color-default {
+  color: inherit;
+}
+@utility color-muted {
+  color: var(--muted-foreground);
+}
+@utility color-subtle {
+  color: var(--foreground-subtle);
+}
+@utility color-primary {
+  color: var(--primary);
+}
+@utility color-destructive {
+  color: var(--destructive);
+}
+@utility color-success {
+  color: var(--success);
+}
+@utility color-warning {
+  color: var(--warning);
+}
+@utility color-rpc-sent {
+  color: var(--rpc-sent);
+}
+@utility color-rpc-received {
+  color: var(--rpc-received);
+}
+/* shiki 着色片段：style 里带两套主题的变量，跟着 dark class 取用，切换主题不重新着色。 */
+@utility color-syntax {
+  color: var(--shiki-light);
+  font-style: var(--shiki-light-font-style);
+  font-weight: var(--shiki-light-font-weight);
+  text-decoration: var(--shiki-light-text-decoration);
+  &:where(.dark *) {
+    color: var(--shiki-dark);
+    font-style: var(--shiki-dark-font-style);
+    font-weight: var(--shiki-dark-font-weight);
+    text-decoration: var(--shiki-dark-text-decoration);
+  }
+}
+
+/* Markdown 正文里的长词、长链接随处换行；代码块和表格不折行，自己横向滚动。 */
+.markdown-view {
+  overflow-wrap: anywhere;
+}
+
+/* 收起来信只在溢出时淡出最后一行，展开正文不加遮罩。 */
+.agent-message-preview-fade {
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 1lh), transparent);
+}
+
+/* 运行标题整体扫过明暗，普通文字和绝对定位的数字共用同一遮罩。 */
+.shimmer {
+  color: var(--foreground);
+  background-image: none;
+  background-clip: border-box;
+  -webkit-background-clip: border-box;
+  -webkit-text-fill-color: currentColor;
+  mask-image: linear-gradient(
+    110deg,
+    rgb(0 0 0 / 65%) calc(50% - 3ch),
+    #000 50%,
+    rgb(0 0 0 / 65%) calc(50% + 3ch)
+  );
+  mask-size: calc(200% + 6ch) 100%;
+  mask-repeat: no-repeat;
+  animation: process-shimmer 1.8s linear infinite;
+}
+@keyframes process-shimmer {
+  from {
+    mask-position: 100% 0;
+  }
+  to {
+    mask-position: 0 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .shimmer {
+    animation: none;
+    mask-image: none;
+  }
+}
+
+/* React Bits Lattice Loader 工作态；许可见 ../THIRD_PARTY_NOTICES.md。 */
+.lattice-loader__cell {
+  opacity: 0.15;
+  animation: lattice-loader-orbit 864ms cubic-bezier(0.77, 0, 0.175, 1) infinite;
+}
+.lattice-loader__cell[data-hole] {
+  animation: none;
+  opacity: 0.0705;
+}
+@keyframes lattice-loader-orbit {
+  0%,
+  62%,
+  100% {
+    opacity: 0.15;
+  }
+  18%,
+  42% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lattice-loader__cell:not([data-hole]) {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+/* 指标字形（上下文环、用量柱）专用字体，连字需要 calt。 */
+.font-datatype {
+  font-family: "Datatype", ui-monospace, monospace;
+  font-feature-settings: "calt" 1;
+}
+
+/* 状态只选语义色，徽标、文字和状态点共用主题与对比度。 */
+[data-status-tone="success"] {
+  --status-color: var(--status-success, var(--success));
+}
+[data-status-tone="warning"] {
+  --status-color: var(--status-warning, var(--warning));
+}
+[data-status-tone="destructive"] {
+  --status-color: var(--status-destructive, var(--destructive));
+}
+[data-status-tone="neutral"] {
+  --status-color: var(--status-neutral, var(--muted-foreground));
+}
+[data-status-tone="info"] {
+  --status-color: var(--status-info, var(--info));
+}
+[data-status-tone] {
+  color: var(--status-color);
+}
+[data-slot="badge"][data-status-tone] {
+  border-color: transparent;
+  background: color-mix(in oklch, var(--status-color) 10%, transparent);
+}
+
+/* 工具输出的 ANSI 基础色随主题变化；扩展颜色由解析器保留原始 RGB。 */
+.ansi-output {
+  font: inherit;
+}
+.ansi-output .ansi-red-fg,
+.ansi-output .ansi-bright-red-fg {
+  color: var(--destructive);
+}
+.ansi-output .ansi-green-fg,
+.ansi-output .ansi-bright-green-fg {
+  color: var(--success);
+}
+.ansi-output .ansi-yellow-fg,
+.ansi-output .ansi-bright-yellow-fg {
+  color: var(--warning);
+}
+.ansi-output .ansi-blue-fg,
+.ansi-output .ansi-bright-blue-fg {
+  color: var(--info);
+}
+.ansi-output .ansi-magenta-fg,
+.ansi-output .ansi-bright-magenta-fg {
+  color: var(--ansi-magenta);
+}
+.ansi-output .ansi-cyan-fg,
+.ansi-output .ansi-bright-cyan-fg {
+  color: var(--ansi-cyan);
+}
+.ansi-output .ansi-black-fg,
+.ansi-output .ansi-white-fg,
+.ansi-output .ansi-bright-white-fg {
+  color: var(--foreground);
+}
+.ansi-output .ansi-bright-black-fg {
+  color: var(--muted-foreground);
+}
+.ansi-output .ansi-bold {
+  font-weight: 700;
+}
+.ansi-output .ansi-dim {
+  opacity: 0.65;
+}
+.ansi-output .ansi-italic {
+  font-style: italic;
+}
+.ansi-output .ansi-underline {
+  text-decoration: underline;
+}
+.ansi-output .ansi-strikethrough {
+  text-decoration: line-through;
+}
+.ansi-output .ansi-hidden {
+  visibility: hidden;
+}
+@layer base {
+  body {
+    @apply text-body;
+  }
+}
+
+/* 显式文字角色优先于官方组件的默认字号和行高，包括紧凑卡片。 */
+[data-slot].text-title {
+  @apply text-title;
+}
+[data-slot].text-section {
+  @apply text-section;
+}
+[data-slot].text-body {
+  @apply text-body;
+}
+[data-slot].text-ui {
+  @apply text-ui;
+}
+[data-slot].text-table {
+  @apply text-table;
+}
+[data-slot].text-code {
+  @apply text-code;
+}
+[data-slot].text-caption {
+  @apply text-caption;
+}
+[data-slot].text-token {
+  @apply text-token;
+}
+
+/* 中断按钮沿用 VaalaAI 的实色红底与白色图标。 */
+.composer-interrupt {
+  --destructive: hsl(0 60% 55%);
+  @apply bg-destructive text-white hover:bg-destructive/60 hover:text-white;
+}
+.dark .composer-interrupt {
+  --destructive: hsl(0 55% 60%);
+}
+
+/* 过程默认退一档；查看主区域或展开时提升标题，状态颜色独立。 */
+.item-header-trigger {
+  color: var(--foreground-subtle);
+}
+.item-header-summary {
+  color: var(--muted-foreground);
+}
+.process-action {
+  color: var(--muted-foreground);
+}
+.item-header-trigger[data-slot="button"],
+.item-header-summary[data-slot="button"] {
+  border-width: 0;
+  background-color: transparent;
+  font-weight: inherit;
+}
+[data-item-header]:is([data-open="true"], [data-interacting="true"])
+  > .item-header-trigger {
+  color: var(--foreground);
+}
+[data-item-header]:is([data-open="true"], [data-interacting="true"])
+  > .item-header-summary,
+[data-item-header]:is([data-open="true"], [data-interacting="true"])
+  .process-action {
+  color: var(--foreground-subtle);
+}
+
+/* 来信来源跟随标题提亮，预览与异常图标保留各自颜色。 */
+.agent-message-source {
+  color: var(--foreground-subtle);
+}
+[data-item-header]:is([data-open="true"], [data-interacting="true"])
+  .agent-message-source,
+[data-item-header]:has(.agent-message-source:is(:hover, :focus-visible))
+  > .item-header-trigger,
+.agent-message-source:is(:hover, :focus-visible) {
+  color: var(--foreground);
+}
+
+/* Base UI 在开合时提供实测高度，展开完成后恢复 auto，流式内容直接增长。 */
+.process-disclosure-panel {
+  height: var(--collapsible-panel-height);
+  overflow: hidden;
+  transition: height 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.process-disclosure-panel[hidden] {
+  display: none;
+}
+.process-disclosure-panel[data-closed] {
+  transition-duration: 150ms;
+}
+.process-disclosure-panel:is([data-starting-style], [data-ending-style]) {
+  height: 0;
+}
+.process-disclosure-content {
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity 200ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.process-disclosure-panel[data-closed] > .process-disclosure-content {
+  transition-duration: 150ms;
+}
+.process-disclosure-panel:is([data-starting-style], [data-ending-style])
+  > .process-disclosure-content {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+.conversation-panel-transition[data-panel-transition] > [data-panel] {
+  transition: flex-grow 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 手机抽屉保留淡入淡出，服务器的位置由共享布局动画负责。 */
+[data-sidebar="sidebar"][data-mobile="true"]:has(
+    [data-server-connection-header]
+  ) {
+  translate: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .process-disclosure-panel,
+  .process-disclosure-content,
+  .conversation-panel-transition[data-panel-transition] > [data-panel] {
+    transition: none;
+  }
+  .process-disclosure-content,
+  .process-disclosure-panel:is([data-starting-style], [data-ending-style])
+    > .process-disclosure-content {
+    transform: none;
+  }
+  .server-reconnect-icon {
+    animation: none;
+  }
+}
+
+/* 会话选中态持续保留，悬停背景比选中背景更轻。 */
+.conversation-list-button {
+  transition:
+    width 200ms ease,
+    height 200ms ease,
+    padding 200ms ease,
+    background-color 120ms ease;
+}
+.conversation-list-title {
+  transition: color 120ms ease;
+}
+.conversation-list-button:hover,
+.conversation-list-button:focus-visible {
+  background-color: color-mix(in oklch, var(--sidebar-accent) 60%, transparent);
+}
+.conversation-list-button[data-active] {
+  background-color: var(--sidebar-accent);
+}
+.conversation-list-button:is(:hover, :focus-visible, [data-active])
+  .conversation-list-title {
+  color: var(--foreground);
+}
+
+/* 菜单操作名称保持正文色，装饰图标次要；高亮与异常各自保持语义色。 */
+:is(
+    [data-slot="dropdown-menu-item"],
+    [data-slot="dropdown-menu-sub-trigger"],
+    [data-slot="context-menu-item"],
+    [data-slot="context-menu-sub-trigger"],
+    [data-slot="select-item"],
+    [data-slot="combobox-item"]
+  ):not([data-variant="destructive"])
+  > svg {
+  color: var(--foreground-subtle);
+}
+:is(
+    [data-slot="dropdown-menu-item"],
+    [data-slot="dropdown-menu-sub-trigger"],
+    [data-slot="context-menu-item"],
+    [data-slot="context-menu-sub-trigger"],
+    [data-slot="select-item"],
+    [data-slot="combobox-item"]
+  ):not([data-variant="destructive"]):is(
+    :focus,
+    [data-highlighted],
+    [data-popup-open],
+    [data-open]
+  )
+  > svg {
+  color: var(--accent-foreground);
+}
+
+/* 通知的文字节点没有 data-slot，同样使用项目正文和辅助文字角色。 */
+[data-sonner-toast][data-styled="true"] [data-title].text-body {
+  @apply text-body;
+}
+[data-sonner-toast][data-styled="true"] [data-description].text-caption {
+  @apply text-caption;
+}
+
+/* 字段值统一使用常规字重，避免选择器和单位继承按钮或附加区域的中等字重。
+   按元素和语义角色匹配，兼容 Tooltip 组合时覆盖 data-slot 的输入控件。 */
+input,
+textarea,
+[role="combobox"],
+[data-slot="input-group-addon"] {
+  font-weight: 400;
+}
+
+/* 模型和思考强度的值与选项使用普通文字，操作按钮的字重不变。 */
+.model-selection-value,
+.model-selection-option {
+  font-weight: 400;
+}
+
+/* 窄屏只增大编辑控件文字，正文和桌面字号不变。 */
+@media (width < 48rem) {
+  input,
+  textarea,
+  input[data-slot][class],
+  textarea[data-slot][class] {
+    font-size: 1rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-list-button,
+  .conversation-list-title,
+  [data-sidebar="sidebar"][data-mobile="true"] {
+    transition: none;
+  }
+  [data-sidebar="sidebar"][data-mobile="true"]:has(
+      [data-server-connection-header]
+    ) {
+    opacity: 1;
+  }
+}
+
+/* 展开状态只由箭头表示，标题背景与分节保持一致。 */
+.configuration-trigger[aria-expanded="true"] {
+  background-color: transparent;
+}
+
+[data-field-error="true"] {
+  border-color: var(--destructive);
+}
+
+/* 尾部图标按钮贴合输入内边缘，焦点描边保留在按钮内。 */
+[data-slot="input-group-addon"][data-align="inline-end"]:has(
+    > :is([data-size="icon-xs"], [data-size="icon-sm"])
+  ) {
+  align-self: stretch;
+  margin: 0;
+  padding: 0;
+}
+[data-slot="input-group-addon"][data-align="inline-end"]
+  > :is([data-size="icon-xs"], [data-size="icon-sm"]) {
+  width: auto;
+  height: 100%;
+  aspect-ratio: 1;
+  --tw-ring-inset: inset;
+}
+
+/* 组合输入隐藏尾部控件后，空附加区不占文字宽度。 */
+[data-slot="input-group-addon"]:empty {
+  display: none;
+}
+
+[data-slot="field-group"]:has(> .configuration-section) {
+  gap: 1rem;
+}
+
+[data-slot="switch"],
+[data-slot="switch-thumb"] {
+  border-radius: var(--radius);
+}
+
+/* 原生滚动节点共用透明轨道和主题滑块；系统强制配色保留浏览器样式。 */
+@media (forced-colors: none) {
+  * {
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+    scrollbar-width: thin;
+  }
+
+  /* WebKit 使用可拖动的滑块，并保留 hover、active 对比。 */
+  @supports selector(::-webkit-scrollbar) {
+    * {
+      scrollbar-color: auto;
+      scrollbar-width: auto;
+    }
+    ::-webkit-scrollbar {
+      width: 12px;
+      height: 12px;
+    }
+    :is(
+      pre,
+      textarea,
+      .text-code,
+      .ansi-output,
+      [data-scroll-density="compact"]
+    )::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    ::-webkit-scrollbar-track,
+    ::-webkit-scrollbar-corner {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      border: 2px solid transparent;
+      background: var(--scrollbar-thumb);
+      background-clip: padding-box;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background-color: var(--scrollbar-thumb-hover);
+    }
+    ::-webkit-scrollbar-thumb:active {
+      background-color: var(--scrollbar-thumb-active);
+    }
+  }
+}

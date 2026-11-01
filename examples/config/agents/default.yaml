@@ -1,0 +1,4 @@
+# default Agent 沿用内置说明和指令，使用下面指定的模型；省略 model 时使用 models.default_model。
+model:
+  provider: local
+  model: default
