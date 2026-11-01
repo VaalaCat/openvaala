@@ -1,0 +1,1 @@
+import{er as e}from"./paths-l2ethvZU.js";function t(t){return e(t.defaultTagName??`div`,t,t)}export{t};

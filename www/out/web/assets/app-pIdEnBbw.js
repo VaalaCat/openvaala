@@ -1,0 +1,1 @@
+import{r as e}from"./clsx-C5NLMtLp.js";import{a as t,u as n}from"./paths-l2ethvZU.js";import{t as r}from"./components-YLq1ASTI.js";var i=e();function a(){let e=n();return(0,i.jsx)(r,{to:t(e.getServerID()),replace:!0})}export{a as IndexPage};

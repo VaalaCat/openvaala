@@ -1,0 +1,1 @@
+import{a as e,i as t}from"./request-error-BeMKOdtv.js";function n(n,r){return t(n,e,r)}export{n as t};

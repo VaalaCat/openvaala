@@ -1,0 +1,1 @@
+import{b as e}from"./notify-9ljw9ix5.js";function t(t,n){return e({queryKey:[t.getServerID(),`skills`,n],queryFn:()=>t.call(`skill/list`,`conversationID`in n?{conversation_id:n.conversationID}:{agent_name:n.agentName,executor_settings:n.executorSettings})})}export{t};
