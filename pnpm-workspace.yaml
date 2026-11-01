@@ -2,5 +2,7 @@ packages:
   - www
   - website
 
+minimumReleaseAge: 1440
+
 allowBuilds:
   esbuild: true
