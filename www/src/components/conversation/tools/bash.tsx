@@ -217,7 +217,7 @@ function CommandOutput({
 }) {
   return (
     <OutputBlock copyValue={stripAnsi(output)} followOutput>
-      <pre className="w-max min-w-full px-3 py-2 text-code">
+      <pre className="code-padding w-max min-w-full text-code-reading">
         {command !== undefined && (
           <span className="color-muted">
             {"$ " + command + (output ? "\n" : "")}
@@ -280,7 +280,7 @@ function CommandStatus({
         ]}
       />
       {result.error && (
-        <p className="text-body wrap-anywhere whitespace-pre-wrap color-destructive">
+        <p className="text-reading wrap-anywhere whitespace-pre-wrap color-destructive">
           {result.error}
         </p>
       )}

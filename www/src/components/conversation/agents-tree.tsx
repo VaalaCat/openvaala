@@ -8,6 +8,7 @@ import { useServerConnection } from "@/components/server-connection-provider"
 import { buttonVariants } from "@/components/ui/button"
 import { LatticeLoader } from "@/components/base/lattice-loader"
 import type { ConversationSync } from "@/lib/api/conversation-sync"
+import { useIsSessionLinked } from "@/components/conversation/session-link-context"
 import type { SessionState } from "@/lib/api/protocol.gen"
 import { getConversationPath, getSessionPath } from "@/lib/paths"
 import {
@@ -41,7 +42,7 @@ const sessionStates = {
 >
 
 // 子 Agent 页签：按 $sessions 画 Session 树，主 Agent 在最上面，子 Agent 按创建顺序挂在创建它的 Session 下；
-// 每行是名字、Agent 名和运行状态，点击进入对应的 Session 页，当前页面跟随的 Session 高亮
+// 每行是名字、Agent 名和运行状态，点击进入对应的 Session 页（旁支的 Session 没有页面，只显示），当前页面跟随的 Session 高亮
 export function AgentsTree({ sync }: { sync: ConversationSync }) {
   const { t } = useTranslation()
   const sessions = useStore(sync.$sessions)
@@ -90,50 +91,67 @@ function SessionTreeItem({
   const isFollowed = session.id === sync.getFollowedSessionID()
   // serve 新增的状态用中性色
   const tone = sessionStates[state]?.tone ?? "neutral"
+  const isLinked = useIsSessionLinked(sync)
+  const rowStyle = { paddingInlineStart: 8 + depth * 16, paddingInlineEnd: 8 }
+  const row = (
+    <>
+      <span className="flex size-4 shrink-0 items-center justify-center">
+        {state === "running" ? (
+          <LatticeLoader aria-hidden />
+        ) : (
+          <span
+            aria-hidden
+            data-status-tone={tone}
+            className="size-2 rounded-full bg-current"
+          />
+        )}
+      </span>
+      <OverflowTooltip
+        render={<span className="min-w-0 flex-1 truncate text-table" />}
+      >
+        {getSessionName(node.info, t("conversation.session.root"))}
+      </OverflowTooltip>
+      {!isRoot && session.task_name && (
+        <OverflowTooltip
+          render={
+            <span className="max-w-20 min-w-0 truncate text-caption color-muted" />
+          }
+        >
+          {session.agent_name}
+        </OverflowTooltip>
+      )}
+      <span className="ml-auto shrink-0 text-caption color-muted">
+        <SessionStateLabel state={state} />
+      </span>
+    </>
+  )
   return (
     <li className="flex min-w-0 flex-col">
-      <Link
-        to={
-          isRoot
-            ? getConversationPath(serverID, sync.conversationID)
-            : getSessionPath(serverID, sync.conversationID, session.id)
-        }
-        aria-current={isFollowed ? "page" : undefined}
-        className={cn(
-          buttonVariants({ variant: "ghost" }),
-          "h-8 w-full min-w-0 justify-start gap-2 text-ui aria-[current=page]:bg-muted"
-        )}
-        style={{ paddingInlineStart: 8 + depth * 16, paddingInlineEnd: 8 }}
-      >
-        <span className="flex size-4 shrink-0 items-center justify-center">
-          {state === "running" ? (
-            <LatticeLoader aria-hidden />
-          ) : (
-            <span
-              aria-hidden
-              data-status-tone={tone}
-              className="size-2 rounded-full bg-current"
-            />
+      {isLinked ? (
+        <Link
+          to={
+            isRoot
+              ? getConversationPath(serverID, sync.conversationID)
+              : getSessionPath(serverID, sync.conversationID, session.id)
+          }
+          aria-current={isFollowed ? "page" : undefined}
+          className={cn(
+            buttonVariants({ variant: "ghost" }),
+            "h-8 w-full min-w-0 justify-start gap-2 text-ui aria-[current=page]:bg-muted"
           )}
-        </span>
-        <OverflowTooltip
-          render={<span className="min-w-0 flex-1 truncate text-table" />}
+          style={rowStyle}
         >
-          {getSessionName(node.info, t("conversation.session.root"))}
-        </OverflowTooltip>
-        {!isRoot && session.task_name && (
-          <OverflowTooltip
-            render={
-              <span className="max-w-20 min-w-0 truncate text-caption color-muted" />
-            }
-          >
-            {session.agent_name}
-          </OverflowTooltip>
-        )}
-        <span className="ml-auto shrink-0 text-caption color-muted">
-          <SessionStateLabel state={state} />
-        </span>
-      </Link>
+          {row}
+        </Link>
+      ) : (
+        <div
+          aria-current={isFollowed ? "page" : undefined}
+          className="flex h-8 w-full min-w-0 items-center gap-2 border border-transparent text-ui aria-[current=page]:bg-muted"
+          style={rowStyle}
+        >
+          {row}
+        </div>
+      )}
       {node.children.length > 0 && (
         <ul className="flex min-w-0 flex-col">
           {node.children.map((child) => (

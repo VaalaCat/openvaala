@@ -77,9 +77,7 @@ func (d *Desktop) attachmentsView(c *ui.Context, draft *conversationDraft) {
 			break
 		}
 	}
-	if !kit.GetTheme(c).Motion.Reduced && !c.Preferences().ReduceMotion {
-		height = attachments.Animate("attachment-height", height, 150*time.Millisecond)
-	}
+	height = attachments.Animate("attachment-height", height, 150*time.Millisecond)
 	attachments.Height(height).Children(func() {
 		ui.ScrollHorizontal(c).Height(40).Children(func() {
 			ui.Row(c).Gap(8).Children(func() {
@@ -234,9 +232,7 @@ func (d *Desktop) composerToolbar(c *ui.Context, composer ui.Element, key draftK
 		if queueVisible {
 			queueWidth = t.Metrics.ControlHeight
 		}
-		if !t.Motion.Reduced && !c.Preferences().ReduceMotion {
-			queueWidth = queueSlot.Animate("queue-width", queueWidth, 150*time.Millisecond)
-		}
+		queueWidth = queueSlot.Animate("queue-width", queueWidth, 150*time.Millisecond)
 		queueSlot.Width(queueWidth)
 		queueSlot.Children(func() {
 			if queueVisible || queueWidth > 0 {

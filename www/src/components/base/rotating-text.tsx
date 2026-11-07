@@ -1,5 +1,5 @@
 import { AnimatePresence, motion, useIsPresent } from "motion/react"
-import { forwardRef, useEffect, useState, useSyncExternalStore } from "react"
+import { forwardRef, useEffect, useState } from "react"
 import { cn } from "@/lib/utils"
 import {
   reconcileRotatingCharacters,
@@ -26,7 +26,6 @@ type TextPresentation = {
   isStreamingAppend: boolean
 }
 
-const reducedMotionQuery = "(prefers-reduced-motion: reduce)"
 const characterDuration = 0.2
 const ease = [0.22, 1, 0.36, 1] as const
 
@@ -38,10 +37,6 @@ export function RotatingText({
   exitDelayMs = 0,
 }: RotatingTextProps) {
   // 1. 输入立即更新，延迟期间只保留最后一段展示文字。
-  const reducedMotion = useSyncExternalStore(
-    subscribeReducedMotion,
-    () => window.matchMedia(reducedMotionQuery).matches
-  )
   const [presentation, setPresentation] = useState<TextPresentation>(() => {
     const { characters, nextID } = reconcileRotatingCharacters([], text, 0)
     return {
@@ -82,7 +77,7 @@ export function RotatingText({
 
   // 2. 变化字同步进入和退出，共同文字只做位置移动。
   if (!presentation.text && presentation.exitDelays.size === 0) return null
-  const instant = reducedMotion || presentation.isStreamingAppend
+  const instant = presentation.isStreamingAppend
   const layoutTransition = { duration: instant ? 0 : characterDuration, ease }
   return (
     <motion.span
@@ -115,7 +110,7 @@ export function RotatingText({
             <AnimatePresence
               key={character.id}
               mode="popLayout"
-              custom={{ delays: presentation.exitDelays, reducedMotion }}
+              custom={presentation.exitDelays}
               onExitComplete={() => {
                 setPresentation((latest) => {
                   if (!latest.exitDelays.has(character.id)) return latest
@@ -168,18 +163,12 @@ const RotatingLetter = forwardRef<
       animate={{ y: 0, opacity: 1 }}
       exit="exit"
       variants={{
-        exit: ({
-          delays,
-          reducedMotion,
-        }: {
-          delays: Map<number, number>
-          reducedMotion: boolean
-        }) => ({
-          y: reducedMotion ? 0 : "-100%",
+        exit: (delays: Map<number, number>) => ({
+          y: "-100%",
           opacity: 0,
           transition: {
-            duration: reducedMotion ? 0 : characterDuration,
-            delay: reducedMotion ? 0 : (delays.get(character.id) ?? 0),
+            duration: characterDuration,
+            delay: delays.get(character.id) ?? 0,
             ease,
           },
         }),
@@ -239,12 +228,4 @@ function updatePresentation(
       : previous.characters.map(({ value }) => value).join(""),
     isStreamingAppend,
   }
-}
-
-// 系统减少动画设置变化时更新文字动画。
-function subscribeReducedMotion(onChange: () => void): () => void {
-  // 1. 监听媒体查询，卸载时取消监听。
-  const mediaQuery = window.matchMedia(reducedMotionQuery)
-  mediaQuery.addEventListener("change", onChange)
-  return () => mediaQuery.removeEventListener("change", onChange)
 }

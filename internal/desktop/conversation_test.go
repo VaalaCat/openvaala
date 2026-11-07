@@ -485,3 +485,42 @@ func TestSendWithoutModel(t *testing.T) {
 		t.Fatalf("page=%q err=%v", d.page, err)
 	}
 }
+
+// TestStartNewConversation 检查「新对话」入口：正在看对话时新对话表单照抄它的 Executor 和目录，没有看对话时保持表单；
+// 设置草稿未保存时，确认放弃之后走同样的预填。
+func TestStartNewConversation(t *testing.T) {
+	remote := defs.Conversation{ID: "remote", ExecutorSettings: defs.ExecutorSettings{DefaultExecutorID: "ssh-a", ExecutorIDs: []string{"ssh-a"}, WorkspaceDirectories: map[string]string{"ssh-a": "/srv/app", "local": "/home"}}}
+	local := defs.Conversation{ID: "local", ExecutorSettings: defs.ExecutorSettings{WorkspaceDirectories: map[string]string{"local": "/home/app"}}}
+	for _, tt := range []struct {
+		name                        string
+		conversation                defs.Conversation
+		isSettingsDirty             bool
+		wantExecutor, wantDirectory string
+	}{
+		{"viewing conversation with default executor", remote, false, "ssh-a", "/srv/app"},
+		{"viewing conversation with empty default executor", local, false, "local", "/home/app"},
+		{"no conversation keeps the form", defs.Conversation{}, false, "ssh-form", "/form"},
+		{"unsaved settings are confirmed first", remote, true, "ssh-a", "/srv/app"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.newExecutor, d.newDirectory = "ssh-form", "/form"
+			d.conversation = tt.conversation
+			d.readingTarget = readingTarget{ServerID: "fixture", ConversationID: tt.conversation.ID}
+			if tt.isSettingsDirty {
+				d.providerDraft = providerToDraft(defs.ProviderConfig{ID: "sample", Protocol: "openai_chat"})
+				d.providerBaseline = providerToDraft(defs.ProviderConfig{})
+			}
+			d.startNewConversation()
+			if tt.isSettingsDirty {
+				if !d.confirmOpen || d.confirm.Kind != "navigate-conversation" || d.newExecutor != "ssh-form" || d.newDirectory != "/form" {
+					t.Fatalf("confirm = %+v open=%v form = %q %q", d.confirm, d.confirmOpen, d.newExecutor, d.newDirectory)
+				}
+				d.submitConfirmation()
+			}
+			if d.newExecutor != tt.wantExecutor || d.newDirectory != tt.wantDirectory || d.conversation.ID != "" {
+				t.Fatalf("form = %q %q conversation = %q, want %q %q and a blank conversation", d.newExecutor, d.newDirectory, d.conversation.ID, tt.wantExecutor, tt.wantDirectory)
+			}
+		})
+	}
+}

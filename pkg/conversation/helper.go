@@ -62,9 +62,9 @@ func validateConversationDefinitions(definitions *ConversationDefinitions) error
 }
 
 // getFilledExecutorSettings 返回补上 local 工作区目录的设置。
-func getFilledExecutorSettings(settings defs.ExecutorSettings, executors []*defs.ExecutorDefinition) defs.ExecutorSettings {
-	// 1. 查找 local 定义；设置里没有 local 目录时复制目录表，填入定义里的目录。
-	index := slices.IndexFunc(executors, func(definition *defs.ExecutorDefinition) bool { return definition.ID == defs.LocalExecutorID })
+func getFilledExecutorSettings(settings defs.ExecutorSettings, executors []executor.Executor) defs.ExecutorSettings {
+	// 1. 查找 local Executor；设置里没有 local 目录时复制目录表，填入定义里的目录。
+	index := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == defs.LocalExecutorID })
 	if index < 0 || settings.WorkspaceDirectories[defs.LocalExecutorID] != "" {
 		return settings
 	}
@@ -72,17 +72,17 @@ func getFilledExecutorSettings(settings defs.ExecutorSettings, executors []*defs
 	if settings.WorkspaceDirectories == nil {
 		settings.WorkspaceDirectories = make(map[string]string, 1)
 	}
-	settings.WorkspaceDirectories[defs.LocalExecutorID] = executors[index].WorkspaceDirectory
+	settings.WorkspaceDirectories[defs.LocalExecutorID] = executors[index].GetDefinition().WorkspaceDirectory
 	return settings
 }
 
-// getAvailableExecutors 返回设置允许使用的 Executor 定义，默认 Executor 排在最前。
-func getAvailableExecutors(settings defs.ExecutorSettings, executors []*defs.ExecutorDefinition) []*defs.ExecutorDefinition {
-	// 1. 按定义顺序筛出可用的 Executor，设置了默认 Executor 且它可用时移到最前。
-	available := slices.DeleteFunc(slices.Clone(executors), func(definition *defs.ExecutorDefinition) bool {
-		return !settings.IsExecutorAvailable(definition.ID)
+// getAvailableExecutors 返回设置允许使用的 Executor，默认 Executor 排在最前。
+func getAvailableExecutors(settings defs.ExecutorSettings, executors []executor.Executor) []executor.Executor {
+	// 1. 按列表顺序筛出可用的 Executor，设置了默认 Executor 且它可用时移到最前。
+	available := slices.DeleteFunc(slices.Clone(executors), func(listed executor.Executor) bool {
+		return !settings.IsExecutorAvailable(listed.GetDefinition().ID)
 	})
-	index := slices.IndexFunc(available, func(definition *defs.ExecutorDefinition) bool { return definition.ID == settings.DefaultExecutorID })
+	index := slices.IndexFunc(available, func(listed executor.Executor) bool { return listed.GetDefinition().ID == settings.DefaultExecutorID })
 	if index > 0 {
 		defaultExecutor := available[index]
 		available = slices.Insert(slices.Delete(available, index, index+1), 0, defaultExecutor)
@@ -90,12 +90,19 @@ func getAvailableExecutors(settings defs.ExecutorSettings, executors []*defs.Exe
 	return available
 }
 
-// getUnknownExecutorIDs 返回设置里定义中没有的 Executor ID。
-func getUnknownExecutorIDs(settings defs.ExecutorSettings, executors []*defs.ExecutorDefinition) []string {
+// getMemoryProjectName 返回默认 Executor 和根目录对应的项目记忆目录，相对记忆根目录：
+// projects/<executorID>/<把根目录里的 / 换成 - 之后的名字>。
+func getMemoryProjectName(executorID, rootDirectory string) string {
+	// 1. 根目录里的 / 换成 -，作为 Executor 目录下的一层目录名。
+	return filepath.Join("projects", executorID, strings.ReplaceAll(rootDirectory, "/", "-"))
+}
+
+// getUnknownExecutorIDs 返回设置里 Executor 列表中没有的 ID。
+func getUnknownExecutorIDs(settings defs.ExecutorSettings, executors []executor.Executor) []string {
 	// 1. 先看默认 Executor，再看 executor_ids，收集未知 ID，跳过空值和重复项。
 	var unknownIDs []string
 	for _, id := range append([]string{settings.DefaultExecutorID}, settings.ExecutorIDs...) {
-		isKnown := id == "" || slices.ContainsFunc(executors, func(definition *defs.ExecutorDefinition) bool { return definition.ID == id })
+		isKnown := id == "" || slices.ContainsFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == id })
 		if !isKnown && !slices.Contains(unknownIDs, id) {
 			unknownIDs = append(unknownIDs, id)
 		}
@@ -133,16 +140,6 @@ func mergeSkills(groups ...[]*skill.Skill) []*skill.Skill {
 	}
 	slices.SortFunc(merged, func(a, b *skill.Skill) int { return strings.Compare(a.Name, b.Name) })
 	return merged
-}
-
-// getVirtualFiles 把定义里的文件内容转成虚拟工作区文件。
-func getVirtualFiles(files map[string][]byte) map[string]*workspace.VirtualFile {
-	// 1. 按路径把 ExecutorDefinition.Files 的内容填进虚拟文件。
-	virtualFiles := make(map[string]*workspace.VirtualFile, len(files))
-	for filePath, content := range files {
-		virtualFiles[filePath] = &workspace.VirtualFile{Content: content}
-	}
-	return virtualFiles
 }
 
 // getUsedMCPServers 按定义顺序返回 Agent 使用的 MCP server。
@@ -293,21 +290,21 @@ func getRequestedModelSelection(models map[defs.ModelRef]*defs.ModelDefinition, 
 
 // getExecutorToolNames 汇总各执行环境的内置工具名，不含 MCP 工具。
 func getExecutorToolNames(environments []executor.ExecutionEnvironment) []string {
-	// 1. 按环境顺序收集执行环境自带的工具名，有工作区的环境再追加 Session 建的命令工具名。
+	// 1. 按环境顺序收集执行环境自带的工具名，有工作区且能跑命令的环境再追加 Session 建的命令工具名。
 	var toolNames []string
 	for _, environment := range environments {
 		for _, tool := range environment.GetTools() {
 			toolNames = append(toolNames, tool.GetDefinition().Name)
 		}
-		if environment.GetWorkspace() != nil {
+		if environment.GetWorkspace() != nil && environment.IsCommandSupported() {
 			toolNames = append(toolNames, tools.GetCommandToolNames()...)
 		}
 	}
 	return toolNames
 }
 
-// newExecutorDetails 按配置顺序取出各执行环境的展示字段。
-func newExecutorDetails(environments []executor.ExecutionEnvironment) []ExecutorDetails {
+// newExecutorDetails 按配置顺序取出各执行环境的展示字段，种类取自同 ID 的 Executor。
+func newExecutorDetails(environments []executor.ExecutionEnvironment, executors []executor.Executor) []ExecutorDetails {
 	// 1. 按环境顺序填写 ID、说明和工作区根目录，没有工作区时目录为空。
 	details := make([]ExecutorDetails, len(environments))
 	for index, environment := range environments {
@@ -315,8 +312,14 @@ func newExecutorDetails(environments []executor.ExecutionEnvironment) []Executor
 		if environmentWorkspace := environment.GetWorkspace(); environmentWorkspace != nil {
 			directory = environmentWorkspace.GetRootDirectory()
 		}
+		// 2. 在列表里找同 ID 的 Executor，取它的种类。
+		var kind defs.ExecutorKind
+		if executorIndex := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == environment.GetID() }); executorIndex >= 0 {
+			kind = executors[executorIndex].GetDefinition().Kind
+		}
 		details[index] = ExecutorDetails{
 			ID:                 environment.GetID(),
+			Kind:               kind,
 			Description:        environment.GetDescription(),
 			WorkspaceDirectory: directory,
 		}
@@ -648,6 +651,12 @@ func newExecutorPromptEntries(environments []executor.ExecutionEnvironment) []pr
 		}
 	}
 	return entries
+}
+
+// isMemoryEnvironment 执行环境是不是 memory？
+func isMemoryEnvironment(environment executor.ExecutionEnvironment) bool {
+	// 1. 按 ID 判断。
+	return environment.GetID() == defs.MemoryExecutorID
 }
 
 // newAgentPromptEntries 按 Agent 定义生成 spawn_agent 工具说明里的可选 Agent 条目。

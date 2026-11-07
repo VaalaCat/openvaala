@@ -11,13 +11,13 @@ function lazyPage<K extends string>(
 }
 
 const IndexPage = lazyPage(() => import("@/app/index"), "IndexPage")
-const ConversationPage = lazyPage(
-  () => import("@/app/conversation"),
-  "ConversationPage"
-)
 const NewConversationPage = lazyPage(
   () => import("@/app/new-conversation"),
   "NewConversationPage"
+)
+const WorkspacePage = lazyPage(
+  () => import("@/components/workspace/workspace-page"),
+  "WorkspacePage"
 )
 const ProviderListPage = lazyPage(
   () => import("@/app/settings/providers"),
@@ -26,6 +26,10 @@ const ProviderListPage = lazyPage(
 const GeneralSettingsPage = lazyPage(
   () => import("@/app/settings/general"),
   "GeneralSettingsPage"
+)
+const AppearanceSettingsPage = lazyPage(
+  () => import("@/app/settings/appearance"),
+  "AppearanceSettingsPage"
 )
 const ArchivedConversationsPage = lazyPage(
   () => import("@/app/settings/archived"),
@@ -60,13 +64,14 @@ export function AppRouter() {
         <Route path="/" element={<IndexPage />} />
         <Route path="/s/:serverID" element={<AppLayout />}>
           <Route index element={<NewConversationPage />} />
-          <Route path="c/:conversationID" element={<ConversationPage />}>
+          <Route path="c/:conversationID" element={<WorkspacePage />}>
             <Route index element={null} />
             <Route path="sessions/:sessionID" element={null} />
           </Route>
           <Route path="settings">
             <Route index element={<Navigate to="general" replace />} />
             <Route path="general" element={<GeneralSettingsPage />} />
+            <Route path="appearance" element={<AppearanceSettingsPage />} />
             <Route path="archived" element={<ArchivedConversationsPage />} />
             <Route path="providers" element={<ProviderListPage />} />
             <Route path="providers/new" element={<ProviderCreatePage />} />

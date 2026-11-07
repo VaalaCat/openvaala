@@ -5,6 +5,7 @@ import {
   expect,
   getComposer,
   getMessages,
+  openTurnRaw,
   startConversation,
   test,
 } from "./fixture"
@@ -25,8 +26,7 @@ test(
   { tag: "@p1" },
   async ({ page, fixture }) => {
     // 1. 在工具执行途中归档；页面和运行任务保留，运行中提交的继续输入照常得到回复，对话仍是归档。
-    // 本例核对列表和菜单操作，不看动画：关闭动画省去弹层展开、收起的稳定等待。
-    await page.emulateMedia({ reducedMotion: "reduce" })
+
     const gate = fixture.createCommandGate("archived-running")
     await fixture.replies(
       {
@@ -170,16 +170,98 @@ test(
   }
 )
 
-// 通用页的字体按钮保持 32px 高，页面不横向溢出。
-async function expectGeneralControlsFit(page: Page) {
+test("fork_running_conversation_shows_the_running_turn_as_interrupted", async ({
+  page,
+  fixture,
+}) => {
+  // 1. 主对话停在受控命令上，从侧栏菜单分叉：新对话带着这一轮已保存的部分，这一轮显示已中断。
+  const gate = fixture.createCommandGate("fork-running")
+  await fixture.replies(
+    {
+      text: "分叉前已保存的回复",
+      tool: "bash",
+      arguments: JSON.stringify({ command: `${gate.wait}; printf fork-done` }),
+    },
+    { text: "原对话继续完成" }
+  )
+  await fixture.openApp(page)
+  await startConversation(page, "运行中分叉")
+  const sourceURL = page.url()
+  const sourceID = sourceURL.split("/c/")[1]
+  await expect(getMessages(page).getByText("分叉前已保存的回复")).toBeVisible()
+  await expect(
+    page.getByRole("button", { name: "中断", exact: true })
+  ).toBeVisible()
+  const sourceRow = page
+    .getByRole("listitem")
+    .filter({ has: page.locator(`a[href*="/c/${sourceID}"]`) })
+    .filter({ has: page.getByRole("button", { name: /的更多操作/ }) })
+  await sourceRow.getByRole("button", { name: /的更多操作/ }).click()
+  await page.getByRole("menuitem", { name: "分叉", exact: true }).click()
+  await expect(page).not.toHaveURL(sourceURL)
+  await expect(page).toHaveURL(/\/c\/[^/?]+/)
+  const forkID = new URL(page.url()).pathname.split("/c/")[1]
+  expect(forkID).not.toBe(sourceID)
+  const messages = getMessages(page)
+  await expect(messages.getByText("运行中分叉", { exact: true })).toBeVisible()
+  await expect(messages.getByText("分叉前已保存的回复")).toBeVisible()
+  await expect(
+    messages.locator('[data-turn-status="interrupted"]')
+  ).toHaveCount(1)
+  await expect(messages.locator('[data-turn-status="running"]')).toHaveCount(0)
+  await expect(
+    page.getByRole("button", { name: "中断", exact: true })
+  ).toHaveCount(0)
+  // 2. 历史最前面写明来源：同消息列边缘对齐，排在第一轮之前，链接指向来源对话。
+  const origin = messages.locator('[data-fork-origin="fork"]')
+  await expect(origin).toHaveText("从『运行中分叉』分叉")
+  const [originBox, firstTurnBox] = await Promise.all([
+    origin.boundingBox(),
+    messages.locator("[data-turn-id]").first().boundingBox(),
+  ])
+  expect(Math.abs(originBox!.x - firstTurnBox!.x)).toBeLessThanOrEqual(1)
+  expect(originBox!.y).toBeLessThan(firstTurnBox!.y)
+  const originLink = origin.getByRole("link", { name: "从『运行中分叉』分叉" })
+  await expect(originLink).toHaveAttribute(
+    "href",
+    new RegExp(`/c/${sourceID}$`)
+  )
+  // 3. 回到原对话：它没有被打断，放行命令后照常收尾，新对话里这一轮仍是已中断；原对话不是分叉，没有来源提示。
+  await originLink.click()
+  await expect(page).toHaveURL(sourceURL)
+  await expect(messages.locator("[data-fork-origin]")).toHaveCount(0)
+  await expect(
+    page.getByRole("button", { name: "中断", exact: true })
+  ).toBeVisible()
+  await expect(
+    getMessages(page).locator('[data-turn-status="interrupted"]')
+  ).toHaveCount(0)
+  await gate.release()
+  await expect(getMessages(page).getByText("原对话继续完成")).toBeVisible()
+  await expect(
+    getMessages(page).locator('[data-turn-status="completed"]')
+  ).toBeVisible()
+  await page.goto(sourceURL.replace(sourceID, forkID))
+  await expect(
+    getMessages(page).locator('[data-turn-status="interrupted"]')
+  ).toHaveCount(1)
+  await expect(getMessages(page).getByText("原对话继续完成")).toHaveCount(0)
+  await gate.cleanup()
+})
+
+// 外观页的字体按钮保持 32px 高，页面不横向溢出。
+async function expectAppearanceControlsFit(page: Page) {
   // 1. 读取字体按钮高度和页面横向尺寸。
-  const controlHeights = await page
-    .getByRole("group", { name: "正文字体", exact: true })
-    .getByRole("button")
-    .evaluateAll((buttons) =>
-      buttons.map((button) => button.getBoundingClientRect().height)
+  await expect
+    .poll(() =>
+      page
+        .getByRole("group", { name: "正文字体", exact: true })
+        .getByRole("button")
+        .evaluateAll((buttons) =>
+          buttons.map((button) => button.getBoundingClientRect().height)
+        )
     )
-  expect(controlHeights).toEqual([32, 32, 32])
+    .toEqual([32, 32, 32])
   const dimensions = await page.evaluate(() => ({
     width: innerWidth,
     content: document.documentElement.scrollWidth,
@@ -192,11 +274,11 @@ test(
   { tag: "@p1" },
   async ({ page, fixture }) => {
     // 1. 进入默认通用页；本机偏好不提供应用或重载操作。
-    await page.emulateMedia({ reducedMotion: "reduce" })
     await page.setViewportSize({ width: 1280, height: 844 })
     await fixture.openApp(page)
     await page.getByRole("link", { name: "设置", exact: true }).click()
     await expect(page).toHaveURL(/\/settings\/general$/)
+    await page.getByRole("tab", { name: "外观", exact: true }).click()
     await expect(
       page.getByRole("button", { name: "重新加载配置" })
     ).toHaveCount(0)
@@ -244,7 +326,7 @@ test(
           "system-ui, sans-serif"
         )
         await expect(
-          page.getByRole("heading", { name: "通用", exact: true })
+          page.getByRole("heading", { name: "外观", exact: true })
         ).toHaveCSS("font-family", '"Noto Serif Variable", serif')
         const primary = await page.evaluate(() =>
           getComputedStyle(document.documentElement).getPropertyValue(
@@ -268,6 +350,7 @@ test(
     }
 
     // 3. 切换语言立即更新导航、文档语言和存储。
+    await page.getByRole("tab", { name: "通用", exact: true }).click()
     await page.getByRole("button", { name: /^语言/ }).click()
     await page
       .getByRole("menuitemradio", { name: "English", exact: true })
@@ -278,6 +361,7 @@ test(
     ).toBeVisible()
 
     // 4. 恢复默认只重置外观，语言保持英文。
+    await page.getByRole("tab", { name: "Appearance", exact: true }).click()
     await page
       .getByRole("button", { name: "Reset appearance", exact: true })
       .click()
@@ -288,8 +372,9 @@ test(
       '"Noto Serif Variable", serif'
     )
     await expect(
-      page.getByRole("heading", { name: "General", exact: true })
+      page.getByRole("heading", { name: "Appearance", exact: true })
     ).toHaveCSS("font-family", '"JetBrains Mono Variable", monospace')
+    await page.getByRole("tab", { name: "General", exact: true }).click()
     await page.getByRole("button", { name: /^Language/ }).click()
     await page
       .getByRole("menuitemradio", { name: "简体中文", exact: true })
@@ -307,9 +392,10 @@ test(
       .toBe(JSON.stringify(defaultAppearance))
 
     // 5. 桌面和窄屏下控件高度不变，页面都不横向溢出。
-    await expectGeneralControlsFit(page)
+    await page.getByRole("tab", { name: "外观", exact: true }).click()
+    await expectAppearanceControlsFit(page)
     await page.setViewportSize({ width: 390, height: 844 })
-    await expectGeneralControlsFit(page)
+    await expectAppearanceControlsFit(page)
   }
 )
 
@@ -321,7 +407,6 @@ test(
     for (const storageInaccessible of [false, true]) {
       const page = await context.newPage()
       try {
-        await page.emulateMedia({ reducedMotion: "reduce" })
         await page.addInitScript((inaccessible) => {
           if (inaccessible) {
             Object.defineProperty(window, "localStorage", {
@@ -341,6 +426,7 @@ test(
         await fixture.openApp(page)
         await page.getByRole("link", { name: "设置", exact: true }).click()
         await expect(page).toHaveURL(/\/settings\/general$/)
+        await page.getByRole("tab", { name: "外观", exact: true }).click()
 
         // 2. 配色和明暗立即生效。
         await page
@@ -355,6 +441,7 @@ test(
         await expect(page.locator("html")).toHaveClass(/dark/)
 
         // 3. 语言立即更新导航和文档语言；恢复默认只重置外观。
+        await page.getByRole("tab", { name: "通用", exact: true }).click()
         await page.getByRole("button", { name: /^语言/ }).click()
         await page
           .getByRole("menuitemradio", { name: "English", exact: true })
@@ -363,6 +450,7 @@ test(
         await expect(
           page.getByRole("tab", { name: "General", selected: true })
         ).toBeVisible()
+        await page.getByRole("tab", { name: "Appearance", exact: true }).click()
         await page
           .getByRole("button", { name: "Reset appearance", exact: true })
           .click()
@@ -383,9 +471,9 @@ test(
   { tag: "@p1" },
   async ({ page, fixture }) => {
     // 1. 保存配色和双字体，切换页面和刷新后仍使用已选外观。
-    await page.emulateMedia({ reducedMotion: "reduce" })
     await fixture.openApp(page)
     await page.getByRole("link", { name: "设置", exact: true }).click()
+    await page.getByRole("tab", { name: "外观", exact: true }).click()
     await page
       .getByRole("group", { name: "主题配色", exact: true })
       .getByRole("button", { name: "蓝色", exact: true })
@@ -408,7 +496,7 @@ test(
     await expect(
       page.getByRole("heading", { name: "模型服务", exact: true })
     ).toHaveCSS("font-family", "system-ui, sans-serif")
-    await page.getByRole("tab", { name: "通用", exact: true }).click()
+    await page.getByRole("tab", { name: "外观", exact: true }).click()
 
     // 2. 同源第二标签页修改外观，原页同步；重置和清除存储也同步。
     const secondPage = await page.context().newPage()
@@ -466,7 +554,7 @@ test(
       "system-ui, sans-serif"
     )
     await expect(
-      page.getByRole("heading", { name: "通用", exact: true })
+      page.getByRole("heading", { name: "外观", exact: true })
     ).toHaveCSS("font-family", '"JetBrains Mono Variable", monospace')
     await fixture.replies({ text: "```text\nappearance_code_42\n```" })
     await page.getByRole("link", { name: "新对话", exact: true }).click()
@@ -488,6 +576,228 @@ test(
     )
   }
 )
+
+for (const scenario of [
+  { width: 1280, colorScheme: "light" },
+  { width: 390, colorScheme: "light" },
+  { width: 390, colorScheme: "dark" },
+] as const) {
+  test(`appearance_reading_controls_${scenario.width}_${scenario.colorScheme}`, async ({
+    page,
+    fixture,
+  }) => {
+    // 1. 独立外观菜单提供三组阅读尺寸，预览不创建终端进程。
+    await page.setViewportSize({ width: scenario.width, height: 844 })
+    await page.emulateMedia({
+      colorScheme: scenario.colorScheme,
+    })
+    const terminalCalls: string[] = []
+    page.on("websocket", (socket) =>
+      socket.on("framesent", (frame) => {
+        const payload = String(frame.payload)
+        if (payload.includes('"terminal/open"')) terminalCalls.push(payload)
+      })
+    )
+    await fixture.openApp(page)
+    const serverURL = page.url().split("/c/")[0]
+    await page.goto(serverURL + "/settings/appearance")
+    const body = page.getByRole("region", { name: "正文", exact: true })
+    const code = page.getByRole("region", { name: "代码", exact: true })
+    const terminal = page.getByRole("region", { name: "终端", exact: true })
+    await expect(
+      terminal.getByRole("spinbutton", { name: "行高", exact: true })
+    ).toHaveValue("1.1")
+    await expect(terminal.locator(".xterm-rows")).toContainText("Hello, 世界")
+    expect(terminalCalls).toHaveLength(0)
+    // 段落实际间距跟随小数值，不能被 Markdown 的默认外边距撑大。
+    for (const spacing of [0, 8, 12]) {
+      await body
+        .getByRole("spinbutton", { name: "段落间距", exact: true })
+        .fill(String(spacing))
+      await expect
+        .poll(async () => {
+          const paragraphs = await body
+            .locator(".markdown-view > p")
+            .evaluateAll((nodes) =>
+              nodes.map((node) => {
+                const box = node.getBoundingClientRect()
+                return { top: box.top, bottom: box.bottom }
+              })
+            )
+          return paragraphs[1].top - paragraphs[0].bottom
+        })
+        .toBe(spacing)
+    }
+
+    // 2. 每个输入立即更新对应阅读样式，输入本身维持 14px，打字不丢焦点。
+    for (const change of [
+      {
+        scope: body,
+        label: "字号",
+        value: "18",
+        target: body.locator(".markdown-view"),
+        property: "font-size",
+        expected: "18px",
+      },
+      {
+        scope: body,
+        label: "行高",
+        value: "28",
+        target: body.locator(".markdown-view"),
+        property: "line-height",
+        expected: "28px",
+      },
+      {
+        scope: body,
+        label: "段落间距",
+        value: "20",
+        target: body.locator(".markdown-view > p").nth(1),
+        property: "margin-block-start",
+        expected: "20px",
+      },
+      {
+        scope: code,
+        label: "字号",
+        value: "16",
+        target: code.locator("pre"),
+        property: "font-size",
+        expected: "16px",
+      },
+      {
+        scope: code,
+        label: "行高",
+        value: "26",
+        target: code.locator("pre"),
+        property: "line-height",
+        expected: "26px",
+      },
+      {
+        scope: code,
+        label: "水平内边距",
+        value: "20",
+        target: code.locator("pre"),
+        property: "padding-left",
+        expected: "20px",
+      },
+      {
+        scope: code,
+        label: "垂直内边距",
+        value: "16",
+        target: code.locator("pre"),
+        property: "padding-top",
+        expected: "16px",
+      },
+    ]) {
+      const input = change.scope.getByRole("spinbutton", {
+        name: change.label,
+        exact: true,
+      })
+      await input.fill(change.value)
+      await expect(input).toBeFocused()
+      await expect(input).toHaveCSS("font-size", "14px")
+      await expect(change.target).toHaveCSS(change.property, change.expected)
+    }
+    await body.getByRole("button", { name: "增大字号", exact: true }).click()
+    await expect(
+      body.getByRole("spinbutton", { name: "字号", exact: true })
+    ).toHaveValue("19")
+    await terminal
+      .getByRole("button", { name: "减小行高", exact: true })
+      .click()
+    await expect(
+      terminal.getByRole("spinbutton", { name: "行高", exact: true })
+    ).toHaveValue("1.05")
+    await terminal
+      .getByRole("spinbutton", { name: "内容内边距", exact: true })
+      .fill("16")
+    await expect(terminal.locator(".xterm")).toHaveCSS("padding", "16px")
+    await expectAppearanceControlsFit(page)
+
+    // 3. 刷新仍保留；本组重置不改其他组，全部重置恢复原值。
+    await page.reload()
+    await expect(
+      body.getByRole("spinbutton", { name: "字号", exact: true })
+    ).toHaveValue("19")
+    // 真实消息复用同一阅读设置，输入和模型选择维持原字号。
+    await fixture.replies({
+      text: "真实阅读正文\n\n```text\nreading_code_42\n```",
+    })
+    await page.goto(serverURL)
+    await startConversation(page, "阅读字号隔离")
+    await expect(
+      getMessages(page).getByText("阅读字号隔离", { exact: true })
+    ).toHaveCSS("font-size", "19px")
+    await expect(
+      getMessages(page).getByText("真实阅读正文", { exact: true })
+    ).toHaveCSS("font-size", "19px")
+    await expect(
+      getMessages(page).getByText("reading_code_42", { exact: true })
+    ).toHaveCSS("font-size", "16px")
+    await expect(getComposer(page)).toHaveCSS("font-size", "14px")
+    await expect(page.getByLabel("模型", { exact: true })).toHaveCSS(
+      "font-size",
+      "14px"
+    )
+    await page.goto(serverURL + "/settings/appearance")
+    await body
+      .getByRole("button", { name: "恢复本组默认", exact: true })
+      .click()
+    await expect(body.locator(".markdown-view")).toHaveCSS("font-size", "14px")
+    await expect(code.locator("pre")).toHaveCSS("font-size", "16px")
+    await page
+      .getByRole("button", { name: "恢复默认外观", exact: true })
+      .click()
+    await expect(code.locator("pre")).toHaveCSS("font-size", "12px")
+    await expect(
+      terminal.getByRole("spinbutton", { name: "行高", exact: true })
+    ).toHaveValue("1.1")
+  })
+}
+
+test("appearance_code_line_height_changes_actual_json_rows", async ({
+  page,
+  fixture,
+}) => {
+  // 1. 打开真实消息的原始 JSON；从同源设置页调节代码行高。
+  await fixture.replies({ text: "JSON行高检查" })
+  await fixture.openApp(page)
+  await startConversation(page, "JSON行高")
+  await expect(
+    getMessages(page).getByText("JSON行高检查", { exact: true })
+  ).toBeVisible()
+  const raw = await openTurnRaw(
+    getMessages(page).locator("[data-turn-id]").last()
+  )
+  const settings = await page.context().newPage()
+  try {
+    await settings.goto(page.url().split("/c/")[0] + "/settings/appearance")
+    const code = settings.getByRole("region", { name: "代码", exact: true })
+    // 2. 检查整行和相邻行起点，包含折叠首列和复制按钮的行也不能保持20px。
+    const rows = raw.locator("[data-json-path]")
+    await expect(rows.first()).toBeVisible()
+    for (const height of [16, 18, 28]) {
+      await code
+        .getByRole("spinbutton", { name: "行高", exact: true })
+        .fill(String(height))
+      await expect
+        .poll(async () =>
+          rows.evaluateAll((nodes) =>
+            nodes.slice(0, 8).map((node, index, list) => ({
+              height: node.getBoundingClientRect().height,
+              advance:
+                index === 0
+                  ? node.getBoundingClientRect().height
+                  : node.getBoundingClientRect().top -
+                    list[index - 1].getBoundingClientRect().top,
+            }))
+          )
+        )
+        .toEqual(Array(8).fill({ height, advance: height }))
+    }
+  } finally {
+    await settings.close()
+  }
+})
 
 test(
   "standalone_authentication_keeps_language_switcher",

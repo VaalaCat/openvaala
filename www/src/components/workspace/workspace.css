@@ -1,0 +1,184 @@
+@reference "../../index.css";
+
+/* flexlayout 的主题：颜色、字号和圆角全部取本项目的变量，外观是连续的面板，和桌面端一致 */
+.workspace-layout .flexlayout__layout {
+  --flexlayout-font-family: var(--appearance-body);
+  --flexlayout-font-size: 1em;
+  --flexlayout-font-weight: 400;
+  --flexlayout-color-text: var(--foreground);
+  --flexlayout-color-background: var(--background);
+  --flexlayout-color-base: var(--background);
+  --flexlayout-color-1: var(--muted);
+  --flexlayout-color-2: var(--muted);
+  --flexlayout-color-3: var(--accent);
+  --flexlayout-color-4: var(--border);
+  --flexlayout-color-5: var(--border);
+  --flexlayout-color-6: var(--ring);
+  --flexlayout-color-tab-content: var(--background);
+  --flexlayout-color-tab-selected: var(--foreground);
+  --flexlayout-color-tab-selected-background: var(--background);
+  --flexlayout-color-tab-unselected: var(--muted-foreground);
+  --flexlayout-color-tab-unselected-background: var(--sidebar);
+  --flexlayout-color-tabset-background: var(--sidebar);
+  --flexlayout-color-icon: var(--muted-foreground);
+  --flexlayout-color-focus: var(--ring);
+  --flexlayout-color-drag1: var(--ring);
+  --flexlayout-color-drag2: var(--ring);
+  --flexlayout-color-drag1-background: var(--muted);
+  --flexlayout-color-drag2-background: var(--muted);
+  --flexlayout-color-drag-rect-border: var(--ring);
+  --flexlayout-color-drag-rect-background: var(--muted);
+  --flexlayout-color-drag-rect: var(--foreground);
+  /* 区域之间只有一条 1px 的线，可拖动的范围比线宽，悬停和拖动时才有高亮 */
+  --flexlayout-splitter-size: 1px;
+  --flexlayout-splitter-active-size: 6px;
+  --flexlayout-color-splitter: var(--border);
+  --flexlayout-color-splitter-hover: var(--border);
+  --flexlayout-color-splitter-drag: var(--ring);
+  --flexlayout-splitter-handle-visibility: hidden;
+  --flexlayout-color-popup-border: var(--border);
+  --flexlayout-color-popup-unselected-background: var(--popover);
+  --flexlayout-color-popup-unselected: var(--popover-foreground);
+  --flexlayout-color-popup-selected-background: var(--accent);
+  --flexlayout-color-popup-selected: var(--accent-foreground);
+  --flexlayout-color-toolbar-button-hover: var(--sidebar-accent);
+}
+.workspace-layout .flexlayout__tab_button_content {
+  @apply text-ui;
+}
+.workspace-layout .flexlayout__layout * {
+  border-radius: 0;
+}
+
+/* 区域本身没有外框，区域之间没有间隙 */
+.workspace-layout .flexlayout__tabset {
+  border: 0;
+  background: var(--background);
+}
+/* 标签页内容自成一层，里面的 z-index（例如贴底的输入框）不会盖到分割线的可拖范围上 */
+.workspace-layout .flexlayout__tab {
+  isolation: isolate;
+}
+.workspace-layout .flexlayout__splitter:hover::before,
+.workspace-layout .flexlayout__splitter:active::before {
+  background: color-mix(in oklch, var(--ring) 35%, transparent);
+}
+.workspace-layout .flexlayout__splitter:hover {
+  background-color: var(--border);
+  transition: none;
+}
+
+/* 标签栏的外观（高度、底色、底线、标签、操作区按钮）在 base/tab-bar.css 里和右栏共用，这里只放 flexlayout 自己的结构 */
+.workspace-layout .flexlayout__mini_scrollbar_container {
+  container-type: inline-size;
+  min-width: 0;
+  flex-grow: 1;
+}
+.workspace-layout .flexlayout__tabset_tabbar_inner {
+  height: 100%;
+}
+.workspace-layout .flexlayout__tabset_tabbar_inner_tab_container {
+  padding: 0;
+  border: 0;
+  gap: 0;
+  height: 100%;
+  align-items: stretch;
+  /* 不超出标签栏的宽度，里面的标签才会收窄 */
+  min-width: 0;
+  max-width: 100%;
+}
+.workspace-layout .flexlayout__tabset_tab_spacer,
+.workspace-layout .flexlayout__tabset_tab_divider {
+  display: none;
+}
+
+/* 标签右侧留 4px 给关闭按钮；标签在剩下的宽度里一起收窄（标题省略），收到最小宽度再滚动，不压到右端的按钮 */
+.workspace-layout .flexlayout__tab_button {
+  max-width: 100cqw;
+  padding: 0 4px 0 12px;
+  flex: 0 1 auto;
+  min-width: 96px;
+}
+/* 不能关闭的标签（主对话）没有关闭按钮，左右内边距对称 */
+.workspace-layout .flexlayout__tab_button:has([data-tab-closable="false"]) {
+  padding-right: 12px;
+}
+.workspace-layout .flexlayout__tab_button_leading {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.workspace-layout .flexlayout__tab_button_content {
+  min-width: 0;
+  display: block;
+  max-width: 192px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 关闭按钮只在选中、悬停或键盘聚焦时出现，其余时候透明 */
+.workspace-layout .flexlayout__tab_button_trailing {
+  visibility: visible;
+  opacity: 0;
+  margin: 0;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: inherit;
+}
+.workspace-layout
+  .flexlayout__tab_button[aria-selected="true"]
+  .flexlayout__tab_button_trailing,
+.workspace-layout
+  .flexlayout__tab_button:hover
+  .flexlayout__tab_button_trailing,
+.workspace-layout
+  .flexlayout__tab_button:focus-visible
+  .flexlayout__tab_button_trailing {
+  opacity: 1;
+}
+.workspace-layout .flexlayout__tab_button_trailing:hover {
+  background: color-mix(in oklch, currentColor 14%, transparent);
+}
+
+/* 溢出按钮和「+」同样大小；隐藏的标签个数不画出来，名称里有说明 */
+.workspace-layout .flexlayout__tab_button_overflow {
+  width: 28px;
+  padding: 0;
+}
+.workspace-layout .flexlayout__tab_button_overflow_count {
+  display: none;
+}
+/* 最大化、还原放进「+」菜单，不再单独一个按钮；双击标签栏的空白处仍然能最大化 */
+.workspace-layout .flexlayout__tab_toolbar_button-min,
+.workspace-layout .flexlayout__tab_toolbar_button-max {
+  display: none;
+}
+
+/* 窄屏（< 768）：不显示标签栏和分栏，选中的标签页铺满；其余区域的内容面板由 WorkspaceLayout 收起 */
+@media (max-width: 767px) {
+  /* 分隔条的手柄自己设了 visible，子元素也要一起收起 */
+  .workspace-layout .flexlayout__layout_main,
+  .workspace-layout .flexlayout__layout_main * {
+    visibility: hidden !important;
+  }
+  .workspace-layout .flexlayout__tab {
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+  }
+}
+
+/* 终端：fit addon 按 .xterm 自己的内边距算行列，所以 8px 内边距加在 .xterm 上，不加在容器上 */
+.terminal-viewport .xterm {
+  height: 100%;
+  padding: var(--terminal-padding, 8px);
+}
+/* xterm 自带的滚动区域是黑底，换成透明，内边距那一圈才和主题底色一致 */
+.terminal-viewport .xterm .xterm-viewport {
+  background-color: transparent;
+}

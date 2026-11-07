@@ -55,7 +55,7 @@ export function HookSettingsPage() {
                       </OverflowTooltip>
                     )}
                   </div>
-                  <pre className="overflow-x-auto text-code">
+                  <pre className="overflow-x-auto text-code-reading">
                     {hook.handler}
                   </pre>
                   <div className="flex min-w-0 items-center gap-2 color-muted">

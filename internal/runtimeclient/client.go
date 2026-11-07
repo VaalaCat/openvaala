@@ -36,6 +36,8 @@ type Client interface {
 	Reconnect(ctx context.Context) (err error)
 	// SubscribeRunningConversations 启用全局运行集合订阅及断线恢复；初始集合和错误经 Events 交付，重复调用合并。
 	SubscribeRunningConversations(ctx context.Context) (err error)
+	// SubscribeTerminals 启用运行中终端的订阅及断线恢复；初始列表和错误经 Events 交付，重复调用合并。
+	SubscribeTerminals(ctx context.Context) (err error)
 	// GetRPCFrames 返回有界调试记录的独立副本，并允许下一次日志变化通知。
 	GetRPCFrames(ctx context.Context) (frames []RPCFrame, err error)
 	// ClearRPCFrames 清空记录和拥塞丢帧计数，保留暂停状态和递增序号。
@@ -75,12 +77,19 @@ type Client interface {
 	// SendClientMCPClosed 发出 clientMCP/closed 通知，告知 serve streamID 这条流已结束：连不上本机 MCP server 或它退出了；
 	// err 是失败原因，nil 表示正常结束。送达规则与 ctx 的要求同 SendClientMCPMessage。
 	SendClientMCPClosed(ctx context.Context, streamID string, err error) error
-	// OpenTerminal 调 terminal/open，在 Executor 上为本连接新开一个终端并返回它的 ID、实际 Executor 和起始目录。
-	// 输出和结束分别经 Events 交付 TerminalOutput 与 TerminalExited；终端只属于当前这条连接，连接断开后 serve 结束它，重连后需要重新打开。
-	// virtual Executor 不支持终端，返回错误。
+	// OpenTerminal 调 terminal/open，在 Executor 上新开一个终端并返回它的 ID、实际 Executor 和起始目录，本连接自动接入。
+	// 输出和结束分别经 Events 交付 TerminalOutput 与 TerminalExited；终端属于 serve，连接断开后继续运行，
+	// 重连后用 AttachTerminal 从已收到的位置接回。virtual Executor 不支持终端，返回错误。
 	OpenTerminal(ctx context.Context, request *TerminalOpenRequest) (result *runtimeprotocol.TerminalOpenResult, err error)
-	// CloseTerminal 调 terminal/close，结束终端进程；终端已经结束时成功。结束后 Events 交付 TerminalExited。
+	// AttachTerminal 调 terminal/attach，把本连接接入 serve 上已有的终端，输出从 cursor 起经 Events 交付 TerminalOutput，
+	// 返回 PTY 当前尺寸；终端已经结束但记录还在时同样成功，补完输出后交付 TerminalExited。
+	// 终端不存在时返回的错误可用 errors.As 取出 *ResponseError，Code 为 runtimeprotocol.ErrorCodeTerminalNotFound。
+	AttachTerminal(ctx context.Context, terminalID string, cursor uint64) (result *runtimeprotocol.TerminalAttachResult, err error)
+	// CloseTerminal 调 terminal/close，结束终端进程；终端已经结束或不存在时成功。结束后 Events 交付 TerminalExited。
 	CloseTerminal(ctx context.Context, terminalID string) (err error)
+	// ResetTerminal 调 terminal/reset，丢掉 serve 保留的输出，已接入的连接经 TerminalOutput 收到清屏序列；
+	// 终端不存在时返回 *ResponseError，Code 为 runtimeprotocol.ErrorCodeTerminalNotFound。
+	ResetTerminal(ctx context.Context, terminalID string) (err error)
 	// WriteTerminal 发出 terminal/input 通知，把键盘或粘贴的字节原样写进终端；写出后返回，不等待 serve 处理。
 	// 当前没有已连接的连接时立即返回 ErrConnectionLost，不等重连。
 	WriteTerminal(terminalID string, data []byte) (err error)
@@ -113,8 +122,8 @@ type Client interface {
 	// ListConversations 返回一页对话记录：Archived 为 true 时只列归档的，否则只列没归档的；NextCursor 非零时可作为下一页的 Cursor。
 	ListConversations(ctx context.Context, request *ListConversationsRequest) (ListConversationsResult, error)
 	// ForkConversation 调 conversation/fork，把对话复制到截取点为止并在服务端打开新对话，返回新对话的记录；原对话不变。
-	// 截取点之前一轮都没有时服务端新建一个空对话。两个截取点都给、轮次不在根 Session 里、LastTurnID 还没结束时，分别返回可用
-	// errors.Is 识别的 conversation.ErrForkBoundaryConflict、ErrForkTurnNotFound、ErrForkTurnRunning。
+	// 截取点之前一轮都没有时服务端新建一个空对话。两个截取点都给、轮次不在根 Session 里时，分别返回可用 errors.Is 识别的
+	// conversation.ErrForkBoundaryConflict、ErrForkTurnNotFound。
 	ForkConversation(ctx context.Context, request *ForkConversationRequest) (defs.Conversation, error)
 	// SetConversationArchived 调 conversation/setArchived，归档或取消归档，返回保存后的记录；不打开也不停止对话，
 	// 已经是这个状态时什么都不改。
@@ -152,6 +161,9 @@ type Client interface {
 	InterruptTurnWithInput(ctx context.Context, conversationID defs.ConversationID, turnID defs.TurnID, itemID defs.ItemID) error
 	// WithdrawInput 原子取走用户输入；returnContent 为 true 时返回完整用户消息内容，断线不重发。
 	WithdrawInput(ctx context.Context, conversationID defs.ConversationID, itemID defs.ItemID, returnContent bool) ([]*defs.Content, error)
+	// AppendContextItems 调 conversation/appendContextItems，把 Item 交给对话根 Session，下一轮 Turn 开始时写在本轮输入之前，不启动 Turn；
+	// 对话没打开、Item 无效或对话已开始停止时返回错误，断线不重发。
+	AppendContextItems(ctx context.Context, request *AppendContextItemsRequest) (err error)
 	// CompactContext 调 conversation/compact，让根 Session 开一个只压缩的 Turn，返回它的 TurnID；
 	// 根 Session 忙时返回可用 errors.Is 识别的 session.ErrSessionBusy。
 	CompactContext(ctx context.Context, conversationID defs.ConversationID) (defs.TurnID, error)
@@ -183,15 +195,9 @@ type clientImpl struct {
 	reconnectTimer   *time.Timer
 	isConnecting     bool
 	connectionNumber uint64
-	// wantsRunningConversations 保存调用方的订阅意图；其余字段属于当前连接的全局订阅。
-	wantsRunningConversations         bool
-	isSubscribingRunningConversations bool
-	isRunningConversationsSubscribed  bool
-	runningSubscriptionGeneration     uint64
-	stagedRunningConversations        *runtime.RunningConversations
-	runningSubscriptionRetryTimer     *time.Timer
-	failedRunningSubscriptions        int
-	cancelRunningSubscribe            context.CancelFunc
+	// runningSubscription、terminalsSubscription 是两种全局订阅：运行中的对话、运行中的终端。
+	runningSubscription   *globalSubscription[runtime.RunningConversations]
+	terminalsSubscription *globalSubscription[runtimeprotocol.TerminalListResult]
 
 	// events 是交给调用方的事件，Run 返回前关闭。
 	events chan ClientEvent
@@ -287,7 +293,7 @@ func NewClient(opt *ClientOpt) (Client, error) {
 	if opt.RPCFrameCapacity > 0 {
 		samples = make(chan RPCFrame, min(opt.RPCFrameCapacity, 256))
 	}
-	return &clientImpl{
+	c := &clientImpl{
 		rpcSamples:  samples,
 		rpcDropWake: make(chan struct{}, 1),
 		opt:         *opt,
@@ -295,7 +301,22 @@ func NewClient(opt *ClientOpt) (Client, error) {
 		loopInputs:  make(chan clientLoopInput),
 		started:     make(chan struct{}, 1),
 		stopped:     make(chan struct{}),
-	}, nil
+	}
+	c.runningSubscription = newGlobalSubscription(c, globalSubscriptionOpt[runtime.RunningConversations]{
+		SubscribeMethod:   "conversation/running/subscribe",
+		UnsubscribeMethod: "conversation/running/unsubscribe",
+		ChangedMethod:     "conversation/runningChanged",
+		ClosedMethod:      "conversation/runningClosed",
+		NewEvent:          newRunningConversationsChanged,
+	})
+	c.terminalsSubscription = newGlobalSubscription(c, globalSubscriptionOpt[runtimeprotocol.TerminalListResult]{
+		SubscribeMethod:   "terminal/subscribe",
+		UnsubscribeMethod: "terminal/unsubscribe",
+		ChangedMethod:     "terminal/listChanged",
+		ClosedMethod:      "terminal/listClosed",
+		NewEvent:          newTerminalsChanged,
+	})
+	return c, nil
 }
 
 // Events 返回客户端按发生顺序交付事件的通道。
@@ -320,9 +341,8 @@ func (c *clientImpl) Run(ctx context.Context) error {
 		if c.reconnectTimer != nil {
 			c.reconnectTimer.Stop()
 		}
-		if c.runningSubscriptionRetryTimer != nil {
-			c.runningSubscriptionRetryTimer.Stop()
-		}
+		c.runningSubscription.stopRetryTimer()
+		c.terminalsSubscription.stopRetryTimer()
 		c.tasks.Wait()
 		close(c.stopped)
 		close(c.events)
@@ -331,12 +351,9 @@ func (c *clientImpl) Run(ctx context.Context) error {
 	c.emit(ctx, &ConnectionChanged{State: ConnectionConnecting})
 	c.startConnecting(ctx, 0)
 	for {
-		var retry, runningRetry <-chan time.Time
+		var retry <-chan time.Time
 		if c.reconnectTimer != nil {
 			retry = c.reconnectTimer.C
-		}
-		if c.runningSubscriptionRetryTimer != nil {
-			runningRetry = c.runningSubscriptionRetryTimer.C
 		}
 		var logEvents chan ClientEvent
 		if c.rpcLogDirty && !c.rpcLogNotified {
@@ -349,9 +366,10 @@ func (c *clientImpl) Run(ctx context.Context) error {
 		case <-retry:
 			c.reconnectTimer = nil
 			c.startConnecting(ctx, 0)
-		case <-runningRetry:
-			c.runningSubscriptionRetryTimer = nil
-			c.startRunningSubscription(ctx)
+		case <-c.runningSubscription.getRetryTimer():
+			c.runningSubscription.handleRetryTimerElapsed(ctx)
+		case <-c.terminalsSubscription.getRetryTimer():
+			c.terminalsSubscription.handleRetryTimerElapsed(ctx)
 		case frame := <-c.rpcSamples:
 			c.appendRPCFrame(frame)
 		case <-c.rpcDropWake:
@@ -381,21 +399,18 @@ func (c *clientImpl) handleLoopInput(ctx context.Context, input clientLoopInput)
 			c.startConnecting(ctx, 0)
 		}
 		input.reply <- struct{}{}
-	case *runningSubscribeRequested:
-		if !c.wantsRunningConversations {
-			c.wantsRunningConversations = true
-			c.emit(ctx, &RunningConversationsChanged{})
-			c.startRunningSubscription(ctx)
-		}
-		input.reply <- struct{}{}
-	case *runningSubscriptionPrepared:
-		isCurrent := input.connection == c.connection && input.generation == c.runningSubscriptionGeneration
-		if isCurrent {
-			c.stagedRunningConversations = nil
-		}
-		input.reply <- isCurrent
-	case *runningConversationsSubscribed:
-		c.handleRunningSubscribed(ctx, input)
+	case *globalSubscribeRequested[runtime.RunningConversations]:
+		input.subscription.handleSubscribeRequested(ctx, input)
+	case *globalSubscriptionPrepared[runtime.RunningConversations]:
+		input.subscription.handlePrepared(input)
+	case *globalSubscribed[runtime.RunningConversations]:
+		input.subscription.handleSubscribed(ctx, input)
+	case *globalSubscribeRequested[runtimeprotocol.TerminalListResult]:
+		input.subscription.handleSubscribeRequested(ctx, input)
+	case *globalSubscriptionPrepared[runtimeprotocol.TerminalListResult]:
+		input.subscription.handlePrepared(input)
+	case *globalSubscribed[runtimeprotocol.TerminalListResult]:
+		input.subscription.handleSubscribed(ctx, input)
 	case *rpcLogRequested:
 		c.handleRPCLogRequested(input)
 	case *connectionRequested:
@@ -420,7 +435,7 @@ func (c *clientImpl) handleLoopInput(ctx context.Context, input clientLoopInput)
 
 // CreateConversation 请求服务端创建对话，返回对话记录。
 func (c *clientImpl) CreateConversation(ctx context.Context, request *CreateConversationRequest) (defs.Conversation, error) {
-	// 1. 提交 Agent、模型、Executor、环境变量和临时对话设置，返回新对话。
+	// 1. 提交 Agent、模型、Executor、环境变量，以及是否临时、是否不装配 Executor，返回新对话。
 	var result runtimeprotocol.ConversationResult
 	err := c.call(ctx, "conversation/create", &runtimeprotocol.CreateConversationParams{
 		AgentName:        request.AgentName,
@@ -428,6 +443,7 @@ func (c *clientImpl) CreateConversation(ctx context.Context, request *CreateConv
 		ExecutorSettings: request.ExecutorSettings,
 		Environment:      request.Environment,
 		Ephemeral:        request.Ephemeral,
+		WithoutExecutors: request.WithoutExecutors,
 	}, &result)
 	return result.Conversation, err
 }
@@ -531,19 +547,37 @@ func (c *clientImpl) SendClientMCPClosed(ctx context.Context, streamID string, e
 
 // OpenTerminal 请求 serve 为本连接新开一个终端。
 func (c *clientImpl) OpenTerminal(ctx context.Context, request *TerminalOpenRequest) (*runtimeprotocol.TerminalOpenResult, error) {
-	// 1. 提交 Executor、起始目录、初始行列数和客户端环境变量，返回终端信息。
+	// 1. 提交 Executor、起始目录、初始行列数、客户端环境变量和打开终端的对话，返回终端信息。
 	var result runtimeprotocol.TerminalOpenResult
 	err := c.call(ctx, "terminal/open", &runtimeprotocol.TerminalOpenParams{
-		ExecutorID:  request.ExecutorID,
-		Directory:   request.Directory,
-		Rows:        request.Rows,
-		Cols:        request.Cols,
-		Environment: request.Environment,
+		ExecutorID:     request.ExecutorID,
+		Directory:      request.Directory,
+		Rows:           request.Rows,
+		Cols:           request.Cols,
+		Environment:    request.Environment,
+		ConversationID: request.ConversationID,
 	}, &result)
 	if err != nil {
 		return nil, err
 	}
 	return &result, nil
+}
+
+// AttachTerminal 请求 serve 把本连接接入已有终端。
+func (c *clientImpl) AttachTerminal(ctx context.Context, terminalID string, cursor uint64) (*runtimeprotocol.TerminalAttachResult, error) {
+	// 1. 提交终端 ID 和开始发送输出的位置，返回终端信息和 PTY 当前尺寸。
+	var result runtimeprotocol.TerminalAttachResult
+	err := c.call(ctx, "terminal/attach", &runtimeprotocol.TerminalAttachParams{TerminalID: terminalID, Cursor: cursor}, &result)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ResetTerminal 请求 serve 丢掉终端保留的输出。
+func (c *clientImpl) ResetTerminal(ctx context.Context, terminalID string) error {
+	// 1. 按终端 ID 提交重置请求。
+	return c.call(ctx, "terminal/reset", &runtimeprotocol.TerminalParams{TerminalID: terminalID}, nil)
 }
 
 // CloseTerminal 请求 serve 结束一个终端进程。
@@ -701,7 +735,7 @@ func (c *clientImpl) ListConversations(ctx context.Context, request *ListConvers
 
 // ForkConversation 按截取点复制对话，返回新对话记录。
 func (c *clientImpl) ForkConversation(ctx context.Context, request *ForkConversationRequest) (defs.Conversation, error) {
-	// 1. 提交来源、截取点、模型、Executor 和环境变量设置，返回新对话。
+	// 1. 提交来源、截取点、模型、Executor 和环境变量设置，以及是否临时，返回新对话。
 	var result runtimeprotocol.ConversationResult
 	err := c.call(ctx, "conversation/fork", &runtimeprotocol.ForkConversationParams{
 		ConversationID:   request.ConversationID,
@@ -710,6 +744,7 @@ func (c *clientImpl) ForkConversation(ctx context.Context, request *ForkConversa
 		Model:            request.Model,
 		ExecutorSettings: request.ExecutorSettings,
 		Environment:      request.Environment,
+		Ephemeral:        request.Ephemeral,
 	}, &result)
 	return result.Conversation, err
 }
@@ -1063,7 +1098,8 @@ func (c *clientImpl) handleConnectionReady(ctx context.Context, input *connectio
 	}
 	c.connectionWaiters = nil
 	// 3. 恢复全局订阅；没有打开对话时清零失败次数，否则恢复内容同步。
-	c.startRunningSubscription(ctx)
+	c.runningSubscription.start(ctx)
+	c.terminalsSubscription.start(ctx)
 	if c.openedConversation == nil {
 		c.failedConnectAttempts = 0
 		return
@@ -1089,10 +1125,8 @@ func (c *clientImpl) handleConnectionLost(ctx context.Context, input *connection
 		return
 	}
 	c.connection = nil
-	c.resetRunningSubscription()
-	if c.wantsRunningConversations {
-		c.emit(ctx, &RunningConversationsChanged{Err: input.err})
-	}
+	c.runningSubscription.handleConnectionLost(ctx, input.err)
+	c.terminalsSubscription.handleConnectionLost(ctx, input.err)
 	c.scheduleReconnect(ctx, input.err)
 }
 
@@ -1271,6 +1305,9 @@ func (c *clientImpl) handleNotificationReceived(ctx context.Context, input *noti
 		c.emit(ctx, &TerminalOutput{
 			TerminalID: params.TerminalID,
 			Data:       params.Data,
+			NextCursor: params.NextCursor,
+			Truncated:  params.Truncated,
+			HasMore:    params.HasMore,
 		})
 		return
 	case "terminal/exited":
@@ -1282,8 +1319,12 @@ func (c *clientImpl) handleNotificationReceived(ctx context.Context, input *noti
 		return
 	}
 	// 3. 全局集合不依赖已打开的对话。
-	if notification.method == "conversation/runningChanged" || notification.method == "conversation/runningClosed" {
-		c.handleRunningNotification(ctx, notification.method, input.message.Params)
+	switch notification.method {
+	case c.runningSubscription.opt.ChangedMethod, c.runningSubscription.opt.ClosedMethod:
+		c.runningSubscription.handleNotification(ctx, notification.method, input.message.Params)
+		return
+	case c.terminalsSubscription.opt.ChangedMethod, c.terminalsSubscription.opt.ClosedMethod:
+		c.terminalsSubscription.handleNotification(ctx, notification.method, input.message.Params)
 		return
 	}
 	// 4. 忽略其他对话通知；同步期间暂存通知，旧订阅关闭时删除这个订阅暂存的通知。
@@ -1565,6 +1606,15 @@ func (c *clientImpl) WithdrawInput(ctx context.Context, conversationID defs.Conv
 	return result.Content, err
 }
 
+// AppendContextItems 提交要注入下一轮上下文的 Item。
+func (c *clientImpl) AppendContextItems(ctx context.Context, request *AppendContextItemsRequest) (err error) {
+	// 1. 发送一次请求并返回结果。
+	return c.call(ctx, "conversation/appendContextItems", &runtimeprotocol.AppendContextItemsParams{
+		ConversationID: request.ConversationID,
+		Items:          request.Items,
+	}, nil)
+}
+
 // Reconnect 跳过普通断线的等待，由 Run 合并正在进行的连接尝试。
 func (c *clientImpl) Reconnect(ctx context.Context) error {
 	// 1. 交给循环决定是否立即拨号。
@@ -1585,131 +1635,12 @@ func (c *clientImpl) Reconnect(ctx context.Context) error {
 
 // SubscribeRunningConversations 登记全局订阅意图，初始集合和后续变化经 Events 交付。
 func (c *clientImpl) SubscribeRunningConversations(ctx context.Context) error {
-	// 1. 将请求交给唯一事件循环，重复调用合并。
-	reply := make(chan struct{}, 1)
-	if err := c.sendFromCaller(ctx, &runningSubscribeRequested{reply: reply}); err != nil {
-		return err
-	}
-	// 2. 等待订阅意图登记完成，不等待网络返回。
-	select {
-	case <-reply:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.stopped:
-		return ErrClientStopped
-	}
+	// 1. 交给运行中对话的订阅登记。
+	return c.runningSubscription.subscribe(ctx)
 }
 
-// resetRunningSubscription 作废当前全局订阅请求、暂存通知和重试等待，保留调用方订阅意图。
-func (c *clientImpl) resetRunningSubscription() {
-	// 1. 取消网络请求和重试，清除当前连接的订阅记录。
-	c.runningSubscriptionGeneration++
-	if c.cancelRunningSubscribe != nil {
-		c.cancelRunningSubscribe()
-		c.cancelRunningSubscribe = nil
-	}
-	if c.runningSubscriptionRetryTimer != nil {
-		c.runningSubscriptionRetryTimer.Stop()
-		c.runningSubscriptionRetryTimer = nil
-	}
-	c.isSubscribingRunningConversations = false
-	c.isRunningConversationsSubscribed = false
-	c.stagedRunningConversations = nil
-}
-
-// startRunningSubscription 在当前连接建立全局运行订阅，网络响应交回循环。
-func (c *clientImpl) startRunningSubscription(ctx context.Context) {
-	// 1. 只有已启用且已连接时发起一次订阅。
-	if !c.wantsRunningConversations || c.connection == nil || c.isSubscribingRunningConversations || c.isRunningConversationsSubscribed {
-		return
-	}
-	c.isSubscribingRunningConversations = true
-	c.runningSubscriptionGeneration++
-	generation, connection := c.runningSubscriptionGeneration, c.connection
-	requestCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	c.cancelRunningSubscribe = cancel
-	// 2. 重试先清理可能残留的旧订阅，再订阅；请求不占用事件循环。
-	retry := c.failedRunningSubscriptions > 0
-	c.tasks.Go(func() {
-		defer cancel()
-		var result runtime.RunningConversations
-		var err error
-		if retry {
-			err = connection.call(requestCtx, "conversation/running/unsubscribe", &runtimeprotocol.EmptyParams{}, nil)
-			if err == nil {
-				prepared := make(chan bool, 1)
-				c.sendFromTask(requestCtx, &runningSubscriptionPrepared{connection: connection, generation: generation, reply: prepared})
-				select {
-				case isCurrent := <-prepared:
-					if !isCurrent {
-						return
-					}
-				case <-requestCtx.Done():
-					err = requestCtx.Err()
-				}
-			}
-		}
-		if err == nil {
-			err = connection.call(requestCtx, "conversation/running/subscribe", &runtimeprotocol.EmptyParams{}, &result)
-		}
-		c.sendFromTask(ctx, &runningConversationsSubscribed{connection: connection, generation: generation, result: result, err: err})
-	})
-}
-
-// handleRunningSubscribed 应用全局订阅响应，再交付请求期间暂存的最新完整集合。
-func (c *clientImpl) handleRunningSubscribed(ctx context.Context, result *runningConversationsSubscribed) {
-	// 1. 丢弃旧连接、旧订阅的响应。
-	if result.connection != c.connection || result.generation != c.runningSubscriptionGeneration {
-		return
-	}
-	c.isSubscribingRunningConversations = false
-	c.cancelRunningSubscribe = nil
-	// 2. 失败时标为未知，保持内容订阅并安排全局订阅重试。
-	if result.err != nil {
-		c.stagedRunningConversations = nil
-		c.failedRunningSubscriptions++
-		c.emit(ctx, &RunningConversationsChanged{Err: result.err})
-		c.runningSubscriptionRetryTimer = time.NewTimer(getReconnectDelay(c.failedRunningSubscriptions))
-		return
-	}
-	// 3. 初始集合先交付，随后交付暂存通知；每条都独立于 Client 内部状态。
-	c.isRunningConversationsSubscribed = true
-	c.failedRunningSubscriptions = 0
-	c.emit(ctx, &RunningConversationsChanged{IsKnown: true, ConversationIDs: result.result.ConversationIDs})
-	if c.stagedRunningConversations != nil {
-		c.emit(ctx, &RunningConversationsChanged{IsKnown: true, ConversationIDs: c.stagedRunningConversations.ConversationIDs})
-		c.stagedRunningConversations = nil
-	}
-}
-
-// handleRunningNotification 接收全局运行集合或订阅关闭通知。
-func (c *clientImpl) handleRunningNotification(ctx context.Context, method string, params json.RawMessage) {
-	// 1. 未启用订阅时忽略通知，关闭时作废本次同步并安排重试。
-	if !c.wantsRunningConversations {
-		return
-	}
-	if method == "conversation/runningClosed" {
-		var closed runtimeprotocol.RunningConversationsClosedParams
-		if err := json.Unmarshal(params, &closed); err != nil {
-			return
-		}
-		c.resetRunningSubscription()
-		c.failedRunningSubscriptions++
-		c.emit(ctx, &RunningConversationsChanged{Err: errors.New(closed.Reason)})
-		c.runningSubscriptionRetryTimer = time.NewTimer(getReconnectDelay(c.failedRunningSubscriptions))
-		return
-	}
-	// 2. 订阅响应还没应用时保留最新完整集合，之后直接交付。
-	var running runtime.RunningConversations
-	if err := json.Unmarshal(params, &running); err != nil {
-		return
-	}
-	if c.isSubscribingRunningConversations {
-		c.stagedRunningConversations = &running
-		return
-	}
-	if c.isRunningConversationsSubscribed {
-		c.emit(ctx, &RunningConversationsChanged{IsKnown: true, ConversationIDs: running.ConversationIDs})
-	}
+// SubscribeTerminals 登记终端列表订阅意图，初始列表和后续变化经 Events 交付。
+func (c *clientImpl) SubscribeTerminals(ctx context.Context) error {
+	// 1. 交给运行中终端的订阅登记。
+	return c.terminalsSubscription.subscribe(ctx)
 }

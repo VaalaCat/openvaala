@@ -3,6 +3,7 @@ package runtimeserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
@@ -13,8 +14,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
-	"github.com/VaalaCat/openvaala/pkg/workspace"
-	"github.com/google/uuid"
+	"github.com/VaalaCat/openvaala/pkg/terminal"
 )
 
 // maxItemsPageBytes 是一页日志累计 JSON 字节数的截取值，超过后保留当前 Item 再截断。
@@ -37,6 +37,7 @@ var openvaalaMethods = map[string]methodHandler{
 	"conversation/steerInput":             newMethodHandler(handleConversationSteerInput),
 	"conversation/interruptTurnWithInput": newMethodHandler(handleConversationInterruptTurnWithInput),
 	"conversation/withdrawInput":          newMethodHandler(handleConversationWithdrawInput),
+	"conversation/appendContextItems":     newMethodHandler(handleConversationAppendContextItems),
 	"conversation/interruptTurn":          newMethodHandler(handleConversationInterruptTurn),
 	"conversation/compact":                newMethodHandler(handleConversationCompact),
 	"session/get":                         newMethodHandler(handleSessionGet),
@@ -71,7 +72,11 @@ var openvaalaMethods = map[string]methodHandler{
 	"session/subscribe":                   newMethodHandler(handleSessionSubscribe),
 	"session/unsubscribe":                 newMethodHandler(handleSessionUnsubscribe),
 	"terminal/open":                       newMethodHandler(handleTerminalOpen),
+	"terminal/attach":                     newMethodHandler(handleTerminalAttach),
 	"terminal/close":                      newMethodHandler(handleTerminalClose),
+	"terminal/reset":                      newMethodHandler(handleTerminalReset),
+	"terminal/subscribe":                  newMethodHandler(handleTerminalsSubscribe),
+	"terminal/unsubscribe":                newMethodHandler(handleTerminalsUnsubscribe),
 }
 
 // handleInitialize 检查协议版本并返回服务端身份。
@@ -90,13 +95,14 @@ func handleInitialize(_ context.Context, connection *serverConnection, params *r
 
 // handleConversationCreate 按请求创建并启动对话。
 func handleConversationCreate(ctx context.Context, connection *serverConnection, params *runtimeprotocol.CreateConversationParams) (*runtimeprotocol.ConversationResult, error) {
-	// 1. 提交 Agent、模型、Executor 设置和环境；设置无效时返回 -32602，临时对话不装配 Executor 和 Skill。
+	// 1. 提交 Agent、模型、Executor 设置和环境；设置无效时返回 -32602；WithoutExecutors 的对话不装配 Executor 和 Skill。
 	record, err := connection.runtime.CreateConversation(ctx, &runtime.CreateConversationRequest{
 		AgentName:        params.AgentName,
 		Model:            params.Model,
 		ExecutorSettings: params.ExecutorSettings,
 		Environment:      params.Environment,
 		Ephemeral:        params.Ephemeral,
+		WithoutExecutors: params.WithoutExecutors,
 	})
 	if err != nil {
 		return nil, err
@@ -172,7 +178,7 @@ func handleConversationSetTitle(ctx context.Context, connection *serverConnectio
 
 // handleConversationFork 复制对话到指定轮次，打开并返回分叉记录。
 func handleConversationFork(ctx context.Context, connection *serverConnection, params *runtimeprotocol.ForkConversationParams) (*runtimeprotocol.ConversationResult, error) {
-	// 1. 提交截取点、模型、Executor 设置和环境；截取点之前没有轮次时新建未保存的对话，截取点或新增 Executor ID 无效时返回 -32602，来源已删除的 Executor 只记 Warn。
+	// 1. 提交截取点、模型、Executor 设置、环境和是否临时；截取点之前没有轮次时新建未保存的对话，截取点或新增 Executor ID 无效时返回 -32602，来源已删除的 Executor 只记 Warn。
 	record, err := connection.runtime.ForkConversation(ctx, &runtime.ForkConversationRequest{
 		ConversationID:   params.ConversationID,
 		BeforeTurnID:     params.BeforeTurnID,
@@ -180,6 +186,7 @@ func handleConversationFork(ctx context.Context, connection *serverConnection, p
 		Model:            params.Model,
 		ExecutorSettings: params.ExecutorSettings,
 		Environment:      params.Environment,
+		Ephemeral:        params.Ephemeral,
 	})
 	if err != nil {
 		return nil, err
@@ -684,24 +691,18 @@ func handleRunningConversationsSubscribe(ctx context.Context, connection *server
 		connection.removeSubscription(key, registration)
 		return nil, err
 	}
-	// 3. 初始响应先入队，再转发完整集合；主动退订和断线不发送关闭通知。
+	// 3. 初始响应先入队，再转发完整集合。
 	connection.startAfterResponse(func() {
-		defer close(registration.forwarderDone)
-		for running := range subscription.Events {
-			if !connection.send(ctx, &runtimeprotocol.JSONRPCMessage{Method: "conversation/runningChanged", Params: running}) {
-				connection.removeSubscription(key, registration)
-				return
-			}
-		}
-		shouldNotifyClosed := subscriptionCtx.Err() == nil && ctx.Err() == nil
-		connection.removeSubscription(key, registration)
-		if !shouldNotifyClosed {
-			return
-		}
-		connection.send(ctx, &runtimeprotocol.JSONRPCMessage{
-			Method: "conversation/runningClosed",
-			Params: &runtimeprotocol.RunningConversationsClosedParams{Reason: getErrorText(subscription.GetCloseReason())},
-		})
+		forwardGlobalSubscription(ctx, connection, key, registration, subscriptionCtx, subscription.Events,
+			func(running runtime.RunningConversations) *runtimeprotocol.JSONRPCMessage {
+				return &runtimeprotocol.JSONRPCMessage{Method: "conversation/runningChanged", Params: running}
+			},
+			func() *runtimeprotocol.JSONRPCMessage {
+				return &runtimeprotocol.JSONRPCMessage{
+					Method: "conversation/runningClosed",
+					Params: &runtimeprotocol.RunningConversationsClosedParams{Reason: getErrorText(subscription.GetCloseReason())},
+				}
+			})
 	})
 	return &subscription.Initial, nil
 }
@@ -787,6 +788,34 @@ func handleSessionUnsubscribe(ctx context.Context, connection *serverConnection,
 		sessionID:      params.SessionID,
 	})
 	return &runtimeprotocol.EmptyResult{}, nil
+}
+
+// forwardGlobalSubscription 转发全局订阅的完整集合，事件流被 serve 关闭时通知客户端；主动退订和断线不发送关闭通知。
+func forwardGlobalSubscription[T any](
+	ctx context.Context,
+	connection *serverConnection,
+	key subscriptionKey,
+	registration *connectionSubscription,
+	subscriptionCtx context.Context,
+	events <-chan T,
+	newChangedNotification func(T) *runtimeprotocol.JSONRPCMessage,
+	newClosedNotification func() *runtimeprotocol.JSONRPCMessage,
+) {
+	// 1. 登记转发完成通知，逐条转发集合变化，连接结束时停止发送。
+	defer close(registration.forwarderDone)
+	for event := range events {
+		if !connection.send(ctx, newChangedNotification(event)) {
+			connection.removeSubscription(key, registration)
+			return
+		}
+	}
+	// 2. 事件流关闭后移除登记；订阅方没有主动退订、连接也还在时，发送带原因的关闭通知。
+	shouldNotifyClosed := subscriptionCtx.Err() == nil && ctx.Err() == nil
+	connection.removeSubscription(key, registration)
+	if !shouldNotifyClosed {
+		return
+	}
+	connection.send(ctx, newClosedNotification())
 }
 
 // forwardOpenVaalaSubscription 转发订阅通知，事件流关闭后通知客户端订阅结束。
@@ -1045,63 +1074,142 @@ func handleConversationWithdrawInput(ctx context.Context, connection *serverConn
 	return result, nil
 }
 
-// handleTerminalOpen 为本连接新开一个终端：在所选 Executor 上新建独立工作区并启动 TTY shell。
+// handleConversationAppendContextItems 把客户端注入的 Item 交给根 Session，写在下一轮输入之前。
+func handleConversationAppendContextItems(ctx context.Context, connection *serverConnection, params *runtimeprotocol.AppendContextItemsParams) (*runtimeprotocol.EmptyResult, error) {
+	// 1. 检查必填身份参数。
+	if params.ConversationID == "" {
+		return nil, newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams, "conversation_id is required")
+	}
+	// 2. 交给已打开对话暂存，Item 无效时整批返回错误。
+	if err := connection.runtime.AppendContextItems(ctx, &runtime.AppendContextItemsRequest{
+		ConversationID: params.ConversationID,
+		Items:          params.Items,
+	}); err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.EmptyResult{}, nil
+}
+
+// handleTerminalOpen 新开一个终端并让本连接接入：在所选 Executor 上新建独立工作区并启动 TTY shell。
 func handleTerminalOpen(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalOpenParams) (*runtimeprotocol.TerminalOpenResult, error) {
-	// 1. 按 Executor 配置新建这个终端独占的工作区；virtual Executor 和无效目录在这里返回错误。
-	terminalWorkspace, err := connection.runtime.OpenTerminalWorkspace(ctx, &runtime.OpenTerminalWorkspaceRequest{
-		ExecutorID:  params.ExecutorID,
-		Directory:   params.Directory,
-		Environment: params.Environment,
+	// 1. 交给 Runtime 新建工作区并启动 shell；virtual Executor 和无效目录在这里返回错误。
+	opened, err := connection.runtime.OpenTerminal(ctx, &runtime.OpenTerminalRequest{
+		ExecutorID:     params.ExecutorID,
+		Directory:      params.Directory,
+		Environment:    params.Environment,
+		Rows:           params.Rows,
+		Cols:           params.Cols,
+		ConversationID: params.ConversationID,
 	})
 	if err != nil {
 		return nil, err
 	}
-	// 2. 创建终端并启动 shell，输出写入终端；启动失败时关闭工作区。
-	terminalCtx, cancel := context.WithCancel(connection.connectionCtx)
-	terminal := &connectionTerminal{
-		id:         uuid.NewString(),
-		connection: connection,
-		workspace:  terminalWorkspace.Workspace,
-		ctx:        terminalCtx,
-		cancel:     cancel,
-		output:     make(chan []byte, terminalOutputBufferSize),
-		input:      make(chan []byte, terminalInputBufferSize),
-	}
-	terminal.process, err = terminal.workspace.StartProcess(ctx, &workspace.ProcessRequest{
-		Command:   terminalShellCommand,
-		Directory: terminalWorkspace.Directory,
-		TTY:       true,
-		Rows:      params.Rows,
-		Cols:      params.Cols,
-		Stdout:    terminal,
-	})
+	// 2. 读第一页并登记接入，响应入队之后才启动转发，客户端先拿到 terminal_id 再收到输出。
+	firstOutput, err := opened.Terminal.ReadOutput(ctx, 0, 0)
 	if err != nil {
-		cancel()
-		terminal.closeWorkspace()
 		return nil, err
 	}
-	// 3. 登记终端，响应入队之后才启动转发任务，客户端先拿到 terminal_id 再收到输出。
-	connection.terminals.Store(terminal.id, terminal)
-	connection.startAfterResponse(terminal.run)
+	connection.attachTerminal(opened.Terminal, firstOutput)
 	return &runtimeprotocol.TerminalOpenResult{
-		TerminalID: terminal.id,
-		ExecutorID: terminalWorkspace.ExecutorID,
-		Directory:  terminalWorkspace.Directory,
+		TerminalID: firstOutput.Info.ID,
+		ExecutorID: opened.ExecutorID,
+		Directory:  opened.Directory,
 	}, nil
 }
 
-// handleTerminalClose 结束本连接打开的一个终端进程；终端已经结束或不存在时成功，exited 通知由终端自己发出。
-func handleTerminalClose(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalParams) (*runtimeprotocol.EmptyResult, error) {
-	// 1. 取得终端，不存在说明已经结束。
-	terminal, found := connection.terminals.Load(params.TerminalID)
-	if !found {
-		return &runtimeprotocol.EmptyResult{}, nil
-	}
-	// 2. 限时结束进程组，进程结束后转发任务发出 terminal/exited。
-	terminateCtx, cancel := context.WithTimeout(ctx, terminalReleaseTimeout)
-	defer cancel()
-	if err := terminal.terminate(terminateCtx); err != nil {
+// handleTerminalAttach 把本连接接入已有终端，从 cursor 起补发输出。
+func handleTerminalAttach(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalAttachParams) (*runtimeprotocol.TerminalAttachResult, error) {
+	// 1. 查找终端，找不到时返回错误，不新开 shell。
+	runtimeTerminal, err := connection.runtime.GetTerminal(ctx, params.TerminalID)
+	if err != nil {
 		return nil, err
 	}
+	// 2. 取消并等待本连接已有的同一终端接入，新的从 cursor 重发。
+	connection.cancelTerminalAttachment(ctx, params.TerminalID)
+	// 3. 读第一页，游标越界时返回错误。
+	firstOutput, err := runtimeTerminal.ReadOutput(ctx, params.Cursor, 0)
+	if err != nil {
+		return nil, err
+	}
+	// 4. 登记接入，响应入队后启动转发；响应里带 PTY 当前行列。
+	connection.attachTerminal(runtimeTerminal, firstOutput)
+	return &runtimeprotocol.TerminalAttachResult{
+		ExecutorID: firstOutput.Info.EnvironmentID,
+		Directory:  firstOutput.Info.Directory,
+		Rows:       firstOutput.Info.Rows,
+		Cols:       firstOutput.Info.Cols,
+	}, nil
+}
+
+// handleTerminalClose 结束一个终端，终端可由任何连接打开；终端已经结束或不存在时成功，terminal/exited 由各接入自己发出。
+func handleTerminalClose(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalParams) (*runtimeprotocol.EmptyResult, error) {
+	// 1. 查找终端，不存在说明已经结束。
+	runtimeTerminal, err := connection.runtime.GetTerminal(ctx, params.TerminalID)
+	if errors.Is(err, terminal.ErrTerminalNotFound) {
+		return &runtimeprotocol.EmptyResult{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	// 2. 限时结束进程组。
+	stopCtx, cancel := context.WithTimeout(ctx, terminalCloseTimeout)
+	defer cancel()
+	if _, err := runtimeTerminal.Stop(stopCtx); err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.EmptyResult{}, nil
+}
+
+// handleTerminalReset 丢掉终端保留的输出并让全部接入的客户端清屏。
+func handleTerminalReset(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalParams) (*runtimeprotocol.EmptyResult, error) {
+	// 1. 查找终端，找不到时返回错误。
+	runtimeTerminal, err := connection.runtime.GetTerminal(ctx, params.TerminalID)
+	if err != nil {
+		return nil, err
+	}
+	// 2. 清除保留的输出，已结束的终端返回错误。
+	if err := runtimeTerminal.ClearOutput(ctx); err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.EmptyResult{}, nil
+}
+
+// handleTerminalsSubscribe 登记运行中终端列表的订阅并在响应后启动转发。
+func handleTerminalsSubscribe(ctx context.Context, connection *serverConnection, _ *runtimeprotocol.EmptyParams) (*runtimeprotocol.TerminalListResult, error) {
+	// 1. 使用终端列表种类登记订阅，重复订阅返回 already subscribed。
+	key := subscriptionKey{kind: subscriptionKindTerminals}
+	subscriptionCtx, registration, err := connection.registerSubscription(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	// 2. 订阅 Runtime，失败时撤销连接登记。
+	subscription, err := connection.runtime.SubscribeTerminals(subscriptionCtx)
+	if err != nil {
+		connection.removeSubscription(key, registration)
+		return nil, err
+	}
+	// 3. 初始响应先入队，再转发完整列表。
+	connection.startAfterResponse(func() {
+		forwardGlobalSubscription(ctx, connection, key, registration, subscriptionCtx, subscription.Events,
+			func(running []runtime.RunningTerminal) *runtimeprotocol.JSONRPCMessage {
+				return &runtimeprotocol.JSONRPCMessage{
+					Method: "terminal/listChanged",
+					Params: &runtimeprotocol.TerminalListResult{Terminals: getTerminalItems(running)},
+				}
+			},
+			func() *runtimeprotocol.JSONRPCMessage {
+				return &runtimeprotocol.JSONRPCMessage{
+					Method: "terminal/listClosed",
+					Params: &runtimeprotocol.TerminalsClosedParams{Reason: getErrorText(subscription.GetCloseReason())},
+				}
+			})
+	})
+	return &runtimeprotocol.TerminalListResult{Terminals: getTerminalItems(subscription.Initial)}, nil
+}
+
+// handleTerminalsUnsubscribe 取消运行中终端列表的订阅并等待旧转发结束。
+func handleTerminalsUnsubscribe(ctx context.Context, connection *serverConnection, _ *runtimeprotocol.EmptyParams) (*runtimeprotocol.EmptyResult, error) {
+	// 1. 取消并等待转发结束，未订阅时直接成功。
+	connection.cancelSubscription(ctx, subscriptionKey{kind: subscriptionKindTerminals})
 	return &runtimeprotocol.EmptyResult{}, nil
 }

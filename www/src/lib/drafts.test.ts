@@ -5,6 +5,7 @@ import {
   $drafts,
   getDraft,
   getDraftText,
+  newConversationDraftID,
   replaceDraftText,
   removeSentContent,
   setDraft,
@@ -17,8 +18,16 @@ test("draft identities isolate servers, existing conversations and new conversat
     { serverID: "server-A", conversationID: "A", text: "draft-A" },
     { serverID: "server-A", conversationID: "B", text: "draft-B" },
     { serverID: "server-B", conversationID: "A", text: "other-server" },
-    { serverID: "server-A", conversationID: "", text: "new-A" },
-    { serverID: "server-B", conversationID: "", text: "new-B" },
+    {
+      serverID: "server-A",
+      conversationID: newConversationDraftID,
+      text: "new-A",
+    },
+    {
+      serverID: "server-B",
+      conversationID: newConversationDraftID,
+      text: "new-B",
+    },
   ]
   for (const target of targets)
     setDraft(target.serverID, target.conversationID, {

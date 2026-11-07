@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // iso-agents：后方是根 Agent 的卡片，三张较小的子 Agent 卡片依次从它身上滑出、落到前方，
-// 由细线连回根卡片；稍后中间那张子 Agent 完成任务，一个信号蓝数据包沿连线汇报回根卡片。
+// 停稳后才由细线连回根卡片，细线也先于卡片淡出；稍后中间那张子 Agent 完成任务，一个信号蓝数据包沿连线汇报回根卡片。
 import IsoCable from "../primitives/IsoCable.vue"
 import IsoPacket from "../primitives/IsoPacket.vue"
 import IsoSlab from "../primitives/IsoSlab.vue"
@@ -47,11 +47,11 @@ function getSpawnStops(center: [number, number], spawnAt: number): SceneStop[] {
 </script>
 
 <template>
-  <SceneCanvas view-box="-156 -100 312 192" :period="10000">
+  <SceneCanvas view-box="-160 -100 312 192" :period="10000">
     <IsoCable
       v-for="subagent in subagents"
       :key="`cable-${subagent.spawnAt}`"
-      v-track="getShowStops(subagent.spawnAt + 0.09, 0.9)"
+      v-track="getShowStops(subagent.spawnAt + 0.12, 0.88)"
       :points="getCable(subagent.center)"
       tone="lo"
     />

@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"fmt"
+	"maps"
 	"math/big"
 	"reflect"
 	"regexp"
@@ -160,7 +161,7 @@ func (d *Desktop) setDefaultModel(model string) {
 	})
 }
 
-// providerFormView 绘制服务编辑表单：基本信息、自定义端点、模型；应用和撤销在页头。
+// providerFormView 绘制服务编辑表单：基本信息、自定义端点、请求头、模型；应用和撤销在页头。
 func (d *Desktop) providerFormView(c *ui.Context) {
 	// 1. 基本信息：已有服务的 ID 不可改，只读显示。
 	draft := d.providerDraft
@@ -190,13 +191,41 @@ func (d *Desktop) providerFormView(c *ui.Context) {
 			}
 		}
 	})
-	// 3. 模型：手填、拉取上游、目录模型和应用时的默认模型。
+	// 3. 请求头：一行一条，可添加和删除。
+	d.providerHeadersView(c, draft)
+	// 4. 模型：手填、拉取上游、目录模型和应用时的默认模型。
 	d.providerModelsView(c, draft, protocols, protocolLabels)
 	if d.providerBaseline != nil && d.providerBaseline.ID != "" {
 		if kit.DangerButton(c, d.t("delete.provider")).AlignSelf(ui.Start).Disabled(d.isProviderDirty()).Clicked() {
 			d.confirm = confirmation{Kind: "delete-provider", ProviderID: d.providerBaseline.ID}
 			d.confirmOpen = true
 		}
+	}
+}
+
+// providerHeadersView 绘制表单的请求头部分：每行是名称、值和删除按钮，末尾是添加按钮和变量说明。
+func (d *Desktop) providerHeadersView(c *ui.Context, draft *providerDraft) {
+	// 1. 逐行绘制，删除在本帧绘制完后生效。
+	removed := -1
+	kit.SettingSection(c.Key("provider-headers"), d.t("provider.section.headers"), func() {
+		for index, header := range draft.Headers {
+			kit.SettingRow(c.Key("provider-header:"+strconv.Itoa(index)), "", "", func() {
+				kit.TextInputWith(c.Key("name"), &header.Name, kit.InputOpt{Placeholder: d.t("header.name")}).Label(d.t("header.name")).Width(settingControlWidth)
+				kit.TextInputWith(c.Key("value"), &header.Value, kit.InputOpt{Placeholder: d.t("header.value")}).Label(d.t("header.value")).Width(settingControlWidth)
+				if kit.Button(c, d.t("remove.header")).Clicked() {
+					removed = index
+				}
+			})
+		}
+		kit.SettingRow(c, d.t("add.header"), d.t("headers.hint"), func() {
+			if kit.Button(c, d.t("add.header")).Clicked() {
+				draft.Headers = append(draft.Headers, &providerHeaderDraft{})
+			}
+		})
+	})
+	// 2. 删除被点击的那一行。
+	if removed >= 0 {
+		draft.Headers = slices.Delete(draft.Headers, removed, removed+1)
 	}
 }
 
@@ -482,6 +511,9 @@ func providerToDraft(provider defs.ProviderConfig) *providerDraft {
 	for key, value := range provider.Endpoints {
 		draft.Endpoints[key] = value
 	}
+	for _, name := range slices.Sorted(maps.Keys(provider.Headers)) {
+		draft.Headers = append(draft.Headers, &providerHeaderDraft{Name: name, Value: provider.Headers[name]})
+	}
 	keys := []string{}
 	for key := range provider.Models {
 		keys = append(keys, key)
@@ -516,6 +548,11 @@ func cloneProviderDraft(draft *providerDraft) *providerDraft {
 	copy.Endpoints = map[string]string{}
 	for key, value := range draft.Endpoints {
 		copy.Endpoints[key] = value
+	}
+	copy.Headers = nil
+	for _, header := range draft.Headers {
+		value := *header
+		copy.Headers = append(copy.Headers, &value)
 	}
 	copy.Models = nil
 	copy.RemovedModels = map[string]*providerModelDraft{}
@@ -574,6 +611,7 @@ func draftToProvider(draft *providerDraft, defaults defs.ModelDefaults) (defs.Pr
 			provider.Endpoints[protocol] = strings.TrimSpace(url)
 		}
 	}
+	provider.Headers = toProviderHeaders(draft.Headers)
 	for _, draftModel := range draft.Models {
 		draftModel.Error = ""
 		alias := strings.TrimSpace(draftModel.Alias)
@@ -728,7 +766,7 @@ func (d *Desktop) fetchProviderModels() {
 		return
 	}
 	draft := d.providerDraft
-	provider := defs.ProviderConfig{ID: draft.ID, Protocol: draft.Protocol, BaseURL: draft.BaseURL, APIKey: draft.APIKey, Endpoints: draft.Endpoints}
+	provider := defs.ProviderConfig{ID: draft.ID, Protocol: draft.Protocol, BaseURL: draft.BaseURL, APIKey: draft.APIKey, Endpoints: draft.Endpoints, Headers: toProviderHeaders(draft.Headers)}
 	client := d.client
 	d.modelsFetching = true
 	d.tasks.Go(func() {

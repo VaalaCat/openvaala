@@ -193,7 +193,7 @@ func (t *transcript) isHistoryEntryFinished(entry historyEntry) bool {
 // formatExpandedEntry 按历史单元类型生成展开视图里的行。
 func (t *transcript) formatExpandedEntry(entry historyEntry) []string {
 	// 1. 用户输入整行铺底色；回复渲染 Markdown 并给首行加回复标记；步骤组逐步展开；
-	// 指令先写来源（名称 · Executor · 路径）再渲染正文；hook 运行逐项展开；Turn 分隔线画满一行。
+	// 指令先写来源（名称 · Executor · 路径），记忆目录被截断时再写一行提示，然后渲染正文；hook 运行逐项展开；Turn 分隔线画满一行。
 	switch entry.kind {
 	case historyUserInput:
 		lines := t.formatUserInput(entry.userInput)
@@ -214,19 +214,31 @@ func (t *transcript) formatExpandedEntry(entry historyEntry) []string {
 	case historyStepGroup:
 		return t.formatExpandedGroup(entry.group)
 	case historyInstruction:
-		name := "AGENTS.md"
-		var executorID, path, text string
-		if instruction := entry.instruction.SkillInstruction; instruction != nil {
-			name, executorID, path, text = "Skill: "+instruction.Name, instruction.Executor, instruction.Path, instruction.Text
-		} else {
+		var title, text string
+		isTruncated := false
+		switch {
+		case entry.instruction.SkillInstruction != nil:
+			instruction := entry.instruction.SkillInstruction
+			title, text = "Skill: "+instruction.Name+" · "+instruction.Executor+" · "+instruction.Path, instruction.Text
+		case entry.instruction.MemoryIndex != nil:
+			index := entry.instruction.MemoryIndex
+			title, text = "Memory · "+defs.MemoryExecutorID+" · "+index.Path, index.Text
+			isTruncated = index.IsTruncated
+		case entry.instruction.ClientInstruction != nil:
+			title, text = "客户端指令", entry.instruction.ClientInstruction.Text
+		default:
 			instruction := entry.instruction.AgentsInstruction
-			executorID, path, text = instruction.Executor, instruction.Path, instruction.Text
+			title, text = "AGENTS.md · "+instruction.Executor+" · "+instruction.Path, instruction.Text
 		}
 		header := formatStyledTexts([]styledText{{
 			style: t.styles.faint,
-			text:  name + " · " + executorID + " · " + path,
+			text:  title,
 		}})
-		return append(wrapTextKeepingStyles(header, t.renderer.width), t.renderer.render(text)...)
+		lines := wrapTextKeepingStyles(header, t.renderer.width)
+		if isTruncated {
+			lines = append(lines, t.styles.faint.Render("超过 8 KiB，已截断"))
+		}
+		return append(lines, t.renderer.render(text)...)
 	case historyHookRun:
 		return t.formatExpandedHookRun(entry.hookRun, entry.hookToolName)
 	case historyTurnDivider:

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 // runtime-layers：Runtime → Conversation → Session → Turn → Agent 逐层嵌套出现；
+// Agent 这一层出现后，循环和通往 Item 列表、Executor 的连线才出现；
 // Agent 循环运转时产出的 Item 依次流出到右上的 Item 列表，工具调用发往右下的 Executor 并带回结果。
 import { computed } from "vue"
 import { useData } from "vitepress"
@@ -26,6 +27,8 @@ const layers = ["Runtime", "Conversation", "Session", "Turn", "Agent"].map((name
 }))
 const agent = layers[4]
 const loopCenter: Vec2 = [agent.x + 60, agent.y + 44]
+// agentLinkStops 让循环和从 Agent 出发的连线在 Agent 这一层出现之后才显示。
+const agentLinkStops = getShowStops(agent.appear + 0.06, reset, 0.03)
 
 // Item 依次流出到列表；工具调用在 0.42 和 0.66 发往不同的 Executor。
 const items = [0.34, 0.42, 0.5, 0.6, 0.7, 0.78].map((at, index) => ({ at, y: 44 + index * 13 }))
@@ -72,16 +75,20 @@ const loopStops: SceneStop[] = [
       <text class="scene-label scene-label--small scene-label--ink" :x="layer.x + 9" :y="layer.y + 13">{{ layer.name }}</text>
     </g>
 
-    <circle class="loop-ring" :cx="loopCenter[0]" :cy="loopCenter[1]" r="16" />
-    <g v-track="loopStops" class="loop-orbit" :style="{ transformOrigin: `${loopCenter[0]}px ${loopCenter[1]}px` }">
-      <circle class="loop-dot" :cx="loopCenter[0]" :cy="loopCenter[1] - 16" r="2.6" />
+    <!-- Agent 出现后才显示的循环和连线 -->
+    <g v-track="agentLinkStops">
+      <circle class="loop-ring" :cx="loopCenter[0]" :cy="loopCenter[1]" r="16" />
+      <g v-track="loopStops" class="loop-orbit" :style="{ transformOrigin: `${loopCenter[0]}px ${loopCenter[1]}px` }">
+        <circle class="loop-dot" :cx="loopCenter[0]" :cy="loopCenter[1] - 16" r="2.6" />
+      </g>
+      <text class="scene-label scene-label--small" :x="loopCenter[0] + 28" :y="loopCenter[1] - 4">model</text>
+      <text class="scene-label scene-label--small" :x="loopCenter[0] + 28" :y="loopCenter[1] + 9">⇄ tools</text>
+      <FlowEdge :points="itemEdge" tone="lo" />
+      <FlowEdge v-for="executor in executors" :key="`edge-${executor.label}`" :points="getExecutorEdge(executor.y)" tone="lo" />
     </g>
-    <text class="scene-label scene-label--small" :x="loopCenter[0] + 28" :y="loopCenter[1] - 4">model</text>
-    <text class="scene-label scene-label--small" :x="loopCenter[0] + 28" :y="loopCenter[1] + 9">⇄ tools</text>
 
     <!-- Item 列表 -->
     <text class="scene-group-label" x="326" y="30">items</text>
-    <FlowEdge :points="itemEdge" tone="lo" />
     <FlowPacket v-for="item in items" :key="`packet-${item.at}`" :points="itemEdge" :at="item.at - 0.035" :span="0.035" />
     <rect
       v-for="(item, index) in items"
@@ -99,7 +106,6 @@ const loopStops: SceneStop[] = [
     <!-- Executor -->
     <text class="scene-group-label" x="338" y="140">executors</text>
     <template v-for="executor in executors" :key="executor.label">
-      <FlowEdge :points="getExecutorEdge(executor.y)" tone="lo" />
       <template v-if="executor.call >= 0">
         <FlowPacket :points="getExecutorEdge(executor.y)" :at="executor.call" :span="0.05" />
         <FlowPacket :points="getExecutorEdge(executor.y)" :at="executor.call + 0.1" :span="0.05" is-reverse />

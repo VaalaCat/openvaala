@@ -5,6 +5,7 @@ import {
   getComposer,
   getMessages,
   getMessageScroller,
+  openRightPanel,
   openTurnRaw,
   startConversation,
   test,
@@ -326,6 +327,7 @@ test("turn_usage_aligns_compact_and_small_values_and_opens_full_numbers", async 
   }
   // 3. 右侧轮次用量与展开原始记录的触发器分别操作。
   await page.setViewportSize({ width: 1280, height: 844 })
+  await openRightPanel(page)
   await page.getByRole("tab", { name: "Turn", exact: true }).click()
   const turns = page.getByRole("tabpanel", { name: "Turn", exact: true })
   const fullValue = turns.getByRole("button", {
@@ -347,7 +349,6 @@ test("turn_usage_aligns_compact_and_small_values_and_opens_full_numbers", async 
 test("turn_divider_lines_and_item_actions_align", async ({ page, fixture }) => {
   // 1. 同一对话里依次生成完成、中断、失败三轮；仅读取历史时放大返回的耗时与用量。
   await page.setViewportSize({ width: 320, height: 844 })
-  await page.emulateMedia({ reducedMotion: "reduce" })
   let enlargeHistory = false
   await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
     const server = socket.connectToServer()
@@ -545,7 +546,6 @@ test("disclosure_lines_follow_icon_centers_and_preserve_reading", async ({
 }) => {
   // 1. 真实推理、中途回复与两种工具生成独立详情和嵌套过程组。
   await page.setViewportSize({ width: 1280, height: 844 })
-  await page.emulateMedia({ reducedMotion: "reduce" })
   await fixture.replies(
     {
       reasoning: "逐项核对竖线和图标中心",
@@ -884,6 +884,8 @@ test("single_reasoning_always_has_a_group", async ({ page, fixture }) => {
   )
   await fixture.openApp(page)
   await startConversation(page, "单成员思考聚合")
+  // 右栏先展开：之后点调试信息不会再改变消息列的宽度
+  await openRightPanel(page)
   const messages = getMessages(page)
   const collapsedToggle =
     'button[aria-expanded="false"]:has([data-item-title]):not([tabindex="-1"]):visible'
@@ -949,7 +951,6 @@ test("single_reasoning_always_has_a_group", async ({ page, fixture }) => {
   ).toBeVisible()
 
   // 5. 中断留下的提示记录没有展开详情：悬停和调试操作都不把类型图标变成箭头，也没有展开控件。
-  await page.emulateMedia({ reducedMotion: "reduce" })
   const header = interruptedTurn
     .locator("[data-item-key]")
     .filter({ hasText: "这一轮已中断" })
@@ -1359,11 +1360,11 @@ test("opened_skill_stays_visible_when_tools_append_and_turn_completes", async ({
   expect(await node!.evaluate((element) => element.isConnected)).toBe(true)
 })
 
-test("conversation_switch_keeps_public_dom_and_edits_only_target_draft_while_loading", async ({
+test("conversation_switch_edits_only_target_draft_while_loading", async ({
   page,
   fixture,
 }) => {
-  // 1. 代理真实 RPC，仅暂存一次 A 的打开响应。
+  // 1. 代理真实 RPC，仅暂存一次 A 的打开响应。先后发出 A、B 两条对话，各有各的草稿。
   let holdConversationID: string | undefined
   let releaseOpen: (() => void) | undefined
   await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
@@ -1390,39 +1391,24 @@ test("conversation_switch_keeps_public_dom_and_edits_only_target_draft_while_loa
   })
   await fixture.openApp(page)
   await startConversation(page, "常驻布局目标A")
-  const urlA = page.url()
-  const conversationA = urlA.split("/c/")[1]
+  const conversationA = page.url().split("/c/")[1]
   await expect(getMessages(page).getByText("ok", { exact: true })).toBeVisible()
   await getComposer(page).fill("A原草稿")
   await page.getByRole("link", { name: "新对话", exact: true }).click()
   await startConversation(page, "常驻布局目标B")
   await expect(getMessages(page).getByText("ok", { exact: true })).toBeVisible()
   await getComposer(page).fill("B草稿")
-  const modelControl = page.locator('form [aria-label="模型"]')
+  const modelControl = page.locator('form [aria-label="模型"]:visible')
   await expect(modelControl).toBeEnabled()
-  const modelNode = await modelControl.elementHandle()
   const modelLabel = await modelControl.textContent()
-  const sendNode = await page
-    .getByRole("button", { name: "发送", exact: true })
-    .elementHandle()
-  const composerNode = await getComposer(page).elementHandle()
-  const messagesNode = await getMessages(page).elementHandle()
-  const tabNode = await page
-    .getByRole("tab", { name: "Agent", exact: true })
-    .elementHandle()
-  const toggleNode = await page
-    .getByRole("button", { name: "切换对话详情", exact: true })
-    .elementHandle()
 
-  // 2. A 尚未同步时，B 消息和详情不冒充 A；输入框保留并可编辑 A 草稿，但不可发送。
+  // 2. 从列表打开 A：A 尚未同步时，B 消息不冒充 A；输入框带着 A 的草稿并可编辑，但不可发送。
   holdConversationID = conversationA
   await page.getByRole("link", { name: /^常驻布局目标A/ }).click()
   await expect.poll(() => !!releaseOpen).toBe(true)
   await expect(getComposer(page)).toHaveValue("A原草稿")
   await expect(modelControl).toBeDisabled()
   await expect(modelControl).toHaveText("正在加载…")
-  expect(await modelNode!.evaluate((element) => element.isConnected)).toBe(true)
-  expect(await sendNode!.evaluate((element) => element.isConnected)).toBe(true)
   await getComposer(page).fill("A加载中编辑")
   await expect(
     page.getByRole("button", { name: "发送", exact: true })
@@ -1433,16 +1419,15 @@ test("conversation_switch_keeps_public_dom_and_edits_only_target_draft_while_loa
   await expect(
     page.getByRole("navigation", { name: "当前位置" })
   ).toContainText("常驻布局目标A")
-  for (const node of [composerNode, messagesNode, tabNode, toggleNode])
-    expect(await node!.evaluate((element) => element.isConnected)).toBe(true)
 
-  // 3. 尚未返回就切 B，旧响应不会把 A 内容和草稿写进 B；再次切 A 可正常继续订阅。
+  // 3. 尚未返回就切 B，旧响应不会把 A 内容和草稿写进 B；再切回 A 可正常继续订阅。
   await page.getByRole("link", { name: /^常驻布局目标B/ }).click()
   await expect(getComposer(page)).toHaveValue("B草稿")
   releaseOpen!()
   await expect(
     getMessages(page).getByText("常驻布局目标B", { exact: true })
   ).toBeVisible()
+  await expect(getComposer(page)).toHaveValue("B草稿")
   await page.getByRole("link", { name: /^常驻布局目标A/ }).click()
   await expect(getComposer(page)).toHaveValue("A加载中编辑")
   await expect(
@@ -1450,14 +1435,10 @@ test("conversation_switch_keeps_public_dom_and_edits_only_target_draft_while_loa
   ).toBeEnabled()
   await expect(modelControl).toBeEnabled()
   await expect(modelControl).toHaveText(modelLabel!)
-  expect(await modelNode!.evaluate((element) => element.isConnected)).toBe(true)
-  expect(await sendNode!.evaluate((element) => element.isConnected)).toBe(true)
   await getComposer(page).press("Enter")
   await expect(
     getMessages(page).getByText("A加载中编辑", { exact: true })
   ).toBeVisible()
-  for (const node of [composerNode, messagesNode, tabNode, toggleNode])
-    expect(await node!.evaluate((element) => element.isConnected)).toBe(true)
 })
 
 test("late_send_success_clears_only_original_conversation_draft", async ({
@@ -1704,19 +1685,22 @@ test("user_message_copies_only_typed_text_while_running", async ({
     page.getByRole("button", { name: "预览图片 复制检查图片", exact: true })
   ).toBeVisible()
   await page.getByRole("button", { name: "附带材料", exact: true }).click()
-  await expect(page.getByText("附带材料不复制", { exact: true })).toBeVisible()
+  // 原对话的标签页还挂着，只看输入框里恢复出来的附带材料。
+  await expect(
+    page.locator("form").getByText("附带材料不复制", { exact: true })
+  ).toBeVisible()
 })
 
 for (const scenario of [
   { width: 1280, colorScheme: "light" },
   { width: 390, colorScheme: "dark" },
 ] as const) {
-  test(`only_latest_conversation_reply_has_copy_${scenario.width}`, async ({
+  test(`each_turn_last_text_has_copy_${scenario.width}`, async ({
     page,
     fixture,
   }) => {
     test.setTimeout(120_000)
-    // 1. 真实长会话里再发两轮不同的正文，始终只给最新回复一个复制入口。
+    // 1. 真实长会话每轮保留一个复制入口，同轮中途正文不重复提供入口。
     await page.setViewportSize({ width: scenario.width, height: 844 })
     await page.emulateMedia({ colorScheme: scenario.colorScheme })
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"])
@@ -1731,32 +1715,68 @@ for (const scenario of [
       name: "复制结果",
       exact: true,
     })
-    await expect(copies).toHaveCount(1)
+    await expect.poll(() => copies.count()).toBeGreaterThan(1)
+    const initialCopies = await copies.count()
     const oldReplyKeys: string[] = []
     for (const round of [1, 2]) {
       const reply = `历史正文第 ${round} 条`
-      await fixture.replies({ text: reply })
-      await getComposer(page).fill(`独立输入第 ${round} 条`)
-      await getComposer(page).press("Enter")
-      const replyItem = messages.locator("[data-item-key]").filter({
-        has: page.getByText(reply, { exact: true }),
-      })
-      await expect(
-        replyItem.getByRole("button", { name: "复制结果", exact: true })
-      ).toBeVisible()
-      await expect(copies).toHaveCount(1)
-      oldReplyKeys.push((await replyItem.getAttribute("data-item-key"))!)
-      await expect(
-        messages
-          .locator("[data-item-key]")
-          .filter({
-            has: page.getByText(`独立输入第 ${round} 条`, { exact: true }),
-          })
-          .getByRole("button", { name: "复制消息", exact: true })
-      ).toBeVisible()
+      const gate = fixture.createCommandGate(
+        `turn-copy-${scenario.width}-${round}`
+      )
+      try {
+        await fixture.replies(
+          {
+            text: `第 ${round} 轮中途文字`,
+            tool: "bash",
+            arguments: JSON.stringify({
+              command: `${gate.wait}; printf per-turn-copy`,
+            }),
+          },
+          { text: reply }
+        )
+        await getComposer(page).fill(`独立输入第 ${round} 条`)
+        await getComposer(page).press("Enter")
+        const runningTurn = messages.locator("[data-turn-id]").last()
+        await expect(
+          runningTurn.getByText(`第 ${round} 轮中途文字`, { exact: true })
+        ).toBeVisible()
+        await expandTurnProcess(runningTurn)
+        await expect(
+          runningTurn.locator('[data-tool-state="running"]')
+        ).toBeVisible()
+        await expect(
+          runningTurn.getByRole("button", { name: "复制结果", exact: true })
+        ).toHaveCount(0)
+        await expect(copies).toHaveCount(initialCopies + round - 1)
+        await gate.release()
+        const replyItem = messages.locator("[data-item-key]").filter({
+          has: page.getByText(reply, { exact: true }),
+        })
+        await expect(
+          replyItem.getByRole("button", { name: "复制结果", exact: true })
+        ).toBeVisible()
+        await expect(copies).toHaveCount(initialCopies + round)
+        await expect(
+          messages
+            .locator("[data-turn-id]")
+            .last()
+            .getByRole("button", { name: "复制结果", exact: true })
+        ).toHaveCount(1)
+        oldReplyKeys.push((await replyItem.getAttribute("data-item-key"))!)
+        await expect(
+          messages
+            .locator("[data-item-key]")
+            .filter({
+              has: page.getByText(`独立输入第 ${round} 条`, { exact: true }),
+            })
+            .getByRole("button", { name: "复制消息", exact: true })
+        ).toBeVisible()
+      } finally {
+        await gate.cleanup()
+      }
     }
 
-    // 2. 最新正文流式生成时不回退旧回复；结束后仅复制最新条目的原始 Markdown。
+    // 2. 新轮流式生成只隐藏本轮入口，旧轮保留；结束后复制该轮末条原始 Markdown。
     const latestText = "最新流式正文 **保留 Markdown**\n\n第二段原文"
     await fixture.replies({
       text: latestText,
@@ -1771,7 +1791,7 @@ for (const scenario of [
     await expect(
       page.getByRole("button", { name: "中断", exact: true })
     ).toBeVisible()
-    await expect(copies).toHaveCount(0)
+    await expect(copies).toHaveCount(initialCopies + 2)
     const latestInput = messages.locator("[data-item-key]").filter({
       has: page.getByText("最新流式输入", { exact: true }),
     })
@@ -1781,7 +1801,7 @@ for (const scenario of [
     await expect
       .poll(() => page.evaluate(() => navigator.clipboard.readText()))
       .toBe("最新流式输入")
-    await expect(copies).toHaveCount(1, { timeout: 15_000 })
+    await expect(copies).toHaveCount(initialCopies + 3, { timeout: 15_000 })
     const latestReply = messages.locator("[data-item-key]").filter({
       has: page.getByText("保留 Markdown", { exact: true }),
     })
@@ -1797,11 +1817,11 @@ for (const scenario of [
         messages
           .locator(`[data-item-key="${key}"]`)
           .getByRole("button", { name: "复制结果", exact: true })
-      ).toHaveCount(0)
+      ).toHaveCount(1)
 
-    // 3. 刷新只加载尾页，继续上翻加载更早轮次也不增加复制入口。
+    // 3. 刷新只加载尾页；每轮尾部正文可复制，加载旧轮后增加对应入口。
     await page.reload()
-    await expect(copies).toHaveCount(1)
+    await expect.poll(() => copies.count()).toBeGreaterThan(1)
     await expect(
       messages.getByText("长对话第 1 轮", { exact: true })
     ).toHaveCount(0)
@@ -1816,6 +1836,7 @@ for (const scenario of [
       .innerText()
     const earlierTurn = Number(earliest.match(/\d+/)![0]) - 1
     expect(earlierTurn).toBeGreaterThan(0)
+    const beforeEarlierCopies = await copies.count()
     const scroller = getMessageScroller(page)
     await expect(async () => {
       await scroller.evaluate((node) => {
@@ -1827,13 +1848,13 @@ for (const scenario of [
         messages.getByText(`长对话第 ${earlierTurn} 轮`, { exact: true })
       ).toBeAttached({ timeout: 1000 })
     }).toPass({ timeout: 20_000 })
-    await expect(copies).toHaveCount(1)
+    await expect.poll(() => copies.count()).toBeGreaterThan(beforeEarlierCopies)
     for (const key of oldReplyKeys)
       await expect(
         messages
           .locator(`[data-item-key="${key}"]`)
           .getByRole("button", { name: "复制结果", exact: true })
-      ).toHaveCount(0)
+      ).toHaveCount(1)
     await expect(
       messages
         .locator(`[data-item-key="${latestReplyKey}"]`)

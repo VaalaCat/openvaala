@@ -1,5 +1,5 @@
 import type { ReactNode } from "react"
-import { motion, useReducedMotion } from "motion/react"
+import { motion } from "motion/react"
 import type { ParseKeys } from "i18next"
 import { useTranslation } from "react-i18next"
 import { useLocation, useNavigate } from "react-router"
@@ -17,6 +17,7 @@ import {
 // 各节的标题，也是页签文字，按页签顺序
 const sectionLabelKeys = {
   general: "settings.sections.general",
+  appearance: "settings.sections.appearance",
   providers: "settings.sections.providers",
   executors: "settings.sections.executors",
   hooks: "settings.sections.hooks",
@@ -35,7 +36,6 @@ export function SettingsLayout({
   children: ReactNode
 }) {
   const { t } = useTranslation()
-  const reduceMotion = useReducedMotion()
   const connection = useServerConnection()
   const navigate = useNavigate()
   const { search } = useLocation()
@@ -55,9 +55,9 @@ export function SettingsLayout({
         parent={{ label: t("settings.title") }}
         actions={
           <>
-            {section !== "general" && section !== "archived" && (
-              <ReloadConfigButton />
-            )}
+            {section !== "general" &&
+              section !== "appearance" &&
+              section !== "archived" && <ReloadConfigButton />}
             {actions}
           </>
         }
@@ -77,9 +77,9 @@ export function SettingsLayout({
           className="flex min-w-0 flex-col gap-4 text-body"
           render={
             <motion.div
-              initial={reduceMotion ? false : { opacity: 0 }}
+              initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              transition={{ duration: reduceMotion ? 0 : 0.12 }}
+              transition={{ duration: 0.12 }}
             />
           }
         >

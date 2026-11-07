@@ -63,7 +63,21 @@ Session 记录的每样东西都是一个 **Item**，按首次出现的顺序保
 
 ## Executor 和工具
 
-**Executor** 是一个有文件系统和 shell 的环境：Runtime 服务自己所在的机器、通过 SSH 访问的机器，或者内存沙箱。对话会在它能用的每个 Executor 上打开一个*工作区*，根目录是这个 Executor 的工作目录。
+**Executor** 是一个有文件系统和 shell 的环境：Runtime 服务自己所在的机器、通过 SSH 访问的机器，或者内存沙箱。Executor 分三层：
+
+```text
+ExecutorProvider   这个对话能用哪些 Executor
+ └─ Executor       一个能干活的地方
+     └─ Workspace  读写文件、运行命令
+```
+
+- **`ExecutorProvider`**：给出一个对话能用的 Executor 列表。`openvaala serve` 用的是由 `executors/` 下的文件建出来的那一份，所有对话看到的列表相同。把 OpenVaala 当 Go 库嵌入的程序可以提供自己的实现，比如每个对话给出不同的列表。
+- **`Executor`**：说明一个地方是什么（ID、种类、说明、默认目录），并在上面打开工作区。新增一种 Executor 只需要写一个类型，对话不用知道它的细节。
+- **`Workspace`**：工具真正打交道的对象。对话在它能用的每个 Executor 上打开自己的工作区，根目录是这个 Executor 的工作目录，对话停止时关闭，所以 SSH 连接和 MCP server 不会比对话活得更久。
+
+重新加载配置时，Provider 和其他定义一起被替换：空闲的对话换用新的列表，新对话从一开始就用新的。
+
+已保存的对话如果没人查看，也没有在运行的 Turn 或后台命令，超过 `server.conversation_idle_timeout`（默认 30 分钟）后会被停止，它的工作区随之释放；再次打开时重新连接。见[配置总览](../configuration/overview.md)。
 
 工具分两类。**环境工具**（`read_file`、`apply_patch`、命令工具和 MCP 工具）由各个工作区提供；多个 Executor 提供同一个工具时，模型看到的是一个带 `executor` 参数的工具，调用会转给对应的工作区。**协作工具**（`spawn_agent` 等）作用于 Runtime 服务里的 Session。hook 在工具调用所在的 Executor 上、围绕工具调用运行。
 
@@ -91,6 +105,13 @@ pkg/dao   对话 · Session · Turn · Item
 ```
 
 日志是唯一的事实来源。`metadata.jsonl` 里每个条目都带着一个对话、Session 或 Turn 最新的完整状态，所以以最后一条为准；删除也是一个条目。每次改动都先追加并刷盘，再更新索引，`openvaala reindex` 随时可以从日志重建 `metadata.db`。对话能搬走就是因为这一点：一个对话目录本身就是完整的，可以拷贝、备份或迁移。见[对话存在哪里](../guides/conversations.md#对话存在哪里)。
+
+<!-- scene: portable-conversations | 日志是唯一的事实来源，索引随时可以重建 -->
+```text
+追加      metadata.jsonl、<session-id>.jsonl ──▶ metadata.db
+重建      metadata.jsonl ──▶ metadata.db，由 openvaala reindex 按日志重建
+迁移      conversations/<conversation-id>/ ──▶ 另一台机器，再 reindex
+```
 
 新对话先通过 `StagedLogStorage` 和 `StagedRecordStorage` 写进一个内存里的 SQLite 数据库。收到第一条消息时，暂存的数据被拷到真正的存储，之后所有读写都切换过去；所以空对话不会在磁盘上留下任何东西。
 

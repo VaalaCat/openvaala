@@ -656,6 +656,17 @@ func TestCodexItemTranslatorGetThreadItems(t *testing.T) {
 						BlockReason: "run tests",
 					},
 				},
+				{
+					ID:          "x-7",
+					Kind:        defs.ItemMemoryIndex,
+					MemoryIndex: &defs.MemoryIndex{Path: "user/MEMORY.md", Text: "- 回复用中文"},
+				},
+				{
+					ID:                "x-8",
+					TurnID:            "turn-1",
+					Kind:              defs.ItemClientInstruction,
+					ClientInstruction: &defs.ClientInstruction{Text: "boundary"},
+				},
 				newTestMessage("m-1", testUser, newTestText("after")),
 			},
 			want: `[{"type":"userMessage","id":"m-1","clientId":null,"content":[{"type":"text","text":"after","text_elements":[]}]}]`,
@@ -1132,6 +1143,32 @@ func TestGetCodexInputContent(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("getCodexInputContent = %s, want %s", toJSON(t, got), toJSON(t, tt.want))
+			}
+		})
+	}
+}
+
+// TestNewCodexThreadOpenResult 检查打开结果的沙箱只跟对话有没有装配 Executor 有关，跟 Thread 是不是临时的无关。
+func TestNewCodexThreadOpenResult(t *testing.T) {
+	// 1. 列出有无 Executor、是否临时的组合：thread/start 带空 environments 没有 Executor，临时分叉和普通 Thread 都有。
+	tests := []struct {
+		name         string
+		isEphemeral  bool
+		hasExecutors bool
+		wantSandbox  string
+	}{
+		{name: "saved_with_executors", hasExecutors: true, wantSandbox: "dangerFullAccess"},
+		{name: "ephemeral_fork_with_executors", isEphemeral: true, hasExecutors: true, wantSandbox: "dangerFullAccess"},
+		{name: "ephemeral_start_without_executors", isEphemeral: true, wantSandbox: "readOnly"},
+		{name: "saved_without_executors", wantSandbox: "readOnly"},
+	}
+	// 2. 创建打开结果，核对沙箱和未改动的 Thread。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			thread := codexThread{ID: "thread-1", Ephemeral: tt.isEphemeral, Model: "local/default", Cwd: "/work"}
+			result := newCodexThreadOpenResult(thread, tt.hasExecutors)
+			if result.Sandbox.Type != tt.wantSandbox || result.Thread.ID != thread.ID {
+				t.Fatalf("open result sandbox = %q thread = %q, want sandbox %q for thread %q", result.Sandbox.Type, result.Thread.ID, tt.wantSandbox, thread.ID)
 			}
 		})
 	}

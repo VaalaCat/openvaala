@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
+	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/charmbracelet/x/ansi"
@@ -91,6 +92,52 @@ func TestGetDisplayDirectory(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := getDisplayDirectory(tt.directory); got != tt.want {
 				t.Fatalf("getDisplayDirectory(%q) = %q, want %q", tt.directory, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetDefaultExecutorLocation 检查默认 Executor 和目录的取法：memory 不能当默认 Executor。
+func TestGetDefaultExecutorLocation(t *testing.T) {
+	// 1. 列出设置里有默认、没有默认且 memory 排在前面、没有目录的场景。
+	executors := []conversation.ExecutorDetails{
+		{ID: "local", Kind: defs.ExecutorKindLocal, WorkspaceDirectory: "/srv/serve"},
+		{ID: "memory", Kind: defs.ExecutorKindMemory},
+		{ID: "buildbox", Kind: defs.ExecutorKindSSH, WorkspaceDirectory: "/srv/build"},
+	}
+	tests := []struct {
+		name          string
+		settings      defs.ExecutorSettings
+		wantExecutor  string
+		wantDirectory string
+	}{
+		{
+			name:          "first_available_executor",
+			wantExecutor:  "local",
+			wantDirectory: "/srv/serve",
+		},
+		{
+			name:          "memory_is_skipped_when_it_is_first_available",
+			settings:      defs.ExecutorSettings{ExecutorIDs: []string{"memory", "buildbox"}},
+			wantExecutor:  "buildbox",
+			wantDirectory: "/srv/build",
+		},
+		{
+			name: "saved_default_and_directory",
+			settings: defs.ExecutorSettings{
+				DefaultExecutorID:    "buildbox",
+				WorkspaceDirectories: map[string]string{"buildbox": "/data/app"},
+			},
+			wantExecutor:  "buildbox",
+			wantDirectory: "/data/app",
+		},
+	}
+	// 2. 比较取到的 Executor 和目录。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executorID, directory := getDefaultExecutorLocation(tt.settings, executors)
+			if executorID != tt.wantExecutor || directory != tt.wantDirectory {
+				t.Fatalf("getDefaultExecutorLocation() = %q, %q; want %q, %q", executorID, directory, tt.wantExecutor, tt.wantDirectory)
 			}
 		})
 	}

@@ -1,4 +1,4 @@
-// Package terminal 管一个 Session 里后台命令的进程、输出、输入、时限和容量，不认识模型和 JSON。
+// Package terminal 管后台命令和交互终端的进程、输出、输入、时限和容量，不认识模型、JSON 和对话。
 package terminal
 
 import (
@@ -10,21 +10,26 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
 )
 
-// TerminalManager 是一个 Session 的命令集合：启动、查找、容量与淘汰；Session 结束时停止并等待全部命令。
+// TerminalManager 是一组命令的集合：启动、查找、容量与淘汰；创建它的 Session 或 Runtime 结束时停止并等待全部命令。
 type TerminalManager interface {
 	// Run 阻塞到 ctx 结束；之后不再接受新命令，停止并等待全部 Terminal 后返回。只能调用一次。
 	Run(ctx context.Context) error
 	// StartTerminal 启动一条命令；进程启动成功才返回 Terminal，失败时不返回编号。命令不随 ctx 取消。
+	// request.OwnsWorkspace 为 true 时，容量已满、管理器已停止、启动失败也会关闭工作区。
 	StartTerminal(ctx context.Context, request *TerminalRequest) (Terminal, error)
 	// GetTerminal 按编号查 environmentID 上启动成功、还没淘汰的命令；否则返回 ErrTerminalNotFound。
 	GetTerminal(environmentID, terminalID string) (Terminal, error)
 	// ListTerminals 按启动先后返回 environmentID 上启动成功、还没淘汰的命令。
 	ListTerminals(environmentID string) []Terminal
+	// GetTerminalByID 按编号查启动成功、还没淘汰的命令；否则返回 ErrTerminalNotFound。
+	GetTerminalByID(terminalID string) (result Terminal, err error)
+	// ListAllTerminals 按启动先后返回启动成功、还没淘汰的全部命令。
+	ListAllTerminals() (terminals []Terminal)
 	// IsBusy 是否还有没结束的命令？正在启动的也算。
 	IsBusy() bool
 }
 
-// terminalManagerImpl 保存一个 Session 登记的全部 Terminal，不用事件循环：查询直接读登记表，容量上限按 Best-Effort 检查，
+// terminalManagerImpl 保存一组登记的全部 Terminal，不用事件循环：查询直接读登记表，容量上限按 Best-Effort 检查，
 // 同一批并发启动的命令可能同时通过检查。
 type terminalManagerImpl struct {
 	opt *TerminalManagerOpt
@@ -36,12 +41,14 @@ type terminalManagerImpl struct {
 	tasks sync.WaitGroup
 }
 
-// TerminalManagerOpt 是一个 Session 的命令容量配置。
+// TerminalManagerOpt 是命令容量和结束通知配置。
 type TerminalManagerOpt struct {
-	// MaxTerminals 是一个 Session 最多保留的命令数，所有环境合计；正在启动、启动失败和已结束未淘汰的都算。
+	// MaxTerminals 是最多保留的命令数，所有环境合计；正在启动、启动失败和已结束未淘汰的都算。
 	MaxTerminals int
 	// MaxOutputBytes 是每条命令保留的输出末尾。
 	MaxOutputBytes int
+	// TerminalFinished 在命令结束后收到一次唤醒，通道已有未处理的唤醒时合并；为 nil 时不通知。
+	TerminalFinished chan<- struct{}
 }
 
 // NewTerminalManagerOpt 创建命令容量和输出保留量的默认配置。
@@ -53,7 +60,14 @@ func NewTerminalManagerOpt() *TerminalManagerOpt {
 	}
 }
 
-// NewTerminalManager 校验并保存 Session 的命令管理配置。
+// WithTerminalFinished 设置命令结束时的唤醒通道并返回本配置。
+func (o *TerminalManagerOpt) WithTerminalFinished(terminalFinished chan<- struct{}) *TerminalManagerOpt {
+	// 1. 保存唤醒通道。
+	o.TerminalFinished = terminalFinished
+	return o
+}
+
+// NewTerminalManager 校验并保存命令管理配置。
 func NewTerminalManager(opt *TerminalManagerOpt) (TerminalManager, error) {
 	// 1. 检查容量和输出上限为正，复制配置并创建停止信号。
 	if opt == nil || opt.MaxTerminals <= 0 || opt.MaxOutputBytes <= 0 {
@@ -66,7 +80,7 @@ func NewTerminalManager(opt *TerminalManagerOpt) (TerminalManager, error) {
 	}, nil
 }
 
-// Run 等待 Session 关闭，再停止并等待全部命令。
+// Run 等待 ctx 结束，再停止并等待全部命令。
 func (m *terminalManagerImpl) Run(ctx context.Context) error {
 	// 1. 等待 ctx 结束，关闭停止信号，不再登记新命令。
 	<-ctx.Done()
@@ -78,11 +92,13 @@ func (m *terminalManagerImpl) Run(ctx context.Context) error {
 
 // StartTerminal 登记并启动命令，等待启动结果。
 func (m *terminalManagerImpl) StartTerminal(ctx context.Context, request *TerminalRequest) (Terminal, error) {
-	// 1. 拒绝已停止的管理器，容量已满时尝试淘汰最早结束的命令。
+	// 1. 拒绝已停止的管理器，容量已满时尝试淘汰最早结束的命令；被拒绝时关闭独占的工作区。
 	if isChannelClosed(m.stopping) {
+		request.CloseWorkspace(ctx)
 		return nil, ErrTerminalManagerStopped
 	}
 	if err := m.evictFinishedTerminal(); err != nil {
+		request.CloseWorkspace(ctx)
 		return nil, err
 	}
 	// 2. 登记命令并启动任务；命令不随本次调用的 ctx 取消。
@@ -103,9 +119,12 @@ func (m *terminalManagerImpl) StartTerminal(ctx context.Context, request *Termin
 
 // GetTerminal 按环境和编号查询命令。
 func (m *terminalManagerImpl) GetTerminal(environmentID, terminalID string) (Terminal, error) {
-	// 1. 查登记表，要求命令已成功启动、未淘汰且环境匹配，否则返回 ErrTerminalNotFound。
-	terminal, found := m.terminals.Load(terminalID)
-	if !found || !terminal.isStartSucceeded() || terminal.request.EnvironmentID != environmentID {
+	// 1. 按编号查，要求命令属于指定环境，否则返回 ErrTerminalNotFound。
+	terminal, err := m.GetTerminalByID(terminalID)
+	if err != nil {
+		return nil, err
+	}
+	if terminal.GetInfo().EnvironmentID != environmentID {
 		return nil, ErrTerminalNotFound
 	}
 	return terminal, nil
@@ -113,16 +132,38 @@ func (m *terminalManagerImpl) GetTerminal(environmentID, terminalID string) (Ter
 
 // ListTerminals 按启动先后返回指定环境的命令。
 func (m *terminalManagerImpl) ListTerminals(environmentID string) []Terminal {
-	// 1. 筛选已成功启动且属于指定环境的命令。
+	// 1. 从全部已启动的命令里筛选属于指定环境的。
+	var terminals []Terminal
+	for _, terminal := range m.ListAllTerminals() {
+		if terminal.GetInfo().EnvironmentID == environmentID {
+			terminals = append(terminals, terminal)
+		}
+	}
+	return terminals
+}
+
+// GetTerminalByID 按编号查询命令。
+func (m *terminalManagerImpl) GetTerminalByID(terminalID string) (result Terminal, err error) {
+	// 1. 查登记表，要求命令已成功启动且未淘汰，否则返回 ErrTerminalNotFound。
+	terminal, found := m.terminals.Load(terminalID)
+	if !found || !terminal.isStartSucceeded() {
+		return nil, ErrTerminalNotFound
+	}
+	return terminal, nil
+}
+
+// ListAllTerminals 按启动先后返回全部命令。
+func (m *terminalManagerImpl) ListAllTerminals() (terminals []Terminal) {
+	// 1. 筛选已成功启动的命令。
 	var startedTerminals []*terminalImpl
 	for _, terminal := range m.terminals.Values() {
-		if terminal.isStartSucceeded() && terminal.request.EnvironmentID == environmentID {
+		if terminal.isStartSucceeded() {
 			startedTerminals = append(startedTerminals, terminal)
 		}
 	}
 	// 2. 按登记时间排序并返回 Terminal 列表。
 	slices.SortFunc(startedTerminals, func(a, b *terminalImpl) int { return a.createdAt.Compare(b.createdAt) })
-	terminals := make([]Terminal, 0, len(startedTerminals))
+	terminals = make([]Terminal, 0, len(startedTerminals))
 	for _, terminal := range startedTerminals {
 		terminals = append(terminals, terminal)
 	}

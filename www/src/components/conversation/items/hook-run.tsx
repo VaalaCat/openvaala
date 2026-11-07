@@ -59,7 +59,7 @@ export function HookRunItem({ view }: ItemRendererProps) {
             ([label, value]) =>
               value && (
                 <DetailSection key={label} label={label}>
-                  <p className="text-body wrap-anywhere whitespace-pre-wrap">
+                  <p className="text-reading wrap-anywhere whitespace-pre-wrap">
                     {value}
                   </p>
                 </DetailSection>
@@ -67,7 +67,7 @@ export function HookRunItem({ view }: ItemRendererProps) {
           )}
           {run.updated_tool_arguments && (
             <DetailSection label={t("conversation.hook.updatedArguments")}>
-              <pre className="overflow-x-auto text-code">
+              <pre className="overflow-x-auto text-code-reading">
                 {run.updated_tool_arguments}
               </pre>
             </DetailSection>

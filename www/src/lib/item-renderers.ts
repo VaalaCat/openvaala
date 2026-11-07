@@ -1,10 +1,12 @@
 import { createContext, useContext, type ComponentType } from "react"
 import type { ParseKeys, TFunction } from "i18next"
 import { AgentsInstructionItem } from "../components/conversation/items/agents-instruction"
+import { ClientInstructionItem } from "../components/conversation/items/client-instruction"
 import { ContextSummaryItem } from "../components/conversation/items/context-summary"
 import { ExecutorsChangeItem } from "../components/conversation/items/executors-change"
 import { FallbackItem } from "../components/conversation/items/fallback"
 import { HookRunItem } from "../components/conversation/items/hook-run"
+import { MemoryIndexItem } from "../components/conversation/items/memory-index"
 import { MessageItem } from "../components/conversation/items/message"
 import { ModelChangeItem } from "../components/conversation/items/model-change"
 import { ModelErrorItem } from "../components/conversation/items/model-error"
@@ -147,6 +149,8 @@ const itemRenderers: Partial<Record<ItemKind, ItemRenderer>> = {
   executors_change: ExecutorsChangeItem,
   skill_instruction: SkillInstructionItem,
   agents_instruction: AgentsInstructionItem,
+  memory_index: MemoryIndexItem,
+  client_instruction: ClientInstructionItem,
   hook_run: HookRunItem,
   turn_interrupted: TurnInterruptedItem,
 }
@@ -200,6 +204,8 @@ export function getToolActionLabel(name: string, t: TFunction): string {
     list_commands: "conversation.process.actions.list_commands",
     apply_patch: "conversation.process.actions.apply_patch",
     read_file: "conversation.process.actions.read_file",
+    glob: "conversation.process.actions.glob",
+    grep: "conversation.process.actions.grep",
     spawn_agent: "conversation.process.actions.spawn_agent",
     send_message: "conversation.process.actions.send_message",
     wait_agent: "conversation.process.actions.wait_agent",
@@ -488,20 +494,23 @@ export function isTurnRangeLoaded(items: ViewItem[], turn?: Turn): boolean {
   )
 }
 
-// 会话最后一条模型回复结束后可复制其正文，不要求完整历史已加载。
-export function getReplyToCopy(items: ViewItem[]): ViewItem | undefined {
-  // 1. 只检查最后一条回复，不回退复制更早的正文或正在生成的内容。
-  const reply = items.findLast(
-    (view) =>
-      view.item.kind === "message" && getMessageSource(view.item) === "reply"
-  )
-  if (!reply || reply.isStreaming || reply.ordinal === undefined) return
-  const text = getContentText(
-    (reply.item.message?.content ?? []).flatMap((content) =>
-      content ? [content] : []
+// 各轮最后一条有文字的模型回复保存后可复制，不要求完整历史已加载。
+export function getReplyKeysToCopy(items: ViewItem[]): Map<TurnID, string> {
+  // 1. 按原序更新每轮候选；最后正文尚在生成或保存时，移除该轮入口。
+  const keys = new Map<TurnID, string>()
+  for (const view of items) {
+    if (view.item.kind !== "message" || getMessageSource(view.item) !== "reply")
+      continue
+    const text = getContentText(
+      (view.item.message?.content ?? []).flatMap((content) =>
+        content ? [content] : []
+      )
     )
-  )
-  return text.trim() ? reply : undefined
+    if (!text.trim()) continue
+    if (view.isStreaming || view.ordinal === undefined) keys.delete(view.turnID)
+    else keys.set(view.turnID, view.key)
+  }
+  return keys
 }
 
 // 只有成功、完整且不含工具的最终调用才产出结果；返回该调用的全部正文。

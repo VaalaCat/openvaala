@@ -22,10 +22,43 @@ for (const scenario of [
     saved:
       '{"mode":"light","theme":"blue","bodyFont":"jetbrains-mono","headingFont":"noto-serif"}',
     expected: {
+      ...defaultAppearance,
       mode: "light",
       theme: "blue",
       bodyFont: "jetbrains-mono",
       headingFont: "noto-serif",
+    },
+  },
+  {
+    name: "independent typography groups",
+    saved: JSON.stringify({
+      body: { fontSize: 18, lineHeight: 28, paragraphSpacing: 16 },
+      code: { paddingX: 20 },
+      terminal: { lineHeight: 1.05, padding: 0, letterSpacing: 0.5 },
+    }),
+    expected: {
+      ...defaultAppearance,
+      body: { fontSize: 18, lineHeight: 28, paragraphSpacing: 16 },
+      code: { ...defaultAppearance.code, paddingX: 20 },
+      terminal: {
+        ...defaultAppearance.terminal,
+        lineHeight: 1.05,
+        padding: 0,
+        letterSpacing: 0.5,
+      },
+    },
+  },
+  {
+    name: "invalid sizes do not discard valid siblings",
+    saved: JSON.stringify({
+      body: { fontSize: "18", lineHeight: 22, paragraphSpacing: -4 },
+      code: { fontSize: 1000, paddingX: 3 },
+      terminal: { lineHeight: 1.01, padding: 12, letterSpacing: null },
+    }),
+    expected: {
+      ...defaultAppearance,
+      body: { ...defaultAppearance.body, lineHeight: 22 },
+      terminal: { ...defaultAppearance.terminal, padding: 12 },
     },
   },
   {

@@ -379,10 +379,4 @@ async function copyInstallCommand() {
     border-radius: 12px;
   }
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .home-title-caret {
-    animation: none;
-  }
-}
 </style>

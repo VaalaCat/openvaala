@@ -34,8 +34,8 @@ export function DetailPageState<T>({
   title: string
   entity: string
   parents: PageNavigation["parents"]
-  // 资源不存在时按钮回到的页面和按钮文字
-  notFoundReturn: { to: string; label: string }
+  // 资源不存在时的按钮：回到 to 指向的页面，或者没有页面可回时只执行 onClick（例如关掉指向这个资源的标签页）
+  notFoundReturn: { label: string } & ({ to: string } | { onClick: () => void })
   missingIdText: string
   query: { data?: T; error: unknown; refetch(): void }
   notFound?: boolean
@@ -67,14 +67,24 @@ export function DetailPageState<T>({
             </EmptyDescription>
           </EmptyHeader>
           <EmptyContent className="text-body">
-            <Button
-              className="text-ui"
-              nativeButton={false}
-              variant="outline"
-              render={<Link to={notFoundReturn.to} />}
-            >
-              {notFoundReturn.label}
-            </Button>
+            {"to" in notFoundReturn ? (
+              <Button
+                className="text-ui"
+                nativeButton={false}
+                variant="outline"
+                render={<Link to={notFoundReturn.to} />}
+              >
+                {notFoundReturn.label}
+              </Button>
+            ) : (
+              <Button
+                className="text-ui"
+                variant="outline"
+                onClick={notFoundReturn.onClick}
+              >
+                {notFoundReturn.label}
+              </Button>
+            )}
           </EmptyContent>
         </Empty>
       ) : state === "error" ? (

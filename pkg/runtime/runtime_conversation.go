@@ -18,12 +18,12 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 )
 
-// runtimeConversation 是 Runtime 运行表里的一个已打开对话：保存对话记录、订阅、Session 运行信息和未保存对话的丢弃计时，
+// runtimeConversation 是 Runtime 运行表里的一个已打开对话：保存对话记录、订阅、Session 运行信息和空闲停止计时，
 // 由它自己的事件循环串行修改。
 type runtimeConversation struct {
 	conversation conversation.Conversation
 	// cancel 取消这个对话实例的 ctx：删除对话时由 Runtime 事件循环调用以停止实例，
-	// 没保存的对话到时丢弃时由本对话的事件循环调用，实例退出后由运行任务调用以释放 ctx。
+	// 对话空闲到时停止（未保存的对话同时丢弃）由本对话的事件循环调用，实例退出后由运行任务调用以释放 ctx。
 	cancel   context.CancelFunc
 	query    dao.Query
 	mutation dao.Mutation
@@ -31,6 +31,8 @@ type runtimeConversation struct {
 	unsavedStore *unsavedConversationStore
 	// unsavedIdleTimeout 是对话没保存时的丢弃等待时长。
 	unsavedIdleTimeout time.Duration
+	// savedIdleTimeout 是对话已保存时的停止等待时长，0 表示不停止。
+	savedIdleTimeout time.Duration
 	// requests 是交给本对话事件循环的请求。
 	requests chan runtimeConversationRequest
 	// runningChanged 是 Runtime 持有的运行集合唤醒通道。
@@ -62,9 +64,9 @@ type runtimeConversation struct {
 	conversationSubscribers map[*subscriptionStream[ConversationEvent]]*runtimeSubscriber
 	// rootTurnMessageCount 是根 Session 当前这一轮已保存、计入对话消息数的条数；这一轮结束时累加到对话记录并清零。
 	rootTurnMessageCount int
-	// discardTimer 在没保存的对话没有订阅者、也没有 Session 在跑时开始计时，到时调用 cancel 结束对话；
-	// 有人订阅、开始跑 Turn 或对话已保存时停掉。从共用库打开的对话一直为 nil。
-	discardTimer *time.Timer
+	// idleTimer 在对话没有订阅者、也没有 Session 在跑时开始计时，到时调用 cancel 停止对话；
+	// 有人订阅、开始跑 Turn，或当前时长为 0 时停掉。
+	idleTimer *time.Timer
 }
 
 // newRuntimeConversation 创建已打开对话的运行记录。
@@ -77,6 +79,7 @@ func newRuntimeConversation(
 	definitions *runtimeDefinitions,
 	unsavedStore *unsavedConversationStore,
 	unsavedIdleTimeout time.Duration,
+	savedIdleTimeout time.Duration,
 	runningChanged chan<- struct{},
 ) *runtimeConversation {
 	// 1. 保存依赖并创建请求通道、退出通知和各类运行信息表。
@@ -90,6 +93,7 @@ func newRuntimeConversation(
 		agentDefaultModels:      definitions.agentDefaultModels,
 		unsavedStore:            unsavedStore,
 		unsavedIdleTimeout:      unsavedIdleTimeout,
+		savedIdleTimeout:        savedIdleTimeout,
 		requests:                make(chan runtimeConversationRequest),
 		runningChanged:          runningChanged,
 		stopped:                 make(chan struct{}),
@@ -103,10 +107,10 @@ func newRuntimeConversation(
 
 // Run 启动对话实例，在当前 goroutine 跑事件循环；对话退出后关闭 stopped 和全部订阅。
 func (c *runtimeConversation) Run(ctx context.Context) {
-	// 1. 添加对话遥测，读取已有 Session 信息。
-	ctx = telemetry.ContextWithAttrs(ctx, telemetry.ConversationID(string(c.conversation.GetID())))
+	// 1. 添加对话身份，读取已有 Session 信息。
+	ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: c.conversation.GetID()})
 	c.seedRuntimeSessions(ctx)
-	signalRunningConversationsChanged(c.runningChanged)
+	signalChanged(c.runningChanged)
 	// 2. 启动对话任务，在本任务中处理事件与请求。
 	events := make(chan conversation.ConversationEvent)
 	var tasks sync.WaitGroup
@@ -136,20 +140,31 @@ func (c *runtimeConversation) seedRuntimeSessions(ctx context.Context) {
 	}
 }
 
-// runEventLoop 串行更新订阅、Session 信息和未保存对话的丢弃计时。
+// runEventLoop 串行更新订阅、Session 信息和空闲停止计时。
 func (c *runtimeConversation) runEventLoop(ctx context.Context, events <-chan conversation.ConversationEvent) {
-	// 1. 按对话状态安排丢弃计时，未计时时使用 nil 通道。
+	// 1. 按对话状态安排空闲停止计时，未计时时使用 nil 通道。
 	for {
-		c.scheduleDiscard()
-		var discardTimerFired <-chan time.Time
-		if c.discardTimer != nil {
-			discardTimerFired = c.discardTimer.C
+		c.scheduleIdleStop()
+		var idleTimerFired <-chan time.Time
+		if c.idleTimer != nil {
+			idleTimerFired = c.idleTimer.C
 		}
 		// 2. 处理计时、对话事件和订阅等请求；对话事件通道关闭后返回。
 		select {
-		case <-discardTimerFired:
-			// 到期且仍可丢弃时取消对话；到期的计时器留着，不再重新计时。
-			if c.isDiscardable() {
+		case <-idleTimerFired:
+			// 1. 时长为 0 时清空计时器。
+			idleTimeout := c.getIdleTimeout()
+			if idleTimeout == 0 {
+				c.idleTimer = nil
+				continue
+			}
+			// 2. 已保存的对话还有后台命令时重新计时；命令结束没有事件，只能到期再看一次。
+			if !c.isUnsaved() && c.conversation.IsTerminalBusy() {
+				c.idleTimer.Reset(idleTimeout)
+				continue
+			}
+			// 3. 仍然空闲时停止实例；到期的计时器留着，不再重新计时。
+			if c.isIdle() {
 				c.cancel()
 			}
 		case event, open := <-events:
@@ -190,20 +205,34 @@ func (c *runtimeConversation) runEventLoop(ctx context.Context, events <-chan co
 	}
 }
 
-// scheduleDiscard 按未保存对话的使用状态启动或停止丢弃计时。
-func (c *runtimeConversation) scheduleDiscard() {
-	// 1. 不可丢弃时停止并清空计时器。
-	if !c.isDiscardable() {
-		if c.discardTimer != nil {
-			c.discardTimer.Stop()
-			c.discardTimer = nil
+// scheduleIdleStop 按对话的使用状态启动或停止空闲计时。
+func (c *runtimeConversation) scheduleIdleStop() {
+	// 1. 对话空闲且时长不为 0 时，未计时则启动计时器，已到期计时器不重启。
+	if c.isIdle() {
+		if idleTimeout := c.getIdleTimeout(); idleTimeout > 0 {
+			if c.idleTimer == nil {
+				c.idleTimer = time.NewTimer(idleTimeout)
+			}
+			return
 		}
-		return
 	}
-	// 2. 可丢弃且未计时时启动计时器，已到期计时器不重启。
-	if c.discardTimer == nil {
-		c.discardTimer = time.NewTimer(c.unsavedIdleTimeout)
+	// 2. 否则停止并清空计时器。
+	if c.idleTimer != nil {
+		c.idleTimer.Stop()
+		c.idleTimer = nil
 	}
+}
+
+// getIdleTimeout 返回这个对话空闲多久后停止；为 0 时不停止。
+func (c *runtimeConversation) getIdleTimeout() time.Duration {
+	// 1. 未保存和已保存的对话各用自己的时长；已保存却无法按记录恢复的对话不停止。
+	if c.isUnsaved() {
+		return c.unsavedIdleTimeout
+	}
+	if !c.conversation.IsRestorableFromRecord() {
+		return 0
+	}
+	return c.savedIdleTimeout
 }
 
 // isUnsaved 对话是否仍未写入共享库？
@@ -216,10 +245,10 @@ func (c *runtimeConversation) isUnsaved() bool {
 	return c.unsavedStore.stagedLogs == nil || !c.unsavedStore.stagedLogs.IsPersisted()
 }
 
-// isDiscardable 对话是否尚未保存，且没有订阅者和运行中的 Turn？
-func (c *runtimeConversation) isDiscardable() bool {
-	// 1. 先检查订阅和 Session 运行信息，再查询存储是否已保存。
-	return len(c.contentSubscribers) == 0 && len(c.conversationSubscribers) == 0 && !c.isAnyRuntimeSessionRunning() && c.isUnsaved()
+// isIdle 对话是否没有订阅者和运行中的 Turn？
+func (c *runtimeConversation) isIdle() bool {
+	// 1. 检查订阅和 Session 运行信息。
+	return len(c.contentSubscribers) == 0 && len(c.conversationSubscribers) == 0 && !c.isAnyRuntimeSessionRunning()
 }
 
 // subscribe 经对话事件循环登记订阅并取回初始信息。
@@ -271,7 +300,7 @@ func (c *runtimeConversation) handleConversationEvent(ctx context.Context, event
 		projection.handleSessionStopped()
 	}
 	if wasRunning != c.isAnyRuntimeSessionRunning() {
-		signalRunningConversationsChanged(c.runningChanged)
+		signalChanged(c.runningChanged)
 	}
 	// 3. 刷新上下文占用，运行信息变化时推送给对话订阅者，再转发内容事件。
 	projection.refreshContext(c.models, c.agentDefaultModels)
@@ -397,7 +426,7 @@ func (c *runtimeConversation) forwardContentEvent(ctx context.Context, sessionID
 		select {
 		case stream.events <- event:
 		default:
-			logCtx := telemetry.ContextWithAttrs(ctx, telemetry.SessionID(string(sessionID)))
+			logCtx := defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{SessionID: sessionID})
 			telemetry.GetLogger(logCtx).Warn("subscriber removed", "reason", ErrSubscriberTooSlow.Error())
 			removeSubscriber(c.contentSubscribers, stream, ErrSubscriberTooSlow)
 		}

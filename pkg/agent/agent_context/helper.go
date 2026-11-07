@@ -233,6 +233,32 @@ func itemsToLLMKitMessages(items []*defs.Item, isImageInputSupported bool) ([]*l
 			}, index)
 			continue
 		}
+		if item.Kind == defs.ItemClientInstruction {
+			if item.ClientInstruction == nil {
+				return nil, nil, fmt.Errorf("context item %d has no client instruction", index)
+			}
+			appendMessage(&llmkit.Message{
+				Role: llmkit.RoleUser,
+				Content: []llmkit.ContentBlock{{
+					Type: llmkit.ContentTypeText,
+					Text: prompt.FormatClientInstruction(*item.ClientInstruction),
+				}},
+			}, index)
+			continue
+		}
+		if item.Kind == defs.ItemMemoryIndex {
+			if item.MemoryIndex == nil {
+				return nil, nil, fmt.Errorf("context item %d has no memory index", index)
+			}
+			appendMessage(&llmkit.Message{
+				Role: llmkit.RoleUser,
+				Content: []llmkit.ContentBlock{{
+					Type: llmkit.ContentTypeText,
+					Text: prompt.FormatMemoryIndex(*item.MemoryIndex),
+				}},
+			}, index)
+			continue
+		}
 		if item.Kind == defs.ItemHookRun {
 			if item.HookRun == nil {
 				return nil, nil, fmt.Errorf("context item %d has no hook run", index)
@@ -425,7 +451,7 @@ func IsSentToModel(item *defs.Item) bool {
 func GetContextCategory(item *defs.Item) ContextCategory {
 	// 1. 按 Item 类别识别指令、摘要、推理、工具结果和通知。
 	switch item.Kind {
-	case defs.ItemSkillInstruction, defs.ItemAgentsInstruction, defs.ItemHookRun:
+	case defs.ItemSkillInstruction, defs.ItemAgentsInstruction, defs.ItemMemoryIndex, defs.ItemClientInstruction, defs.ItemHookRun:
 		return ContextCategoryInstruction
 	case defs.ItemContextSummary:
 		return ContextCategorySummary

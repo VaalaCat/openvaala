@@ -92,6 +92,9 @@ export function getToolArgumentPreview(name: string, value: unknown): string {
         .join(", ")
     case "bash":
       return firstLine(getStringField(value, "command"))
+    case "glob":
+    case "grep":
+      return firstLine(getStringField(value, "pattern"))
     case "read_command_output":
     case "stop_command":
       return firstLine(getStringField(value, "command_id"))

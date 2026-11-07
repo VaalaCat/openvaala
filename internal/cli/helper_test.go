@@ -203,6 +203,10 @@ func TestGetACPMCPServerSummary(t *testing.T) {
 	}
 }
 
+// acpGlobalHeaders 是传给 getACPClientMCPTransport 的全局 http.headers：User-Agent 应出现在每个请求里，
+// 和编辑器配置的请求头同名的条目应被编辑器的值覆盖。
+var acpGlobalHeaders = map[string]string{"User-Agent": acpGlobalUserAgent, acpEditorHeaderName: "global-value"}
+
 // TestGetACPClientMCPTransport 检查本机 MCP 传输的目录、环境和请求头。
 func TestGetACPClientMCPTransport(t *testing.T) {
 	// 1. 准备工作目录并列出三种传输配置。
@@ -269,7 +273,7 @@ func TestGetACPClientMCPTransport(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.transport == "" {
 				environment := append(os.Environ(), "MCP_TEST_ENV=from-acp", "KEEP=kept")
-				transport := getACPClientMCPTransport(tt.getServer(""), directory, environment)
+				transport := getACPClientMCPTransport(tt.getServer(""), directory, environment, nil)
 				output, err := transport.(*mcp.CommandTransport).Command.Output()
 				if err != nil || string(output) != tt.want {
 					t.Fatalf("command output = %q (%v), want %q", output, err, tt.want)
@@ -283,7 +287,7 @@ func TestGetACPClientMCPTransport(t *testing.T) {
 			session, err := mcp.NewClient(&mcp.Implementation{
 				Name:    "test",
 				Version: "1.0.0",
-			}, nil).Connect(ctx, getACPClientMCPTransport(tt.getServer(editorServer.URL), directory, nil), nil)
+			}, nil).Connect(ctx, getACPClientMCPTransport(tt.getServer(editorServer.URL), directory, nil, acpGlobalHeaders), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -295,7 +299,7 @@ func TestGetACPClientMCPTransport(t *testing.T) {
 				t.Fatal(err)
 			}
 			if requests.Load() < 2 || requests.Load() != headed.Load() {
-				t.Fatalf("editor server got %d requests, %d with the configured header, want at least 2 and all of them", requests.Load(), headed.Load())
+				t.Fatalf("editor server got %d requests, %d with the editor header and the global User-Agent, want at least 2 and all of them", requests.Load(), headed.Load())
 			}
 		})
 	}

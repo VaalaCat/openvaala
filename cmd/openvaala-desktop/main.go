@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,8 +13,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var version = "dev"
-
 // desktopCommandFlags 保存桌面入口选择的界面模式。
 type desktopCommandFlags struct {
 	Native bool
@@ -21,7 +20,7 @@ type desktopCommandFlags struct {
 
 // main 接收退出信号，执行完整命令树并输出退出错误。
 func main() {
-	// 1. 准备命令执行上下文；版本由构建参数注入，不查询图形后端。
+	// 1. 准备命令执行上下文，不查询图形后端。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	command := newDesktopCommand()
 	// 2. 在主 goroutine 执行所选命令，结束后释放信号监听。
@@ -38,9 +37,8 @@ func newDesktopCommand() *cobra.Command {
 	// 1. 保留原命令树，将无参数入口设为桌面模式选择。
 	flags := &desktopCommandFlags{}
 	command := cli.NewCLI(&cli.CLIOpt{
-		Stdout:  os.Stdout,
-		Stderr:  os.Stderr,
-		Version: version,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
 	})
 	command.Short = "OpenVaala desktop, terminal UI and runtime server"
 	command.RunE = flags.runAppCommand
@@ -78,7 +76,7 @@ func (f *desktopCommandFlags) runAppCommand(command *cobra.Command, _ []string) 
 		IdleTimeout: 0,
 	}
 	if f.Native {
-		app, err := desktop.NewDesktop(&desktop.DesktopOpt{RuntimeServerStart: runtimeServerStart})
+		app, err := desktop.NewDesktop(&desktop.DesktopOpt{RuntimeServerStart: runtimeServerStart, HTTPHeaders: getDesktopHTTPHeaders(command)})
 		if err != nil {
 			return err
 		}
@@ -89,4 +87,15 @@ func (f *desktopCommandFlags) runAppCommand(command *cobra.Command, _ []string) 
 		return err
 	}
 	return app.Run(command.Context())
+}
+
+// getDesktopHTTPHeaders 读取配置里的 http.headers，给原生界面下载图片时使用；配置加载失败时记录警告并返回 nil。
+func getDesktopHTTPHeaders(command *cobra.Command) map[string]string {
+	// 1. 加载失败不阻止窗口打开，由窗口里的连接错误提示报告本机服务的问题。
+	cfg, _, err := cli.LoadConfig(command)
+	if err != nil {
+		slog.Warn("cannot load config for desktop image downloads; sending no http.headers", "error", err)
+		return nil
+	}
+	return cfg.GetHTTPHeaders()
 }

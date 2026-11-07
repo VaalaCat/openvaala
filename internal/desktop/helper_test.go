@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -435,6 +436,65 @@ func TestGetProtocolLabel(t *testing.T) {
 		t.Run(tt.protocol, func(t *testing.T) {
 			if got := getProtocolLabel(tt.protocol); got != tt.want {
 				t.Fatalf("label = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetWorkLocation 检查对话的工作位置：默认 Executor 为空时是 local，没有记录目录时目录为空。
+func TestGetWorkLocation(t *testing.T) {
+	for _, tt := range []struct {
+		name                        string
+		settings                    defs.ExecutorSettings
+		wantExecutor, wantDirectory string
+	}{
+		{"default executor with directory", defs.ExecutorSettings{DefaultExecutorID: "ssh-a", WorkspaceDirectories: map[string]string{"ssh-a": "/srv/app", "local": "/home"}}, "ssh-a", "/srv/app"},
+		{"empty default executor is local", defs.ExecutorSettings{WorkspaceDirectories: map[string]string{"local": "/home", "ssh-a": "/srv/app"}}, "local", "/home"},
+		{"default executor without directory", defs.ExecutorSettings{DefaultExecutorID: "ssh-a", WorkspaceDirectories: map[string]string{"local": "/home"}}, "ssh-a", ""},
+		{"no settings", defs.ExecutorSettings{}, "local", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			executor, directory := getWorkLocation(defs.Conversation{ExecutorSettings: tt.settings})
+			if executor != tt.wantExecutor || directory != tt.wantDirectory {
+				t.Fatalf("location = %q %q, want %q %q", executor, directory, tt.wantExecutor, tt.wantDirectory)
+			}
+		})
+	}
+}
+
+// TestGetRecentDirectories 检查最近用过的目录只取默认 Executor 是所选 Executor 的对话，保持从新到旧的顺序、去重并受数量限制。
+func TestGetRecentDirectories(t *testing.T) {
+	withDirectories := func(directories map[string]string) defs.Conversation {
+		return defs.Conversation{ExecutorSettings: defs.ExecutorSettings{WorkspaceDirectories: directories}}
+	}
+	withSSH := func(directories map[string]string) defs.Conversation {
+		return defs.Conversation{ExecutorSettings: defs.ExecutorSettings{DefaultExecutorID: "ssh", WorkspaceDirectories: directories}}
+	}
+	conversations := []defs.Conversation{
+		withDirectories(map[string]string{"local": "/a", "ssh": "/s0"}),
+		withDirectories(map[string]string{"local": "/b"}),
+		withSSH(map[string]string{"local": "/root", "ssh": "/s1"}),
+		withSSH(map[string]string{"ssh": "/s2"}),
+		withDirectories(map[string]string{"local": "/a"}),
+		withDirectories(map[string]string{"local": ""}),
+		withDirectories(nil),
+		withDirectories(map[string]string{"local": "/c"}),
+		withDirectories(map[string]string{"local": "/d"}),
+	}
+	for _, tt := range []struct {
+		name     string
+		executor string
+		limit    int
+		want     []string
+	}{
+		{"dedupes and skips empty directories", "local", 5, []string{"/a", "/b", "/c", "/d"}},
+		{"stops at the limit", "local", 2, []string{"/a", "/b"}},
+		{"only conversations whose default executor is the chosen one", "ssh", 5, []string{"/s1", "/s2"}},
+		{"executor without directories", "other", 5, []string{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getRecentDirectories(conversations, tt.executor, tt.limit); !slices.Equal(got, tt.want) {
+				t.Fatalf("directories = %q, want %q", got, tt.want)
 			}
 		})
 	}

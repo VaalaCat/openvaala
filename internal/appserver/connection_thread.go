@@ -50,7 +50,7 @@ type connectionThread struct {
 	// isHistoryPaged 客户端是不是自己翻页读历史（thread/resume、thread/fork 带 excludeTurns）？是时首次同步时在跑的那一轮里已经保存、
 	// 还在执行的工具调用由翻页给出（inProgress），接入时只登记、不再发 item/started，之后的输出和结果照常发出。
 	isHistoryPaged bool
-	// isEphemeral 这是不是本连接用 thread/start 建的临时 Thread？是时回复打开请求的 Thread 对象带 ephemeral。
+	// isEphemeral 这是不是本连接用 thread/start 或 thread/fork 建的临时 Thread？是时回复打开请求的 Thread 对象带 ephemeral。
 	isEphemeral bool
 	// requests 是连接交来的请求。
 	requests chan connectionThreadRequest
@@ -72,7 +72,7 @@ type connectionThread struct {
 	// conversationSessions 是对话里各 Session 最近的运行信息（来自 ConversationSynced 和 SessionStatusChanged）：agent 路径、
 	// 子 Thread 对象的父 Thread 和层数取自其中的 Session 记录，根 Thread 还据此找出要跟随的子 Session。
 	conversationSessions map[defs.SessionID]runtime.SessionRuntimeInfo
-	// executors 是跟随的 Session 最近读到的 Executor，按配置顺序，第一个是默认 Executor：翻译工具调用用它；临时对话没有 Executor。
+	// executors 是跟随的 Session 最近读到的 Executor，按配置顺序，第一个是默认 Executor：翻译工具调用用它；对话不装配 Executor 时为空。
 	executors []conversation.ExecutorDetails
 	// agentPaths 是对话里各 Session 的 agent 路径，对话里出现新的 Session 时重算。
 	agentPaths map[defs.SessionID]string
@@ -154,7 +154,7 @@ type connectionThreadOpt struct {
 	StartedStatusType string
 	// IsHistoryPaged 客户端是不是自己翻页读历史（thread/resume、thread/fork 带 excludeTurns）？
 	IsHistoryPaged bool
-	// IsEphemeral 这是不是本连接用 thread/start 建的临时 Thread？
+	// IsEphemeral 这是不是本连接用 thread/start 或 thread/fork 建的临时 Thread？
 	IsEphemeral bool
 }
 
@@ -216,7 +216,8 @@ func (t *connectionThread) Run(ctx context.Context) (err error) {
 	}
 	delivered := make(chan struct{})
 	t.opened <- connectionThreadOpened{
-		thread: thread,
+		thread:       thread,
+		hasExecutors: len(t.executors) > 0,
 		followStart: historyReadEnd{
 			ordinal:      t.followStartOrdinal,
 			activeTurnID: t.followStartActiveTurnID,
@@ -320,7 +321,7 @@ func (t *connectionThread) isRootThread() bool {
 
 // readSessionDetails 读取跟随 Session 的模型和 Executor 等详情。
 func (t *connectionThread) readSessionDetails(ctx context.Context) (conversation.SessionDetails, error) {
-	// 1. 调用 Client 获取详情；临时对话可无 Executor，模型不在目录时详情里的模型为空。
+	// 1. 调用 Client 获取详情；对话可无 Executor，模型不在目录时详情里的模型为空。
 	return callClient(ctx, t, func(ctx context.Context) (conversation.SessionDetails, error) {
 		return t.client.GetSessionDetails(ctx, t.conversationID, t.sessionID)
 	})
@@ -657,7 +658,7 @@ func (t *connectionThread) handleThreadResumeRequested(ctx context.Context, requ
 	// 2. 创建带调用方历史的 Thread，响应后记录已实时推送的位置为分页终点。
 	thread := t.newCodexThread(record, details)
 	thread.Turns = request.turns
-	t.respond(ctx, "thread/resume", request.requestID, newCodexThreadOpenResult(thread), nil)
+	t.respond(ctx, "thread/resume", request.requestID, newCodexThreadOpenResult(thread, len(details.Executors) > 0), nil)
 	t.historyEndOrdinal = t.lastDisplayedOrdinal
 	// 3. 已保存的回复和推理由历史分页给出，标为完成后从 openReplies 移除；按位置重发未保存的回复和推理的累计内容。
 	t.openReplies = slices.DeleteFunc(t.openReplies, func(reply openReply) bool {

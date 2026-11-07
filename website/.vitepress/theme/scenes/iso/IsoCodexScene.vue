@@ -37,7 +37,7 @@ const serverLabel = project([90, -42, 0])
 </script>
 
 <template>
-  <SceneCanvas view-box="-222 -96 406 196" :period="10000">
+  <SceneCanvas view-box="-226 -89 406 196" :period="10000">
     <IsoCable :points="cable" />
     <IsoPacket :points="cable" :at="requestAt" :span="packetSpan" />
     <IsoPacket v-for="eventAt in eventsAt" :key="eventAt" :points="cable" :at="eventAt" :span="packetSpan" is-reverse />

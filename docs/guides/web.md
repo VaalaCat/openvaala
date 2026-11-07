@@ -14,7 +14,7 @@ openvaala web
 
 This prints an address like `http://127.0.0.1:8790/web/v1/#token=…` and tries to open it in your browser. If the local runtime server is not running, `openvaala web` starts it and leaves it running until you run `openvaala serve stop`.
 
-The web UI is built into the binaries from GitHub Releases and the desktop app. A binary built with `go install` does not include it, and the page shows *web UI is not built into this binary*; see [Install](../getting-started/install.md).
+The web UI is built into GitHub Release binaries, into `go install` of a published version, and into the desktop app. `go install` of `@main` does not include it, and the page shows *web UI is not built into this binary*; see [Install](../getting-started/install.md).
 
 ### The token
 
@@ -25,6 +25,7 @@ The part after `#token=` is the runtime server's access token, and the only cred
 - **Sidebar** — your conversations, newest first, with search. Each conversation's menu offers **Rename**, **Fork**, **Archive** and **Delete**. Archived conversations are under **Settings → Archived conversations**.
 - **New conversation** — choose the model and reasoning effort, the executor and the working directory (with suggestions from that executor), then send your first message.
 - **Composer** — **Enter** sends, **Shift+Enter** adds a line. Paste, drop or attach images (up to 10 MB in total). Type `/` to pick a [skill](../configuration/extensions.md#skills).
+- **Tabs** — the main area is the workspace of the conversation you picked in the sidebar. Its tabs are the main conversation, subagents, side conversations and terminals. See [Tabs, splits and terminals](#tabs-splits-and-terminals).
 - **Model picker and context meter** — switch model and effort at any time; the meter shows how full the context is and has a **Compact context** button.
 - **Conversation details** — a side panel with tabs:
   - **Agents** — the tree of subagents and their state.
@@ -38,6 +39,29 @@ The part after `#token=` is the runtime server's access token, and the only cred
 There is no first-run wizard in the web UI. If no model is configured, add one under **Settings → Model providers**.
 
 ![The context tab in the conversation details panel](../images/web-context-usage.png)
+
+## Tabs, splits and terminals
+
+Switch conversations in the sidebar; the main area always shows the tabs of one conversation, and every conversation keeps its own tabs and splits. The tabs are:
+
+- the **main conversation**, which can't be closed,
+- **subagents**: clicking a subagent in the Agents panel or in a message opens it in a read-only tab next to the main conversation, which keeps showing the main agent,
+- **side conversations** from `/btw`, see below,
+- **terminals**.
+
+Each area has a **+** menu at the end of its tab bar to open a terminal there, split the area to the right or below (the new area starts with a new terminal), and maximize it. You can also drag a tab to another area or to an edge of an area to split.
+
+A **terminal** tab opens a shell on the working directory of the conversation it belongs to. The shell runs on the server, so reloading the page or losing the connection does not end it: the tab reconnects to the same shell and catches up on the output it missed (the last 1 MiB is kept). A terminal ends when its shell exits, when you close its tab, when its conversation is deleted, or when the server stops; only then does the tab offer **Restart**.
+
+A running terminal also appears as a tab on other devices that open the same conversation, and you can type in it from either one. After a lot of output, reloading may leave a full-screen program such as vim looking wrong until you reopen it. If the screen gets garbled, choose **Reset terminal** in the **+** menu (or in the tab list on a narrow screen) to clear the kept output and redraw.
+
+When you switch away from a conversation that still has a side conversation or a running terminal, it stays in the background: the side conversation is not dropped and the terminal keeps running. Other conversations stop receiving updates while you are away, and reconnect with the same tabs and splits when you come back. The tabs and splits of the 50 most recently used conversations are kept in the browser. After a reload, the conversation in the address bar gets its layout back right away and the others when you open them. The page for a new conversation has no tabs; it becomes a normal conversation after you send the first message.
+
+### Ask on the side with /btw
+
+While a conversation is running — or after it has finished — type `/btw` followed by a question, for example `/btw why does this use SQLite`. The web UI opens a side conversation in a new tab to the right, which starts from everything the conversation has saved so far. It can read files and run commands, and you can keep asking in it. Nothing from the side conversation is written back to the original conversation, and the original keeps running. The side tab shows only what happens after the fork, with a link back to the original conversation at the top.
+
+A side conversation is temporary. It is not in the conversation list and is not saved; closing its tab interrupts it if it is still running and discards it. After a reload it is kept if it is still alive, otherwise its tab is removed. `/btw` is offered once a conversation has its first message, and not inside a side conversation.
 
 ## While the agent is working
 
@@ -55,6 +79,7 @@ To try again from an earlier point, use **Restart from here** on one of your mes
 The web UI is laid out for small screens too, so you can check on a long task, answer a question or steer the agent from your phone while the work keeps running on your machines.
 
 - The conversation list, the conversation details and the model picker open as drawers, and the composer's controls fit a narrow screen.
+- Only one tab is shown at a time. The button with the tab count in the top bar opens a drawer from the bottom to switch between the tabs of the current conversation, close them, or open a terminal. A subagent or a side conversation from `/btw` opens as a new tab and is selected right away.
 - On a touch keyboard, Enter adds a new line; send with the **Send** button. Queue and Stop work as on a computer.
 - Attach images with the **+** button.
 

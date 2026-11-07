@@ -1,11 +1,12 @@
 # Extensions
 
-This page shows how to extend agents with skills, project instructions, MCP servers, hooks and plugins.
+This page shows how to extend agents with skills, project instructions, memory, MCP servers, hooks and plugins.
 
 | You want to… | Use |
 | --- | --- |
 | Give the agent reusable know-how it loads only when relevant | [Skills](#skills) |
 | Tell the agent how a project works | [Project instructions](#project-instructions) |
+| Let the agent remember things across conversations | [Memory](#memory) |
 | Add tools from an external server | [MCP servers](#mcp-servers) |
 | Run your own scripts at fixed points, for example to block a command or format code | [Hooks](#hooks) |
 | Install a bundle of skills, hooks and MCP servers in one step | [Plugins](#plugins) |
@@ -61,12 +62,24 @@ Skills are discovered when a conversation opens or is reconfigured. After adding
 
 Put project conventions — how to build, how to run tests, what not to touch — in `AGENTS.md` files. OpenVaala reads them for you; there is nothing to configure.
 
-- At the start of every turn, the agent receives each `AGENTS.md` from the root of the Git repository that contains the working directory down to the working directory itself, on the default executor. Outside a Git repository, only the working directory's `AGENTS.md` is read.
-- When the agent reads a file deeper in the tree, `AGENTS.md` files between the working directory and that file are added too. On other executors, their `AGENTS.md` files are added after the agent first uses a tool there.
-- Deeper files take precedence over higher ones, and what you ask for directly takes precedence over all of them.
+- Put rules shared across projects in `~/.agents/AGENTS.md`. The home directory belongs to the executor's machine: the user running serve for local, or the remote login user for SSH. Virtual executors have no home directory and skip global rules.
+- At the start of every turn, OpenVaala reads the default executor's global rules, then each `AGENTS.md` from the root of the Git repository containing the working directory down to the working directory itself. Outside a Git repository, project rules come only from the working directory.
+- When the agent reads a file deeper in the tree, `AGENTS.md` files between the working directory and that file are added too. Other executors' global and project rules are loaded after the agent first successfully uses a tool there, without accessing those executors ahead of time.
+- Project directory rules take precedence over global rules; deeper directory rules take precedence over higher ones. What you ask for directly takes precedence over all of them.
 - Each file enters the context once, and comes back after the context is compacted.
+- A missing global file is skipped. A failure to resolve the home directory or read global rules is logged as a warning; project rules and the conversation continue, and discovery is retried on the next turn.
 
-Only files named `AGENTS.md` are read; `CLAUDE.md` and files in your home directory are not. Use an agent's `instructions` for guidance that applies everywhere.
+Only files named `AGENTS.md` are read. `~/AGENTS.md`, `~/.config/openvaala/AGENTS.md` and `CLAUDE.md` are not automatically loaded as global rules. Use an agent's `instructions` for guidance specific to that agent. New conversations see edited files; rules already loaded into an existing conversation are not replaced every turn.
+
+## Memory
+
+The agent can remember things across conversations, such as "tests in this project use table-driven style" or "reply in Chinese". Nothing needs to be configured.
+
+- Memory is plain Markdown on the machine that runs the runtime server, under `~/.local/share/openvaala/memory/`. It is split in two: `user/` applies to every conversation, and `projects/<default executor>/<working directory>/` applies to conversations whose default executor and working directory are the same. The working directory is encoded by replacing `/` with `-`.
+- The agent reads and writes memory through the built-in [`memory` executor](executors.md#built-in-executors), which maps the two directories to `user/` and `project/`. SSH conversations see the same memory, because it never lives on the remote machine.
+- At the start of every turn, `user/MEMORY.md` and `project/MEMORY.md` enter the context, at most 8 KiB each; a longer file is cut at the last whole line. Each file is an index with one topic per line, and the agent reads the topic files it links to when needed. Like `AGENTS.md`, each file enters the context once and comes back after the context is compacted. A missing file is skipped, and a file that cannot be read is logged as a warning without stopping the turn.
+- You can read, edit or delete the files yourself. New turns see the changes; an index already in the context is not replaced every turn.
+- To turn memory off for a conversation, uncheck `memory` in **Conversation settings → Executor** (or `/executor` in the terminal UI). Reading and writing stop together.
 
 ## MCP servers
 
@@ -96,7 +109,7 @@ Fields:
 - `id` — required, matching the file name. Letters, digits, `-` and `_` only, and no `__`.
 - `type` — `stdio`, `http` or `sse`.
 - `command`, `args`, `env` — for `stdio`. `command` is required. `env` is added on top of the inherited environment. `url` and `headers` are not allowed.
-- `url`, `headers` — for `http` and `sse`. `url` must be an `http(s)` URL. `command`, `args` and `env` are not allowed.
+- `url`, `headers` — for `http` and `sse`. `url` must be an `http(s)` URL. `command`, `args` and `env` are not allowed. `headers` are sent with every request to the server. A name that also appears in `http.headers` in `config.yaml` replaces that entry, and `""` stops sending it. Values can use the `${OPENVAALA_...}` variables described under [`http`](overview.md#http). Headers the MCP protocol itself sets, such as `Content-Type` and `Accept`, cannot be overridden.
 - `executors` — the executors the server runs on; defaults to `[local]`. Each id must be `local` or an executor from `executors/` that is not `virtual`. The built-in `openvaala` executor cannot run MCP servers.
 - `tools` — the tool names (as the server calls them) to offer the model. Defaults to all.
 - `required` — when `true`, a connection failure fails the turn. By default the server's tools are skipped instead.
@@ -104,19 +117,28 @@ Fields:
 - `startup_timeout_seconds` — how long one connection attempt may take; default 30.
 - `tool_timeout_seconds` — how long one tool call may take; default 300.
 
-Values are used as written; `${VAR}` is not expanded.
+Values are used as written; `${VAR}` is not expanded. The one exception is `${OPENVAALA_...}` in `headers`.
 
 **Where it runs.** A `stdio` server is started in the executor's working directory, on the executor's machine. `http` and `sse` servers are contacted from the executor's machine. Listing an SSH executor therefore runs the server on that remote host.
 
+**Request headers.** Requests to `http` and `sse` servers also carry the headers from `http.headers` in `config.yaml`: by default a `User-Agent`, plus `Session-Id` and `Conversation-Id` for tool calls made in a conversation. To keep one of them away from a server, set it to `""` in that server's `headers`.
+
 **Which agents get it.** An agent's `mcp_servers` list chooses servers by id; leaving it out gives the agent every server, and `[]` gives it none. See [Agents](agents.md).
 
-**Servers from your editor.** When you connect through ACP, the MCP servers configured in your editor (stdio, http or sse) are also available in that conversation. They run on the editor's machine and their messages are relayed through the connection, so they disappear when the editor disconnects. See [Editors](../guides/editors.md).
+**Servers from your editor.** When you connect through ACP, the MCP servers configured in your editor (stdio, http or sse) are also available in that conversation. They run on the editor's machine and their messages are relayed through the connection, so they disappear when the editor disconnects. Remote ones also get the `http.headers` from `config.yaml`, with the headers your editor gives them winning on a name clash. Their requests can use `${OPENVAALA_VERSION}`, `${OPENVAALA_OS}` and `${OPENVAALA_ARCH}`, but not the session and conversation variables, so a header that uses those is left out. See [Editors](../guides/editors.md).
 
 Check connection status with `/mcp` in the terminal UI or the **MCP** tab of the conversation settings in the web UI.
 
 ## Hooks
 
 Hooks run your commands at fixed points in a conversation. A hook can block a tool call, rewrite its arguments, add context for the model, or stop a turn from ending.
+
+<!-- scene: tool-hooks | A PreToolUse hook allows, blocks or rewrites a tool call before it runs -->
+```text
+agent ─ tool call ─▶ PreToolUse ─┬─ allow ─────────────▶ run ─▶ PostToolUse
+                                 ├─ block (exit 2) ────▶ reason goes back to the model
+                                 └─ rewrite (updatedInput) ─▶ run with the new arguments
+```
 
 Put any number of `*.yaml` files in `~/.config/openvaala/hooks/`; all of them apply. Other files there, such as scripts, are not read as configuration.
 

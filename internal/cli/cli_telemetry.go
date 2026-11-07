@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/VaalaCat/openvaala/internal/config"
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
@@ -42,7 +43,7 @@ const (
 )
 
 // newTelemetry 创建写日志文件、stderr 和 OTLP 的遥测，接管全局日志，返回遥测对象和关闭函数。
-func newTelemetry(ctx context.Context, cfg *config.Config, version string, stderr io.Writer) (*telemetry.Telemetry, func(context.Context) error, error) {
+func newTelemetry(ctx context.Context, cfg *config.Config, stderr io.Writer) (*telemetry.Telemetry, func(context.Context) error, error) {
 	// 1. 打开轮转日志文件，stderr 不为 nil 时再写一份文本日志；localLogger 只写这两处，记录 OTel 内部错误和关闭错误。
 	level := cfg.GetTelemetryLogLevel()
 	logFile, err := openLogFile(cfg.Telemetry.LogFile)
@@ -58,7 +59,7 @@ func newTelemetry(ctx context.Context, cfg *config.Config, version string, stder
 	}
 	localLogger := slog.New(slog.NewMultiHandler(handlers...)).With("pid", os.Getpid())
 	// 2. 创建进程的资源信息；配置了 otlp_endpoint 时创建 trace、指标和日志导出器，日志也经 OTLP 发出。
-	res, err := newTelemetryResource(version)
+	res, err := newTelemetryResource(defs.GetBuildVersion())
 	if err != nil {
 		return nil, nil, errors.Join(err, logFile.Close())
 	}

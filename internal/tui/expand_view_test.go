@@ -1060,14 +1060,16 @@ func TestFormatPatchDiff(t *testing.T) {
 	}
 }
 
-// TestInstructionHistory 检查 Skill 和 AGENTS.md 指令的历史显示。
+// TestInstructionHistory 检查 Skill、AGENTS.md 指令、记忆目录和客户端指令的历史显示。
 func TestInstructionHistory(t *testing.T) {
 	// 1. 每种指令连同用户输入保存两次，检查输入历史只有用户输入、写出的行不含指令正文，
-	// 展开内容带来源、Executor 和正文且正文只出现一次。
+	// 展开内容带来源、Executor（客户端指令没有）和正文且正文只出现一次。
 	for _, tt := range []struct {
 		name   string
 		item   *defs.Item
 		source string
+		// wantTruncatedNote 展开内容里是否带截断提示？
+		wantTruncatedNote bool
 	}{
 		{
 			"skill",
@@ -1084,6 +1086,7 @@ func TestInstructionHistory(t *testing.T) {
 				},
 			},
 			"Skill: review",
+			false,
 		},
 		{
 			"agents",
@@ -1098,6 +1101,47 @@ func TestInstructionHistory(t *testing.T) {
 				},
 			},
 			"AGENTS.md",
+			false,
+		},
+		{
+			"memory",
+			&defs.Item{
+				ID:     "i1",
+				TurnID: "t1",
+				Kind:   defs.ItemMemoryIndex,
+				MemoryIndex: &defs.MemoryIndex{
+					Path: "project/MEMORY.md",
+					Text: "saved instruction body",
+				},
+			},
+			"Memory · memory · project/MEMORY.md",
+			false,
+		},
+		{
+			"client_instruction",
+			&defs.Item{
+				ID:                "i1",
+				TurnID:            "t1",
+				Kind:              defs.ItemClientInstruction,
+				ClientInstruction: &defs.ClientInstruction{Text: "saved instruction body"},
+			},
+			"客户端指令",
+			false,
+		},
+		{
+			"memory_truncated",
+			&defs.Item{
+				ID:     "i1",
+				TurnID: "t1",
+				Kind:   defs.ItemMemoryIndex,
+				MemoryIndex: &defs.MemoryIndex{
+					Path:        "project/MEMORY.md",
+					Text:        "saved instruction body",
+					IsTruncated: true,
+				},
+			},
+			"Memory · memory · project/MEMORY.md",
+			true,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1112,13 +1156,23 @@ func TestInstructionHistory(t *testing.T) {
 				t.Fatal("instructions printed as user input")
 			}
 			expanded := strings.Join(newExpandView().getContentLines(tr, ""), "\n")
-			for _, want := range []string{tt.source, "local", "saved instruction body"} {
+			wantExecutor := "local"
+			switch tt.item.Kind {
+			case defs.ItemMemoryIndex:
+				wantExecutor = "memory"
+			case defs.ItemClientInstruction:
+				wantExecutor = ""
+			}
+			for _, want := range []string{tt.source, wantExecutor, "saved instruction body"} {
 				if !strings.Contains(expanded, want) {
 					t.Fatalf("missing %q: %s", want, expanded)
 				}
 			}
 			if strings.Count(expanded, "saved instruction body") != 1 {
 				t.Fatalf("replayed instruction duplicated: %s", expanded)
+			}
+			if strings.Contains(expanded, "超过 8 KiB，已截断") != tt.wantTruncatedNote {
+				t.Fatalf("truncated note present = %v, want %v: %s", !tt.wantTruncatedNote, tt.wantTruncatedNote, expanded)
 			}
 		})
 	}

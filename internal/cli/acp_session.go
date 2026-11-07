@@ -82,6 +82,8 @@ type acpSession struct {
 	// clientDirectory 是编辑器给的工作目录，映射前的客户端路径（acp 和编辑器在同一台机器上）：stdio 的 MCP server 在这个目录下运行；
 	// 已经打开的会话再 session/load 时更新。只由会话的事件循环读写。
 	clientDirectory string
+	// httpHeaders 是 acp 进程已加载配置里的 http.headers（合并内置默认后）：连编辑器 MCP server 的 http、sse 请求先用它，编辑器配置的同名 header 覆盖它。
+	httpHeaders map[string]string
 	// clientMCPServers 是编辑器带来的 MCP server，id 已转换成合法的 server id；转发流按 serve 请求的 server id 在这里找配置，
 	// 已经打开的会话再 session/load 时整体替换。只由会话的事件循环读写。
 	clientMCPServers []acpClientMCPServer
@@ -467,7 +469,7 @@ func (s *acpSession) getClientMCPTransport(serverID string) (mcp.Transport, erro
 	if index < 0 {
 		return nil, fmt.Errorf("the editor has no MCP server %q", serverID)
 	}
-	return getACPClientMCPTransport(s.clientMCPServers[index].Server, s.clientDirectory, os.Environ()), nil
+	return getACPClientMCPTransport(s.clientMCPServers[index].Server, s.clientDirectory, os.Environ(), s.httpHeaders), nil
 }
 
 // runRelayStream 在 serve 和本机 MCP server 之间转发一条流，结束后告知 serve。

@@ -26,7 +26,13 @@ export function getSessionPath(
 
 // SettingsSection 是设置页的一节，对应 /settings/<section>
 export type SettingsSection =
-  "general" | "providers" | "executors" | "hooks" | "skills" | "archived"
+  | "general"
+  | "appearance"
+  | "providers"
+  | "executors"
+  | "hooks"
+  | "skills"
+  | "archived"
 
 // 页面跳转只保留侧栏搜索词。
 export function getConversationListSearch(search: string): string {

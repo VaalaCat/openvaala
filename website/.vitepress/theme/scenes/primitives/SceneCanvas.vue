@@ -1,8 +1,7 @@
 <script setup lang="ts">
 // SceneCanvas：每个场景的 SVG 画布和播放控制。
 // viewBox 画布坐标；period 循环周期（毫秒）；label 给读屏软件的整体描述。
-// 挂载后为画布内所有 v-track 元素创建同一周期的动画，进入视口播放、离开视口暂停；
-// 要求减少动效时不创建动画，画面停在模板写的静态状态。画布内的 CSS 动画同样随 is-playing 暂停。
+// 挂载后为画布内所有 v-track 元素创建同一周期的动画，进入视口播放、离开视口暂停；画布内的 CSS 动画同样随 is-playing 暂停。
 import { onMounted, onUnmounted, ref } from "vue"
 import { createTrackAnimations } from "./motion"
 
@@ -13,19 +12,11 @@ const isPlaying = ref(false)
 
 let animations: Animation[] = []
 let visibilityObserver: IntersectionObserver | undefined
-let motionPreference: MediaQueryList | undefined
 let isVisible = false
 
-// updatePlayback 在可见、页面处于前台且允许动效时播放；减少动效时恢复静态画面。
+// updatePlayback 在画布可见且页面处于前台时播放，否则暂停。
 function updatePlayback() {
-  if (!rootEl.value) return
-  if (motionPreference?.matches) {
-    for (const animation of animations) animation.cancel()
-    animations = []
-  } else if (animations.length === 0) {
-    animations = createTrackAnimations(rootEl.value, props.period)
-  }
-  isPlaying.value = isVisible && !document.hidden && !motionPreference?.matches
+  isPlaying.value = isVisible && !document.hidden
   for (const animation of animations) {
     if (isPlaying.value) animation.play()
     else animation.pause()
@@ -40,17 +31,16 @@ function handleVisibility(entries: IntersectionObserverEntry[]) {
 
 onMounted(() => {
   if (!rootEl.value) return
-  motionPreference = window.matchMedia("(prefers-reduced-motion: reduce)")
-  motionPreference.addEventListener("change", updatePlayback)
+  // 1. 创建暂停在起点的动画。
+  animations = createTrackAnimations(rootEl.value, props.period)
+  // 2. 按页面前后台和画布可见性播放或暂停。
   document.addEventListener("visibilitychange", updatePlayback)
-  updatePlayback()
   visibilityObserver = new IntersectionObserver(handleVisibility, { threshold: 0.2 })
   visibilityObserver.observe(rootEl.value)
 })
 
 onUnmounted(() => {
   visibilityObserver?.disconnect()
-  motionPreference?.removeEventListener("change", updatePlayback)
   document.removeEventListener("visibilitychange", updatePlayback)
   for (const animation of animations) animation.cancel()
 })

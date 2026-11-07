@@ -25,6 +25,7 @@ compact_model:                       # 可选；写上下文摘要的模型
 tools: [read_file, bash, read_command_output, write_stdin, stop_command, list_commands]
 skills: [code-review]                # 可选；默认全部 skill
 mcp_servers: [serena]                # 可选；默认全部；[] 表示不用
+max_steps: 50                        # 可选；默认 0，不限
 ```
 
 ## 字段
@@ -37,6 +38,7 @@ mcp_servers: [serena]                # 可选；默认全部；[] 表示不用
 - `tools`：这个 Agent 能用的文件和命令工具。不写表示全部能用。见[限制 Agent 能用的工具](tools.md#限制-agent-能用的工具)。
 - `skills`：这个 Agent 能用的 skill，按名字写（插件里的 skill 写成 `<plugin>:<skill>`）。不写表示全部能用。
 - `mcp_servers`：这个 Agent 能用的 MCP server id。不写表示全部能用，包括编辑器提供的；写 `[]` 表示都不用。每个 id 都必须在 `mcp_servers/` 或某个插件里存在（disabled 的也算）。
+- `max_steps`：一轮最多调用几次模型。默认 `0` 表示不限，不能为负数。到最后一次调用时，Agent 不能再用工具，模型会总结已经做完的和还剩下的。这一轮正常结束，你说继续就开始新的一轮。
 
 每个模型引用都必须对应一个已配置的模型，否则配置加载失败。
 

@@ -470,13 +470,14 @@ func (f *webUIFixture) readServeLog() string {
 	return string(content)
 }
 
-// getServeEnvironment 返回 serve 的环境：HOME 换成临时目录，去掉 OPENVAALA_*、XDG_*、CODEX_HOME 和 PASEO_HOME。
+// getServeEnvironment 返回 serve 的环境：HOME 换成临时目录，SHELL 固定为 /bin/sh（终端里的 shell 不受开发机配置影响，
+// 临时 HOME 里没有 rc 文件，zsh 会弹出新用户向导），去掉 OPENVAALA_*、XDG_*、CODEX_HOME 和 PASEO_HOME。
 func getServeEnvironment(home string) []string {
 	// 1. 复制当前环境并过滤。
-	environment := []string{"HOME=" + home}
+	environment := []string{"HOME=" + home, "SHELL=/bin/sh"}
 	for _, entry := range os.Environ() {
 		name, _, _ := strings.Cut(entry, "=")
-		if name == "HOME" || name == "CODEX_HOME" || name == "PASEO_HOME" || strings.HasPrefix(name, "OPENVAALA_") || strings.HasPrefix(name, "XDG_") {
+		if name == "HOME" || name == "SHELL" || name == "CODEX_HOME" || name == "PASEO_HOME" || strings.HasPrefix(name, "OPENVAALA_") || strings.HasPrefix(name, "XDG_") {
 			continue
 		}
 		environment = append(environment, entry)

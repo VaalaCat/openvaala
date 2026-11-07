@@ -86,7 +86,7 @@ type ListConversationsResult struct {
 	NextCursor dao.RecordCursor[defs.ConversationID]
 }
 
-// ForkConversationRequest 把对话复制到截取点为止；BeforeTurnID 和 LastTurnID 最多填一个，都不填时复制全部已结束的轮次。
+// ForkConversationRequest 把对话复制到截取点为止；BeforeTurnID 和 LastTurnID 最多填一个，都不填时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
 type ForkConversationRequest struct {
 	ConversationID defs.ConversationID
 	// BeforeTurnID 复制到这一轮之前（不含），回退重来用。
@@ -99,6 +99,8 @@ type ForkConversationRequest struct {
 	ExecutorSettings defs.ExecutorSettings
 	// Environment 的含义同 CreateConversationRequest。
 	Environment []string
+	// Ephemeral 是否分叉成临时对话？含义同 CreateConversationRequest.Ephemeral。
+	Ephemeral bool
 }
 
 // SetConversationArchivedRequest 归档（Archived 为 true）或取消归档一个已保存的对话。
@@ -121,6 +123,13 @@ type SubmitInputRequest struct {
 	Content []*defs.Content
 }
 
+// AppendContextItemsRequest 指定要注入对话根 Session 下一轮上下文的 Item。
+type AppendContextItemsRequest struct {
+	ConversationID defs.ConversationID
+	// Items 可以是任何不需要模型调用、也不由运行时自己写入的种类，载荷必须有效；ID 由调用方生成，还没分配 TurnID 和 ModelCallID。
+	Items []*defs.Item
+}
+
 // CreateConversationRequest 以 AgentName 对应的 Agent 新建对话。
 type CreateConversationRequest struct {
 	AgentName string
@@ -130,9 +139,10 @@ type CreateConversationRequest struct {
 	ExecutorSettings defs.ExecutorSettings
 	// Environment 为 nil 时本机命令继承 serve 进程的环境。
 	Environment []string
-	// Ephemeral 是否建临时对话？临时对话不存盘、不进对话列表，没有 Executor 和 Skill，ExecutorSettings 原样存进记录、不装配，
-	// Environment 不使用；没有订阅者、也没有在跑的 Turn 一段时间后由服务端丢弃。
+	// Ephemeral 是否建临时对话？临时对话只在服务端内存里，不进对话列表；没有订阅者、也没有在跑的 Turn 一段时间后由服务端丢弃。
 	Ephemeral bool
+	// WithoutExecutors 是否不装配 Executor 和 Skill？为 true 时 ExecutorSettings 原样存进记录、不装配，Environment 不使用。
+	WithoutExecutors bool
 }
 
 // OpenConversationRequest 打开一个已有对话，服务端按对话记录里的 Executor 设置打开。
@@ -157,6 +167,8 @@ type TerminalOpenRequest struct {
 	Rows, Cols uint16
 	// Environment 为 nil 时 local Executor 的 shell 继承 serve 进程的环境。
 	Environment []string
+	// ConversationID 是打开终端的对话，只决定其他客户端把标签显示在哪；为空表示不属于任何对话。
+	ConversationID defs.ConversationID
 }
 
 // GetSkillsRequest 选择已有对话的 Skills；尚未建立对话时用 AgentName 和 ExecutorSettings 查草稿 Skills。
@@ -307,7 +319,16 @@ type RPCFrame struct {
 	Payload      json.RawMessage
 }
 
+// TerminalsChanged 由 Client 在订阅完成、列表变化、连接丢失或订阅失败时交付；未知时不把空切片当成空列表。
+// Terminals 是 serve 上全部运行中的终端，不分对话。
+type TerminalsChanged struct {
+	IsKnown   bool
+	Terminals []runtimeprotocol.TerminalItem
+	Err       error
+}
+
 func (*RunningConversationsChanged) isClientEvent() {}
+func (*TerminalsChanged) isClientEvent()            {}
 func (*RPCLogChanged) isClientEvent()               {}
 
 // SessionSynced 由 Client 在打开对话或重连后完成同步时发出，紧跟在 ConversationSynced 之后；之后的 ItemsSaved 紧接 Items。
@@ -449,6 +470,12 @@ type ClientMCPDisconnectRequested struct {
 type TerminalOutput struct {
 	TerminalID string
 	Data       []byte
+	// NextCursor 是这批输出之后的位置，断线重连从这里续读。
+	NextCursor uint64
+	// Truncated 表示请求的位置已被 serve 丢弃，Data 从最早保留处开始。
+	Truncated bool
+	// HasMore 表示接入时已有的输出还没发完；为 false 时回放结束，之后的新输出都是 false。
+	HasMore bool
 }
 
 // TerminalExited 由 Client 在收到 serve 的 terminal/exited 通知时立即发出（不经同步暂存）：TerminalID 这个终端的进程已结束，此后不再有它的事件。
@@ -534,6 +561,10 @@ type notificationParams struct {
 	TerminalID string `json:"terminal_id"`
 	Data       []byte `json:"data"`
 	ExitCode   int    `json:"exit_code"`
+	// NextCursor、Truncated 与 HasMore 是 terminal/output 带的输出位置和回放状态。
+	NextCursor uint64 `json:"next_cursor"`
+	Truncated  bool   `json:"truncated"`
+	HasMore    bool   `json:"has_more"`
 }
 
 // receivedNotification 是一条已解码的通知。
@@ -618,15 +649,27 @@ func (*syncFinished) isClientLoopInput()              {}
 // reconnectRequested 由调用方点击重连时触发，循环确认是否需要跳过退避。
 type reconnectRequested struct{ reply chan struct{} }
 
-// runningSubscribeRequested 由调用方启用全局运行集合时触发，循环登记恢复意图后回复。
-type runningSubscribeRequested struct{ reply chan struct{} }
+// globalSubscribeRequested 由调用方启用一种全局订阅时触发，循环登记恢复意图后回复。
+type globalSubscribeRequested[T any] struct {
+	subscription *globalSubscription[T]
+	reply        chan struct{}
+}
 
-// runningConversationsSubscribed 由全局订阅请求完成后触发，携带连接和本次订阅的结果。
-type runningConversationsSubscribed struct {
-	connection *clientConnection
-	generation uint64
-	result     runtime.RunningConversations
-	err        error
+// globalSubscribed 由全局订阅请求完成后触发，携带连接和本次订阅的结果。
+type globalSubscribed[T any] struct {
+	subscription *globalSubscription[T]
+	connection   *clientConnection
+	generation   uint64
+	result       T
+	err          error
+}
+
+// globalSubscriptionPrepared 由重试任务退订完成时触发；循环清除旧订阅通知后允许重新订阅。
+type globalSubscriptionPrepared[T any] struct {
+	subscription *globalSubscription[T]
+	connection   *clientConnection
+	generation   uint64
+	reply        chan bool
 }
 
 // rpcLogRequested 由调用方读取、清空或暂停调试记录时触发。
@@ -643,16 +686,9 @@ const (
 	rpcLogPause rpcLogOperation = "pause"
 )
 
-func (*reconnectRequested) isClientLoopInput()             {}
-func (*runningSubscribeRequested) isClientLoopInput()      {}
-func (*runningConversationsSubscribed) isClientLoopInput() {}
-func (*rpcLogRequested) isClientLoopInput()                {}
+func (*reconnectRequested) isClientLoopInput() {}
+func (*rpcLogRequested) isClientLoopInput()    {}
 
-// runningSubscriptionPrepared 由重试任务退订完成时触发；循环清除旧订阅通知后允许重新订阅。
-type runningSubscriptionPrepared struct {
-	connection *clientConnection
-	generation uint64
-	reply      chan bool
-}
-
-func (*runningSubscriptionPrepared) isClientLoopInput() {}
+func (*globalSubscribeRequested[T]) isClientLoopInput()   {}
+func (*globalSubscribed[T]) isClientLoopInput()           {}
+func (*globalSubscriptionPrepared[T]) isClientLoopInput() {}

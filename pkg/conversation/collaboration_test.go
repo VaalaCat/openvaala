@@ -719,7 +719,7 @@ func TestGetSessionInfosUsesSelectedModelWindow(t *testing.T) {
 			store, model := openConversationDAO(t), newConversationModel(t)
 			opt := conversationOpt(store, model)
 			opt.Definitions.Models[0].ContextWindow = 8000 // test/test 的窗口为 8000。
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}

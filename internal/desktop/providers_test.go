@@ -2,6 +2,9 @@ package desktop
 
 import (
 	"context"
+	"maps"
+	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
@@ -92,6 +95,149 @@ func TestProviderDraftValues(t *testing.T) {
 				if saved.Thinking == nil || *saved.Thinking || saved.ReasoningEfforts == nil || len(saved.ReasoningEfforts) != 0 {
 					t.Fatalf("explicit empty/false lost: %+v", saved)
 				}
+			}
+		})
+	}
+}
+
+// TestProviderDraftHeaders 检查请求头行与配置的互相转换：行按名称排序，保存时名称去空白、空名称的行忽略、空值照常保留。
+func TestProviderDraftHeaders(t *testing.T) {
+	// 1. 从配置生成草稿，追加编辑行后写回，比较保存的 headers。
+	for _, tt := range []struct {
+		name    string
+		headers map[string]string
+		added   []*providerHeaderDraft
+		want    map[string]string
+	}{
+		{"round_trip", map[string]string{"X-Title": "MyTool", "Session-Id": ""}, nil, map[string]string{"X-Title": "MyTool", "Session-Id": ""}},
+		{"skip_empty_name_trim_name", nil, []*providerHeaderDraft{{Name: "  ", Value: "x"}, {Name: " X-Team ", Value: "infra"}}, map[string]string{"X-Team": "infra"}},
+		{"only_blank_rows_omit_headers", nil, []*providerHeaderDraft{{}}, nil},
+		{"no_headers", nil, nil, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			draft := providerToDraft(defs.ProviderConfig{ID: "provider", Headers: tt.headers, Models: map[string]*defs.ProviderModelConfig{"model": {}}})
+			names := make([]string, len(draft.Headers))
+			for index, header := range draft.Headers {
+				names[index] = header.Name
+			}
+			if !slices.IsSorted(names) || len(names) != len(tt.headers) {
+				t.Fatalf("header rows = %v, want sorted names of %v", names, tt.headers)
+			}
+			// 2. 刚载入的草稿与基线逐字段相等，基线是独立的副本。
+			baseline := cloneProviderDraft(draft)
+			if !reflect.DeepEqual(draft, baseline) {
+				t.Fatalf("loaded draft differs from baseline: %+v vs %+v", draft.Headers, baseline.Headers)
+			}
+			if len(baseline.Headers) > 0 {
+				baseline.Headers[0].Value = "changed"
+				if draft.Headers[0].Value == "changed" {
+					t.Fatal("baseline shares header rows with the draft")
+				}
+			}
+			// 3. 追加编辑行后写回配置。
+			draft.Headers = append(draft.Headers, tt.added...)
+			provider, err := draftToProvider(draft, defs.ModelDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !maps.Equal(provider.Headers, tt.want) || (provider.Headers == nil) != (tt.want == nil) {
+				t.Fatalf("headers = %#v, want %#v", provider.Headers, tt.want)
+			}
+		})
+	}
+}
+
+// TestProviderHeadersForm 检查服务表单的请求头小节：已有行显示，添加和删除作用在草稿上，名称输入写回对应行。
+func TestProviderHeadersForm(t *testing.T) {
+	// 1. 每个用例从一条已保存的请求头开始，点击实际控件。
+	for _, tt := range []struct {
+		name   string
+		action func(t *testing.T, tester *ui.Tester)
+		want   []providerHeaderDraft
+	}{
+		{"add", func(t *testing.T, tester *ui.Tester) {
+			// 添加行的标题和按钮同名，按钮与删除按钮右对齐、同宽，取删除按钮的横坐标和标题所在行的纵坐标点击。
+			title, found := tester.Find("添加请求头")
+			remove, foundRemove := tester.Find("删除请求头")
+			if !found || !foundRemove {
+				t.Fatalf("add or remove header missing in %q", tester.Texts())
+			}
+			tester.ClickAt(remove.X+remove.W/2, title.Y+title.H/2)
+		}, []providerHeaderDraft{{"X-Title", "MyTool"}, {}}},
+		{"remove", func(t *testing.T, tester *ui.Tester) {
+			if err := tester.Click("删除请求头"); err != nil {
+				t.Fatal(err)
+			}
+		}, nil},
+		{"edit_name", func(t *testing.T, tester *ui.Tester) {
+			if err := tester.Click("名称"); err != nil {
+				t.Fatal(err)
+			}
+			tester.Key(ui.Cmd, ui.KeyA)
+			tester.Type("X-Team")
+		}, []providerHeaderDraft{{"X-Team", "MyTool"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.navigate("providers")
+			d.providerDraft = providerToDraft(defs.ProviderConfig{ID: "sample", Protocol: "openai_chat", Headers: map[string]string{"X-Title": "MyTool"}})
+			d.providerBaseline = cloneProviderDraft(d.providerDraft)
+			tester := ui.NewTester(d.view, 1280, 1600)
+			tester.SetLocale("zh-Hans")
+			for _, text := range []string{"请求头", "添加请求头", "值可写 ${OPENVAALA_SESSION_ID} 等变量；值留空表示不发全局同名的 header。"} {
+				if !tester.HasText(text) {
+					t.Fatalf("missing %q in %q", text, tester.Texts())
+				}
+			}
+			tt.action(t, tester)
+			var got []providerHeaderDraft
+			for _, header := range d.providerDraft.Headers {
+				got = append(got, *header)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("header rows = %+v, want %+v", got, tt.want)
+			}
+			if !d.isProviderDirty() {
+				t.Fatal("editing header rows did not mark the provider dirty")
+			}
+		})
+	}
+}
+
+// providerFetchRecorder 记录拉取上游模型时收到的 Provider。
+type providerFetchRecorder struct {
+	runtimeclient.Client
+	provider defs.ProviderConfig
+}
+
+func (r *providerFetchRecorder) FetchProviderModels(_ context.Context, provider defs.ProviderConfig) (map[string]*defs.ProviderModelConfig, error) {
+	r.provider = provider
+	return nil, nil
+}
+
+// TestProviderFetchModelsHeaders 检查拉取上游模型用正在编辑的请求头，未保存的修改也生效。
+func TestProviderFetchModelsHeaders(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		headers []*providerHeaderDraft
+		want    map[string]string
+	}{
+		{"edited_rows", []*providerHeaderDraft{{Name: " X-Title ", Value: "MyTool"}, {Name: "Session-Id"}, {Name: " ", Value: "dropped"}}, map[string]string{"X-Title": "MyTool", "Session-Id": ""}},
+		{"no_rows", nil, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			recorder := &providerFetchRecorder{}
+			d.client = recorder
+			d.providerDraft = providerToDraft(defs.ProviderConfig{ID: "provider", Protocol: "openai_chat", BaseURL: "https://upstream.example/v1"})
+			d.providerDraft.Headers = tt.headers
+			d.fetchProviderModels()
+			d.tasks.Wait()
+			if !maps.Equal(recorder.provider.Headers, tt.want) || (recorder.provider.Headers == nil) != (tt.want == nil) {
+				t.Fatalf("fetched headers = %#v, want %#v", recorder.provider.Headers, tt.want)
+			}
+			if recorder.provider.BaseURL != "https://upstream.example/v1" {
+				t.Fatalf("fetched provider = %+v", recorder.provider)
 			}
 		})
 	}

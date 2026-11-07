@@ -59,7 +59,6 @@ models:
 
 OpenVaala speaks three wire protocols to model providers, alongside the client and tool protocols it supports:
 
-<!-- scene: ecosystem | Models, clients and tools plug into one runtime -->
 ```text
  models             clients          tools
  openai_responses   terminal, web,   built-in tools
@@ -89,7 +88,17 @@ Use these exact names in `protocol` and as keys of `endpoints`:
 - `base_url` — required. An `http` or `https` URL including the version prefix, such as `https://api.openai.com/v1`. It may not contain a user name, a query string or a `#` fragment. OpenVaala appends the protocol path shown above.
 - `endpoints` — optional full request URLs per protocol, used instead of `base_url` for that protocol. They may point to another host. Each value must be an `http(s)` URL with a real path (not just a host or `/`), and the same restrictions as `base_url` apply.
 - `api_key` — the key sent to the provider, stored in plain text. Leave it empty for local servers that need none.
+- `headers` — optional request headers sent only to this provider, with its model requests and its model list. A name that also appears in `http.headers` in `config.yaml` replaces that entry, and `""` stops sending it. Values can use the `${OPENVAALA_...}` variables described under [`http`](overview.md#http).
 - `models` — required, at least one entry. Keys are model ids (letters, digits, `-`, `_`, `.`). A model with no settings can be written as `name: {}`.
+
+For example, an extra header for one gateway, and no `Session-Id` for it:
+
+```yaml
+# ~/.config/openvaala/models/openrouter.yaml (excerpt)
+headers:
+  X-Title: MyTool
+  Session-Id: ""
+```
 
 ## Model fields
 

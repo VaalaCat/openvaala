@@ -50,11 +50,11 @@ For socket and WebSocket listeners it prints the `codex --remote <url>` command 
 
 ## What maps and what doesn't
 
-- **Threads** are conversations; a subagent appears as its own thread. Starting, resuming, forking, archiving, renaming, deleting, compacting, steering and interrupting all work.
+- **Threads** are conversations; a subagent appears as its own thread. Starting, resuming, forking, archiving, renaming, deleting, compacting, steering and interrupting all work, and so do the `/btw` and `/side` side conversations.
 - **Models** listed in Codex are your OpenVaala models (`provider/model`), with their reasoning efforts. Choosing a model or effort in Codex applies to that connection and is not written to your configuration.
 - **Approvals and sandbox modes** are ignored. OpenVaala runs tools without asking and reports its sandbox as full access; see [Approvals](../configuration/tools.md#approvals).
 - **Images** can be attached as data URLs or local image files.
-- **Not supported:** dynamic tools, ephemeral forks, Codex plugins and apps, and permission profiles.
+- **Not supported:** dynamic tools, Codex plugins and apps, and permission profiles.
 - **Paths:** with [`client.path_mappings`](../configuration/overview.md#client), the thread's working directory is translated; paths inside command and file-change items are shown as they are on the server.
 
 The agent is `run.agent_name` (or `--agent`); its tools, skills and MCP servers are configured in OpenVaala, not in Codex.

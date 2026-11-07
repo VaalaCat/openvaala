@@ -178,6 +178,8 @@ openvaala app --native    # opens the native interface instead
 openvaala --native        # same
 ```
 
+The packaged app names that executable `openvaala` (`OpenVaala` on macOS). `go install github.com/VaalaCat/openvaala/cmd/openvaala-desktop@latest` installs the same commands as a binary named `openvaala-desktop`. See [Install](../getting-started/install.md).
+
 In the desktop build, `tui` starts the terminal UI. `--url` is not accepted for the desktop window, which always uses the local runtime server. See [Desktop](../guides/desktop.md).
 
 ## Environment variables

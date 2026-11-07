@@ -2,6 +2,8 @@ package config_test
 
 import (
 	"cmp"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
@@ -15,9 +17,11 @@ import (
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v3"
 )
@@ -432,6 +436,12 @@ func TestConfigDefinitionsRejectInvalidFilesAtLoad(t *testing.T) {
 			wantFile: "mcp_servers/a.yaml",
 		},
 		{
+			name:     "mcp_headers_unknown_variable",
+			files:    map[string]string{"mcp_servers/a.yaml": httpServer + "headers:\n  X-Trace: \"${OPENVAALA_TURN_ID}\"\n"},
+			wantErr:  "headers.X-Trace: unknown variable OPENVAALA_TURN_ID",
+			wantFile: "mcp_servers/a.yaml",
+		},
+		{
 			name:     "mcp_server_unknown_field",
 			files:    map[string]string{"mcp_servers/a.yaml": stdioServer + "unknown: x\n"},
 			wantErr:  "invalid YAML, field type or unknown field",
@@ -514,6 +524,48 @@ func TestConfigDefinitionsRejectInvalidFilesAtLoad(t *testing.T) {
 			files:    map[string]string{"hooks/go.yaml": preToolUseHook + "          command: echo\n          unknown: x\n"},
 			wantErr:  "invalid YAML, field type or unknown field",
 			wantFile: "hooks/go.yaml",
+		},
+		{
+			name:     "provider_headers_unknown_variable",
+			body:     "id: local\nbase_url: https://example.com\napi_key: secret-value\nheaders:\n  X-Title: \"${OPENVAALA_VERSON}\"\nmodels:\n  MyModel: {}\n",
+			wantErr:  "headers.X-Title: unknown variable OPENVAALA_VERSON",
+			wantFile: "models/local.yaml",
+		},
+		{
+			name:     "provider_headers_invalid_name",
+			body:     "id: local\nbase_url: https://example.com\napi_key: secret-value\nheaders:\n  X Title: MyTool\nmodels:\n  MyModel: {}\n",
+			wantErr:  "headers.X Title: invalid header name",
+			wantFile: "models/local.yaml",
+		},
+		{
+			name:     "provider_headers_value_with_newline",
+			body:     "id: local\nbase_url: https://example.com\napi_key: secret-value\nheaders:\n  X-Title: \"My\\nTool\"\nmodels:\n  MyModel: {}\n",
+			wantErr:  "headers.X-Title: invalid header value",
+			wantFile: "models/local.yaml",
+		},
+		{
+			name:     "provider_headers_duplicate_name_differing_in_case",
+			body:     "id: local\nbase_url: https://example.com\napi_key: secret-value\nheaders:\n  x-title: a\n  X-Title: b\nmodels:\n  MyModel: {}\n",
+			wantErr:  "headers.X-Title: duplicate header name",
+			wantFile: "models/local.yaml",
+		},
+		{
+			name:     "mcp_headers_invalid_name",
+			files:    map[string]string{"mcp_servers/a.yaml": httpServer + "headers:\n  X Trace: a\n"},
+			wantErr:  "headers.X Trace: invalid header name",
+			wantFile: "mcp_servers/a.yaml",
+		},
+		{
+			name:     "mcp_headers_value_with_newline",
+			files:    map[string]string{"mcp_servers/a.yaml": httpServer + "headers:\n  X-Trace: \"a\\nb\"\n"},
+			wantErr:  "headers.X-Trace: invalid header value",
+			wantFile: "mcp_servers/a.yaml",
+		},
+		{
+			name:     "mcp_headers_duplicate_name_differing_in_case",
+			files:    map[string]string{"mcp_servers/a.yaml": httpServer + "headers:\n  x-trace: a\n  X-Trace: b\n"},
+			wantErr:  "headers.X-Trace: duplicate header name",
+			wantFile: "mcp_servers/a.yaml",
 		},
 		{
 			name: "mismatched_id",
@@ -987,8 +1039,10 @@ func TestConfigAgentDefinitions(t *testing.T) {
 		compactModel     string
 		tools            string
 		skills           string
+		maxSteps         string
 		wantErr          string
 		wantCompactModel string
+		wantMaxSteps     int
 		wantToolNames    []string
 		wantSkillNames   []string
 	}{
@@ -1033,6 +1087,18 @@ func TestConfigAgentDefinitions(t *testing.T) {
 			skills:         "skills: [code-review]\n",
 			wantSkillNames: []string{"code-review"},
 		},
+		{
+			name:          "max_steps_selected",
+			summaryWindow: "2000",
+			maxSteps:      "max_steps: 50\n",
+			wantMaxSteps:  50,
+		},
+		{
+			name:          "max_steps_negative_rejected",
+			summaryWindow: "2000",
+			maxSteps:      "max_steps: -1\n",
+			wantErr:       "agent max_steps must not be negative",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			directory := writeDefinitionConfig(t)
@@ -1045,6 +1111,7 @@ func TestConfigAgentDefinitions(t *testing.T) {
 			}
 			agentBody += tt.tools
 			agentBody += tt.skills
+			agentBody += tt.maxSteps
 			for name, body := range map[string]string{"models/local.yaml": models, "agents/default.yaml": agentBody} {
 				if err := os.WriteFile(filepath.Join(directory, name), []byte(body), 0600); err != nil {
 					t.Fatal(err)
@@ -1081,6 +1148,9 @@ func TestConfigAgentDefinitions(t *testing.T) {
 				}
 			} else if definition.CompactModel.ModelID != tt.wantCompactModel {
 				t.Fatalf("compact model = %s, want %s", definition.CompactModel, tt.wantCompactModel)
+			}
+			if definition.MaxSteps != tt.wantMaxSteps {
+				t.Fatalf("max steps = %d, want %d", definition.MaxSteps, tt.wantMaxSteps)
 			}
 			if !slices.Equal(definition.ToolNames, tt.wantToolNames) {
 				t.Fatalf("tool names = %v, want %v", definition.ToolNames, tt.wantToolNames)
@@ -1500,6 +1570,12 @@ func TestConfigExecutors(t *testing.T) {
 			wantErr: "reserved",
 		},
 		{
+			name:    "reserved_memory",
+			file:    "memory.yaml",
+			body:    "id: memory\nkind: virtual\ndescription: 记忆\n",
+			wantErr: `executor id "memory" is reserved`,
+		},
+		{
 			name:    "id_mismatch",
 			file:    "other.yaml",
 			body:    "id: sandbox\nkind: local\ndescription: 试验目录\nworkspace_directory: {{workspace}}\n",
@@ -1571,6 +1647,18 @@ func TestConfigExecutors(t *testing.T) {
 	}
 }
 
+// openExecutorWorkspace 用 Executor 打开工作区，测试结束时关闭。
+func openExecutorWorkspace(t *testing.T, opened executor.Executor, request *executor.NewWorkspaceRequest) workspace.Workspace {
+	t.Helper()
+	// 1. 打开工作区，失败时结束测试，登记关闭。
+	executorWorkspace, err := opened.NewWorkspace(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = executorWorkspace.Close() })
+	return executorWorkspace
+}
+
 // TestConfigRuntimeDefinitions 验证 GetRuntimeDefinitions 组装的 Executor 和 skill：Executor 的顺序和字段，skill 目录的优先级和插件前缀；skills/ 里的坏 skill 报错，插件里的跳过。
 func TestConfigRuntimeDefinitions(t *testing.T) {
 	// 1. 准备 Executor、skill 和插件文件。
@@ -1595,32 +1683,57 @@ func TestConfigRuntimeDefinitions(t *testing.T) {
 				".ssh/id_ed25519":        "private key",
 			},
 			check: func(t *testing.T, home string, definitions *runtime.Definitions) {
-				var ids []string
-				for _, executor := range definitions.Executors {
-					ids = append(ids, executor.ID)
+				executors, err := definitions.Executors.GetExecutors(t.Context(), "")
+				if err != nil {
+					t.Fatal(err)
 				}
-				if want := []string{defs.LocalExecutorID, config.BuiltinExecutorID, "gpu", "ssh-dev"}; !slices.Equal(ids, want) {
+				var ids []string
+				for _, listed := range executors {
+					ids = append(ids, listed.GetDefinition().ID)
+				}
+				if want := []string{defs.LocalExecutorID, config.BuiltinExecutorID, defs.MemoryExecutorID, "gpu", "ssh-dev"}; !slices.Equal(ids, want) {
 					t.Fatalf("executor ids = %v, want %v", ids, want)
 				}
-				local, builtin, gpu, sshDev := definitions.Executors[0], definitions.Executors[1], definitions.Executors[2], definitions.Executors[3]
+				local, builtin, memory, gpu, sshDev := executors[0].GetDefinition(), executors[1].GetDefinition(), executors[2].GetDefinition(), executors[3].GetDefinition(), executors[4].GetDefinition()
 				if local.Kind != defs.ExecutorKindLocal || local.WorkspaceDirectory != filepath.Join(home, "work") || local.Description != prompt.LocalExecutorDescription {
 					t.Fatalf("local = %+v, want local kind, the configured server.workspace_directory and the local description", local)
 				}
 				if builtin.Kind != defs.ExecutorKindVirtual || builtin.WorkspaceDirectory != "/workspace" || builtin.Description != prompt.BuiltinExecutorDescription {
 					t.Fatalf("builtin = %+v, want virtual kind rooted at /workspace with the builtin description", builtin)
 				}
-				if content, found := builtin.Files["/skills/openvaala/SKILL.md"]; !found || len(content) == 0 {
-					t.Fatalf("builtin files = %v, want /skills/openvaala/SKILL.md", slices.Sorted(maps.Keys(builtin.Files)))
+				if memory.Kind != defs.ExecutorKindMemory || memory.WorkspaceDirectory != "" || memory.Description != prompt.MemoryExecutorDescription {
+					t.Fatalf("memory = %+v, want memory kind without a workspace directory and with the memory description", memory)
 				}
-				if gpu.Kind != defs.ExecutorKindVirtual || gpu.Description != "实验环境" || gpu.WorkspaceDirectory != "/workspace" || gpu.SSH != nil || len(gpu.Files) != 0 {
-					t.Fatalf("gpu = %+v, want a virtual executor without ssh settings or preloaded files", gpu)
+				if gpu.Kind != defs.ExecutorKindVirtual || gpu.Description != "实验环境" || gpu.WorkspaceDirectory != "/workspace" {
+					t.Fatalf("gpu = %+v, want a virtual executor rooted at /workspace", gpu)
 				}
-				wantSSH := &defs.SSHExecutorDefinition{
-					Address:      "me@dev:22",
-					IdentityFile: filepath.Join(home, ".ssh/id_ed25519"),
+				if sshDev.Kind != defs.ExecutorKindSSH || sshDev.WorkspaceDirectory != "/srv/app" {
+					t.Fatalf("ssh-dev = %+v, want ssh kind in /srv/app", sshDev)
 				}
-				if sshDev.Kind != defs.ExecutorKindSSH || sshDev.WorkspaceDirectory != "/srv/app" || !reflect.DeepEqual(sshDev.SSH, wantSSH) {
-					t.Fatalf("ssh-dev = %+v (ssh %+v), want ssh kind in /srv/app with %+v", sshDev, sshDev.SSH, wantSSH)
+				// 内置文档只在 builtin 的工作区里。
+				const builtinSkillPath = "/skills/openvaala/SKILL.md"
+				if _, err := openExecutorWorkspace(t, executors[1], &executor.NewWorkspaceRequest{}).ReadFile(t.Context(), builtinSkillPath, 0, 1); err != nil {
+					t.Fatalf("builtin read %s: %v", builtinSkillPath, err)
+				}
+				if _, err := openExecutorWorkspace(t, executors[3], &executor.NewWorkspaceRequest{}).ReadFile(t.Context(), builtinSkillPath, 0, 1); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("gpu read %s error = %v, want the file missing", builtinSkillPath, err)
+				}
+				// memory 写到数据目录下的 memory。
+				userMemoryPath := filepath.Join(home, ".local", "share", "openvaala", "memory", "user", "MEMORY.md")
+				if err := os.MkdirAll(filepath.Dir(userMemoryPath), 0700); err != nil {
+					t.Fatal(err)
+				}
+				memoryWorkspace := openExecutorWorkspace(t, executors[2], &executor.NewWorkspaceRequest{MemoryProjectName: "projects/demo"})
+				if err := memoryWorkspace.WriteFile(t.Context(), "/user/MEMORY.md", []byte("- 回复用中文\n"), 0600, false); err != nil {
+					t.Fatal(err)
+				}
+				if content, err := os.ReadFile(userMemoryPath); err != nil || string(content) != "- 回复用中文\n" {
+					t.Fatalf("memory file = %q, %v; want the written content", content, err)
+				}
+				// ssh-dev 用配置里的地址和私钥连接；私钥内容无效，报错时不用联网。
+				_, err = openExecutorWorkspace(t, executors[4], &executor.NewWorkspaceRequest{RootDirectory: "/srv/app"}).GetMetadata(t.Context(), "/srv/app", true)
+				if identityFile := filepath.Join(home, ".ssh/id_ed25519"); err == nil || !strings.Contains(err.Error(), "connect me@dev:22") || !strings.Contains(err.Error(), identityFile) {
+					t.Fatalf("ssh-dev connect error = %v, want me@dev:22 and %s", err, identityFile)
 				}
 			},
 		},
@@ -1631,7 +1744,11 @@ func TestConfigRuntimeDefinitions(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if got := definitions.Executors[0].WorkspaceDirectory; got != workingDirectory {
+				executors, err := definitions.Executors.GetExecutors(t.Context(), "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := executors[0].GetDefinition().WorkspaceDirectory; got != workingDirectory {
 					t.Fatalf("local directory = %q, want the working directory %q", got, workingDirectory)
 				}
 			},
@@ -1768,7 +1885,7 @@ func TestConfigMCPServers(t *testing.T) {
 					ID:             "c",
 					Type:           mcpclient.ServerTransportSSE,
 					URL:            "https://example.com/sse",
-					Headers:        map[string]string{"Authorization": "Bearer x"},
+					Headers:        withDefaultHTTPHeaders(map[string]string{"Authorization": "Bearer x"}),
 					ExecutorIDs:    []string{"local", "remote"},
 					ToolNames:      []string{"read"},
 					Required:       true,
@@ -1787,6 +1904,7 @@ func TestConfigMCPServers(t *testing.T) {
 					ID:             "my-server_1",
 					Type:           mcpclient.ServerTransportHTTP,
 					URL:            "http://127.0.0.1:8080/mcp?mode=full",
+					Headers:        withDefaultHTTPHeaders(nil),
 					ExecutorIDs:    []string{"local"},
 					ToolNames:      []string{},
 					StartupTimeout: 30 * time.Second,
@@ -1830,6 +1948,169 @@ func TestConfigMCPServers(t *testing.T) {
 			}
 			if again := cfg.GetMCPServers(); !reflect.DeepEqual(again, tt.want) {
 				t.Fatalf("caller modified MCP server snapshot: %+v", again)
+			}
+		})
+	}
+}
+
+// defaultHTTPHeaders 是没写 http.headers 时的内置默认 header 模板。
+var defaultHTTPHeaders = map[string]string{
+	"User-Agent":      "openvaala/${OPENVAALA_VERSION} (${OPENVAALA_OS}; ${OPENVAALA_ARCH})",
+	"Session-Id":      "${OPENVAALA_SESSION_ID}",
+	"Conversation-Id": "${OPENVAALA_CONVERSATION_ID}",
+}
+
+// withDefaultHTTPHeaders 在内置默认 header 上叠加 overrides，得到期望的 header 模板。
+func withDefaultHTTPHeaders(overrides map[string]string) map[string]string {
+	// 1. 复制内置默认后覆盖同名条目。
+	headers := maps.Clone(defaultHTTPHeaders)
+	maps.Copy(headers, overrides)
+	return headers
+}
+
+// TestConfigHTTPHeaders 验证 http.headers 与内置默认合并，Provider 和 MCP server 的 headers 覆盖全局同名条目，写了不认识的变量时加载失败。
+func TestConfigHTTPHeaders(t *testing.T) {
+	// 1. 准备内置默认、Provider 文件和 MCP server 文件，以及各层 headers 的组合。
+	const (
+		localProvider = "id: local\nbase_url: https://example.com\napi_key: secret-value\nmodels:\n  MyModel: {}\n  unused:\n    upstream_model: another-upstream\n"
+		httpServer    = "id: a\ntype: http\nurl: https://example.com/mcp\n"
+	)
+	tests := []struct {
+		name  string
+		files map[string]string
+		// wantGlobal 是 GetHTTPHeaders 的期望值，wantTarget 是 local/MyModel 的 Target.Headers 的期望值（每个名字一个值）。
+		wantGlobal map[string]string
+		wantTarget map[string]string
+		// mcpServerID 非空时核对这个 MCP server 的 Headers 等于 wantMCP；wantMCP 为空表示没有 header。
+		mcpServerID string
+		wantMCP     map[string]string
+		// wantErr 非空时加载必须失败，错误以它结尾。
+		wantErr string
+	}{
+		{
+			name:       "defaults_without_http_headers",
+			wantGlobal: defaultHTTPHeaders,
+			wantTarget: defaultHTTPHeaders,
+		},
+		{
+			name:       "lowercase_key_overrides_default",
+			files:      map[string]string{"config.yaml": "http:\n  headers:\n    Session-Id: \"\"\n"},
+			wantGlobal: withDefaultHTTPHeaders(map[string]string{"Session-Id": ""}),
+			wantTarget: withDefaultHTTPHeaders(map[string]string{"Session-Id": ""}),
+		},
+		{
+			name:       "user_headers_added_and_default_kept",
+			files:      map[string]string{"config.yaml": "http:\n  headers:\n    x-team: infra\n    User-Agent: custom/1\n"},
+			wantGlobal: withDefaultHTTPHeaders(map[string]string{"X-Team": "infra", "User-Agent": "custom/1"}),
+			wantTarget: withDefaultHTTPHeaders(map[string]string{"X-Team": "infra", "User-Agent": "custom/1"}),
+		},
+		{
+			name:       "non_openvaala_variable_kept_as_text",
+			files:      map[string]string{"config.yaml": "http:\n  headers:\n    X-Env: ${HOME}\n"},
+			wantGlobal: withDefaultHTTPHeaders(map[string]string{"X-Env": "${HOME}"}),
+			wantTarget: withDefaultHTTPHeaders(map[string]string{"X-Env": "${HOME}"}),
+		},
+		{
+			name: "provider_headers_override_global",
+			files: map[string]string{
+				"config.yaml":       "http:\n  headers:\n    X-Team: infra\n",
+				"models/local.yaml": localProvider + "headers:\n  x-team: provider\n  X-Title: MyTool\n",
+			},
+			wantGlobal: withDefaultHTTPHeaders(map[string]string{"X-Team": "infra"}),
+			wantTarget: withDefaultHTTPHeaders(map[string]string{"X-Team": "provider", "X-Title": "MyTool"}),
+		},
+		{
+			name:        "mcp_headers_merge_global",
+			files:       map[string]string{"mcp_servers/a.yaml": httpServer + "headers:\n  Session-Id: \"\"\n  Authorization: Bearer x\n"},
+			wantGlobal:  defaultHTTPHeaders,
+			wantTarget:  defaultHTTPHeaders,
+			mcpServerID: "a",
+			wantMCP:     withDefaultHTTPHeaders(map[string]string{"Session-Id": "", "Authorization": "Bearer x"}),
+		},
+		{
+			name:        "mcp_without_headers_gets_global",
+			files:       map[string]string{"mcp_servers/a.yaml": httpServer},
+			wantGlobal:  defaultHTTPHeaders,
+			wantTarget:  defaultHTTPHeaders,
+			mcpServerID: "a",
+			wantMCP:     defaultHTTPHeaders,
+		},
+		{
+			name:        "stdio_mcp_server_has_no_headers",
+			files:       map[string]string{"mcp_servers/a.yaml": "id: a\ntype: stdio\ncommand: uvx\n"},
+			wantGlobal:  defaultHTTPHeaders,
+			wantTarget:  defaultHTTPHeaders,
+			mcpServerID: "a",
+		},
+		{
+			name:    "unknown_variable_reports_canonical_name",
+			files:   map[string]string{"config.yaml": "http:\n  headers:\n    session-id: ${OPENVAALA_SESION_ID}\n"},
+			wantErr: "config.yaml: http.headers.Session-Id: unknown variable OPENVAALA_SESION_ID",
+		},
+		{
+			name:    "invalid_name_reports_name_as_loaded",
+			files:   map[string]string{"config.yaml": "http:\n  headers:\n    \"X Title\": MyTool\n"},
+			wantErr: "config.yaml: http.headers.x title: invalid header name",
+		},
+		{
+			name:    "value_with_newline_reports_canonical_name",
+			files:   map[string]string{"config.yaml": "http:\n  headers:\n    x-title: \"My\\nTool\"\n"},
+			wantErr: "config.yaml: http.headers.X-Title: invalid header value",
+		},
+		{
+			name:    "first_unknown_variable_by_sorted_name_is_reported",
+			files:   map[string]string{"config.yaml": "http:\n  headers:\n    x-b: ${OPENVAALA_B}\n    x-a: ${OPENVAALA_A}\n"},
+			wantErr: "config.yaml: http.headers.X-A: unknown variable OPENVAALA_A",
+		},
+	}
+	// 2. 加载配置，比较全局 header、模型 Target.Headers 和 MCP server 的 Headers，或核对错误。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := writeDefinitionConfig(t)
+			writeDefinitionFiles(t, directory, tt.files)
+			cfg, err := config.LoadConfig(&config.LoadConfigOpt{
+				Home: directory,
+				Path: filepath.Join(directory, "config.yaml"),
+			})
+			if tt.wantErr != "" {
+				if err == nil || !strings.HasSuffix(err.Error(), tt.wantErr) {
+					t.Fatalf("LoadConfig() error = %v, want suffix %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 1. 核对全局 header；清空返回值后再查一次，保存的值不变。
+			if got := cfg.GetHTTPHeaders(); !maps.Equal(got, tt.wantGlobal) {
+				t.Fatalf("GetHTTPHeaders() = %v, want %v", got, tt.wantGlobal)
+			}
+			clear(cfg.GetHTTPHeaders())
+			if got := cfg.GetHTTPHeaders(); !maps.Equal(got, tt.wantGlobal) {
+				t.Fatalf("caller changed stored http headers: %v", got)
+			}
+			// 2. 核对模型的 Target.Headers，每个名字一个值。
+			model := findModel(cfg, defs.ModelRef{ProviderID: "local", ModelID: "MyModel"})
+			if model == nil {
+				t.Fatal("model local/MyModel not found")
+			}
+			wantTarget := make(map[string][]string, len(tt.wantTarget))
+			for name, value := range tt.wantTarget {
+				wantTarget[name] = []string{value}
+			}
+			if !reflect.DeepEqual(model.Target.Headers, wantTarget) {
+				t.Fatalf("Target.Headers = %v, want %v", model.Target.Headers, wantTarget)
+			}
+			// 3. 核对指定 MCP server 的 Headers。
+			if tt.mcpServerID == "" {
+				return
+			}
+			index := slices.IndexFunc(cfg.GetMCPServers(), func(server *mcpclient.ServerDefinition) bool { return server.ID == tt.mcpServerID })
+			if index < 0 {
+				t.Fatalf("MCP server %q not found", tt.mcpServerID)
+			}
+			if got := cfg.GetMCPServers()[index].Headers; !maps.Equal(got, tt.wantMCP) {
+				t.Fatalf("MCP server headers = %v, want %v", got, tt.wantMCP)
 			}
 		})
 	}
@@ -3809,5 +4090,45 @@ func TestConfigGetModels(t *testing.T) {
 	// 2. 每个检查项重新取一次 GetModels。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) { tt.check(t, cfg.GetModels()) })
+	}
+}
+
+// TestConfigConversationIdleTimeout 验证 server.conversation_idle_timeout 的默认值、显式写 0s 和负数报错。
+func TestConfigConversationIdleTimeout(t *testing.T) {
+	// 1. 列出省略、写 0、写时长和负数的配置。
+	tests := []struct {
+		name       string
+		configBody string
+		want       time.Duration
+		wantErr    string
+	}{
+		{name: "omitted_uses_thirty_minutes", configBody: "{}\n", want: 30 * time.Minute},
+		{name: "zero_seconds_disables_stop", configBody: "server:\n  conversation_idle_timeout: 0s\n", want: 0},
+		{name: "quoted_zero_disables_stop", configBody: "server:\n  conversation_idle_timeout: \"0\"\n", want: 0},
+		{name: "duration_from_file", configBody: "server:\n  conversation_idle_timeout: 90s\n", want: 90 * time.Second},
+		{name: "negative_rejected", configBody: "server:\n  conversation_idle_timeout: -1s\n", wantErr: "server.conversation_idle_timeout must not be negative"},
+	}
+	// 2. 加载配置，比较时长或核对错误。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := writeDefinitionConfig(t)
+			writeDefinitionFiles(t, directory, map[string]string{"config.yaml": tt.configBody})
+			cfg, err := config.LoadConfig(&config.LoadConfigOpt{
+				Home: directory,
+				Path: filepath.Join(directory, "config.yaml"),
+			})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("LoadConfig() = %v, want error containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Server.ConversationIdleTimeout != tt.want {
+				t.Fatalf("Server.ConversationIdleTimeout = %v, want %v", cfg.Server.ConversationIdleTimeout, tt.want)
+			}
+		})
 	}
 }

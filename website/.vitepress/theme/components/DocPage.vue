@@ -311,10 +311,4 @@ function handleOutlineMenuKeydown(event: KeyboardEvent) {
     grid-column: 1;
   }
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .doc-content {
-    animation: none;
-  }
-}
 </style>

@@ -59,7 +59,6 @@ models:
 
 OpenVaala 和模型 Provider 之间支持三种协议，此外还支持客户端和工具两侧的协议：
 
-<!-- scene: ecosystem | 模型、客户端和工具都接入同一个 Runtime -->
 ```text
  models             clients          tools
  openai_responses   terminal, web,   built-in tools
@@ -89,7 +88,17 @@ OpenVaala 和模型 Provider 之间支持三种协议，此外还支持客户端
 - `base_url`：必填。`http` 或 `https` 地址，包含版本前缀，例如 `https://api.openai.com/v1`。不能带用户名、查询参数或 `#` 片段。OpenVaala 会在后面接上上表里的协议路径。
 - `endpoints`：可选，按协议写完整的请求地址，写了的协议就不再用 `base_url` 拼。可以指向另一个主机。每个值都必须是带实际路径的 `http(s)` 地址（不能只写主机或 `/`），其他限制和 `base_url` 相同。
 - `api_key`：发给 Provider 的 key，以明文保存。不需要 key 的本地服务留空即可。
+- `headers`：可选，只发给这个 Provider 的请求头，随它的模型请求和模型列表请求一起发出。`config.yaml` 的 `http.headers` 里有同名条目时，以这里的为准，写成 `""` 就不再发。值里可以用[`http`](overview.md#http)一节介绍的 `${OPENVAALA_...}` 变量。
 - `models`：必填，至少一项。键是模型 id（字母、数字、`-`、`_`、`.`）。不需要任何设置的模型可以写成 `name: {}`。
+
+例如，给某个网关多加一个请求头，并且不给它发 `Session-Id`：
+
+```yaml
+# ~/.config/openvaala/models/openrouter.yaml（节选）
+headers:
+  X-Title: MyTool
+  Session-Id: ""
+```
 
 ## 模型字段
 

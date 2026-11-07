@@ -277,7 +277,7 @@ func TestListAgentsToolReportsUsageAndContextWindow(t *testing.T) {
 			model := newConversationModel(t)
 			opt := conversationOpt(store, model)
 			opt.Definitions.Models[0].ContextWindow = 8000 // worker-model 的窗口为 0。
-			created, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			created, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}

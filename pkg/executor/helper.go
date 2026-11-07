@@ -13,6 +13,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
+	"github.com/VaalaCat/openvaala/pkg/workspace"
 	schemavalidator "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -318,4 +319,14 @@ func getConnectionInfos(connections []mcpclient.Connection) []mcpclient.Connecti
 		infos = append(infos, connection.GetInfo())
 	}
 	return infos
+}
+
+// getVirtualFiles 把预置文件内容转成虚拟工作区文件。
+func getVirtualFiles(files map[string][]byte) map[string]*workspace.VirtualFile {
+	// 1. 按路径把内容填进虚拟文件。
+	virtualFiles := make(map[string]*workspace.VirtualFile, len(files))
+	for filePath, content := range files {
+		virtualFiles[filePath] = &workspace.VirtualFile{Content: content}
+	}
+	return virtualFiles
 }

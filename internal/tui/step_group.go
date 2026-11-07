@@ -585,13 +585,15 @@ func getChangedFileEntries(calls []*toolCall) []string {
 
 // getToolMainArgument 按工具类型返回可显示的主参数。
 func getToolMainArgument(call defs.ToolCall, statuses *sessionStatuses) string {
-	// 1. 读取命令首行、路径、补丁文件或协作任务和 Session 名；其他工具读取第一个字符串字段。
+	// 1. 读取命令首行、路径、搜索模式首行、补丁文件或协作任务和 Session 名；其他工具读取第一个字符串字段。
 	var argument string
 	switch call.Name {
 	case "bash":
 		argument = getFirstLine(getStringArgument(call.Arguments, "command"))
 	case "read_file":
 		argument = getStringArgument(call.Arguments, "path")
+	case "glob", "grep":
+		argument = getFirstLine(getStringArgument(call.Arguments, "pattern"))
 	case "apply_patch":
 		argument = strings.Join(getPatchPaths(getStringArgument(call.Arguments, "patch")), ", ")
 	case "spawn_agent":

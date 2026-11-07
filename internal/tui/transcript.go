@@ -226,7 +226,7 @@ func (t *transcript) handleSavedItem(item *defs.Item) []string {
 			style: t.styles.failure,
 			text:  "✗ 模型错误：" + item.ModelError.Message,
 		})...)
-	case defs.ItemSkillInstruction, defs.ItemAgentsInstruction:
+	case defs.ItemSkillInstruction, defs.ItemAgentsInstruction, defs.ItemMemoryIndex, defs.ItemClientInstruction:
 		lines := t.closeStepGroup()
 		t.history = append(t.history, historyEntry{
 			kind:        historyInstruction,

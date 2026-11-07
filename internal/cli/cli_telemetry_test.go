@@ -84,7 +84,7 @@ func TestNewTelemetry(t *testing.T) {
 			if tt.withStderr {
 				stderrWriter = &stderr
 			}
-			pipeline, shutdown, err := newTelemetry(t.Context(), cfg, "test", stderrWriter)
+			pipeline, shutdown, err := newTelemetry(t.Context(), cfg, stderrWriter)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("newTelemetry() error = %v, want %q", err, tt.wantErr)
@@ -151,7 +151,7 @@ func TestNewTelemetryCaptureContent(t *testing.T) {
 			restoreProcessLogging(t)
 			collector := newFakeCollector(t)
 			cfg := loadTestTelemetryConfig(t, strings.NewReplacer("{dir}", t.TempDir(), "{endpoint}", collector.URL).Replace(tt.section))
-			pipeline, shutdown, err := newTelemetry(t.Context(), cfg, "test", nil)
+			pipeline, shutdown, err := newTelemetry(t.Context(), cfg, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -294,7 +294,7 @@ func TestNewTelemetryOTLPExport(t *testing.T) {
 			collector := newFakeCollector(t)
 			section := strings.NewReplacer("{dir}", t.TempDir(), "{endpoint}", collector.URL).Replace(tt.section)
 			cfg := loadTestTelemetryConfig(t, section)
-			pipeline, shutdown, err := newTelemetry(t.Context(), cfg, "test", nil)
+			pipeline, shutdown, err := newTelemetry(t.Context(), cfg, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

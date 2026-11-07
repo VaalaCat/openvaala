@@ -26,7 +26,7 @@ func TestRecorders(t *testing.T) {
 		{
 			name: "chat_records_usage_finish_and_stream_facts",
 			run: func(t *testing.T, ctx context.Context, p *telemetrytest.Pipeline) {
-				ctx = telemetry.ContextWithAttrs(ctx, telemetry.AgentName("assistant"), telemetry.SessionID("session-1"))
+				ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{AgentName: "assistant", SessionID: "session-1"})
 				start := newChatStart(telemetry.ChatPurposeConversation)
 				start.ServerAddress, start.ServerPort, start.Compacted, start.TokenModality = "llm.example.com", 443, true, telemetry.TokenModalityText
 				_, recorder := telemetry.StartChat(ctx, start)
@@ -501,8 +501,8 @@ func TestRecorders(t *testing.T) {
 		{
 			name: "metric_dimensions_exclude_identity_ids",
 			run: func(t *testing.T, ctx context.Context, p *telemetrytest.Pipeline) {
-				ctx = telemetry.ContextWithAttrs(ctx, telemetry.ConversationID("conversation-1"), telemetry.SessionID("session-1"),
-					telemetry.AgentName("assistant"), telemetry.ExecutorID("local"), telemetry.TurnStep(1))
+				ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: "conversation-1", SessionID: "session-1", AgentName: "assistant"})
+				ctx = telemetry.ContextWithAttrs(ctx, telemetry.ExecutorID("local"), telemetry.TurnStep(1))
 				turnCtx, turnRecorder := telemetry.StartInvokeAgent(ctx, newInvokeAgentStart())
 				start := newChatStart(telemetry.ChatPurposeConversation)
 				start.ServerAddress, start.ServerPort = "llm.example.com", 443

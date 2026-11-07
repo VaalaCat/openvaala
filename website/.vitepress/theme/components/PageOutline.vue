@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { nextTick, onMounted, ref, watch } from "vue"
-import { isReducedMotion } from "../site"
 import type { OutlineHeading } from "../types"
 
 const props = defineProps<{ headings: OutlineHeading[]; activeId: string; variant: "aside" | "menu" }>()
@@ -23,7 +22,7 @@ function placeIndicator() {
     isIndicatorVisible.value = false
     return
   }
-  isIndicatorGliding.value = isIndicatorVisible.value && !isReducedMotion()
+  isIndicatorGliding.value = isIndicatorVisible.value
   indicatorTop.value = activeLink.offsetTop
   indicatorScale.value = activeLink.offsetHeight
   isIndicatorVisible.value = true

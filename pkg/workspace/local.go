@@ -17,9 +17,13 @@ import (
 	"slices"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
+
+// terminalOutputDrainTimeout 是 TTY 命令的 shell 退出后，Wait 继续等待终端输出读完的上限；超时后关闭 PTY master，不再等待。
+const terminalOutputDrainTimeout = time.Second
 
 // localWorkspaceImpl 是本机目录上的工作区：读取直接访问本机文件系统，写入经 os.Root 限制在根目录内，命令由真实 bash 执行。
 type localWorkspaceImpl struct {
@@ -331,7 +335,7 @@ func syncDirectory(root *os.Root, directory string) error {
 	return errors.Join(handle.Sync(), handle.Close())
 }
 
-// localProcessImpl 是本机 bash 进程：输出由复制任务写入请求的 Writer，Wait 在 bash 退出后结束整个进程组并等待复制完成。
+// localProcessImpl 是本机 bash 进程：输出由复制任务写入请求的 Writer，Wait 在 bash 退出后结束整个进程组并等待复制完成，TTY 命令的等待有时限。
 type localProcessImpl struct {
 	command *exec.Cmd
 	// terminal 是 TTY 命令的 PTY master，非 TTY 时为 nil：WriteTerminalInput 写它，输出复制任务读它并在复制结束后关闭。
@@ -345,13 +349,33 @@ func (p *localProcessImpl) Wait() (int, error) {
 	// 1. 等待命令退出，结束进程组里还在运行的进程（失败不影响退出码），再等待输出复制结束。
 	err := p.command.Wait()
 	_ = p.Terminate()
-	p.outputCopies.Wait()
+	p.waitOutputCopies()
 	// 2. 返回 bash 退出码；未取得进程退出状态时返回错误。
 	var exitError *exec.ExitError
 	if err != nil && !errors.As(err, &exitError) {
 		return -1, err
 	}
 	return p.command.ProcessState.ExitCode(), nil
+}
+
+// waitOutputCopies 等待输出复制任务结束；TTY 命令最多等 terminalOutputDrainTimeout，超时后关闭 PTY master 并返回。
+func (p *localProcessImpl) waitOutputCopies() {
+	// 1. 非 TTY 命令直接等待复制结束。
+	if p.terminal == nil {
+		p.outputCopies.Wait()
+		return
+	}
+	// 2. TTY 命令限时等待，超时后关闭 PTY master，不再等复制任务。
+	copied := make(chan struct{})
+	go func() {
+		p.outputCopies.Wait()
+		close(copied)
+	}()
+	select {
+	case <-copied:
+	case <-time.After(terminalOutputDrainTimeout):
+		_ = p.terminal.Close()
+	}
 }
 
 // Terminate 结束本机命令的整个进程组。
@@ -372,11 +396,11 @@ func (p *localProcessImpl) Close() error {
 
 // ResizeTerminal 修改本机 TTY 命令的终端行列数。
 func (p *localProcessImpl) ResizeTerminal(rows, cols uint16) error {
-	// 1. 非 TTY 返回错误；否则在 PTY master 上设置新尺寸，内核向前台进程组发送 SIGWINCH。
+	// 1. 非 TTY 返回错误；否则在 PTY master 上设置新尺寸，内核向前台进程组发送 SIGWINCH；master 已关闭时返回错误。
 	if p.terminal == nil {
 		return ErrTTYInputUnsupported
 	}
-	return pty.Setsize(p.terminal, getTerminalSize(rows, cols))
+	return setTerminalSize(p.terminal, getTerminalSize(rows, cols))
 }
 
 // WriteTerminalInput 写入本机命令的 TTY 终端。
@@ -396,4 +420,10 @@ func (p *localProcessImpl) copyOutput(reader *os.File, writer io.Writer) {
 		defer reader.Close()
 		_, _ = io.Copy(writer, reader)
 	})
+}
+
+// Close 不持有需要释放的资源，总是返回 nil。
+func (w *localWorkspaceImpl) Close() error {
+	// 1. 返回 nil。
+	return nil
 }

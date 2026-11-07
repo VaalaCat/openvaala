@@ -83,10 +83,13 @@ server:
   listen: 127.0.0.1:8790     # address of `openvaala serve`
   token: ""                  # empty = reuse the token in runtime-server.yaml, or generate one
   workspace_directory: ""    # empty = the directory serve was started in
+  conversation_idle_timeout: 30m  # stop saved conversations nobody is watching; 0s = never
 client:
   url: ""                    # empty = the local runtime server, started on demand
   token: ""
   path_mappings: []          # e.g. [{client: /Users/me/code, server: /srv/code}]
+http:
+  headers: {}                # extra request headers for outside requests, on top of three built-in ones (see below)
 telemetry:
   log_level: info
   log_file: ""               # empty = ~/.local/state/openvaala/openvaala.log
@@ -125,6 +128,9 @@ These settings belong to `openvaala serve`, the runtime server.
 - `listen` — `host:port` to listen on. The default only accepts connections from the same machine. Use `0.0.0.0:8790` to accept connections from your network; see [Web UI](../guides/web.md#access-from-another-machine) before you do.
 - `token` — the access token clients must present, stored in plain text. When empty, serve reuses the token from `~/.local/state/openvaala/runtime-server.yaml` or generates a random one on first start. Clients send it as an `Authorization: Bearer <token>` header or a `?token=` query parameter. Clients on the same machine read it from that file, so you only need to set it when you want a fixed token.
 - `workspace_directory` — the working directory the `local` executor uses when a new conversation does not specify one. Must be an absolute path or start with `~/`. When empty, serve uses the directory it was started in. A runtime server started automatically by a client runs in your home directory.
+- `conversation_idle_timeout` — how long a saved conversation with no viewer, running turn or background command stays loaded before serve stops it. Its history is untouched; the next time you open it, serve loads it again and its MCP servers reconnect. Default `30m`; use `0s` to never stop conversations. Changing it needs a serve restart; a reload does not apply it.
+  - When a conversation stops, these are lost: the output of background commands that already finished, agent messages that were queued but not yet delivered, and files in virtual executors other than the default one.
+  - Conversations whose default executor is a virtual one (its files only exist in memory) and conversations created without executors are never stopped this way.
 
 ### client
 
@@ -147,6 +153,42 @@ These settings tell client commands — the terminal UI, `web`, `acp`, `app-serv
 
 `ws://` traffic is not encrypted. Use `client.url` across machines only on a network you trust, or put the server behind an HTTPS reverse proxy and use `wss://`. A token in a URL can end up in shell history and proxy logs.
 
+### http
+
+`headers` sets request headers for everything OpenVaala sends to outside services: model requests, a provider's model list, the model catalog download, remote MCP servers (including the ones your editor brings) and images the desktop app downloads. OTLP export and requests that stay on your machine are not affected.
+
+Three headers are sent unless you change them:
+
+```yaml
+http:
+  headers:
+    User-Agent: "openvaala/${OPENVAALA_VERSION} (${OPENVAALA_OS}; ${OPENVAALA_ARCH})"
+    Session-Id: "${OPENVAALA_SESSION_ID}"
+    Conversation-Id: "${OPENVAALA_CONVERSATION_ID}"
+    X-Team: infra            # your own header, sent with every outside request
+```
+
+- Header names are not case-sensitive. An entry you write replaces the built-in default with the same name; defaults you do not mention are still sent.
+- A provider's `headers` ([Models](models.md#provider-fields)) and an MCP server's `headers` ([MCP servers](extensions.md#mcp-servers)) are sent only to that provider or server, and replace an entry of the same name here.
+- On model requests, the global and provider headers replace the protocol's own headers of the same name, such as `Authorization`. On a provider's model list the provider's headers do the same; the global headers there, and every header on MCP servers and other requests, only fill in headers the request does not already have.
+- Write `""` as the value to stop sending a header, for example `Session-Id: ""`.
+- Values can contain these variables:
+
+  | Variable | Value |
+  | --- | --- |
+  | `${OPENVAALA_VERSION}` | The OpenVaala version. |
+  | `${OPENVAALA_OS}`, `${OPENVAALA_ARCH}` | The operating system and CPU architecture, such as `linux` and `amd64`. |
+  | `${OPENVAALA_CONVERSATION_ID}` | The ID of the conversation the request belongs to. |
+  | `${OPENVAALA_SESSION_ID}` | The ID of the session that sends the request. The main agent and each sub-agent have their own session, so a gateway can use it to keep each of them on one channel. |
+  | `${OPENVAALA_PARENT_SESSION_ID}` | The session that started the sub-agent. Empty for the main agent. |
+  | `${OPENVAALA_AGENT_NAME}` | The name of the agent that sends the request. |
+
+- A header is left out when a variable in it has no value for that request. The conversation and session variables have no value when OpenVaala downloads the model catalog or lists a provider's models. Only `${OPENVAALA_...}` is treated as a variable; any other `${...}` is sent as written.
+- A variable name OpenVaala does not know is a configuration error, so a typo cannot silently drop a header: `~/.config/openvaala/config.yaml: http.headers.Session-Id: unknown variable OPENVAALA_SESION_ID`.
+- `http.headers` can only be set in the file. These headers are sent to every outside request: all providers, MCP servers, the model catalog, and images the desktop app downloads, even after a redirect to another site. Put credentials in a provider's or MCP server's own `headers` instead. `config show` prints `http.headers` as stored.
+
+`openvaala serve reload` applies changes to model requests and MCP servers. The model catalog and provider model lists (runtime server), MCP servers from your editor (`openvaala acp`) and the desktop app's image downloads read `http.headers` when their process starts; restart that process to apply a change.
+
 ### telemetry
 
 `log_level`, `log_file`, `otlp_endpoint`, `otlp_headers` and `capture_content` control logs, traces and metrics. See [Telemetry](telemetry.md).
@@ -161,7 +203,7 @@ OPENVAALA_CLIENT_URL=ws://10.0.0.5:8790/api/v1/openvaala openvaala
 OPENVAALA_MODELS_DEFAULT_MODEL=openai/gpt-5 openvaala
 ```
 
-Settings are applied in this order, later ones winning: built-in defaults, `config.yaml`, environment variables, then command-line flags (`--agents-dir`, `--models-dir`, `--agent`). Maps and lists of objects — `telemetry.otlp_headers` and `client.path_mappings` — can only be set in the file.
+Settings are applied in this order, later ones winning: built-in defaults, `config.yaml`, environment variables, then command-line flags (`--agents-dir`, `--models-dir`, `--agent`). Maps and lists of objects — `telemetry.otlp_headers`, `http.headers` and `client.path_mappings` — can only be set in the file.
 
 `OPENVAALA_CONFIG` selects the configuration file itself; when it is set it must not be empty.
 
@@ -175,7 +217,7 @@ openvaala config show    # print the effective settings, defaults and resolved p
 openvaala config check   # load every definition and check the selected agent
 ```
 
-`config init` never overwrites existing files; it prints the path of `config.yaml`. `config show` prints tokens and OTLP headers as stored, so be careful where you paste its output.
+`config init` never overwrites existing files; it prints the path of `config.yaml`. `config show` prints tokens, OTLP headers and HTTP headers as stored, so be careful where you paste its output.
 
 `config check` loads models, executors, MCP servers, hooks, plugins and agents, validates every reference between them, and prints the selected agent and model:
 
@@ -197,7 +239,7 @@ You can do the same with `/reload` in the terminal UI or **Settings → Reload c
 
 A reload replaces agents, models, executors, MCP servers, hooks, skills, plugins and `server.workspace_directory`. Open conversations that are idle switch to the new definitions immediately, and conversations you open later use them too. A conversation with a running turn or background command keeps its old definitions; the command lists those conversations so you can reload again once they finish. If the new configuration has an error, the reload fails and the server keeps the old one; at startup, the same error stops the runtime server from starting.
 
-Some settings are only read at startup. To change `server.listen`, `server.token`, `tools.max_image_kb` or anything under `telemetry`, stop the server and let it start again:
+Some settings are only read at startup. To change `server.listen`, `server.token`, `server.conversation_idle_timeout`, `tools.max_image_kb` or anything under `telemetry`, stop the server and let it start again:
 
 ```bash
 openvaala serve stop

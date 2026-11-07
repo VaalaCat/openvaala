@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -406,6 +407,8 @@ type connectionSession struct {
 	clientSession *mcp.ClientSession
 	// serverProcess 只在 stdio 时设置。
 	serverProcess *serverProcess
+	// serverTransport 是走 Executor 拨号和代理的 HTTP 传输，只在 http、sse 时设置；close 时关闭它的空闲连接。
+	serverTransport *http.Transport
 	// serverRoundTripper 只在 http、sse 时设置。
 	serverRoundTripper *serverRoundTripper
 }
@@ -524,17 +527,18 @@ func (s *connectionSession) newTransport(ctx context.Context) (mcp.Transport, er
 	}
 }
 
-// newHTTPClient 创建使用工作区拨号和代理配置的 HTTP 客户端。
+// newHTTPClient 创建走 Executor 拨号和代理、带 server headers 的 HTTP 客户端，并记录认证拒绝状态。
 func (s *connectionSession) newHTTPClient() *http.Client {
-	// 1. 复制 HTTP 传输，设置工作区代理、拨号及请求头。
+	// 1. 复制 HTTP 传输，设置工作区代理和拨号。
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = s.opt.Workspace.GetHTTPProxy
 	transport.DialContext = s.opt.Workspace.Dial
-	s.serverRoundTripper = &serverRoundTripper{
-		transport: transport,
-		headers:   s.opt.Definition.Headers,
-	}
-	return &http.Client{Transport: s.serverRoundTripper}
+	s.serverTransport = transport
+	// 2. 用统一客户端补 server headers，外面再包一层记录 401、403。
+	client := httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt().WithHeaders(s.opt.Definition.Headers).WithTransport(transport))
+	s.serverRoundTripper = &serverRoundTripper{transport: client.Transport}
+	client.Transport = s.serverRoundTripper
+	return client
 }
 
 // listTools 读取 server 全部工具页并按配置转换。
@@ -610,8 +614,8 @@ func (s *connectionSession) close() {
 	if s.clientSession != nil {
 		_ = s.clientSession.Close()
 	}
-	if s.serverRoundTripper != nil {
-		s.serverRoundTripper.transport.CloseIdleConnections()
+	if s.serverTransport != nil {
+		s.serverTransport.CloseIdleConnections()
 	}
 }
 
@@ -752,23 +756,15 @@ func (s *processStderr) getLastLines() string {
 	return strings.ToValidUTF8(strings.TrimSpace(text), "")
 }
 
-// serverRoundTripper 保存 HTTP 传输、附加请求头和最近一次 401、403 的状态行。
+// serverRoundTripper 保存 HTTP 传输和最近一次 401、403 的状态行。
 type serverRoundTripper struct {
-	transport      *http.Transport
-	headers        map[string]string
+	transport      http.RoundTripper
 	rejectedStatus atomic.Pointer[string]
 }
 
 // RoundTrip 发送 MCP HTTP 请求，并记录认证拒绝状态。
 func (t *serverRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	// 1. 有附加请求头时复制请求并设置各个 header。
-	if len(t.headers) > 0 {
-		request = request.Clone(request.Context())
-		for name, value := range t.headers {
-			request.Header.Set(name, value)
-		}
-	}
-	// 2. 发送请求，保存 401 或 403 状态行后返回响应。
+	// 1. 发送请求，保存 401 或 403 状态行后返回响应。
 	response, err := t.transport.RoundTrip(request)
 	if err != nil {
 		return nil, err

@@ -2,6 +2,8 @@
 // Scene：按名称分派到具体场景组件；页面顶部插图、首页卖点和正文里的 <!-- scene: name --> 都经过这里。
 // name 场景名；variant 决定外框：band 页面顶部插图带（装饰性，对读屏隐藏），inline 正文细线框，pillar 首页卖点框；
 // caption 图注；description 正文里原有的 ASCII 示意图，作为读屏可读的文字描述保留。
+// 另画了窄屏布局的场景同时渲染 layout="wide" 和 layout="narrow" 两版，由 scenes.css 按屏幕宽度只显示一版；
+// 隐藏的那版不在视口里，动画不会播放。
 import type { Component } from "vue"
 import UnifiedRuntimeScene from "./pillars/UnifiedRuntimeScene.vue"
 import SharedProgressScene from "./pillars/SharedProgressScene.vue"
@@ -27,7 +29,11 @@ import IsoArchitectureScene from "./iso/IsoArchitectureScene.vue"
 import ConversationForkScene from "./content/ConversationForkScene.vue"
 import ContextCompactionScene from "./content/ContextCompactionScene.vue"
 import RuntimeLayersScene from "./content/RuntimeLayersScene.vue"
-import type { SceneName } from "./scene-names"
+import InputQueueScene from "./content/InputQueueScene.vue"
+import SubagentsScene from "./content/SubagentsScene.vue"
+import ToolHooksScene from "./content/ToolHooksScene.vue"
+import ExecutorRoutingScene from "./content/ExecutorRoutingScene.vue"
+import { narrowLayoutSceneNames, type SceneName } from "./scene-names"
 
 withDefaults(defineProps<{ name: SceneName; variant?: "band" | "inline" | "pillar"; caption?: string; description?: string }>(), {
   variant: "inline",
@@ -58,12 +64,20 @@ const sceneComponents: Record<SceneName, Component> = {
   "conversation-fork": ConversationForkScene,
   "context-compaction": ContextCompactionScene,
   "runtime-layers": RuntimeLayersScene,
+  "input-queue": InputQueueScene,
+  "subagents": SubagentsScene,
+  "tool-hooks": ToolHooksScene,
+  "executor-routing": ExecutorRoutingScene,
 }
 </script>
 
 <template>
   <figure class="scene-figure" :class="`scene-figure--${variant}`" :aria-hidden="variant === 'band' ? 'true' : undefined">
-    <component :is="sceneComponents[name]" />
+    <template v-if="narrowLayoutSceneNames.includes(name)">
+      <component :is="sceneComponents[name]" class="scene-layout--wide" layout="wide" />
+      <component :is="sceneComponents[name]" class="scene-layout--narrow" layout="narrow" />
+    </template>
+    <component :is="sceneComponents[name]" v-else />
     <pre v-if="description" class="visually-hidden">{{ description }}</pre>
     <figcaption v-if="caption">{{ caption }}</figcaption>
   </figure>

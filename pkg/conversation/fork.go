@@ -1,6 +1,7 @@
 package conversation
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -11,13 +12,17 @@ import (
 )
 
 // ForkConversationRequest 是 ForkConversation 的参数。BeforeTurnID 和 LastTurnID 最多填一个；
-// 都不填时复制第一个还在运行的轮次之前的全部轮次。
+// 都不填时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
 type ForkConversationRequest struct {
 	// Source 是来源对话记录（已保存，可以已归档）。
 	Source defs.Conversation
+	// SourceQuery 读来源对话；ConversationOpt 的 Query、Mutation 读写分叉出的对话。
+	SourceQuery dao.Query
+	// ForkedConversationID 是分叉出的新对话 ID；为空时生成。
+	ForkedConversationID defs.ConversationID
 	// BeforeTurnID 非空时复制到这一轮之前，不含这一轮；回退重来时用。
 	BeforeTurnID defs.TurnID
-	// LastTurnID 非空时复制到这一轮，含这一轮。
+	// LastTurnID 非空时复制到这一轮，含这一轮；这一轮还在运行时只复制已保存的部分。
 	LastTurnID defs.TurnID
 	// Model 是新根 Session 的模型；零值时照抄来源根 Session 的模型。
 	Model defs.ModelSelection
@@ -45,7 +50,7 @@ func ForkConversation(ctx context.Context, request *ForkConversationRequest, opt
 		return defs.Conversation{}, err
 	}
 	source := request.Source
-	sourceRoot, found, err := opt.Query.GetSession(ctx, source.ID, source.RootSessionID)
+	sourceRoot, found, err := request.SourceQuery.GetSession(ctx, source.ID, source.RootSessionID)
 	if err != nil {
 		return defs.Conversation{}, err
 	}
@@ -73,7 +78,7 @@ func ForkConversation(ctx context.Context, request *ForkConversationRequest, opt
 		Limit:     forkPageSize,
 	}
 	for {
-		page, err := opt.Query.ListTurns(ctx, turnRequest)
+		page, err := request.SourceQuery.ListTurns(ctx, turnRequest)
 		if err != nil {
 			return defs.Conversation{}, fmt.Errorf("read Turns of Conversation %s: %w", source.ID, err)
 		}
@@ -101,7 +106,7 @@ func ForkConversation(ctx context.Context, request *ForkConversationRequest, opt
 		Limit:          forkPageSize,
 	}
 	for {
-		page, err := opt.Query.ListItems(ctx, itemRequest)
+		page, err := request.SourceQuery.ListItems(ctx, itemRequest)
 		if err != nil {
 			return defs.Conversation{}, fmt.Errorf("read history of Conversation %s: %w", source.ID, err)
 		}
@@ -157,7 +162,7 @@ func ForkConversation(ctx context.Context, request *ForkConversationRequest, opt
 
 	// 7. 依次保存新根 Session、Item、Turn，最后保存对话记录；中途失败时返回错误，已写入的数据留着。
 	record := defs.Conversation{
-		ID:               defs.NewConversationID(),
+		ID:               cmp.Or(request.ForkedConversationID, defs.NewConversationID()),
 		RootSessionID:    defs.NewSessionID(),
 		ExecutorSettings: request.ExecutorSettings,
 		Title:            source.Title,
@@ -193,7 +198,7 @@ func ForkConversation(ctx context.Context, request *ForkConversationRequest, opt
 
 // selectForkTurns 选择分叉要复制的 Turn。
 func selectForkTurns(turns []defs.Turn, beforeTurnID, lastTurnID defs.TurnID) ([]defs.Turn, error) {
-	// 1. 在按开始顺序排列的 Turn 中，按 beforeTurnID、lastTurnID 或第一个 running Turn 定位截取点；指定的轮次找不到或还在运行时返回错误。
+	// 1. 在按开始顺序排列的 Turn 中，按 beforeTurnID、lastTurnID 定位截取点，都不给时取全部；指定的轮次找不到时返回错误。
 	var end int
 	switch {
 	case beforeTurnID != "":
@@ -206,15 +211,9 @@ func selectForkTurns(turns []defs.Turn, beforeTurnID, lastTurnID defs.TurnID) ([
 		if index < 0 {
 			return nil, ErrForkTurnNotFound
 		}
-		if turns[index].Status == defs.TurnStatusRunning {
-			return nil, ErrForkTurnRunning
-		}
 		end = index + 1
 	default:
-		end = slices.IndexFunc(turns, func(turn defs.Turn) bool { return turn.Status == defs.TurnStatusRunning })
-		if end < 0 {
-			end = len(turns)
-		}
+		end = len(turns)
 	}
 	// 2. 截取点之前没有轮次时返回 ErrNothingToFork，否则返回截取点之前的轮次。
 	if end == 0 {

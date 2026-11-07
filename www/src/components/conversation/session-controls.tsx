@@ -34,7 +34,7 @@ export function SessionControls({
   const container = useRef<HTMLDivElement>(null)
   const [compact, setCompact] = useState(true)
   useLayoutEffect(() => {
-    // 1. 使用控件实际可用宽度选择模型入口，不依赖视口断点。
+    // 1. 容器宽度只决定模型与强度入口是否合并，弹层形态由 ModelPicker 按视口决定。
     const element = container.current
     if (!element) return
     setCompact(element.clientWidth < 400)

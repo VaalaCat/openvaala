@@ -227,6 +227,20 @@
 @utility text-table {
   @apply text-ui;
 }
+@utility text-reading {
+  font-family: var(--appearance-body);
+  font-size: var(--reading-font-size, 14px);
+  line-height: var(--reading-line-height, 24px);
+}
+@utility text-code-reading {
+  font-family: var(--font-mono);
+  font-size: var(--code-font-size, 12px);
+  line-height: var(--code-line-height, 20px);
+  font-variant-ligatures: none;
+}
+@utility code-padding {
+  padding: var(--code-padding-y, 8px) var(--code-padding-x, 12px);
+}
 @utility text-caption {
   font-family: var(--appearance-body);
   font-size: 0.75rem;
@@ -312,6 +326,23 @@
 .markdown-view {
   overflow-wrap: anywhere;
 }
+.markdown-view > * {
+  margin-block: 0;
+}
+.markdown-view > :not(:first-child) {
+  margin-block-start: var(--reading-paragraph-spacing, 12px);
+}
+.json-row {
+  min-height: var(--code-line-height, 20px);
+}
+.json-row-control {
+  width: 1.25rem;
+  height: var(--code-line-height, 20px);
+}
+.appearance-terminal-preview .xterm {
+  height: 100%;
+  padding: var(--terminal-padding, 8px);
+}
 
 /* 收起来信只在溢出时淡出最后一行，展开正文不加遮罩。 */
 .agent-message-preview-fade {
@@ -343,13 +374,6 @@
     mask-position: 0 0;
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .shimmer {
-    animation: none;
-    mask-image: none;
-  }
-}
-
 /* React Bits Lattice Loader 工作态；许可见 ../THIRD_PARTY_NOTICES.md。 */
 .lattice-loader__cell {
   opacity: 0.15;
@@ -370,13 +394,6 @@
     opacity: 1;
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .lattice-loader__cell:not([data-hole]) {
-    animation: none;
-    opacity: 0.8;
-  }
-}
-
 /* 指标字形（上下文环、用量柱）专用字体，连字需要 calt。 */
 .font-datatype {
   font-family: "Datatype", ui-monospace, monospace;
@@ -486,6 +503,12 @@
 [data-slot].text-code {
   @apply text-code;
 }
+[data-slot].text-reading {
+  @apply text-reading;
+}
+[data-slot].text-code-reading {
+  @apply text-code-reading;
+}
 [data-slot].text-caption {
   @apply text-caption;
 }
@@ -581,22 +604,6 @@
   ) {
   translate: none;
 }
-@media (prefers-reduced-motion: reduce) {
-  .process-disclosure-panel,
-  .process-disclosure-content,
-  .conversation-panel-transition[data-panel-transition] > [data-panel] {
-    transition: none;
-  }
-  .process-disclosure-content,
-  .process-disclosure-panel:is([data-starting-style], [data-ending-style])
-    > .process-disclosure-content {
-    transform: none;
-  }
-  .server-reconnect-icon {
-    animation: none;
-  }
-}
-
 /* 会话选中态持续保留，悬停背景比选中背景更轻。 */
 .conversation-list-button {
   transition:
@@ -670,29 +677,6 @@ textarea,
 .model-selection-value,
 .model-selection-option {
   font-weight: 400;
-}
-
-/* 窄屏只增大编辑控件文字，正文和桌面字号不变。 */
-@media (width < 48rem) {
-  input,
-  textarea,
-  input[data-slot][class],
-  textarea[data-slot][class] {
-    font-size: 1rem;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .conversation-list-button,
-  .conversation-list-title,
-  [data-sidebar="sidebar"][data-mobile="true"] {
-    transition: none;
-  }
-  [data-sidebar="sidebar"][data-mobile="true"]:has(
-      [data-server-connection-header]
-    ) {
-    opacity: 1;
-  }
 }
 
 /* 展开状态只由箭头表示，标题背景与分节保持一致。 */

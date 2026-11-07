@@ -24,16 +24,18 @@ import (
 
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
+	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
-// TestNewConversationConfig 检查装配配置时 Executor 的顺序和目录、设置校验、Skill 来源、客户端环境变量和 SSH 工作区释放。
+// TestNewConversationConfig 检查装配配置时 Executor 的顺序和目录、设置校验、Skill 来源、客户端环境变量和工作区释放。
 func TestNewConversationConfig(t *testing.T) {
 	// 1. 列出 Executor 排序、目录、设置校验、Skill、客户端环境变量和工作区释放场景。
 	tests := []struct {
@@ -89,7 +91,7 @@ func TestNewConversationConfig(t *testing.T) {
 		{
 			name: "unknown_executor_rejected",
 			run: func(t *testing.T, f *environmentFixture) {
-				_, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{ExecutorIDs: []string{"local", "missing"}}, defs.ExecutorSettings{}, f.newOpt())
+				_, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{ExecutorIDs: []string{"local", "missing"}}, defs.ExecutorSettings{}, f.newOpt())
 				if !errors.Is(err, ErrInvalidExecutorSettings) || !strings.Contains(err.Error(), `unknown executor "missing"`) {
 					t.Fatalf("CreateConversation() error = %v, want ErrInvalidExecutorSettings for missing", err)
 				}
@@ -157,7 +159,7 @@ func TestNewConversationConfig(t *testing.T) {
 					DefaultExecutorID: "openvaala",
 					ExecutorIDs:       []string{"local"},
 				}
-				_, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, f.newOpt())
+				_, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, f.newOpt())
 				if !errors.Is(err, ErrInvalidExecutorSettings) || !strings.Contains(err.Error(), `default executor "openvaala" is not in executor_ids`) {
 					t.Fatalf("CreateConversation() error = %v, want ErrInvalidExecutorSettings for the default executor", err)
 				}
@@ -167,7 +169,7 @@ func TestNewConversationConfig(t *testing.T) {
 			name: "default_executor_missing",
 			run: func(t *testing.T, f *environmentFixture) {
 				settings := defs.ExecutorSettings{WorkspaceDirectories: map[string]string{"local": filepath.Join(t.TempDir(), "missing")}}
-				_, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, f.newOpt())
+				_, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, f.newOpt())
 				if err == nil || !strings.HasPrefix(err.Error(), `executor "local": `) {
 					t.Fatalf("CreateConversation() error = %v, want one starting with executor \"local\": ", err)
 				}
@@ -177,7 +179,7 @@ func TestNewConversationConfig(t *testing.T) {
 			name: "relative_local_directory_rejected",
 			run: func(t *testing.T, f *environmentFixture) {
 				settings := defs.ExecutorSettings{WorkspaceDirectories: map[string]string{"local": "relative/project"}}
-				if _, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, f.newOpt()); err == nil {
+				if _, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, f.newOpt()); err == nil {
 					t.Fatal("relative local directory was accepted")
 				}
 			},
@@ -240,7 +242,7 @@ func TestNewConversationConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "ephemeral_has_no_executors",
+			name: "without_executors_has_no_executors",
 			run: func(t *testing.T, f *environmentFixture) {
 				f.definitions.Skills = []*skill.Skill{{
 					Name:        "shared",
@@ -248,8 +250,8 @@ func TestNewConversationConfig(t *testing.T) {
 					Path:        "/shared/shared/SKILL.md",
 				}}
 				opt := f.newOpt()
-				opt.Ephemeral = true
-				c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+				opt.WithoutExecutors = true
+				c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -277,12 +279,18 @@ func TestNewConversationConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "virtual_files_per_conversation",
+			name: "virtual_workspaces_are_separate_per_conversation",
 			run: func(t *testing.T, f *environmentFixture) {
-				f.definitions.Executors = newTestExecutors("scratch")
+				f.executors = []executor.Executor{executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
+					ID:                 "scratch",
+					Kind:               defs.ExecutorKindVirtual,
+					Description:        "scratch 测试环境",
+					WorkspaceDirectory: "/workspace/scratch",
+				}, map[string][]byte{"/workspace/scratch/seed.txt": []byte("seed\n")}))}
 				first := startTestConversation(t, f.store, f.model, f.create(t, defs.ExecutorSettings{}))
 				second := startTestConversation(t, f.store, f.model, f.create(t, defs.ExecutorSettings{}))
-				patch := `{"patch":"*** Begin Patch\n*** Add File: a.txt\n+first\n*** End Patch"}`
+				third := startTestConversation(t, f.store, f.model, f.create(t, defs.ExecutorSettings{}))
+				patch := `{"patch":"*** Begin Patch\n*** Add File: a.txt\n+first\n*** Update File: seed.txt\n@@\n-seed\n+changed\n*** End Patch"}`
 				if result := f.runTool(t, first, "apply_patch", patch); result.Error != nil {
 					t.Fatalf("apply_patch error = %+v", result.Error)
 				}
@@ -292,22 +300,58 @@ func TestNewConversationConfig(t *testing.T) {
 				if result := f.runTool(t, second, "read_file", `{"path":"/workspace/scratch/a.txt"}`); result.Error == nil {
 					t.Fatalf("second conversation read_file = %s, want the file missing", result.Content)
 				}
+				if result := f.runTool(t, third, "read_file", `{"path":"/workspace/scratch/seed.txt"}`); result.Error != nil || !strings.Contains(string(result.Content), "seed") {
+					t.Fatalf("third conversation seed.txt = %s %+v, want the preset content", result.Content, result.Error)
+				}
+			},
+		},
+		{
+			name: "custom_executor_kind_serves_tools",
+			run: func(t *testing.T, f *environmentFixture) {
+				docker := newRecordingExecutor("docker", "docker", map[string][]byte{"/workspace/docker/hello.txt": []byte("from docker\n")})
+				f.executors = []executor.Executor{docker}
+				c := f.create(t, defs.ExecutorSettings{})
+				if details := getRootDetails(t, c).Executors; len(details) != 1 || details[0].Kind != "docker" {
+					t.Fatalf("executors = %+v, want one docker executor", details)
+				}
+				h := startTestConversation(t, f.store, f.model, c)
+				if result := f.runTool(t, h, "read_file", `{"path":"/workspace/docker/hello.txt"}`); result.Error != nil || !strings.Contains(string(result.Content), "from docker") {
+					t.Fatalf("read_file = %s %+v, want the fake workspace content", result.Content, result.Error)
+				}
+				if err := h.stop(t); !errors.Is(err, context.Canceled) {
+					t.Fatalf("stop() = %v, want context.Canceled", err)
+				}
+				docker.requireClosedOnce(t, 1)
+			},
+		},
+		{
+			name: "provider_receives_conversation_id",
+			run: func(t *testing.T, f *environmentFixture) {
+				provider := &recordingExecutorProvider{executors: newTestExecutors("local", "other")}
+				opt := f.newOpt()
+				opt.Definitions.Executors = provider
+				const conversationID = defs.ConversationID("conversation-from-caller")
+				c, err := CreateConversation(t.Context(), conversationID, "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if record := f.getRecord(t, c); record.ID != conversationID || !slices.Equal(provider.conversationIDs, []defs.ConversationID{conversationID}) {
+					t.Fatalf("record ID = %s, provider IDs = %v; want one call with %s", record.ID, provider.conversationIDs, conversationID)
+				}
+				h := startTestConversation(t, f.store, f.model, c)
+				if _, err := h.c.SetExecutorSettings(t.Context(), defs.ExecutorSettings{ExecutorIDs: []string{"other"}}); err != nil {
+					t.Fatal(err)
+				}
+				if got := provider.conversationIDs; !slices.Equal(got, []defs.ConversationID{conversationID, conversationID}) {
+					t.Fatalf("provider IDs after SetExecutorSettings = %v, want the same conversation twice", got)
+				}
 			},
 		},
 		{
 			name: "run_with_canceled_context_releases",
 			run: func(t *testing.T, f *environmentFixture) {
 				server := newSSHTestServer(t)
-				f.definitions.Executors = []*defs.ExecutorDefinition{{
-					ID:                 "remote",
-					Kind:               defs.ExecutorKindSSH,
-					Description:        "远端",
-					WorkspaceDirectory: t.TempDir(),
-					SSH: &defs.SSHExecutorDefinition{
-						Address:      "test@" + server.address,
-						IdentityFile: server.identityFile,
-					},
-				}}
+				f.executors = []executor.Executor{newSSHTestExecutor(t.TempDir(), "test@"+server.address, server.identityFile)}
 				canceledCtx, cancel := context.WithCancel(t.Context())
 				cancel()
 				created := f.create(t, defs.ExecutorSettings{})
@@ -332,6 +376,67 @@ func TestNewConversationConfig(t *testing.T) {
 				if accepted := server.acceptedConnections.Load(); accepted != 2 {
 					t.Fatalf("accepted SSH connections = %d, want one per assembly", accepted)
 				}
+			},
+		},
+		{
+			name: "conversation_stop_closes_every_workspace",
+			run: func(t *testing.T, f *environmentFixture) {
+				first := newRecordingExecutor("first", defs.ExecutorKindVirtual, nil)
+				second := newRecordingExecutor("second", "docker", nil)
+				memory := &recordingExecutor{Executor: newMemoryTestExecutor(t.TempDir())}
+				f.executors = []executor.Executor{first, second, memory}
+				h := startTestConversation(t, f.store, f.model, f.create(t, defs.ExecutorSettings{}))
+				if got := getExecutorIDs(t, h.c); !slices.Equal(got, []string{"first", "second", defs.MemoryExecutorID}) {
+					t.Fatalf("executors = %v, want first, second and memory", got)
+				}
+				if err := h.stop(t); !errors.Is(err, context.Canceled) {
+					t.Fatalf("stop() = %v, want context.Canceled", err)
+				}
+				for _, opened := range []*recordingExecutor{first, second, memory} {
+					opened.requireClosedOnce(t, 1)
+				}
+			},
+		},
+		{
+			name: "assembly_failure_closes_opened_workspaces",
+			run: func(t *testing.T, f *environmentFixture) {
+				first := newRecordingExecutor("first", defs.ExecutorKindVirtual, nil)
+				failed := newRecordingExecutor("failed", defs.ExecutorKindVirtual, nil)
+				failed.newWorkspaceErr = errors.New("workspace unavailable")
+				f.executors = []executor.Executor{first, failed}
+				_, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, f.newOpt())
+				if !errors.Is(err, failed.newWorkspaceErr) {
+					t.Fatalf("CreateConversation() error = %v, want %v", err, failed.newWorkspaceErr)
+				}
+				first.requireClosedOnce(t, 1)
+				failed.requireClosedOnce(t, 0)
+			},
+		},
+		{
+			name: "memory_executor_must_open_memory_workspace",
+			run: func(t *testing.T, f *environmentFixture) {
+				first := newRecordingExecutor("first", defs.ExecutorKindVirtual, nil)
+				f.executors = []executor.Executor{first, executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
+					ID:   defs.MemoryExecutorID,
+					Kind: defs.ExecutorKindMemory,
+				}, nil))}
+				_, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, f.newOpt())
+				if want := `executor "memory": workspace is not a MemoryWorkspace`; err == nil || err.Error() != want {
+					t.Fatalf("CreateConversation() error = %v, want %q", err, want)
+				}
+				first.requireClosedOnce(t, 1)
+			},
+		},
+		{
+			name: "memory_id_with_other_kind_is_rejected",
+			run: func(t *testing.T, f *environmentFixture) {
+				f.requireMismatchedMemoryRejected(t, defs.MemoryExecutorID, "docker")
+			},
+		},
+		{
+			name: "memory_kind_with_other_id_is_rejected",
+			run: func(t *testing.T, f *environmentFixture) {
+				f.requireMismatchedMemoryRejected(t, "notes", defs.ExecutorKindMemory)
 			},
 		},
 	}
@@ -454,13 +559,7 @@ func TestResolveWorkspaceDirectory(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// 2. 创建目录、文件和软链接样本，替换用例里的临时路径。
 			f := newEnvironmentFixture(t)
-			executors := append(f.definitions.Executors, &defs.ExecutorDefinition{
-				ID:                 "remote",
-				Kind:               defs.ExecutorKindSSH,
-				Description:        "离线",
-				WorkspaceDirectory: "/project",
-				SSH:                &defs.SSHExecutorDefinition{Address: "test@127.0.0.1:1"},
-			})
+			executors := append(f.executors, newSSHTestExecutor("/project", "test@127.0.0.1:1", ""))
 			for _, directory := range []string{filepath.Join(f.home, "proj", "sub"), filepath.Join(f.localDirectory, "sub"), filepath.Join(f.extraDirectory, "sub")} {
 				if err := os.MkdirAll(directory, 0700); err != nil {
 					t.Fatal(err)
@@ -529,7 +628,7 @@ func TestGetWorkspaceDirectories(t *testing.T) {
 			}
 			replacer := strings.NewReplacer("{local}", f.localDirectory, "{home}", f.home)
 			// 3. 核对绝对目录和排序后的普通直接子目录；错误沿用现有设置错误。
-			got, err := GetWorkspaceDirectories(t.Context(), f.definitions.Executors, tt.executorID, replacer.Replace(tt.directory), replacer.Replace(tt.baseDirectory))
+			got, err := GetWorkspaceDirectories(t.Context(), f.executors, tt.executorID, replacer.Replace(tt.directory), replacer.Replace(tt.baseDirectory))
 			if tt.wantInvalid {
 				if !errors.Is(err, ErrInvalidExecutorSettings) {
 					t.Fatalf("GetWorkspaceDirectories = %+v, %v; want ErrInvalidExecutorSettings", got, err)
@@ -566,10 +665,9 @@ func TestGetWorkspaceDirectoriesSSH(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			definition := &defs.ExecutorDefinition{ID: "remote", Kind: defs.ExecutorKindSSH, WorkspaceDirectory: root,
-				SSH: &defs.SSHExecutorDefinition{Address: "test@" + server.address, IdentityFile: server.identityFile}}
+			remote := newSSHTestExecutor(root, "test@"+server.address, server.identityFile)
 			// 2. 先打开另一个工作区，再发起目录查询。
-			conversationWorkspace, err := NewExecutorWorkspace(t.Context(), definition, root, nil)
+			conversationWorkspace, err := remote.NewWorkspace(t.Context(), &executor.NewWorkspaceRequest{RootDirectory: root})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -582,7 +680,7 @@ func TestGetWorkspaceDirectoriesSSH(t *testing.T) {
 				queryDirectory = root
 			}
 			for request := 1; request <= 2; request++ {
-				got, err := GetWorkspaceDirectories(t.Context(), []*defs.ExecutorDefinition{definition}, "remote", queryDirectory, "")
+				got, err := GetWorkspaceDirectories(t.Context(), []executor.Executor{remote}, "remote", queryDirectory, "")
 				if err != nil || got.Directory != root {
 					t.Fatalf("GetWorkspaceDirectories = %+v, %v; want %q", got, err, root)
 				}
@@ -618,10 +716,9 @@ func TestGetWorkspaceDirectoriesSSHUnavailable(t *testing.T) {
 				address = listener.Addr().String()
 				_ = listener.Close()
 			}
-			definition := &defs.ExecutorDefinition{ID: "remote", Kind: defs.ExecutorKindSSH, WorkspaceDirectory: t.TempDir(),
-				SSH: &defs.SSHExecutorDefinition{Address: "test@" + address, IdentityFile: server.identityFile}}
+			remote := newSSHTestExecutor(t.TempDir(), "test@"+address, server.identityFile)
 			started := time.Now()
-			_, err := GetWorkspaceDirectories(t.Context(), []*defs.ExecutorDefinition{definition}, "remote", "", "")
+			_, err := GetWorkspaceDirectories(t.Context(), []executor.Executor{remote}, "remote", "", "")
 			// 2. 连接错误原样返回，静默连接由服务端十秒期限结束，函数返回时连接已关闭。
 			if err == nil || errors.Is(err, ErrInvalidExecutorSettings) {
 				t.Fatalf("GetWorkspaceDirectories error = %v, want an access error", err)
@@ -655,8 +752,7 @@ func TestGetWorkspaceDirectoriesSSHCancellation(t *testing.T) {
 				server := newSSHTestServer(t)
 				server.stallPacket.Store(stage.packet)
 				server.stallHandshake.Store(stage.name == "handshake")
-				definition := &defs.ExecutorDefinition{ID: "remote", Kind: defs.ExecutorKindSSH, WorkspaceDirectory: t.TempDir(),
-					SSH: &defs.SSHExecutorDefinition{Address: "test@" + server.address, IdentityFile: server.identityFile}}
+				remote := newSSHTestExecutor(t.TempDir(), "test@"+server.address, server.identityFile)
 				ctx, cancel := context.WithCancel(t.Context())
 				wantError := context.Canceled
 				if deadline {
@@ -667,7 +763,7 @@ func TestGetWorkspaceDirectoriesSSHCancellation(t *testing.T) {
 				defer cancel()
 				finished := make(chan error, 1)
 				go func() {
-					_, err := GetWorkspaceDirectories(ctx, []*defs.ExecutorDefinition{definition}, "remote", stage.directory, "")
+					_, err := GetWorkspaceDirectories(ctx, []executor.Executor{remote}, "remote", stage.directory, "")
 					finished <- err
 				}()
 				select {
@@ -691,7 +787,7 @@ func TestGetWorkspaceDirectoriesSSHCancellation(t *testing.T) {
 				// 3. 恢复服务后再次查询能正常完成，没有留住原请求的连接。
 				server.stallPacket.Store(0)
 				server.stallHandshake.Store(false)
-				if _, err := GetWorkspaceDirectories(t.Context(), []*defs.ExecutorDefinition{definition}, "remote", "", ""); err != nil {
+				if _, err := GetWorkspaceDirectories(t.Context(), []executor.Executor{remote}, "remote", "", ""); err != nil {
 					t.Fatalf("next directory request: %v", err)
 				}
 				server.waitOpenConnections(t, 0)
@@ -707,9 +803,11 @@ type environmentFixture struct {
 	model                                *conversationModel
 	home, localDirectory, extraDirectory string
 	definitions                          *ConversationDefinitions
+	// executors 是 newOpt 交给对话的 Executor 列表。
+	executors []executor.Executor
 }
 
-// newEnvironmentFixture 创建环境测试的目录、模型、存储和 Executor 定义。
+// newEnvironmentFixture 创建环境测试的目录、模型、存储和 Executor 列表。
 func newEnvironmentFixture(t *testing.T) *environmentFixture {
 	t.Helper()
 	// 1. 创建临时 HOME 和两个 local 根目录，配置 local、内置 virtual、alpha 和 extra。
@@ -722,39 +820,40 @@ func newEnvironmentFixture(t *testing.T) *environmentFixture {
 	}
 	t.Setenv("HOME", f.home)
 	f.definitions = conversationDefinitions(f.model)
-	f.definitions.Executors = []*defs.ExecutorDefinition{
-		{
+	f.executors = []executor.Executor{
+		executor.NewLocalExecutor(&defs.ExecutorDefinition{
 			ID:                 "local",
 			Kind:               defs.ExecutorKindLocal,
 			Description:        "本机",
 			WorkspaceDirectory: f.localDirectory,
-		},
-		{
+		}),
+		executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
 			ID:                 "openvaala",
 			Kind:               defs.ExecutorKindVirtual,
 			Description:        "内置",
 			WorkspaceDirectory: "/workspace",
-		},
-		{
+		}, nil)),
+		executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
 			ID:                 "alpha",
 			Kind:               defs.ExecutorKindVirtual,
 			Description:        "虚拟目录",
 			WorkspaceDirectory: "/workspace",
-		},
-		{
+		}, nil)),
+		executor.NewLocalExecutor(&defs.ExecutorDefinition{
 			ID:                 "extra",
 			Kind:               defs.ExecutorKindLocal,
 			Description:        "试验目录",
 			WorkspaceDirectory: f.extraDirectory,
-		},
+		}),
 	}
 	return f
 }
 
-// newOpt 返回用 fixture 当前定义的对话依赖。
+// newOpt 返回用 fixture 当前定义和 Executor 列表的对话依赖。
 func (f *environmentFixture) newOpt() *ConversationOpt {
-	// 1. 用存储、模型和 fixture 当前的定义生成配置。
+	// 1. 用存储、模型和 fixture 当前的定义生成配置，Executor 列表包成 ExecutorProvider。
 	opt := conversationOpt(f.store, f.model)
+	f.definitions.Executors = newTestExecutorProvider(f.executors)
 	opt.Definitions = f.definitions
 	return opt
 }
@@ -763,7 +862,7 @@ func (f *environmentFixture) newOpt() *ConversationOpt {
 func (f *environmentFixture) create(t *testing.T, settings defs.ExecutorSettings) Conversation {
 	t.Helper()
 	// 1. 用指定设置创建对话，失败时结束测试。
-	c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, f.newOpt())
+	c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, f.newOpt())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,10 +893,10 @@ func (f *environmentFixture) getRecord(t *testing.T, c Conversation) defs.Conver
 func (f *environmentFixture) runEcho(t *testing.T, environment []string) string {
 	t.Helper()
 	// 1. 只留 local，创建带指定客户端环境变量的对话。
-	f.definitions.Executors = f.definitions.Executors[:1]
+	f.executors = f.executors[:1]
 	opt := f.newOpt()
 	opt.Environment = environment
-	c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+	c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -822,6 +921,109 @@ func (f *environmentFixture) runTool(t *testing.T, h *conversationHarness, name,
 	request.reply <- modelResponse{text: "done"}
 	h.waitTurnFinished(t, itemID)
 	return result
+}
+
+// requireMismatchedMemoryRejected 检查列表里有 ID 和种类对不上的 memory Executor 时创建对话失败，一个工作区都不打开。
+func (f *environmentFixture) requireMismatchedMemoryRejected(t *testing.T, id string, kind defs.ExecutorKind) {
+	t.Helper()
+	// 1. 用一个正常的 Executor 和一个对不上的 Executor 创建对话，核对错误和打开的工作区。
+	first := newRecordingExecutor("first", defs.ExecutorKindVirtual, nil)
+	f.executors = []executor.Executor{first, newRecordingExecutor(id, kind, nil)}
+	_, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, f.newOpt())
+	if want := `invalid executor settings: memory executor requires id "memory" and kind "memory"`; !errors.Is(err, ErrInvalidExecutorSettings) || err.Error() != want {
+		t.Fatalf("CreateConversation() error = %v, want %q", err, want)
+	}
+	first.requireClosedOnce(t, 0)
+}
+
+// closeCountingWorkspace 是记录 Close 次数的工作区，其余操作走内嵌的工作区。
+type closeCountingWorkspace struct {
+	workspace.Workspace
+	closeCount atomic.Int32
+}
+
+// Close 记下一次关闭，再关闭内嵌的工作区。
+func (w *closeCountingWorkspace) Close() error {
+	// 1. 累加次数并转给内嵌的工作区。
+	w.closeCount.Add(1)
+	return w.Workspace.Close()
+}
+
+// GetProjectName 返回内嵌 memory 工作区的项目名。
+func (w *closeCountingWorkspace) GetProjectName() string {
+	// 1. 只有 memory 工作区会被问项目名。
+	return w.Workspace.(workspace.MemoryWorkspace).GetProjectName()
+}
+
+// recordingExecutor 是测试用 Executor：工作区由内嵌的 Executor 打开，记下打开过的每个工作区；newWorkspaceErr 不为空时打开失败。
+type recordingExecutor struct {
+	executor.Executor
+	newWorkspaceErr  error
+	openedWorkspaces []*closeCountingWorkspace
+}
+
+// newRecordingExecutor 创建根目录为 /workspace/<id> 的测试 Executor，工作区是装着 files 的虚拟工作区，种类用 kind。
+func newRecordingExecutor(id string, kind defs.ExecutorKind, files map[string][]byte) *recordingExecutor {
+	// 1. 用 virtual Executor 打开工作区，定义里写上 kind。
+	return &recordingExecutor{Executor: executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
+		ID:                 id,
+		Kind:               kind,
+		Description:        id + " 测试环境",
+		WorkspaceDirectory: "/workspace/" + id,
+	}, files))}
+}
+
+// NewWorkspace 打开工作区，包上 Close 计数后记下来。
+func (e *recordingExecutor) NewWorkspace(ctx context.Context, request *executor.NewWorkspaceRequest) (workspace.Workspace, error) {
+	// 1. 设了 newWorkspaceErr 时返回它，否则打开工作区并记录。
+	if e.newWorkspaceErr != nil {
+		return nil, e.newWorkspaceErr
+	}
+	opened, err := e.Executor.NewWorkspace(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	countingWorkspace := &closeCountingWorkspace{Workspace: opened}
+	e.openedWorkspaces = append(e.openedWorkspaces, countingWorkspace)
+	return countingWorkspace, nil
+}
+
+// requireClosedOnce 检查打开过 wantOpened 个工作区，每个都正好关闭一次。
+func (e *recordingExecutor) requireClosedOnce(t *testing.T, wantOpened int) {
+	t.Helper()
+	// 1. 核对工作区个数和各自的 Close 次数。
+	if len(e.openedWorkspaces) != wantOpened {
+		t.Fatalf("executor %q opened %d workspaces, want %d", e.GetDefinition().ID, len(e.openedWorkspaces), wantOpened)
+	}
+	for _, opened := range e.openedWorkspaces {
+		if got := opened.closeCount.Load(); got != 1 {
+			t.Fatalf("executor %q workspace closed %d times, want once", e.GetDefinition().ID, got)
+		}
+	}
+}
+
+// recordingExecutorProvider 是测试用 ExecutorProvider：返回固定列表，按调用顺序记下收到的对话 ID。
+type recordingExecutorProvider struct {
+	executors       []executor.Executor
+	conversationIDs []defs.ConversationID
+}
+
+// GetExecutors 记下对话 ID，返回固定列表。
+func (p *recordingExecutorProvider) GetExecutors(_ context.Context, conversationID defs.ConversationID) ([]executor.Executor, error) {
+	// 1. 保存对话 ID。
+	p.conversationIDs = append(p.conversationIDs, conversationID)
+	return p.executors, nil
+}
+
+// newSSHTestExecutor 创建连到 address 的 remote Executor。
+func newSSHTestExecutor(rootDirectory, address, identityFile string) executor.Executor {
+	// 1. 用 remote 定义和连接参数创建 SSH Executor。
+	return executor.NewSSHExecutor(executor.NewSSHExecutorOpt(&defs.ExecutorDefinition{
+		ID:                 "remote",
+		Kind:               defs.ExecutorKindSSH,
+		Description:        "远端",
+		WorkspaceDirectory: rootDirectory,
+	}, address, identityFile))
 }
 
 // getRootDetails 返回对话根 Session 的详情。

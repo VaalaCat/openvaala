@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // iso-executors：中间是运行时，四个已支持的 Executor 沿四条轴排开，工具调用依次发往本机、build-box、gpu-01 和内置沙箱；
 // 左右两侧是尚未支持的 Executor 的淡虚线轮廓，越往外越淡，不接收数据包。
+// 窄屏上画布缩得更小：去掉淡虚线轮廓下的名字，只留放大的 Executor 名和一行"陆续支持"。
 import { computed } from "vue"
 import { useData } from "vitepress"
 import IsoCable from "../primitives/IsoCable.vue"
@@ -83,7 +84,7 @@ function getShimmerStops(at: number, opacity: number): SceneStop[] {
 </script>
 
 <template>
-  <SceneCanvas view-box="-242 -112 484 220" :period="11000">
+  <SceneCanvas view-box="-242 -116 484 224" :period="11000">
     <!-- 两侧：尚未支持的 Executor，只有淡虚线轮廓，不接收数据包 -->
     <g
       v-for="future in futureExecutors"
@@ -92,9 +93,9 @@ function getShimmerStops(at: number, opacity: number): SceneStop[] {
       :style="{ opacity: future.opacity }"
     >
       <IsoSlab :at="future.at" :size="[24, 24, 10]" :radius="5" tone="ghost" />
-      <text class="scene-label" :x="future.screen[0]" :y="future.screen[1] + 26" text-anchor="middle">{{ future.label }}</text>
+      <text class="scene-label future-label" :x="future.screen[0]" :y="future.screen[1] + 26" text-anchor="middle">{{ future.label }}</text>
     </g>
-    <text class="scene-label scene-label--small" x="0" y="104" text-anchor="middle">
+    <text class="scene-label scene-label--small coming-label" x="0" y="104" text-anchor="middle">
       {{ isZh ? "更多 Executor 陆续支持 …" : "more executors coming …" }}
     </text>
 
@@ -139,7 +140,7 @@ function getShimmerStops(at: number, opacity: number): SceneStop[] {
     <text
       v-for="executor in executors"
       :key="`label-${executor.key}`"
-      class="scene-label scene-label--ink"
+      class="scene-label scene-label--ink executor-label"
       :x="getLabelPosition(executor)[0]"
       :y="getLabelPosition(executor)[1]"
       text-anchor="middle"
@@ -148,3 +149,16 @@ function getShimmerStops(at: number, opacity: number): SceneStop[] {
     </text>
   </SceneCanvas>
 </template>
+
+<style scoped>
+@media (max-width: 719px) {
+  .future-label {
+    display: none;
+  }
+
+  .executor-label,
+  .coming-label {
+    font-size: 12px;
+  }
+}
+</style>

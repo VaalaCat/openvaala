@@ -4,7 +4,7 @@ This page lists the tools an agent can call, what each one does, and how to limi
 
 Agents get four groups of tools:
 
-- **File tools** — `read_file`, `apply_patch`
+- **File tools** — `read_file`, `apply_patch`, `glob`, `grep`
 - **Command tools** — `bash`, `read_command_output`, `write_stdin`, `stop_command`, `list_commands`
 - **Collaboration tools** — `spawn_agent`, `send_message`, `wait_agent`, `interrupt_agent`, `list_agents`, `read_session_history`
 - **MCP tools** — named `mcp__<server>__<tool>`; see [MCP servers](extensions.md#mcp-servers)
@@ -51,6 +51,38 @@ Creates, changes and deletes files with one patch, in the same format Codex uses
 - Adding requires that the file does not exist; updating and deleting require a regular file. Renames (`*** Move to:`) are not supported.
 - A patch may touch up to 128 files and 1024 hunks, and may be up to 4 MB.
 - Files are written one after another. If a later file fails, the earlier ones stay changed and the result says the patch was only partly applied.
+
+### glob
+
+Lists file paths that match a wildcard, without reading the files.
+
+- `pattern` — a wildcard relative to `path`, such as `**/*.go` or `src/**/test_*.py`. A pattern without `/` matches file names at any depth, so `*.go` finds every Go file.
+- `path` — the directory to start from, relative to the working directory or absolute. Default: the working directory.
+- `limit` — number of paths, 1 to 1000. Default 100.
+
+Paths come back sorted, relative to the working directory (absolute when `path` points outside it). With more than `limit` matches, the result has `truncated: true`.
+
+### grep
+
+Searches file contents line by line with a regular expression.
+
+- `pattern` — the regular expression.
+- `path` — a directory or a file, relative to the working directory or absolute. Default: the working directory.
+- `glob` — only search files whose path matches this wildcard, relative to `path`, such as `*.go`.
+- `ignore_case` — match upper and lower case alike. Default false.
+- `limit` — number of matching lines, 1 to 1000. Default 100.
+
+Each match has `path`, `line` (from 1) and the line's `text`, cut to 500 characters. Binary files are skipped. Results are sorted by path and line, and `truncated: true` means there were more than `limit`.
+
+### How glob and grep search
+
+Hidden files and directories (names starting with `.`, including `.git`) are always skipped. On `local` and `ssh` executors the tool uses the first of these that the machine has:
+
+1. `rg` ([ripgrep](https://github.com/BurntSushi/ripgrep)).
+2. `git ls-files` and `git grep`, when the directory is inside a git repository. Files that `.gitignore` excludes are skipped.
+3. `find` and `grep`. These do not read `.gitignore`.
+
+Whichever one runs, the result is the same, so patterns are limited to what ripgrep and POSIX extended regular expressions both understand. `\d`, `\w`, `\s` and their uppercase forms work, but inline flags such as `(?i)` are rejected; use `ignore_case`. `virtual` executors have no commands, so their in-memory files are walked directly. When there are more matches than `limit`, which ones are kept is not guaranteed to be the same across the three commands.
 
 ## Command tools
 
@@ -108,7 +140,7 @@ An agent's `tools` list chooses among the file and command tools only:
 tools: [read_file, bash, read_command_output, write_stdin, stop_command, list_commands]
 ```
 
-- Valid names are `read_file`, `apply_patch`, `bash`, `read_command_output`, `write_stdin`, `stop_command` and `list_commands`. Any other name is an error when a conversation starts.
+- Valid names are `read_file`, `apply_patch`, `glob`, `grep`, `bash`, `read_command_output`, `write_stdin`, `stop_command` and `list_commands`. Any other name is an error when a conversation starts.
 - Leaving `tools` out gives the agent all of them.
 - `bash` only starts commands and waits up to `wait_seconds`; list the other command tools with it so the agent can read output, type input and stop commands.
 - Collaboration tools are always available. MCP tools are chosen with the agent's `mcp_servers` list instead.

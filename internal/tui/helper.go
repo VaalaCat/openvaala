@@ -118,10 +118,12 @@ func formatWorkLocation(executorID, directory string, isLocalServer bool) string
 
 // getDefaultExecutorLocation 返回默认 Executor 和它的工作目录。
 func getDefaultExecutorLocation(settings defs.ExecutorSettings, executors []conversation.ExecutorDetails) (executorID, directory string) {
-	// 1. 优先读取 DefaultExecutorID，否则取 Executor 列表里第一个对这个设置可用的。
+	// 1. 优先读取 DefaultExecutorID，否则取 Executor 列表里第一个对这个设置可用、且不是 memory 的。
 	executorID = settings.DefaultExecutorID
 	if executorID == "" {
-		if index := slices.IndexFunc(executors, func(each conversation.ExecutorDetails) bool { return settings.IsExecutorAvailable(each.ID) }); index >= 0 {
+		if index := slices.IndexFunc(executors, func(each conversation.ExecutorDetails) bool {
+			return each.Kind != defs.ExecutorKindMemory && settings.IsExecutorAvailable(each.ID)
+		}); index >= 0 {
 			executorID = executors[index].ID
 		}
 	}

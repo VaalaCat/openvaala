@@ -92,6 +92,10 @@ class FakeSyncConnection implements SyncConnection {
     return this.calls.map((call) => call.method)
   }
 
+  getCalls(): [string, unknown][] {
+    return this.calls.map((call) => [call.method, call.params])
+  }
+
   getParams<M extends keyof MethodParams>(method: M): MethodParams[M][] {
     return this.calls
       .filter((call) => call.method === method)
@@ -387,6 +391,7 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
       assert.equal(h.sync.$syncState.get(), "synced")
       assert.equal(h.sync.$title.get(), "标题")
       assert.equal(h.sync.getFollowedSessionID(), rootSessionID)
+      assert.equal(h.sync.$rootSessionID.get(), rootSessionID)
       // 2. 推送开始和两段增量，最后一项是两段增量拼起来的文本。
       h.connection.push(
         notification("item/started", {
@@ -1492,3 +1497,271 @@ for (const stage of [
     }
   })
 }
+
+// 有 rootSync 的同步只订阅自己 Session 的内容，对话级订阅留给根 Session 的同步。
+test("session_only_sync_leaves_the_conversation_subscription_to_the_root_sync", async () => {
+  // 1. 根 Session 的同步先同步完，对话里有一个正在执行 t1 的子 Session。
+  const h = createHarness()
+  h.connection.reply("conversation/subscribe", () => ({
+    title: "标题",
+    sessions: [
+      sessionInfo(rootSessionID),
+      { ...sessionInfo("child", rootSessionID), active_turn_id: "t1" },
+    ],
+  }))
+  const stopRoot = await h.start()
+  const sync = new ConversationSync(
+    h.connection,
+    h.queryClient,
+    conversationID,
+    "child",
+    h.sync
+  )
+  let stop = () => {}
+  // 2. 每一步只看这一步发出的请求。
+  const steps: {
+    name: string
+    act(): void | Promise<void>
+    wantCalls: [string, unknown][]
+    check(): void
+  }[] = [
+    {
+      name: "starting subscribes only to its own session",
+      act() {
+        stop = sync.run()
+      },
+      wantCalls: [
+        ["conversation/open", { conversation_id: conversationID }],
+        [
+          "session/unsubscribe",
+          { conversation_id: conversationID, session_id: "child" },
+        ],
+        [
+          "session/subscribe",
+          { conversation_id: conversationID, session_id: "child" },
+        ],
+        [
+          "session/items/list",
+          {
+            conversation_id: conversationID,
+            session_id: "child",
+            order: "desc",
+            limit: 50,
+          },
+        ],
+      ],
+      check() {
+        // 标题和 Session 信息就是根 Session 的同步的，执行中的 Turn 从中读到。
+        assert.equal(sync.$syncState.get(), "synced")
+        assert.equal(sync.$title, h.sync.$title)
+        assert.equal(sync.$sessions, h.sync.$sessions)
+        assert.equal(sync.$title.get(), "标题")
+        assert.equal(sync.$turns.get().t1?.status, "running")
+      },
+    },
+    {
+      name: "conversation notifications are handled by the root sync only and its session info drives the turns",
+      act() {
+        h.connection.push(
+          notification(
+            "conversation/titleUpdated",
+            { title: "新标题" },
+            { subscription: "conversation", session_id: "" }
+          )
+        )
+        h.connection.push(
+          notification(
+            "session/statusUpdated",
+            {
+              info: {
+                ...sessionInfo("child", rootSessionID),
+                last_turn_id: "t1",
+                last_turn_status: "completed",
+              },
+            },
+            { subscription: "conversation", session_id: "child" }
+          )
+        )
+      },
+      wantCalls: [],
+      check() {
+        assert.equal(sync.$title.get(), "新标题")
+        assert.equal(h.sync.$title.get(), "新标题")
+        assert.equal(sync.$sessions.get().child.last_turn_id, "t1")
+        // 只有根 Session 的同步处理了这两条通知，各让查询失效一次。
+        assert.equal(
+          h.getInvalidatedKeys().filter((key) => key?.[1] === "conversations")
+            .length,
+          1
+        )
+        // 根同步写入的 Session 信息里 t1 已结束，只读 Session 内容的同步的 Turn 状态跟着它。
+        assert.equal(sync.$turns.get().t1?.status, "completed")
+      },
+    },
+    {
+      name: "session notifications still reach the session-only sync",
+      act() {
+        h.connection.push(
+          notification(
+            "item/started",
+            {
+              turn_id: "t1",
+              item_index: 0,
+              item: messageItem("child-item", "t1", "子"),
+            },
+            { session_id: "child" }
+          )
+        )
+      },
+      wantCalls: [],
+      check() {
+        assert.deepEqual(getKeys(sync), ["child-item"])
+        assert.deepEqual(getKeys(h.sync), [])
+      },
+    },
+    {
+      name: "stopping leaves the root subscription intact",
+      act() {
+        stop()
+      },
+      wantCalls: [
+        [
+          "session/unsubscribe",
+          { conversation_id: conversationID, session_id: "child" },
+        ],
+      ],
+      check() {
+        assert.equal(h.sync.$syncState.get(), "synced")
+      },
+    },
+  ]
+  try {
+    for (const step of steps) {
+      h.connection.clearCalls()
+      await step.act()
+      await flush()
+      assert.deepEqual(h.connection.getCalls(), step.wantCalls, step.name)
+      step.check()
+    }
+  } finally {
+    stop()
+    stopRoot()
+  }
+})
+
+// 根 Session 的同步还没第一次同步完时，只读 Session 内容的同步等它，才读得到对话里的 Session 信息。
+test("session_only_sync_waits_for_the_root_sync_first_sync", async () => {
+  const h = createHarness()
+  let releaseSubscribe = () => {}
+  h.connection.reply(
+    "conversation/subscribe",
+    async () =>
+      new Promise((resolve) => {
+        releaseSubscribe = () =>
+          resolve({
+            title: "标题",
+            sessions: [
+              sessionInfo(rootSessionID),
+              { ...sessionInfo("child", rootSessionID), active_turn_id: "t1" },
+            ],
+          })
+      })
+  )
+  const stopRoot = h.sync.run()
+  const sync = new ConversationSync(
+    h.connection,
+    h.queryClient,
+    conversationID,
+    "child",
+    h.sync
+  )
+  const stop = sync.run()
+  try {
+    await flush()
+    assert.equal(sync.$syncState.get(), "syncing")
+    assert.equal(sync.hasInitialData(), false)
+    releaseSubscribe()
+    await flush()
+    assert.equal(h.sync.$syncState.get(), "synced")
+    assert.equal(sync.$syncState.get(), "synced")
+    assert.equal(sync.$turns.get().t1?.status, "running")
+    assert.equal(countCalls(h, "conversation/subscribe"), 1)
+  } finally {
+    stop()
+    stopRoot()
+  }
+})
+
+// 断线期间 Turn 的状态变了：重连后根 Session 的同步写入新的 Session 信息，只读 Session 内容的同步的 Turn 状态跟着它，
+// 不依赖两个同步重连完成的先后。
+test("session_only_sync_turns_follow_the_root_session_info_after_reconnect", async () => {
+  const cases: {
+    name: string
+    before: Partial<SessionRuntimeInfo>
+    after: Partial<SessionRuntimeInfo>
+    wantBefore: Record<string, { status: string }>
+    wantAfter: Record<string, { status: string }>
+  }[] = [
+    {
+      name: "turn finished during the disconnect",
+      before: { active_turn_id: "t1" },
+      after: { last_turn_id: "t1", last_turn_status: "completed" },
+      wantBefore: { t1: { status: "running" } },
+      wantAfter: { t1: { status: "completed" } },
+    },
+    {
+      name: "new turn started during the disconnect",
+      before: { last_turn_id: "t1", last_turn_status: "completed" },
+      after: {
+        last_turn_id: "t1",
+        last_turn_status: "completed",
+        active_turn_id: "t2",
+      },
+      wantBefore: { t1: { status: "completed" } },
+      wantAfter: { t1: { status: "completed" }, t2: { status: "running" } },
+    },
+  ]
+  for (const each of cases) {
+    const h = createHarness()
+    let subscribed = 0
+    h.connection.reply("conversation/subscribe", () => ({
+      title: "标题",
+      sessions: [
+        sessionInfo(rootSessionID),
+        {
+          ...sessionInfo("child", rootSessionID),
+          ...(subscribed++ === 0 ? each.before : each.after),
+        },
+      ],
+    }))
+    const stopRoot = await h.start()
+    const sync = new ConversationSync(
+      h.connection,
+      h.queryClient,
+      conversationID,
+      "child",
+      h.sync
+    )
+    const stop = sync.run()
+    try {
+      await flush()
+      assert.deepEqual(sync.$turns.get(), each.wantBefore, each.name)
+      // 重连：根 Session 的同步多一次对话级订阅，晚于只读同步完成，新的 Session 信息才写进来。
+      h.connection.connect()
+      await flush()
+      assert.deepEqual(
+        h.sync.$sessions.get().child,
+        {
+          ...sessionInfo("child", rootSessionID),
+          ...each.after,
+        },
+        each.name
+      )
+      assert.deepEqual(sync.$turns.get(), each.wantAfter, each.name)
+      assert.equal(sync.$syncState.get(), "synced", each.name)
+    } finally {
+      stop()
+      stopRoot()
+    }
+  }
+})

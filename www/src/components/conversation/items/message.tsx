@@ -200,7 +200,7 @@ function AgentMessageBody({
         <p
           ref={previewRef}
           className={cn(
-            "max-h-[4lh] overflow-hidden text-body wrap-anywhere whitespace-pre-wrap color-muted",
+            "max-h-[4lh] overflow-hidden text-reading wrap-anywhere whitespace-pre-wrap color-muted",
             !open && isLong && "agent-message-preview-fade"
           )}
           hidden={open}
@@ -231,7 +231,7 @@ function UserMessage({ contents }: { contents: Content[] }) {
   return (
     <div className="ml-auto flex max-w-[85%] min-w-0 flex-col gap-2 bg-muted px-3 py-2">
       {typedText && (
-        <p className="text-body wrap-anywhere whitespace-pre-wrap">
+        <p className="text-reading wrap-anywhere whitespace-pre-wrap">
           {typedText}
         </p>
       )}
@@ -252,7 +252,7 @@ function UserMessage({ contents }: { contents: Content[] }) {
             aria-hidden={!disclosure?.open || undefined}
           >
             <div className="process-disclosure-content pt-1">
-              <pre className="max-h-60 overflow-auto text-code whitespace-pre-wrap">
+              <pre className="max-h-60 overflow-auto text-code-reading whitespace-pre-wrap">
                 {getContentText(context)}
               </pre>
             </div>

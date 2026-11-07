@@ -45,7 +45,7 @@ export function ConfigurationLayout({
             >
               <ChevronRightIcon
                 className={cn(
-                  "shrink-0 transition-transform motion-reduce:transition-none",
+                  "shrink-0 transition-transform",
                   expanded && "rotate-90"
                 )}
               />

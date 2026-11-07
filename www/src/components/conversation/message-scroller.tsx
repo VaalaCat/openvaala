@@ -1,5 +1,5 @@
 import { CircleAlert, ListTree } from "lucide"
-import { LayoutGroup, motion, useReducedMotion } from "motion/react"
+import { LayoutGroup, motion } from "motion/react"
 import {
   memo,
   useCallback,
@@ -21,6 +21,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { RequestError } from "@/components/base/request-error"
+import { ImagePreviewStrip } from "@/components/base/image-preview"
 import { RotatingText } from "@/components/base/rotating-text"
 import { ItemHeader, ItemStatus } from "@/components/conversation/item-notice"
 import { ItemView } from "@/components/conversation/item-view"
@@ -42,7 +43,7 @@ import {
   getProcessFacts,
   getProcessActionText,
   getTurnResult,
-  getReplyToCopy,
+  getReplyKeysToCopy,
   getMessageSource,
   type ItemRow,
   type MessageRow,
@@ -54,6 +55,9 @@ import { getSessionName } from "@/lib/session-tree"
 import { getStringField, parseToolArguments } from "@/lib/tool-arguments"
 import { shouldShowLoadError } from "@/lib/rpc-error"
 import { cn } from "@/lib/utils"
+
+// 离底部这么近就算贴底，和滚动库的判断一致（px）
+const nearBottomDistance = 70
 
 // 消息区的滚动锚点：视口里第一条露出来的 Item，和滚动位置是 knownScrollTop 时它离滚动区顶部的距离
 interface ScrollAnchor {
@@ -71,6 +75,8 @@ export function MessageScroller({
   isReady,
   loadingContent,
   isSubSession,
+  canLoadEarlier = true,
+  header,
   rows,
   footer,
   onInspect,
@@ -79,16 +85,19 @@ export function MessageScroller({
   isReady: boolean
   loadingContent: ReactNode
   isSubSession: boolean
+  // 是否允许向前加载更早的 Item？旁支只显示分叉之后的内容，开头已经显示出来后不再往前翻
+  canLoadEarlier?: boolean
+  // 消息列的第一行：和 Item 同宽同边距，排在所有行之前
+  header?: ReactNode
   rows: MessageRow[]
   footer: ReactNode
   onInspect(target: ItemDebugTarget): void
 }) {
   const { t } = useTranslation()
-  const reducedMotion = useReducedMotion()
   const connection = useServerConnection()
   const items = useStore(sync.$items)
-  const replyToCopy = useMemo(() => getReplyToCopy(items), [items])
-  const hasEarlierItems = useStore(sync.$hasEarlierItems)
+  const replyKeysToCopy = useMemo(() => getReplyKeysToCopy(items), [items])
+  const hasEarlierItems = useStore(sync.$hasEarlierItems) && canLoadEarlier
   const turnViews = useStore(sync.$turns)
   useLayoutEffect(() => {
     if (isReady) sync.markItemsPresented(items.filter(hasItemPresentation))
@@ -135,6 +144,10 @@ export function MessageScroller({
     state: stickState,
   } = useStickToBottom({ initial: "instant", resize: "smooth" })
   const messagesRef = useRef<HTMLElement>(null)
+  // 最近一次可见时的滚动位置：隐藏（display:none）时浏览器丢掉位置、尺寸变成 0，重新显示时放回去
+  const visiblePositionRef = useRef<
+    { scrollTop: number; isNearBottom: boolean } | undefined
+  >(undefined)
   const anchorRef = useRef<ScrollAnchor | undefined>(undefined)
   const anchorFrameRef = useRef<number | undefined>(undefined)
   const updateAnchor = useCallback(() => {
@@ -256,6 +269,7 @@ export function MessageScroller({
     // 1. 新目标重置阅读锚点，保留公共滚动容器。
     syncRef.current = sync
     anchorRef.current = undefined
+    visiblePositionRef.current = undefined
     hasLeftTopRef.current = false
     if (scrollRef.current) scrollRef.current.scrollTop = 0
   }, [sync, scrollRef])
@@ -266,15 +280,48 @@ export function MessageScroller({
     const scroller = scrollRef.current
     const content = contentRef.current
     if (!scroller || !content) return
+    // 隐藏时（尺寸 0）不记位置，也不让隐藏造成的尺寸变化改动滚动状态；重新显示时再放回去
+    let isHidden = scroller.clientHeight === 0
     const handleScroll = () => {
+      if (!isHidden && scroller.clientHeight > 0)
+        visiblePositionRef.current = {
+          scrollTop: scroller.scrollTop,
+          isNearBottom:
+            stickState.targetScrollTop - scroller.scrollTop <=
+            nearBottomDistance,
+        }
       anchorFrameRef.current ??= requestAnimationFrame(updateAnchor)
+    }
+    // 隐藏前贴着底部的回到底部继续跟随新输出；在中间阅读的放回原来的位置，不再跟随
+    const restoreVisiblePosition = () => {
+      const position = visiblePositionRef.current
+      if (!position) return
+      if (position.isNearBottom) {
+        stickState.scrollTop = stickState.targetScrollTop
+      } else {
+        stopScroll()
+        stickState.scrollTop = position.scrollTop
+      }
+      updateAnchor()
     }
     const observer = new ResizeObserver(updateAnchor)
     observer.observe(content)
     // 窗口高度或手机键盘改变消息区高度时，贴底阅读继续停在最底部。
     let viewportHeight = scroller.clientHeight
     const viewportObserver = new ResizeObserver(() => {
-      // 1. 和内容尺寸变化一样记下高度差，浏览器随之收回滚动位置不算用户上滚。
+      // 1. 隐藏时只记下隐藏了；滚动库会把尺寸归零当成「贴底」，重新显示时按隐藏前的位置恢复。
+      if (scroller.clientHeight === 0) {
+        isHidden = true
+        viewportHeight = 0
+        return
+      }
+      if (isHidden) {
+        isHidden = false
+        viewportHeight = scroller.clientHeight
+        restoreVisiblePosition()
+        return
+      }
+      // 2. 和内容尺寸变化一样记下高度差，浏览器随之收回滚动位置不算用户上滚。
       const difference = viewportHeight - scroller.clientHeight
       viewportHeight = scroller.clientHeight
       if (difference === 0) return
@@ -285,7 +332,7 @@ export function MessageScroller({
             stickState.resizeDifference = 0
         }, 1)
       })
-      // 2. 贴底时本帧补上被遮住的距离。
+      // 3. 贴底时本帧补上被遮住的距离。
       if (
         stickState.isAtBottom &&
         scroller.scrollTop < stickState.targetScrollTop
@@ -303,96 +350,104 @@ export function MessageScroller({
         anchorFrameRef.current = undefined
       }
     }
-  }, [scrollRef, contentRef, updateAnchor, stickState])
+  }, [scrollRef, contentRef, updateAnchor, stopScroll, stickState])
 
   return (
-    <div
-      ref={scrollRef}
-      data-slot="message-scroller"
-      // 滚动锚定由第 3 步做，关掉浏览器自己的，避免补两次；relative 让 sr-only 这类绝对定位的文字随消息滚动、在这里裁剪
-      className="relative min-h-0 flex-1 [scrollbar-gutter:stable] overflow-y-auto [overflow-anchor:none]"
-    >
-      {/* 消息和输入区共用这一列的宽度；输入区滚动时贴在底部 */}
+    <div className="flex min-h-0 flex-1 flex-col">
       <div
-        ref={contentRef}
-        className="mx-auto flex min-h-full w-full max-w-3xl min-w-0 flex-col gap-4 px-3 pt-4 md:px-6"
+        ref={scrollRef}
+        data-slot="message-scroller"
+        // 滚动锚定由第 3 步做，关掉浏览器自己的，避免补两次；relative 让 sr-only 这类绝对定位的文字随消息滚动、在这里裁剪；
+        // 滚到头时不把滚动交给外层，回弹只在消息区里
+        className="relative min-h-0 flex-1 [scrollbar-gutter:stable] overflow-y-auto overscroll-y-contain [overflow-anchor:none]"
       >
-        <section
-          ref={messagesRef}
-          tabIndex={0}
-          aria-label={t("conversation.messages")}
-          className="flex min-w-0 flex-col gap-4"
+        {/* 消息列：输入区在滚动容器外，两边各自按同样的滚动条槽和列宽对齐 */}
+        <div
+          ref={contentRef}
+          className="mx-auto w-full max-w-3xl min-w-0 px-3 py-4 md:px-6"
         >
-          {!isReady && loadingContent}
-          {isReady && hasEarlierItems && (
-            <div
-              ref={sentinelRef}
-              className="flex min-h-8 flex-col items-center justify-center"
-            >
-              {earlierItemsError && shouldShowLoadError(earlierItemsError) ? (
-                <RequestError
-                  error={earlierItemsError}
-                  onRetry={() => void loadEarlierItems()}
-                />
-              ) : (
-                <LatticeLoader
-                  aria-label={t("conversation.loadingEarlier")}
-                  className={isLoadingEarlier ? "color-muted" : "invisible"}
-                />
-              )}
-            </div>
-          )}
-          {isReady && rows.length === 0 && (
-            <p className="py-8 text-center text-body color-muted">
-              {t("conversation.empty")}
-            </p>
-          )}
-          {isReady &&
-            rows.map((row) =>
-              row.kind === "turn" ? (
-                <TurnTimeline
-                  key={row.key}
-                  turnID={row.turnID}
-                  rows={row.rows}
-                  items={row.items}
-                  replyKeyToCopy={
-                    replyToCopy?.turnID === row.turnID
-                      ? replyToCopy.key
-                      : undefined
-                  }
-                  turn={turnsByID.get(row.turnID)}
-                  turnView={turnViews[row.turnID]}
-                  isLoadingTurn={turns.isFetching && !turnsByID.has(row.turnID)}
-                  savedDurationMs={turnSavedDurations.get(row.turnID)}
-                  sync={sync}
-                  isSubSession={isSubSession}
-                  choices={choices}
-                  chooseOpen={chooseOpen}
-                  onInspect={onInspect}
-                />
-              ) : (
-                <TimelineItem
-                  key={row.view.key}
-                  row={row}
-                  copyReply={row.view.key === replyToCopy?.key}
-                  sync={sync}
-                  isSubSession={isSubSession}
-                  choices={choices}
-                  chooseOpen={chooseOpen}
-                  onInspect={onInspect}
-                />
-              )
+          <section
+            ref={messagesRef}
+            tabIndex={0}
+            aria-label={t("conversation.messages")}
+            className="flex min-w-0 flex-col gap-4"
+          >
+            {!isReady && loadingContent}
+            {isReady && hasEarlierItems && (
+              <div
+                ref={sentinelRef}
+                className="flex min-h-8 flex-col items-center justify-center"
+              >
+                {earlierItemsError && shouldShowLoadError(earlierItemsError) ? (
+                  <RequestError
+                    error={earlierItemsError}
+                    onRetry={() => void loadEarlierItems()}
+                  />
+                ) : (
+                  <LatticeLoader
+                    aria-label={t("conversation.loadingEarlier")}
+                    className={isLoadingEarlier ? "color-muted" : "invisible"}
+                  />
+                )}
+              </div>
             )}
-        </section>
-        <div className="sticky bottom-0 z-10 mt-auto bg-background pb-3">
+            {isReady && header}
+            {isReady && rows.length === 0 && (
+              <p className="py-8 text-center text-body color-muted">
+                {t("conversation.empty")}
+              </p>
+            )}
+            {isReady &&
+              rows.map((row) =>
+                row.kind === "turn" ? (
+                  <TurnTimeline
+                    key={row.key}
+                    turnID={row.turnID}
+                    rows={row.rows}
+                    items={row.items}
+                    replyKeyToCopy={replyKeysToCopy.get(row.turnID)}
+                    turn={turnsByID.get(row.turnID)}
+                    turnView={turnViews[row.turnID]}
+                    isLoadingTurn={
+                      turns.isFetching && !turnsByID.has(row.turnID)
+                    }
+                    savedDurationMs={turnSavedDurations.get(row.turnID)}
+                    sync={sync}
+                    isSubSession={isSubSession}
+                    choices={choices}
+                    chooseOpen={chooseOpen}
+                    onInspect={onInspect}
+                  />
+                ) : (
+                  <TimelineItem
+                    key={row.view.key}
+                    row={row}
+                    copyReply={
+                      row.view.key === replyKeysToCopy.get(row.view.turnID)
+                    }
+                    sync={sync}
+                    isSubSession={isSubSession}
+                    choices={choices}
+                    chooseOpen={chooseOpen}
+                    onInspect={onInspect}
+                  />
+                )
+              )}
+          </section>
+        </div>
+      </div>
+      {/* 输入区在滚动容器外面，消息区回弹时它不动；消息列和这里各自保留滚动条槽，同列宽对齐。
+          槽用独立占位元素保留，输入区外面不设 overflow，斜杠补全列表和回到底部按钮才不会被裁掉 */}
+      <div className="flex shrink-0 bg-background">
+        <div className="relative z-10 min-w-0 flex-1">
           <motion.div
             initial={false}
             animate={{
               opacity: isAtBottom ? 0 : 1,
-              y: isAtBottom && !reducedMotion ? 4 : 0,
+              y: isAtBottom ? 4 : 0,
             }}
             transition={{
-              duration: reducedMotion ? 0 : 0.14,
+              duration: 0.14,
               ease: "easeOut",
             }}
             inert={isAtBottom}
@@ -415,7 +470,7 @@ export function MessageScroller({
                     onClick={() => {
                       messagesRef.current?.focus({ preventScroll: true })
                       void scrollToBottom({
-                        animation: reducedMotion ? "instant" : "smooth",
+                        animation: "smooth",
                       })
                     }}
                   />
@@ -428,8 +483,14 @@ export function MessageScroller({
               </TooltipContent>
             </Tooltip>
           </motion.div>
-          {footer}
+          <div className="mx-auto w-full max-w-3xl px-3 pb-3 md:px-6">
+            {footer}
+          </div>
         </div>
+        <div
+          aria-hidden
+          className="[scrollbar-gutter:stable] overflow-y-hidden"
+        />
       </div>
     </div>
   )
@@ -469,7 +530,6 @@ const TurnTimeline = memo(function TurnTimeline({
   isSubSession: boolean
 }) {
   const { t } = useTranslation()
-  const reducedMotion = useReducedMotion()
   // 1. 完整成功轮次确认最终回复，其他模型回复各自显示中途回复入口。
   const result = getTurnResult(items, turn, turnView)
   const resultKeys = new Set(result.map((view) => view.key))
@@ -509,7 +569,7 @@ const TurnTimeline = memo(function TurnTimeline({
           choices={choices}
           chooseOpen={chooseOpen}
           onInspect={onInspect}
-          copyReply={row.view.key === replyKeyToCopy}
+          copyReply={!isRunning && row.view.key === replyKeyToCopy}
           isProgressMessage={
             result.length > 0 &&
             row.view.item.kind === "message" &&
@@ -532,21 +592,40 @@ const TurnTimeline = memo(function TurnTimeline({
       groupRows.some(
         (member) => choices["item:" + member.view.key] !== undefined
       )
+    const images = groupRows.flatMap((member) => {
+      const result =
+        member.toolResult?.item.tool_result ?? member.view.item.tool_result
+      return (result?.images ?? []).flatMap((image, index) =>
+        image
+          ? [
+              {
+                key: `${member.view.key}:${index}`,
+                src: image.data_url,
+                alt: image.alt,
+              },
+            ]
+          : []
+      )
+    })
     return (
       <Collapsible
         key={key}
         render={
           <motion.div
-            initial={isEnteringGroup && !reducedMotion ? { opacity: 0 } : false}
+            initial={isEnteringGroup ? { opacity: 0 } : false}
             animate={{ opacity: 1 }}
-            transition={{ duration: reducedMotion ? 0 : 0.16, ease: "easeOut" }}
+            transition={{ duration: 0.16, ease: "easeOut" }}
           />
         }
         open={isSingle || groupOpen}
         onOpenChange={(open) => chooseOpen("group:" + key, open)}
         className="flex min-w-0 flex-col gap-2"
       >
-        <div data-anchor-key={"group:" + key} hidden={isSingle}>
+        <div
+          data-anchor-key={"group:" + key}
+          hidden={isSingle}
+          className="flex min-w-0 flex-col gap-2"
+        >
           <SummaryButton
             sync={sync}
             open={groupOpen}
@@ -556,6 +635,7 @@ const TurnTimeline = memo(function TurnTimeline({
             isTailGroup={row === rows.at(-1)}
             isModelErrors={row.groupKind === "model_errors"}
           />
+          {!groupOpen && <ImagePreviewStrip images={images} />}
         </div>
         <CollapsibleContent
           keepMounted
@@ -624,7 +704,6 @@ const TimelineItem = memo(function TimelineItem({
   copyReply?: boolean
   suppressEntrance?: boolean
 }) {
-  const reducedMotion = useReducedMotion()
   // 1. 只在本条 Item 的选择变化时更新上下文，其他 Item 的流式通知不刷新它。
   const itemKey = row.view.key
   const key = "item:" + itemKey
@@ -642,14 +721,12 @@ const TimelineItem = memo(function TimelineItem({
   return (
     <motion.div
       initial={
-        !suppressEntrance &&
-        !reducedMotion &&
-        sync.isUnpresentedLiveItem(itemKey)
+        !suppressEntrance && sync.isUnpresentedLiveItem(itemKey)
           ? { opacity: 0 }
           : false
       }
       animate={{ opacity: 1 }}
-      transition={{ duration: reducedMotion ? 0 : 0.16, ease: "easeOut" }}
+      transition={{ duration: 0.16, ease: "easeOut" }}
       data-item-key={row.view.key}
       data-anchor-key={
         row.view.item.kind === "message" &&
@@ -706,7 +783,6 @@ function SummaryButton({
   isModelErrors?: boolean
 }) {
   const { t } = useTranslation()
-  const reducedMotion = useReducedMotion()
   // 1. 当前动作与整组状态从成员和所在位置计算。
   const facts = getProcessFacts(rows, isTurnRunning, isTailGroup)
   const state = isModelErrors ? "failed" : facts.state
@@ -761,9 +837,9 @@ function SummaryButton({
               <RotatingText text={countsText} transitionKey={countsText} />
             </span>
             <motion.span
-              layout={reducedMotion ? false : "position"}
+              layout="position"
               className="min-w-0 empty:hidden"
-              transition={{ duration: reducedMotion ? 0 : 0.16 }}
+              transition={{ duration: 0.16 }}
             >
               <RotatingText
                 text={actionText}

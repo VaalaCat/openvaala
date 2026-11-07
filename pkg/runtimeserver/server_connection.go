@@ -35,7 +35,7 @@ type serverConnection struct {
 	isInitialized bool
 	// tasksAfterResponse 是当前请求登记的后台任务，在它的响应入队之后才启动，订阅结果先于该订阅的通知；只由请求主循环读写。
 	tasksAfterResponse []func()
-	// subscriptions 是本连接的订阅：键包含种类；目标订阅包含对话与 Session，全局运行订阅不带目标。
+	// subscriptions 是本连接的订阅：键包含种类；目标订阅包含对话与 Session，全局运行订阅和终端列表订阅不带目标。
 	subscriptions syncmap.SyncMap[subscriptionKey, *connectionSubscription]
 	// connectionCtx 是 Run 的 ctx，即连接的生命周期；转发给客户端的 MCP 消息没有调用方 ctx，用它发送，连接结束时发送立即返回。
 	// 由 Run 在启动任何任务之前设置，之后只读。
@@ -47,10 +47,10 @@ type serverConnection struct {
 	// clientMCPStreams 是还没结束的转发流：stream_id 对应所属 server 的转发传输，客户端发来的消息按它分发；
 	// 流由 clientMCPSender 在连接和断开时登记与移除，客户端发来 clientMCP/closed 或连接结束时也移除。
 	clientMCPStreams syncmap.SyncMap[string, mcpclient.RelayTransport]
-	// terminals 是本连接打开且还没结束的终端，键是 terminal_id：终端由 terminal/open 登记，进程结束时由终端自己的转发任务移除，
-	// 连接结束时由 releaseTerminals 结束全部进程。
-	terminals syncmap.SyncMap[string, *connectionTerminal]
-	// tasks 是读任务、writer、心跳与各订阅转发任务；Run 返回前等待。
+	// terminalAttachments 是本连接接入的终端，键是 terminal_id：terminal/open 和 terminal/attach 登记，终端结束或被新的接入替换时移除；
+	// 接入的 ctx 派生自 connectionCtx，转发任务在 tasks 里，连接结束时随之取消并由 Run 等待，终端进程不受影响。
+	terminalAttachments syncmap.SyncMap[string, *terminalAttachment]
+	// tasks 是读任务、writer、心跳、各订阅转发任务与终端接入转发任务；Run 返回前等待。
 	tasks sync.WaitGroup
 }
 
@@ -92,7 +92,6 @@ func (c *serverConnection) Run(ctx context.Context) (closeReason error) {
 	defer func() {
 		cancel(closeReason)
 		c.releaseClientMCP(ctx)
-		c.releaseTerminals(ctx)
 		c.tasks.Wait()
 		_ = c.conn.CloseNow()
 	}()
@@ -197,9 +196,9 @@ func (c *serverConnection) handleFrame(ctx context.Context, frame []byte) *runti
 	}
 }
 
-// handleNotification 将客户端 MCP 消息与关闭通知交给对应转发流，把终端输入和尺寸变化交给对应终端；都不阻塞请求循环。
+// handleNotification 将客户端 MCP 消息与关闭通知交给对应转发流，把终端输入和尺寸变化交给本连接对该终端的接入；都不阻塞请求循环。
 func (c *serverConnection) handleNotification(ctx context.Context, request *runtimeprotocol.JSONRPCRequest) {
-	// 1. 按方法解析并交付；流或终端已结束时丢弃迟到通知，未知方法和无效参数记 Warn。
+	// 1. 按方法解析并交付；流已结束或本连接没有接入该终端时丢弃通知，未知方法和无效参数记 Warn。
 	switch request.Method {
 	case "clientMCP/message":
 		var params runtimeprotocol.ClientMCPMessageParams
@@ -231,8 +230,8 @@ func (c *serverConnection) handleNotification(ctx context.Context, request *runt
 			telemetry.GetLogger(ctx).Warn("notification dropped", "rpc.method", request.Method, "error", err)
 			return
 		}
-		if terminal, found := c.terminals.Load(params.TerminalID); found {
-			terminal.handleInput(params.Data)
+		if attachment, found := c.terminalAttachments.Load(params.TerminalID); found {
+			attachment.handleInput(params.Data)
 		}
 	case "terminal/resize":
 		var params runtimeprotocol.TerminalResizeParams
@@ -240,8 +239,8 @@ func (c *serverConnection) handleNotification(ctx context.Context, request *runt
 			telemetry.GetLogger(ctx).Warn("notification dropped", "rpc.method", request.Method, "error", err)
 			return
 		}
-		if terminal, found := c.terminals.Load(params.TerminalID); found {
-			terminal.handleResize(params.Rows, params.Cols)
+		if attachment, found := c.terminalAttachments.Load(params.TerminalID); found {
+			attachment.handleResize(params.Rows, params.Cols)
 		}
 	default:
 		telemetry.GetLogger(ctx).Warn("notification dropped", "rpc.method", request.Method, "reason", "unsupported method")
@@ -423,24 +422,6 @@ func (c *serverConnection) releaseClientMCP(ctx context.Context) {
 			telemetry.GetLogger(ctx).Warn("remove client MCP servers failed", "gen_ai.conversation.id", string(conversationID), "error", err)
 		}
 	}
-}
-
-// releaseTerminals 结束本连接打开的全部终端进程，终端的转发任务随之关闭各自的工作区。
-func (c *serverConnection) releaseTerminals(ctx context.Context) {
-	// 1. 创建不随连接取消的限时上下文，所有终端共用结束时限。
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalReleaseTimeout)
-	defer cancel()
-	// 2. 并行结束各终端进程；结束失败记 Warn，等全部返回后离开。
-	var tasks sync.WaitGroup
-	c.terminals.Range(func(terminalID string, terminal *connectionTerminal) bool {
-		tasks.Go(func() {
-			if err := terminal.terminate(releaseCtx); err != nil {
-				telemetry.GetLogger(ctx).Warn("terminate terminal failed", "terminal.id", terminalID, "error", err)
-			}
-		})
-		return true
-	})
-	tasks.Wait()
 }
 
 // clientMCPSender 保存一次客户端 MCP server 登记对应的连接和传输，向客户端发送转发通知。

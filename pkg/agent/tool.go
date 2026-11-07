@@ -12,6 +12,9 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 )
 
+// errMaxStepsToolRequested 表示最后一步禁用了工具，模型仍然请求工具。
+var errMaxStepsToolRequested = errors.New("agent reached max steps but model still requested tools")
+
 // execTools 执行一批工具调用、保存结果和目录规则，返回是否有 hook 要求结束本轮。
 func (a *agentImpl) execTools(ctx context.Context, calls []*defs.Item) (bool, error) {
 	// 1. 检查执行器和调用是否完整，按 CallID 建立索引并克隆调用；CallID 重复时返回错误。
@@ -79,6 +82,31 @@ func (a *agentImpl) execTools(ctx context.Context, calls []*defs.Item) (bool, er
 	}
 	// 5. 追加工作区和工具返回的目录规则，一并返回执行和追加错误。
 	return isTurnStopped, errors.Join(err, a.appendAgentsInstructions(slices.Concat(workspaceInstructions, instructions), calls[0].ModelCallID))
+}
+
+// rejectToolCalls 不执行工具调用，给每个调用保存一条错误结果，返回达到单轮上限的错误。
+func (a *agentImpl) rejectToolCalls(calls []*defs.Item) error {
+	// 1. 为每个调用创建错误结果 Item，沿用调用的 TurnID 和 ModelCallID。
+	resultItems := make([]*defs.Item, 0, len(calls))
+	for _, call := range calls {
+		resultItems = append(resultItems, &defs.Item{
+			ID:          defs.NewItemID(),
+			TurnID:      call.TurnID,
+			ModelCallID: call.ModelCallID,
+			Kind:        defs.ItemToolResult,
+			ToolResult: &defs.ToolResult{
+				CallID: call.ToolCall.CallID,
+				Error:  &defs.ToolError{Code: "max_steps_reached", Message: errMaxStepsToolRequested.Error()},
+			},
+		})
+	}
+	// 2. 追加到上下文和草稿并发送事件。
+	events, err := a.appendCompletedItems(resultItems...)
+	if err != nil {
+		return fmt.Errorf("append rejected tool results: %w", err)
+	}
+	a.sendEvents(events)
+	return errMaxStepsToolRequested
 }
 
 // consumeExecutorEvents 依次处理工具事件并发送 Agent 事件，返回已完成的执行记录。

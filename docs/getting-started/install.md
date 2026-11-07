@@ -7,7 +7,7 @@ OpenVaala runs on Linux and macOS, on amd64 and arm64. Windows is not supported.
 | | Terminal UI, server, editors, Codex | Web UI | Desktop app |
 | --- | --- | --- | --- |
 | [GitHub Releases](#from-github-releases) | yes | yes | separate package |
-| [`go install`](#with-go-install) | yes | yes | no |
+| [`go install`](#with-go-install) | yes | yes | binary, not a package |
 | [From source](#from-source) | yes | yes | yes |
 
 ## From GitHub Releases
@@ -32,7 +32,15 @@ If you have Go, this installs the command-line tool into `$(go env GOPATH)/bin`:
 go install github.com/VaalaCat/openvaala/cmd/openvaala@latest
 ```
 
-Published version tags include the built web UI, so `@latest` and explicit release versions work with `openvaala web` without Node.js or pnpm. The development branch keeps generated pages out of Git: `@main` does not include the web UI. To run the web UI from a development checkout, build from source as described below.
+The same command with `cmd/openvaala-desktop` installs a separate binary named `openvaala-desktop`, also into `$(go env GOPATH)/bin`. Running it opens the desktop window, and it contains the same command-line tool. It is not the desktop package: no app bundle, disk image or menu entry. On Linux it still needs GTK 3, and WebKitGTK 4.1 for the WebView. See [Desktop](../guides/desktop.md).
+
+```bash
+go install github.com/VaalaCat/openvaala/cmd/openvaala-desktop@latest
+openvaala-desktop                 # WebView window
+openvaala-desktop app --native    # native interface
+```
+
+Published version tags include the built web UI, so `@latest` and an explicit release version of either binary work with the web UI, without Node.js or pnpm. The development branch keeps generated pages out of Git: `@main` does not include the web UI, so that desktop binary cannot open the WebView either. To run the web UI from a development checkout, build from source as described below. In a checkout of this repository, install the version you have with `go install ./cmd/openvaala` or `go install ./cmd/openvaala-desktop`.
 
 Go 1.27.3 or later is required.
 

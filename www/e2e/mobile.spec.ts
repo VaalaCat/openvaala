@@ -1,8 +1,12 @@
+import { devices } from "@playwright/test"
 import {
+  chooseDefaultWorkLocation,
   expect,
   getComposer,
   getMessages,
+  openRightPanel,
   startConversation,
+  startConversationAtCurrentLocation,
   test,
 } from "./fixture"
 
@@ -63,7 +67,7 @@ test("model_controls_fit_text_and_preserve_composer_actions", async ({
     // 2. 桌面独立按钮和最窄屏合并入口随文字展开，最窄屏仍放得下最长的模型名，Range 测量真实字形后的间隙。
     for (const width of [1440, 320]) {
       await page.setViewportSize({ width, height: 900 })
-      const compact = width < 400
+      const compact = width < 768
       const model = composer.getByRole(compact ? "button" : "combobox", {
         name: "模型",
         exact: true,
@@ -178,8 +182,81 @@ test("model_controls_fit_text_and_preserve_composer_actions", async ({
         )
       ).toBe(true)
     }
+    // 3. 桌面真实左右分栏缩小输入区时，入口合并但仍使用锚定浮层。
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await page
+      .locator(".flexlayout__tabset")
+      .first()
+      .getByRole("button", { name: "区域操作", exact: true })
+      .click()
+    await page.getByRole("menuitem", { name: "向右分栏", exact: true }).click()
+    await expect(page.locator(".flexlayout__tabset")).toHaveCount(2)
+    for (const width of [1280, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      const model = composer.getByRole("button", { name: "模型", exact: true })
+      await expect(model).toBeVisible()
+      expect(
+        await model.evaluate((node) => node.parentElement!.clientWidth)
+      ).toBeLessThan(400)
+      await expect(
+        composer.getByRole("combobox", { name: /^推理强度：/ })
+      ).toHaveCount(0)
+      await model.click()
+      const popup = page.locator('[data-slot="popover-content"]')
+      await expect(popup).toBeVisible()
+      await expect(page.locator('[data-slot="drawer-popup"]')).toHaveCount(0)
+      // 浮层通过 Portal 放在分栏外，宽度不跟随收窄的入口。
+      expect(
+        await popup.evaluate((node) => node.closest(".flexlayout__tab"))
+      ).toBeNull()
+      expect((await popup.boundingBox())!.width).toBeGreaterThan(
+        (await model.boundingBox())!.width
+      )
+      await popup
+        .getByRole("searchbox", { name: "搜索模型", exact: true })
+        .fill("DS")
+      await popup.getByRole("button", { name: /^DS/ }).click()
+      await popup.getByRole("button", { name: "max", exact: true }).click()
+      await expect(
+        popup.getByRole("button", { name: "max", exact: true })
+      ).toHaveAttribute("aria-pressed", "true")
+      await popup
+        .getByRole("button", { name: "关闭模型选择", exact: true })
+        .click()
+      await expect(model).toContainText("DS")
+      await expect(model).toContainText("max")
+      await expect(model).toBeFocused()
+      await model.press("Enter")
+      await expect(popup).toBeVisible()
+      await expect(
+        popup.getByRole("searchbox", { name: "搜索模型", exact: true })
+      ).toBeFocused()
+      await page.keyboard.press("Escape")
+      await expect(popup).toBeHidden()
+      await expect(model).toBeFocused()
+    }
+    // 4. 矮窗口中浮层按屏幕可用高度收缩，搜索与列表仍可操作。
+    await page.setViewportSize({ width: 1280, height: 360 })
+    const narrowModel = composer.getByRole("button", {
+      name: "模型",
+      exact: true,
+    })
+    await narrowModel.click()
+    const shortPopup = page.locator('[data-slot="popover-content"]')
+    await expect(
+      shortPopup.getByRole("searchbox", { name: "搜索模型", exact: true })
+    ).toBeFocused()
+    const popupBounds = (await shortPopup.boundingBox())!
+    expect(popupBounds.y).toBeGreaterThanOrEqual(0)
+    expect(popupBounds.y + popupBounds.height).toBeLessThanOrEqual(360)
+    await shortPopup
+      .getByRole("searchbox", { name: "搜索模型", exact: true })
+      .fill("DS")
+    await shortPopup.getByRole("button", { name: /^DS/ }).click()
+    await page.keyboard.press("Escape")
+    await expect(shortPopup).toBeHidden()
   } finally {
-    // 3. 删除本用例创建的模型服务，不改变共享默认模型。
+    // 5. 删除本用例创建的模型服务，不改变共享默认模型。
     await page.setViewportSize({ width: 1440, height: 900 })
     await fixture.openApp(page)
     await page.getByRole("link", { name: "设置", exact: true }).click()
@@ -196,18 +273,18 @@ test("model_controls_fit_text_and_preserve_composer_actions", async ({
   }
 })
 
-test("mobile_editing_text_is_larger_but_message_and_selection_stay_regular", async ({
+test("mobile_editing_text_matches_message_and_selection_stays_regular", async ({
   page,
   fixture,
 }) => {
-  // 1. 窄屏只放大编辑文字，模型入口和选项使用常规字重。
+  // 1. 窄屏编辑文字为 14px，模型入口和选项使用常规字重。
   await fixture.openApp(page)
-  await expect(getComposer(page)).toHaveCSS("font-size", "16px")
+  await expect(getComposer(page)).toHaveCSS("font-size", "14px")
   const model = page.getByRole("button", { name: "模型", exact: true })
   await expect(model).toHaveCSS("font-weight", "400")
   await model.click()
   const drawer = page.getByRole("dialog", { name: "模型", exact: true })
-  await expect(drawer.getByRole("searchbox")).toHaveCSS("font-size", "16px")
+  await expect(drawer.getByRole("searchbox")).toHaveCSS("font-size", "14px")
   await expect(drawer.getByRole("button", { name: /default/ })).toHaveCSS(
     "font-weight",
     "400"
@@ -215,17 +292,147 @@ test("mobile_editing_text_is_larger_but_message_and_selection_stay_regular", asy
   await drawer.getByRole("button", { name: "关闭模型选择" }).click()
   await expect(drawer).toHaveCount(0)
 
-  // 2. 消息正文不跟随输入字号，桌面编辑文字仍为 14px。
+  // 2. 消息正文、移动端和桌面编辑文字均为 14px。
   const message = "输入字号检查"
   await startConversation(page, message)
   await expect(getMessages(page).getByText(message, { exact: true })).toHaveCSS(
     "font-size",
     "14px"
   )
-  await expect(getComposer(page)).toHaveCSS("font-size", "16px")
+  await expect(getComposer(page)).toHaveCSS("font-size", "14px")
   await page.setViewportSize({ width: 1280, height: 800 })
   await expect(getComposer(page)).toHaveCSS("font-size", "14px")
 })
+
+for (const { width, colorScheme } of [
+  { width: 390, colorScheme: "light" },
+  { width: 390, colorScheme: "dark" },
+  { width: 767, colorScheme: "light" },
+  { width: 768, colorScheme: "light" },
+  { width: 1280, colorScheme: "dark" },
+] as const) {
+  test(`control_typography_${width}_${colorScheme}`, async ({
+    page,
+    fixture,
+  }) => {
+    // 1. 同一行的输入值、选择入口使用相同字号，保留 32px 高度。
+    await page.setViewportSize({ width, height: 844 })
+    await page.emulateMedia({ colorScheme })
+    await fixture.openApp(page)
+    const executor = page.getByLabel("Executor", { exact: true })
+    const directory = page.getByRole("combobox", {
+      name: "工作目录",
+      exact: true,
+    })
+    const model = page.getByLabel("模型", { exact: true })
+    for (const control of [executor, directory, model]) {
+      await expect(control).toHaveCSS("font-size", "14px")
+      await expect(control).toHaveCSS("line-height", "20px")
+      await expect(control).toHaveCSS("height", "32px")
+    }
+    await expect(getComposer(page)).toHaveCSS("font-size", "14px")
+    await expect(getComposer(page)).toHaveCSS("line-height", "24px")
+
+    // 2. 展开的下拉选项、模型搜索和模型名称跟随入口，分组说明仍为辅助字号。
+    await executor.click()
+    await expect(
+      page
+        .getByRole("option", { name: /^local/ })
+        .or(page.getByRole("button", { name: /^local/ }))
+    ).toHaveCSS("font-size", "14px")
+    await page.keyboard.press("Escape")
+    await model.click()
+    const search = page.getByLabel("搜索模型", { exact: true })
+    const option = page
+      .getByRole("option", { name: /^default/ })
+      .or(page.getByRole("button", { name: /^default/ }))
+    for (const control of [search, option]) {
+      await expect(control).toHaveCSS("font-size", "14px")
+      await expect(control).toHaveCSS("line-height", "20px")
+      await expect(control).toHaveCSS("font-weight", "400")
+    }
+    await expect(option.getByText("default", { exact: true })).toHaveCSS(
+      "font-size",
+      "14px"
+    )
+    await expect(page.getByText("local", { exact: true }).last()).toHaveCSS(
+      "font-size",
+      "12px"
+    )
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth
+      )
+    ).toBe(true)
+  })
+}
+
+for (const { name, device, ipadDesktopMode, limitsFocusZoom } of [
+  {
+    name: "iphone",
+    device: "iPhone 13",
+    ipadDesktopMode: false,
+    limitsFocusZoom: true,
+  },
+  {
+    name: "ipad_desktop_mode",
+    device: "Desktop Safari",
+    ipadDesktopMode: true,
+    limitsFocusZoom: true,
+  },
+  {
+    name: "android",
+    device: "Pixel 7",
+    ipadDesktopMode: false,
+    limitsFocusZoom: false,
+  },
+  {
+    name: "mac",
+    device: "Desktop Safari",
+    ipadDesktopMode: false,
+    limitsFocusZoom: false,
+  },
+] as const) {
+  test(`input_zoom_policy_${name}`, async ({ browser, fixture }) => {
+    // 1. 模拟设备标识，检查入口只给 iOS 设置聚焦缩放上限。
+    const context = await browser.newContext({
+      ...devices[device],
+      locale: "zh-CN",
+    })
+    try {
+      const page = await context.newPage()
+      if (ipadDesktopMode)
+        await page.addInitScript(() => {
+          Object.defineProperty(navigator, "platform", { value: "MacIntel" })
+          Object.defineProperty(navigator, "maxTouchPoints", { value: 5 })
+        })
+      await fixture.openApp(page)
+      const viewportContent = await page
+        .locator('meta[name="viewport"]')
+        .getAttribute("content")
+      expect(viewportContent).toBe(
+        "width=device-width, initial-scale=1.0" +
+          (limitsFocusZoom ? ", maximum-scale=1.0" : "")
+      )
+
+      // 2. 聚焦和输入保留小字；原生 iOS 软键盘缩放另行在真机验证。
+      const composer = getComposer(page)
+      await expect(composer).toHaveCSS("font-size", "14px")
+      await composer.click()
+      await expect(composer).toBeFocused()
+      await composer.fill("小字输入不改变页面布局")
+      await expect(composer).toHaveCSS("font-size", "14px")
+      await expect
+        .poll(() => page.evaluate(() => window.visualViewport!.scale))
+        .toBe(1)
+      await expect(
+        page.getByRole("button", { name: "发送", exact: true })
+      ).toBeEnabled()
+    } finally {
+      await context.close()
+    }
+  })
+}
 
 test("mobile_server_moves_to_sidebar_and_title_yields", async ({
   page,
@@ -242,7 +449,7 @@ test("mobile_server_moves_to_sidebar_and_title_yields", async ({
     has: page.getByRole("link", { name: "新对话" }),
   })
   for (const reducedMotion of ["no-preference", "reduce"] as const) {
-    // 1. 减少动画偏好在页面加载时读取，换偏好后重新打开页面再采样同一个交接。
+    // 1. 两种系统动画偏好下，顶栏和侧栏都播放相同的服务器交接。
     await page.emulateMedia({ reducedMotion })
     await fixture.openApp(page)
     // 窄屏检测后，先等顶栏完成首次让位，再采样抽屉交接。
@@ -282,7 +489,7 @@ test("mobile_server_moves_to_sidebar_and_title_yields", async ({
     const hasIntermediatePosition = positions.some(
       (x) => x < positions[0] - 1 && x > positions.at(-1)! + 1
     )
-    expect(hasIntermediatePosition).toBe(reducedMotion === "no-preference")
+    expect(hasIntermediatePosition).toBe(true)
     expect(
       servers.every((frame) => frame.some(({ opacity }) => opacity > 0.01))
     ).toBe(true)
@@ -552,11 +759,12 @@ test("details_layout_preserves_messages", async ({ page, fixture }) => {
     "12px"
   )
   const tabs = dialog.getByRole("tablist")
+  // 页签栏和工作区的标签栏一样是 36px 高的连续栏，没有外围留白
   expect(
     await tabs.evaluate(
-      (node) => getComputedStyle(node.parentElement!.parentElement!).padding
+      (node) => node.closest(".tab-bar")!.getBoundingClientRect().height
     )
-  ).toBe("12px")
+  ).toBe(36)
   const tabsBox = (await tabs.boundingBox())!
   const closeBox = (await dialog
     .getByRole("button", { name: "关闭对话详情" })
@@ -570,7 +778,13 @@ test("details_layout_preserves_messages", async ({ page, fixture }) => {
     expect(await messageElement!.evaluate((node) => node.isConnected)).toBe(
       true
     )
-    if (width !== 1440) {
+    if (width === 1440) {
+      // 桌面的右栏默认收起，展开它也不重新挂载消息区
+      await openRightPanel(page)
+      expect(await messageElement!.evaluate((node) => node.isConnected)).toBe(
+        true
+      )
+    } else {
       await page.getByRole("button", { name: "切换对话详情" }).click()
       await expect(dialog).toBeVisible()
       expect(
@@ -827,6 +1041,7 @@ test("executor_directory_candidates_are_lazy_and_keep_manual_input", async ({
   )
   await fixture.openApp(page)
   expect(requests).toHaveLength(0)
+  await chooseDefaultWorkLocation(page)
   const root = fixture.state.workspaceDirectory
   const directory = page.getByRole("combobox", {
     name: "工作目录",
@@ -898,7 +1113,7 @@ test("executor_directory_candidates_are_lazy_and_keep_manual_input", async ({
   await directory.fill(root + "/project-link")
   await page.keyboard.press("Escape")
   await expect(directory).toHaveValue(root + "/project-link")
-  await startConversation(page, "手填工作目录")
+  await startConversationAtCurrentLocation(page, "手填工作目录")
   const conversationID = page.url().split("/").at(-1)!
   const saved = await fixture.executorSettings(conversationID)
   expect(saved.workspace_directories?.local).toBe(root + "/project-link")

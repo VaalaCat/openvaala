@@ -1,6 +1,10 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { getSlashToken, shouldSubmitOnKeyDown } from "./composer-keys"
+import {
+  getSideConversationQuestion,
+  getSlashToken,
+  shouldSubmitOnKeyDown,
+} from "./composer-keys"
 
 test("shouldSubmitOnKeyDown sends on a plain Enter only", () => {
   const cases: {
@@ -124,4 +128,23 @@ test("getSlashToken finds the slash word around the cursor", () => {
   ]
   for (const { name, text, cursor, want } of cases)
     assert.deepEqual(getSlashToken(text, cursor), want, name)
+})
+
+test("getSideConversationQuestion only reads a leading /btw command", () => {
+  const cases: { name: string; text: string; want: string | undefined }[] = [
+    { name: "question", text: "/btw 为什么用 SQLite", want: "为什么用 SQLite" },
+    { name: "command_only", text: "/btw", want: "" },
+    { name: "blank_after_command", text: "/btw  \n", want: "" },
+    {
+      name: "multi_line_question",
+      text: "/btw 第一行\n第二行",
+      want: "第一行\n第二行",
+    },
+    { name: "longer_word", text: "/btwx 问题", want: undefined },
+    { name: "other_skill", text: "/review 问题", want: undefined },
+    { name: "not_at_start", text: "先说 /btw 问题", want: undefined },
+    { name: "plain_text", text: "btw 问题", want: undefined },
+  ]
+  for (const { name, text, want } of cases)
+    assert.equal(getSideConversationQuestion(text), want, name)
 })

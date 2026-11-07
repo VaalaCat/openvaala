@@ -66,7 +66,7 @@ function RenderFailedNotice({
       details={
         <div className="flex flex-col gap-2">
           <DetailSection label={t("common.errors.detail")}>
-            <pre className="text-code wrap-anywhere whitespace-pre-wrap color-destructive">
+            <pre className="text-code-reading wrap-anywhere whitespace-pre-wrap color-destructive">
               {error instanceof Error ? error.message : String(error)}
             </pre>
           </DetailSection>

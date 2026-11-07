@@ -1,5 +1,11 @@
 import type { QueryClient } from "@tanstack/react-query"
-import { atom, map } from "nanostores"
+import {
+  atom,
+  listenKeys,
+  map,
+  type MapStore,
+  type WritableAtom,
+} from "nanostores"
 import { recordConversationResult } from "../conversation-results"
 import { invalidateForNotification } from "../query/invalidation"
 import { RpcError, rpcConnectionLostCode } from "../rpc-error"
@@ -46,8 +52,8 @@ type ConversationNotification = Extract<
 
 // SyncResult 是一次同步读到的内容，全部读完后一起写进 store
 interface SyncResult {
-  title: string
-  sessions: SessionRuntimeInfo[]
+  // 对话的标题和全部 Session 运行信息；只读 Session 内容的同步（有 rootSync）不订阅对话状态，没有这一项
+  conversationStatus?: { title: string; sessions: SessionRuntimeInfo[] }
   lastSavedOrdinal: Ordinal
   streamingItems: StreamingItem[]
   pendingInputs: SessionPendingInputs
@@ -64,13 +70,15 @@ const maxToolProgressLength = 200 * 1024
 // ConversationSync 跟随一个对话里的一个 Session：打开并订阅对话，补齐已保存的 Item，把推送写进 store；
 // 断线重连或订阅被 serve 关闭后重新同步，从已交付的位置继续，不缺不重。照 internal/runtimeclient 的同步规则。
 export class ConversationSync {
-  readonly $title = atom("")
-  readonly $sessions = map<Record<SessionID, SessionRuntimeInfo>>({})
+  readonly $title: WritableAtom<string>
+  readonly $sessions: MapStore<Record<SessionID, SessionRuntimeInfo>>
   // 已保存的和生成中的 Item，按首次出现顺序
   readonly $items = atom<ViewItem[]>([])
   readonly $turns = map<Record<TurnID, TurnView>>({})
   readonly $hasEarlierItems = atom(false)
   readonly $syncState = atom<SyncState>("syncing")
+  // 这条对话的根 Session，第一次打开对话之后才知道
+  readonly $rootSessionID = atom<SessionID | undefined>(undefined)
   // 最近一次同步被 serve 拒绝的错误，例如对话不存在；同步成功后清空
   readonly $syncError = atom<unknown>(undefined)
   // 服务端尚未交给 Turn 的用户输入列表。
@@ -81,9 +89,10 @@ export class ConversationSync {
   readonly serverID: string
   private readonly connection: SyncConnection
   private readonly queryClient: QueryClient
+  // 这条对话根 Session 的同步，见构造函数
+  private readonly rootSync: ConversationSync | undefined
   // 跟随的 Session：构造时指定，没指定时取第一次 conversation/open 返回的根 Session
   private followedSessionID: SessionID | undefined
-  private rootSessionID: SessionID | undefined
   // 已交付的最后一个已保存 Item 的流水号：items/saved 按它去重，重新同步从它往后补
   private lastDeliveredOrdinal: Ordinal = 0
   // 是否完成过一次同步？完成后重新同步只补齐，不再读最近一页
@@ -98,17 +107,25 @@ export class ConversationSync {
   // 实时新增且尚未经过消息列展示的 Item；折叠成员也在展示提交后消耗。
   private readonly unpresentedLiveItemKeys = new Set<string>()
 
+  // rootSync 是这条对话根 Session 的同步，它独占对话的标题和 Session 运行信息的订阅；
+  // 给了它，这个同步只订阅自己 Session 的内容，不调用 conversation/subscribe 和 conversation/unsubscribe，
+  // $title 和 $sessions 就是 rootSync 的，对话订阅的通知也只由 rootSync 处理
   constructor(
     connection: SyncConnection,
     queryClient: QueryClient,
     conversationID: ConversationID,
-    sessionID?: SessionID
+    sessionID?: SessionID,
+    rootSync?: ConversationSync
   ) {
     this.connection = connection
     this.queryClient = queryClient
     this.conversationID = conversationID
     this.serverID = connection.getServerID()
     this.followedSessionID = sessionID
+    this.rootSync = rootSync
+    this.$title = rootSync?.$title ?? atom("")
+    this.$sessions =
+      rootSync?.$sessions ?? map<Record<SessionID, SessionRuntimeInfo>>({})
   }
 
   // 开始同步并跟随推送；返回退订并停止的函数。停止后可以再次 run，从已交付的位置继续
@@ -122,6 +139,15 @@ export class ConversationSync {
     const stopFollowingReconnect = this.connection.onConnected(() =>
       this.startSync()
     )
+    // 有 rootSync 时，对话订阅的通知不在这里处理，跟随的 Session 的运行信息变了就按 rootSync 的更新 Turn 状态。
+    const stopFollowingRootSession =
+      this.rootSync &&
+      listenKeys(
+        this.rootSync.$sessions,
+        [this.followedSessionID!],
+        (sessions) =>
+          this.applyFollowedSessionTurns(sessions[this.followedSessionID!])
+      )
     this.startSync()
     // 2. 停止：作废进行中的同步，取消登记，退订跟随的两个订阅；连接已断开时退订失败不处理。
     return () => {
@@ -129,12 +155,17 @@ export class ConversationSync {
       this.stagedNotifications = []
       stopListening()
       stopFollowingReconnect()
+      stopFollowingRootSession?.()
       const sessionID = this.followedSessionID
       if (sessionID === undefined) return
       void Promise.all([
-        this.connection.call("conversation/unsubscribe", {
-          conversation_id: this.conversationID,
-        }),
+        ...(this.rootSync
+          ? []
+          : [
+              this.connection.call("conversation/unsubscribe", {
+                conversation_id: this.conversationID,
+              }),
+            ]),
         this.connection.call("session/unsubscribe", {
           conversation_id: this.conversationID,
           session_id: sessionID,
@@ -244,25 +275,29 @@ export class ConversationSync {
     const opened = await this.callForSync(generation, "conversation/open", {
       conversation_id: this.conversationID,
     })
-    this.rootSessionID = opened.conversation.root_session_id
-    this.followedSessionID ??= this.rootSessionID
+    this.$rootSessionID.set(opened.conversation.root_session_id)
+    this.followedSessionID ??= opened.conversation.root_session_id
     const sessionID = this.followedSessionID
     // 3. 为防止残留，再退订一次目标对话和跟随 Session 的订阅；同步期间的 subscription/closed 由 handleNotification 处理。
     await this.unsubscribeForSync(generation, sessionID)
-    // 4. 订阅对话状态：标题和全部 Session 运行信息。
-    const status = await this.callForSync(
-      generation,
-      "conversation/subscribe",
-      { conversation_id: this.conversationID }
-    )
+    // 4. 订阅对话状态：标题和全部 Session 运行信息；有 rootSync 时由它订阅，这里等它第一次同步完成。
+    let conversationStatus: SyncResult["conversationStatus"]
+    if (this.rootSync) await this.waitForRootSync(generation)
+    else {
+      const status = await this.callForSync(
+        generation,
+        "conversation/subscribe",
+        { conversation_id: this.conversationID }
+      )
+      conversationStatus = { title: status.title, sessions: status.sessions }
+    }
     // 5. 订阅 Session 内容：已保存位置和生成中 Item。
     const content = await this.callForSync(generation, "session/subscribe", {
       conversation_id: this.conversationID,
       session_id: sessionID,
     })
     const result = {
-      title: status.title,
-      sessions: status.sessions,
+      conversationStatus,
       lastSavedOrdinal: content.last_saved_ordinal,
       streamingItems: content.streaming_items,
       pendingInputs: content.pending_inputs,
@@ -326,30 +361,23 @@ export class ConversationSync {
     if (generation !== this.syncGeneration) return
     // 2. 写入标题、全部 Session 运行信息和跟随 Session 的 Turn 状态；
     //    记为 running 但已不在执行的轮次（断开期间结束的）清掉，改看 Turn 记录。
-    this.$title.set(result.title)
-    this.$sessions.set(
-      Object.fromEntries(result.sessions.map((info) => [info.session.id, info]))
-    )
-    for (const info of result.sessions)
-      recordConversationResult(
-        this.serverID,
-        this.conversationID,
-        this.rootSessionID!,
-        info
+    if (result.conversationStatus) {
+      const { title, sessions } = result.conversationStatus
+      this.$title.set(title)
+      this.$sessions.set(
+        Object.fromEntries(sessions.map((info) => [info.session.id, info]))
       )
-    const followed = result.sessions.find(
-      (info) => info.session.id === this.followedSessionID
+      for (const info of sessions)
+        recordConversationResult(
+          this.serverID,
+          this.conversationID,
+          this.$rootSessionID.get()!,
+          info
+        )
+    }
+    this.applyFollowedSessionTurns(
+      this.$sessions.get()[this.followedSessionID!]
     )
-    for (const [turnID, turn] of Object.entries(this.$turns.get()))
-      if (turn.status === "running" && turnID !== followed?.active_turn_id)
-        this.$turns.setKey(turnID, undefined)
-    if (followed?.last_turn_id)
-      this.$turns.setKey(followed.last_turn_id, {
-        ...this.$turns.get()[followed.last_turn_id],
-        status: followed.last_turn_status,
-      })
-    if (followed?.active_turn_id)
-      this.$turns.setKey(followed.active_turn_id, { status: "running" })
     // 3. 首次同步记下向前加载的游标；应用已保存 Item，再用生成中 Item 替换未保存的。
     if (!this.hasSynced) {
       this.earlierItemsCursor = result.earlierItemsCursor
@@ -369,6 +397,21 @@ export class ConversationSync {
       this.deliverNotification(notification, false)
   }
 
+  // 按跟随的 Session 的运行信息更新 Turn 状态：记为 running 但已不在执行的轮次（断开期间结束的）清掉，
+  // 最近一轮记下终态，正在执行的一轮记为 running
+  private applyFollowedSessionTurns(followed: SessionRuntimeInfo | undefined) {
+    for (const [turnID, turn] of Object.entries(this.$turns.get()))
+      if (turn.status === "running" && turnID !== followed?.active_turn_id)
+        this.$turns.setKey(turnID, undefined)
+    if (followed?.last_turn_id)
+      this.$turns.setKey(followed.last_turn_id, {
+        ...this.$turns.get()[followed.last_turn_id],
+        status: followed.last_turn_status,
+      })
+    if (followed?.active_turn_id)
+      this.$turns.setKey(followed.active_turn_id, { status: "running" })
+  }
+
   // 同步失败：过期的忽略；连接已断开时保持同步中，等 onConnected 重新同步；serve 拒绝时标记失败
   private handleSyncFailed(generation: number, error: unknown): void {
     if (generation !== this.syncGeneration) return
@@ -381,8 +424,10 @@ export class ConversationSync {
 
   // 收到这个对话的通知：其他 Session 的内容通知丢弃；同步期间暂存，期间的 subscription/closed 只删掉同一种订阅暂存的通知；其余立即交付
   private handleNotification(notification: ConversationNotification): void {
-    // 1. Session 订阅的通知只处理跟随的 Session；对话订阅的通知属于对话里的任何 Session，不看 session_id。
+    // 1. 有 rootSync 时对话订阅的通知归它处理；Session 订阅的通知只处理跟随的 Session，
+    //    对话订阅的通知属于对话里的任何 Session，不看 session_id。
     const { params } = notification
+    if (this.rootSync && params.subscription !== "session") return
     if (
       params.subscription === "session" &&
       params.session_id !== this.followedSessionID
@@ -449,7 +494,7 @@ export class ConversationSync {
         recordConversationResult(
           this.serverID,
           this.conversationID,
-          this.rootSessionID!,
+          this.$rootSessionID.get()!,
           notification.params.info
         )
         this.$sessions.setKey(
@@ -540,7 +585,7 @@ export class ConversationSync {
       recordConversationResult(
         this.serverID,
         this.conversationID,
-        this.rootSessionID!,
+        this.$rootSessionID.get()!,
         {
           session: info.session,
           last_turn_id: params.turn_id,
@@ -674,19 +719,38 @@ export class ConversationSync {
     return result
   }
 
-  // 退订对话状态和跟随 Session 的内容，两个请求一起发出；没有订阅的键也返回成功
+  // 退订对话状态和跟随 Session 的内容，两个请求一起发出（有 rootSync 时只退订 Session 的内容）；没有订阅的键也返回成功
   private async unsubscribeForSync(
     generation: number,
     sessionID: SessionID
   ): Promise<void> {
     await Promise.all([
-      this.callForSync(generation, "conversation/unsubscribe", {
-        conversation_id: this.conversationID,
-      }),
+      ...(this.rootSync
+        ? []
+        : [
+            this.callForSync(generation, "conversation/unsubscribe", {
+              conversation_id: this.conversationID,
+            }),
+          ]),
       this.callForSync(generation, "session/unsubscribe", {
         conversation_id: this.conversationID,
         session_id: sessionID,
       }),
     ])
+  }
+
+  // 等 rootSync 第一次同步结束（成功或失败），之后才读得到这条对话的 Session 运行信息；等待期间被新的同步或停止作废时抛错
+  private async waitForRootSync(generation: number): Promise<void> {
+    const root = this.rootSync!
+    if (!root.hasInitialData() && root.$syncState.get() === "syncing")
+      await new Promise<void>((resolve) => {
+        const stopListening = root.$syncState.listen((state) => {
+          if (state === "syncing") return
+          stopListening()
+          resolve()
+        })
+      })
+    if (generation !== this.syncGeneration)
+      throw new Error("conversation sync is outdated")
   }
 }

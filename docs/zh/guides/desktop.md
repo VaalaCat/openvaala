@@ -20,6 +20,13 @@ openvaala app --native    # 原生界面
 
 这里的 `openvaala` 指桌面端自己的可执行文件（见[从桌面端使用 CLI](#从桌面端使用-cli)）。每种界面最多开一个窗口，再次启动同一种界面会把已有窗口切到前面。WebView 窗口和原生窗口可以同时开着。
 
+用 [`go install`](../getting-started/install.md#用-go-install-安装) 装上的程序名叫 `openvaala-desktop`，不会替换命令行里的 `openvaala`。`$(go env GOPATH)/bin` 在 `PATH` 里时：
+
+```bash
+openvaala-desktop                 # WebView 窗口
+openvaala-desktop app --native    # 原生界面
+```
+
 还没有配置模型 Provider 时，在 **设置 → 模型服务** 里添加。原生界面的空白页上也有一个 **添加模型服务** 按钮。
 
 ## 和 Runtime 服务的关系
@@ -41,7 +48,7 @@ openvaala app --native    # 原生界面
 
 桌面端启动的 Runtime 服务在你关掉窗口后会继续运行，直到你执行 `openvaala serve stop`。
 
-关掉窗口不会停下你已经发出的任何任务：正在运行的 Turn 会继续，可能继续消耗模型 Provider 的额度。原生界面终端面板里打开的终端会随窗口一起关闭。
+关掉窗口不会停下你已经发出的任何任务：正在运行的 Turn 会继续，可能继续消耗模型 Provider 的额度。原生界面终端面板里打开的终端也会继续运行，下次启动后回到终端面板。
 
 桌面端总是连接本机的 Runtime 服务。要用别处的服务器，用带 `--url` 的[终端界面](terminal.md)，或者在浏览器里打开那台服务器的 [Web 界面](web.md)。
 
@@ -78,7 +85,7 @@ openvaala app --native    # 原生界面
 
 ## 从桌面端使用 CLI
 
-桌面端包含所有 `openvaala` 命令（`tui`、`serve`、`web`、`acp`、`codex` 等），但它不会把自己加进 `PATH`，也不会替换你另外安装的 `openvaala`。要用它的 CLI，直接运行应用里的可执行文件：
+桌面端安装包包含所有 `openvaala` 命令（`tui`、`serve`、`web`、`acp`、`codex` 等），但它不会把自己加进 `PATH`，也不会替换你另外安装的 `openvaala`。`go install` 装上的 `openvaala-desktop` 在 `$(go env GOPATH)/bin` 已经在 `PATH` 里时，可以直接运行。要用安装包里的 CLI，直接运行应用里的可执行文件：
 
 ```bash
 # macOS

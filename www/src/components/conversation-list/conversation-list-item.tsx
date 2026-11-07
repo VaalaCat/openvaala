@@ -143,7 +143,6 @@ export function ConversationListItem({
       <ConversationActions
         conversation={conversation}
         name={name}
-        isOpened={isOpened}
         trigger={
           <SidebarMenuAction
             showOnHover

@@ -16,7 +16,10 @@ export function AppToaster() {
   return (
     <Toaster
       theme={mode}
-      position="bottom-right"
+      // 放在右上角、顶栏和标签栏下面，不挡输入框的发送和中断：桌面让开 40px 顶栏和 36px 标签栏，窄屏只有顶栏
+      position="top-right"
+      offset={{ top: 84 }}
+      mobileOffset={{ top: 48 }}
       visibleToasts={3}
       icons={{
         success: <CircleCheckIcon className="size-4" />,

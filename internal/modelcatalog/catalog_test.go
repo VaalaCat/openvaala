@@ -571,16 +571,17 @@ func TestCatalogFetchProviderModels(t *testing.T) {
 	}
 }
 
-// TestCatalogFetchProviderModelsUpstreamRequest 验证请求上游 /models 的方法、路径、查询参数和认证头随协议变化。
+// TestCatalogFetchProviderModelsUpstreamRequest 验证请求上游 /models 的方法、路径、查询参数和认证头随协议变化，Provider 的 headers 会发出并覆盖同名认证头。
 func TestCatalogFetchProviderModelsUpstreamRequest(t *testing.T) {
-	// 1. 准备协议、地址和认证样例。
+	// 1. 准备协议、地址、Provider headers 和认证样例。
 	tests := []struct {
-		name        string
-		protocol    string
-		baseURLTail string
-		wantQuery   string
-		wantHeaders map[string]string
-		wantAbsent  []string
+		name            string
+		protocol        string
+		baseURLTail     string
+		providerHeaders map[string]string
+		wantQuery       string
+		wantHeaders     map[string]string
+		wantAbsent      []string
 	}{
 		{
 			name:        "openai_chat_uses_bearer_token",
@@ -613,6 +614,19 @@ func TestCatalogFetchProviderModelsUpstreamRequest(t *testing.T) {
 			baseURLTail: "/",
 			wantHeaders: map[string]string{"Authorization": "Bearer k"},
 		},
+		{
+			name:            "provider_headers_sent_and_override_auth",
+			protocol:        "openai_chat",
+			providerHeaders: map[string]string{"X-Title": "MyTool", "Authorization": "Bearer override"},
+			wantHeaders:     map[string]string{"X-Title": "MyTool", "Authorization": "Bearer override"},
+		},
+		{
+			name:            "provider_headers_override_claude_auth",
+			protocol:        "claude",
+			providerHeaders: map[string]string{"X-Api-Key": "override"},
+			wantQuery:       "limit=1000",
+			wantHeaders:     map[string]string{"X-Api-Key": "override", "Anthropic-Version": "2023-06-01"},
+		},
 	}
 	// 2. 拉取模型，比较上游收到的那次请求。
 	for _, tt := range tests {
@@ -624,6 +638,7 @@ func TestCatalogFetchProviderModelsUpstreamRequest(t *testing.T) {
 				Protocol: tt.protocol,
 				BaseURL:  fixture.server.URL + "/v1" + tt.baseURLTail,
 				APIKey:   "k",
+				Headers:  tt.providerHeaders,
 			}
 			if _, err := fixture.newCatalog(t, newCacheFile(t)).FetchProviderModels(context.Background(), provider); err != nil {
 				t.Fatal(err)

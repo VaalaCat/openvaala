@@ -7,7 +7,7 @@ import type { ExecutorDetails, ExecutorSettings } from "@/lib/api/protocol.gen"
 export interface WorkLocation {
   // 用户选过的 Executor；没选时为空
   chosenExecutorID?: string
-  // 实际使用的 Executor：选过的，否则是已保存设置的默认，再否则是列表里第一个可用的
+  // 实际使用的 Executor：选过的，否则是已保存设置的默认，再否则是列表里第一个可用且不是 memory 的
   executorID?: string
   executor?: ExecutorDetails
   // 输入框里的目录文字；没改过时是已保存设置里这个 Executor 的目录
@@ -19,8 +19,12 @@ export interface WorkLocation {
   // 最近一次解析失败的错误
   directoryError: unknown
   isResolvingDirectory: boolean
+  // 输入框里的目录是用户自己输入的吗？预填值、已保存值和点选「最近用过」填入的值都不算；点选子目录往下走算
+  isDirectoryTyped: boolean
   chooseExecutor(executorID: string): void
   setDirectory(directory: string): void
+  // 点选一个已经解析好的绝对路径：填入输入框并记为已解析，发送时不再解析
+  chooseDirectory(directory: string): void
   // 解析输入框里的目录并换成绝对路径；留空时为空（用 Executor 的默认根目录），失败时抛错
   resolveDirectory(): Promise<string | undefined>
 }
@@ -40,6 +44,7 @@ export function useWorkLocation(
   const [resolvedDirectories, setResolvedDirectories] = useState<
     Record<string, string>
   >({})
+  const [isDirectoryTyped, setIsDirectoryTyped] = useState(false)
   const resolve = useMutation({
     mutationFn: (variables: { executorID: string; directory: string }) =>
       connection.call("executor/resolveDirectory", {
@@ -51,7 +56,9 @@ export function useWorkLocation(
   const executorID =
     chosenExecutorID ??
     (saved?.default_executor_id ||
-      executors.find((each) => isExecutorAvailable(saved, each.id))?.id)
+      executors.find(
+        (each) => each.kind !== "memory" && isExecutorAvailable(saved, each.id)
+      )?.id)
   const executor = executors.find((each) => each.id === executorID)
   const savedDirectory = executorID
     ? saved?.workspace_directories?.[executorID]
@@ -87,13 +94,23 @@ export function useWorkLocation(
     resolvedDirectory,
     directoryError: resolve.error,
     isResolvingDirectory: resolve.isPending,
+    isDirectoryTyped,
     chooseExecutor(next) {
       setChosenExecutorID(next)
+      setIsDirectoryTyped(false)
       resolve.reset()
     },
     setDirectory(next) {
       if (!executorID) return
       setEditedDirectories((edited) => ({ ...edited, [executorID]: next }))
+      setIsDirectoryTyped(true)
+      resolve.reset()
+    },
+    chooseDirectory(next) {
+      if (!executorID) return
+      setEditedDirectories((edited) => ({ ...edited, [executorID]: next }))
+      setResolvedDirectories((known) => ({ ...known, [executorID]: next }))
+      setIsDirectoryTyped(false)
       resolve.reset()
     },
     resolveDirectory,

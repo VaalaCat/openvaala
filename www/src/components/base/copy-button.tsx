@@ -49,7 +49,7 @@ export function CopyButton({
   return (
     <div
       data-copy-result={result?.state}
-      className="inline-flex shrink-0 flex-col items-end gap-2"
+      className="relative inline-flex shrink-0 flex-col items-end gap-2"
     >
       <Tooltip>
         <TooltipTrigger

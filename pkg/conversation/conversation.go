@@ -12,6 +12,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
+	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
@@ -43,10 +44,14 @@ type Conversation interface {
 	InterruptTurnWithInput(ctx context.Context, turnID defs.TurnID, itemID defs.ItemID) error
 	// WithdrawInput 取出根 Session 的完整待处理用户输入组。
 	WithdrawInput(ctx context.Context, itemID defs.ItemID) ([]*defs.Item, error)
+	// AppendContextItems 把 Item 交给根 Session；先等根 Session 首次启动，对话已停止或正在换配置时返回错误。
+	AppendContextItems(ctx context.Context, items []*defs.Item) (err error)
 	// CompactContext 请求根 Session 压缩上下文并返回 TurnID，不等压缩完成；先等根 Session 首次启动，忙时返回 session.ErrSessionBusy，已停止时返回错误。
 	CompactContext(ctx context.Context) (defs.TurnID, error)
 	// IsTerminalBusy 运行中的根或子 Session 是否还有未结束的后台命令？
 	IsTerminalBusy() bool
+	// IsRestorableFromRecord 对话停止后按记录重新打开，能否回到同样的状态？
+	IsRestorableFromRecord() bool
 	// ListSessionInfos 按 SessionID 返回全部 Session 的记录、状态、已保存用量和所选模型窗口。
 	ListSessionInfos(ctx context.Context) ([]SessionInfo, error)
 	// GetSessionDetails 返回本对话中 Session 的模型、环境、Skill 和工具信息；Session 不属于本对话时返回错误。
@@ -59,7 +64,7 @@ type Conversation interface {
 	// SetExecutorSettings 按新设置装配配置，交给 Run 停掉旧 Session 和执行环境、重启根 Session，返回补上 local 目录的设置；客户端 MCP 登记保留。
 	// 调用方要先确认没有执行中的 Turn；装配失败时旧配置不变，换上后根 Session 启动失败则停止对话并返回错误。
 	SetExecutorSettings(ctx context.Context, settings defs.ExecutorSettings) (defs.ExecutorSettings, error)
-	// SetDefinitions 按新定义和当前设置重新装配并替换配置，校验全部 Session 的 Agent 都在新定义里；临时对话不装配 Executor 和 Skill。
+	// SetDefinitions 按新定义和当前设置重新装配并替换配置，校验全部 Session 的 Agent 都在新定义里；WithoutExecutors 的对话不装配 Executor 和 Skill。
 	SetDefinitions(ctx context.Context, definitions *ConversationDefinitions) error
 	// SetClientMCPServers 替换指定客户端登记的全部 MCP server，空列表表示移除；等 Run 换完登记后返回，从下个 Turn 起生效。
 	// 创建连接失败、对话已停止或调用方取消时返回错误。
@@ -68,7 +73,7 @@ type Conversation interface {
 
 // conversationImpl 由 Run 串行处理换配置和客户端 MCP 登记，每个 Session 各有一个 Run 任务和一个事件转发任务。
 type conversationImpl struct {
-	// opt 的 Query、Mutation、Environment、MaxImageBytes、Ephemeral 整个生命周期都用；Definitions 只用来建初始配置，之后以 config 为准。
+	// opt 的 Query、Mutation、Environment、MaxImageBytes、WithoutExecutors 整个生命周期都用；Definitions 只用来建初始配置，之后以 config 为准。
 	opt           ConversationOpt
 	id            defs.ConversationID
 	rootSessionID defs.SessionID
@@ -125,32 +130,32 @@ type ConversationOpt struct {
 	Environment []string
 	// MaxImageBytes 交给每个执行环境的 read_file，必须大于 0。
 	MaxImageBytes int
-	// Ephemeral 是否为临时对话？临时对话没有 Executor 和 Skill，换定义时也不装配。
-	Ephemeral bool
+	// WithoutExecutors 是否不装配 Executor 和 Skill？换定义时也不装配。
+	WithoutExecutors bool
 }
 
-// CreateConversation 装配配置并保存新对话，返回还没启动的对话。
-func CreateConversation(ctx context.Context, rootAgentName string, model defs.ModelSelection, settings, storedSettings defs.ExecutorSettings,
+// CreateConversation 用 conversationID 装配配置并保存新对话，返回还没启动的对话。
+func CreateConversation(ctx context.Context, conversationID defs.ConversationID, rootAgentName string, model defs.ModelSelection, settings, storedSettings defs.ExecutorSettings,
 	opt *ConversationOpt) (Conversation, error) {
 	// 1. 校验依赖，按新旧设置装配配置；旧记录中的未知 Executor 只记警告。
 	if err := validateConversationDependencies(opt); err != nil {
 		return nil, err
 	}
-	config, err := newConversationConfig(ctx, settings, storedSettings, opt, opt.Definitions, nil)
+	config, err := newConversationConfig(ctx, conversationID, settings, storedSettings, opt, opt.Definitions, nil)
 	if err != nil {
 		return nil, err
 	}
-	// 2. 保存根 Session 和对话记录，创建尚未启动的对话实例；保存失败时关闭已创建的 SSH 工作区。
-	record, root, err := saveNewConversation(ctx, rootAgentName, model, config, opt)
+	// 2. 保存根 Session 和对话记录，创建尚未启动的对话实例；保存失败时关闭已创建的工作区。
+	record, root, err := saveNewConversation(ctx, conversationID, rootAgentName, model, config, opt)
 	if err != nil {
-		closeSSHWorkspaces(ctx, config.sshWorkspaces)
+		closeWorkspaces(ctx, config.workspaces)
 		return nil, err
 	}
 	return newConversation(record, []defs.Session{root}, opt, config), nil
 }
 
 // saveNewConversation 选择根 Agent 和模型，保存根 Session 和对话记录。
-func saveNewConversation(ctx context.Context, rootAgentName string, model defs.ModelSelection, config *conversationConfig, opt *ConversationOpt) (defs.Conversation, defs.Session, error) {
+func saveNewConversation(ctx context.Context, conversationID defs.ConversationID, rootAgentName string, model defs.ModelSelection, config *conversationConfig, opt *ConversationOpt) (defs.Conversation, defs.Session, error) {
 	// 1. 查找根 Agent，未指定模型时使用 Agent 默认模型。
 	definition, found := config.agentDefinitions[rootAgentName]
 	if !found {
@@ -160,9 +165,9 @@ func saveNewConversation(ctx context.Context, rootAgentName string, model defs.M
 	if err != nil {
 		return defs.Conversation{}, defs.Session{}, err
 	}
-	// 2. 分配对话和根 Session ID，先保存根 Session，再保存含 Executor 设置的对话记录。
+	// 2. 分配根 Session ID，先保存根 Session，再保存含 Executor 设置的对话记录。
 	record := defs.Conversation{
-		ID:               defs.NewConversationID(),
+		ID:               conversationID,
 		RootSessionID:    defs.NewSessionID(),
 		ExecutorSettings: config.settings,
 	}
@@ -188,7 +193,7 @@ func GetConversation(ctx context.Context, record defs.Conversation, storedSettin
 		return nil, err
 	}
 	id := record.ID
-	ctx = telemetry.ContextWithAttrs(ctx, telemetry.ConversationID(string(id)))
+	ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: id})
 	root, found, err := opt.Query.GetSession(ctx, id, record.RootSessionID)
 	if err != nil {
 		return nil, err
@@ -208,7 +213,7 @@ func GetConversation(ctx context.Context, record defs.Conversation, storedSettin
 		return nil, err
 	}
 	// 3. 按记录设置装配配置，校验各 Session 的 Agent，再创建尚未启动的对话实例。
-	config, err := newConversationConfig(ctx, record.ExecutorSettings, storedSettings, opt, opt.Definitions, records)
+	config, err := newConversationConfig(ctx, record.ID, record.ExecutorSettings, storedSettings, opt, opt.Definitions, records)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +227,7 @@ func newConversation(record defs.Conversation, records []defs.Session, opt *Conv
 		opt:                 *opt,
 		id:                  record.ID,
 		rootSessionID:       record.RootSessionID,
-		modelClient:         llmkit.NewClient(llmkit.ClientOptions{}),
+		modelClient:         llmkit.NewClient(llmkit.ClientOptions{HTTPClient: httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt())}),
 		clientMCPServers:    executor.NewClientMCPServers(),
 		clientMCPRunCancels: make(map[string]context.CancelFunc),
 		configChanges:       make(chan *configChange),
@@ -304,14 +309,14 @@ func (c *conversationImpl) Run(ctx context.Context, events chan<- ConversationEv
 	default:
 		return errors.New("Conversation Run can only be called once")
 	}
-	ctx = telemetry.ContextWithAttrs(ctx, telemetry.ConversationID(string(c.id)))
+	ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: c.id})
 	c.runCtx, c.stopRun = context.WithCancelCause(ctx)
 	defer c.stopRun(nil)
-	// 2. 调用时 ctx 已取消：关闭 rootStarted、stopped、SSH 工作区和 events，返回 ctx 的错误。
+	// 2. 调用时 ctx 已取消：关闭 rootStarted、stopped、工作区和 events，返回 ctx 的错误。
 	if err := ctx.Err(); err != nil {
 		close(c.rootStarted)
 		close(c.stopped)
-		closeSSHWorkspaces(ctx, c.config.Load().sshWorkspaces)
+		closeWorkspaces(ctx, c.config.Load().workspaces)
 		if events != nil {
 			close(events)
 		}
@@ -366,10 +371,10 @@ func (c *conversationImpl) Run(ctx context.Context, events chan<- ConversationEv
 
 // handleConfigChange 停止旧配置的 Session 和环境，换上新配置并重启根 Session。
 func (c *conversationImpl) handleConfigChange(change *configChange) {
-	// 1. 装配时读到的配置已经不是当前配置时，关闭新配置的 SSH 工作区，回复 errConfigChanged。
+	// 1. 装配时读到的配置已经不是当前配置时，关闭新配置的工作区，回复 errConfigChanged。
 	current := c.config.Load()
 	if change.base != current {
-		closeSSHWorkspaces(c.runCtx, change.next.sshWorkspaces)
+		closeWorkspaces(c.runCtx, change.next.workspaces)
 		change.reply <- errConfigChanged
 		return
 	}
@@ -437,21 +442,21 @@ func (c *conversationImpl) startEnvironments(environments []executor.ExecutionEn
 	}
 }
 
-// stopEnvironments 停止当前执行环境的 MCP 连接任务，再关闭这套配置的 SSH 工作区。
+// stopEnvironments 停止当前执行环境的 MCP 连接任务，再关闭这套配置的工作区。
 func (c *conversationImpl) stopEnvironments(config *conversationConfig) {
-	// 1. 取消并等待执行环境的 MCP 连接任务，再关闭这套配置的 SSH 工作区。
+	// 1. 取消并等待执行环境的 MCP 连接任务，再关闭这套配置的工作区。
 	c.stopEnvironmentRuns()
 	c.environmentTasks.Wait()
-	closeSSHWorkspaces(c.runCtx, config.sshWorkspaces)
+	closeWorkspaces(c.runCtx, config.workspaces)
 }
 
 // SetExecutorSettings 装配并替换对话的 Executor 设置。
 func (c *conversationImpl) SetExecutorSettings(ctx context.Context, settings defs.ExecutorSettings) (defs.ExecutorSettings, error) {
 	// 1. 按新设置和当前定义装配配置，交给 Run 替换；装配期间对话换过配置时按最新配置重试，成功时返回补上 local 目录的设置。
-	ctx = telemetry.ContextWithAttrs(ctx, telemetry.ConversationID(string(c.id)))
+	ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: c.id})
 	for {
 		base := c.config.Load()
-		next, err := newConversationConfig(ctx, settings, base.settings, &c.opt, base.definitions, c.sessionRecords.Values())
+		next, err := newConversationConfig(ctx, c.id, settings, base.settings, &c.opt, base.definitions, c.sessionRecords.Values())
 		if err != nil {
 			return defs.ExecutorSettings{}, err
 		}
@@ -469,10 +474,10 @@ func (c *conversationImpl) SetExecutorSettings(ctx context.Context, settings def
 // SetDefinitions 按新定义重新装配并换上对话配置。
 func (c *conversationImpl) SetDefinitions(ctx context.Context, definitions *ConversationDefinitions) error {
 	// 1. 按新定义和当前设置装配配置，交给 Run 替换；装配期间对话换过配置时按最新配置重试。
-	ctx = telemetry.ContextWithAttrs(ctx, telemetry.ConversationID(string(c.id)))
+	ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: c.id})
 	for {
 		base := c.config.Load()
-		next, err := newConversationConfig(ctx, base.settings, base.settings, &c.opt, definitions, c.sessionRecords.Values())
+		next, err := newConversationConfig(ctx, c.id, base.settings, base.settings, &c.opt, definitions, c.sessionRecords.Values())
 		if err != nil {
 			return err
 		}
@@ -484,7 +489,7 @@ func (c *conversationImpl) SetDefinitions(ctx context.Context, definitions *Conv
 
 // applyConfig 向 Run 提交换配置请求并等待回复。
 func (c *conversationImpl) applyConfig(ctx context.Context, base, next *conversationConfig) error {
-	// 1. 提交装配好的配置；提交前对话已停止或调用方取消时，关闭新配置的 SSH 工作区并返回错误。
+	// 1. 提交装配好的配置；提交前对话已停止或调用方取消时，关闭新配置的工作区并返回错误。
 	change := &configChange{
 		base:  base,
 		next:  next,
@@ -493,10 +498,10 @@ func (c *conversationImpl) applyConfig(ctx context.Context, base, next *conversa
 	select {
 	case c.configChanges <- change:
 	case <-c.stopped:
-		closeSSHWorkspaces(ctx, next.sshWorkspaces)
+		closeWorkspaces(ctx, next.workspaces)
 		return fmt.Errorf("Conversation has stopped: %w", context.Cause(c.runCtx))
 	case <-ctx.Done():
-		closeSSHWorkspaces(ctx, next.sshWorkspaces)
+		closeWorkspaces(ctx, next.workspaces)
 		return ctx.Err()
 	}
 	// 2. Run 收到请求后等待它回复，不再因调用方取消而中断。
@@ -598,10 +603,42 @@ func (c *conversationImpl) CompactContext(ctx context.Context) (defs.TurnID, err
 	return root.CompactContext(ctx)
 }
 
+// AppendContextItems 把注入的 Item 交给根 Session，写在它的下一个 Turn 的输入之前。
+func (c *conversationImpl) AppendContextItems(ctx context.Context, items []*defs.Item) (err error) {
+	// 1. 等待根 Session 首次启动并查找运行实例。
+	select {
+	case <-c.rootStarted:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	root, found := c.runningSessions.Load(c.rootSessionID)
+	if !found {
+		return errors.New("Conversation root Session is not running")
+	}
+	// 2. 将 Item 交给根 Session。
+	return root.AppendContextItems(ctx, items)
+}
+
 // IsTerminalBusy 对话内运行的 Session 是否还有未结束的后台命令？
 func (c *conversationImpl) IsTerminalBusy() bool {
 	// 1. 逐个询问运行中的 Session，有一个还有未结束的后台命令就算忙。
 	return slices.ContainsFunc(c.runningSessions.Values(), session.Session.IsTerminalBusy)
+}
+
+// IsRestorableFromRecord 对话停止后按记录重新打开，能否回到同样的状态？
+func (c *conversationImpl) IsRestorableFromRecord() bool {
+	// 1. 不带 Executor 的对话，记录里没有这个选择。
+	if c.opt.WithoutExecutors {
+		return false
+	}
+	// 2. 默认 Executor 是第一个环境；它是 virtual 时文件只在内存里。
+	config := c.config.Load()
+	if len(config.environments) == 0 {
+		return true
+	}
+	defaultID := config.environments[0].GetID()
+	index := slices.IndexFunc(config.executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == defaultID })
+	return index < 0 || config.executors[index].GetDefinition().Kind != defs.ExecutorKindVirtual
 }
 
 // ListSessionInfos 按 SessionID 返回全部 Session 的查询信息。
@@ -630,7 +667,7 @@ func (c *conversationImpl) GetSessionDetails(_ context.Context, sessionID defs.S
 	details := SessionDetails{
 		ConversationID: c.id,
 		Session:        record,
-		Executors:      newExecutorDetails(config.environments),
+		Executors:      newExecutorDetails(config.environments, config.executors),
 		Skills:         getSkillNames(skill.GetSkillsByNames(definition.SkillNames, config.skills)),
 		Tools:          getSessionToolNames(config.environments, c.clientMCPServers, definition, collaborationTools),
 	}
@@ -686,7 +723,7 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 	if !found {
 		return nil, newAgentNotConfiguredError(record)
 	}
-	// 2. 复制 Agent 定义，依次追加 Skill、执行环境和 Session 身份说明。
+	// 2. 复制 Agent 定义，依次追加 Skill、执行环境、记忆规则和 Session 身份说明。
 	definition := *agentDefinition
 	skills := skill.GetSkillsByNames(definition.SkillNames, config.skills)
 	if skillInstructions := prompt.FormatSkillInstructions(skills); skillInstructions != "" {
@@ -694,6 +731,9 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 	}
 	if executorInstructions := prompt.FormatExecutorInstructions(newExecutorPromptEntries(config.environments)); executorInstructions != "" {
 		definition.Instructions += "\n" + executorInstructions
+	}
+	if slices.ContainsFunc(config.environments, isMemoryEnvironment) {
+		definition.Instructions += "\n" + prompt.FormatMemoryInstructions()
 	}
 	definition.Instructions += "\n" + prompt.FormatSessionIdentity(record)
 	// 3. 创建协作工具和 Session 配置，读取日志最新序号并确定 SessionStart hook 的来源。

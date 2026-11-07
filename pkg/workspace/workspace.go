@@ -58,11 +58,14 @@ type Workspace interface {
 	// 本机按 serve 进程的 HTTPS_PROXY、HTTP_PROXY、NO_PROXY（http.ProxyFromEnvironment）；
 	// SSH 拿不到远端 shell 的代理设置，返回 nil 表示直连；virtual 返回 nil。
 	GetHTTPProxy(request *http.Request) (*url.URL, error)
+	// Close 释放工作区持有的连接等资源，不删除文件，也不关闭远端机器；SSH 关闭后的调用返回 net.ErrClosed。可重复调用。
+	Close() error
 }
 
 // Process 是 StartProcess 启动的一条命令。
 type Process interface {
 	// Wait 等待命令结束并返回退出码；返回时输出已全部写入请求中的 Writer。被 Terminate 结束时退出码为 -1。
+	// 本机 TTY 命令退出后，后台作业仍持有终端读不到结束时，最多再等 1 秒收输出，然后关闭终端返回。
 	Wait() (int, error)
 	// Terminate 结束命令所在的整个进程组；没能确认结束时返回错误，可以重试；进程组已不存在时返回 nil。
 	Terminate() error

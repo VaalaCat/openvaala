@@ -1,4 +1,4 @@
-import { ImagePreview } from "@/components/base/image-preview"
+import { ImagePreviewStrip } from "@/components/base/image-preview"
 import { JsonView } from "@/components/base/json-view"
 import { OverflowTooltip } from "@/components/base/overflow-tooltip"
 import { OutputBlock } from "@/components/base/output-block"
@@ -184,19 +184,15 @@ export function ToolCard({
               </div>
             )}
             {details}
-            {images.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {images.map((image, index) => (
-                  <ImagePreview
-                    key={index}
-                    src={image.data_url}
-                    alt={image.alt ?? ""}
-                  />
-                ))}
-              </div>
-            )}
+            <ImagePreviewStrip
+              images={images.map((image, index) => ({
+                key: String(index),
+                src: image.data_url,
+                alt: image.alt,
+              }))}
+            />
             {error && (
-              <p className="text-body wrap-anywhere whitespace-pre-wrap color-destructive">
+              <p className="text-reading wrap-anywhere whitespace-pre-wrap color-destructive">
                 {error.code}: {error.message}
               </p>
             )}
@@ -213,7 +209,7 @@ function RawArguments({ text }: { text: string }) {
   return (
     <DetailSection label={t("conversation.tool.arguments")}>
       <OutputBlock copyValue={text}>
-        <pre className="px-3 py-2 text-code">{text}</pre>
+        <pre className="code-padding text-code-reading">{text}</pre>
       </OutputBlock>
     </DetailSection>
   )

@@ -52,7 +52,7 @@ type ItemTokens struct {
 type ContextCategory string
 
 const (
-	ContextCategoryInstruction     ContextCategory = "instruction"    // Skill、目录规则和 hook 输出
+	ContextCategoryInstruction     ContextCategory = "instruction"    // Skill、目录规则、记忆目录和 hook 输出
 	ContextCategorySummary         ContextCategory = "summary"        // 上下文摘要
 	ContextCategoryUserInput       ContextCategory = "user_input"     // 用户输入
 	ContextCategoryAgentMessage    ContextCategory = "agent_message"  // 其他 Session 发来的消息，包括子 Agent 的结果通知

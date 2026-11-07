@@ -93,9 +93,14 @@ type TurnOpt struct {
 	Hooks hook.Hooks
 	// Session 是本 Turn 所属 Session 的记录，随 hook 事件交给脚本；ParentSessionID 非空表示子 Session。
 	Session defs.Session
+	// MaxSteps 是本轮最多调用模型的次数，交给 Agent；0 表示不限。
+	MaxSteps int
 	// HookStartSource 只有 Session 启动后的第一个非压缩 Turn 非空：startup 或 resume。
 	// 非空时 Turn 在写输入前触发 SessionStart（子 Session 触发 SubagentStart，不带来源）；为空则不触发。
 	HookStartSource string
+	// ContextItems 是 Session 交来的注入 Item，本轮开始时补上 TurnID，写在模型、Executor 变化 Item 之后、本轮输入之前；
+	// 只压缩的 Turn 为空。
+	ContextItems []*defs.Item
 }
 
 // NewTurnOpt 填写本轮所属对话、角色和执行依赖。
@@ -244,6 +249,7 @@ func (t *turnImpl) runTurn(
 	agentOpt.IsCompactOnly = t.opt.IsCompactOnly
 	agentOpt.Hooks = t.opt.Hooks
 	agentOpt.Session = t.opt.Session
+	agentOpt.MaxSteps = t.opt.MaxSteps
 	agentInstance, err := agent.NewAgent(agentOpt)
 	if err != nil {
 		return t.finishTurn(ctx, nil, err)
@@ -279,7 +285,12 @@ func (t *turnImpl) appendTurnInput(ctx context.Context, turnExecutors []defs.Tur
 			},
 		})
 	}
-	// 2. HookStartSource 非空时运行 SessionStart 或 SubagentStart，追加保存的运行记录；hook 要求结束时跳过 Agent。
+	// 2. 追加 Session 交来的注入 Item，补上本轮 TurnID。
+	for _, item := range t.opt.ContextItems {
+		item.TurnID = t.opt.TurnID
+		batch = append(batch, item)
+	}
+	// 3. HookStartSource 非空时运行 SessionStart 或 SubagentStart，追加保存的运行记录；hook 要求结束时跳过 Agent。
 	if t.opt.HookStartSource != "" {
 		startEvent := &hook.HookEvent{
 			Name:   defs.HookEventSessionStart,
@@ -292,7 +303,7 @@ func (t *turnImpl) appendTurnInput(ctx context.Context, turnExecutors []defs.Tur
 		batch = append(batch, newHookRunItems(startOutcome.SavedRuns, t.opt.TurnID)...)
 		isAgentSkipped = startOutcome.IsTurnStopped
 	}
-	// 3. 启动 hook 要求结束时追加输入；否则运行 UserPromptSubmit，依次追加未被拦下的输入和用户输入 hook 记录。
+	// 4. 启动 hook 要求结束时追加输入；否则运行 UserPromptSubmit，依次追加未被拦下的输入和用户输入 hook 记录。
 	if isAgentSkipped {
 		batch = append(batch, turnInput...)
 	} else {
@@ -303,7 +314,7 @@ func (t *turnImpl) appendTurnInput(ctx context.Context, turnExecutors []defs.Tur
 		batch = append(batch, newHookRunItems(promptOutcome.SavedRuns, t.opt.TurnID)...)
 		isAgentSkipped = promptOutcome.IsBlocked || promptOutcome.IsTurnStopped
 	}
-	// 4. 使用不受取消影响的上下文保存整批内容，并发送保存事件。
+	// 5. 使用不受取消影响的上下文保存整批内容，并发送保存事件。
 	saved, err := t.appendItems(context.WithoutCancel(ctx), batch...)
 	if err != nil {
 		return false, fmt.Errorf("append turn input: %w", err)

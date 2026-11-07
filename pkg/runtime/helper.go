@@ -11,6 +11,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 )
@@ -34,20 +35,25 @@ func getTitleFromInput(content []*defs.Content) string {
 
 // newRuntimeDefinitions 整理对话使用的定义和模型索引。
 func newRuntimeDefinitions(source *Definitions) *runtimeDefinitions {
-	// 1. 复制各类定义，用这份 hook 定义新建 Hooks，并创建空的模型索引。
+	// 1. 没有 ExecutorProvider 时换成空列表。
+	executors := source.Executors
+	if executors == nil {
+		executors = executor.NewConfigExecutorProvider(nil)
+	}
+	// 2. 复制各类定义，用这份 hook 定义新建 Hooks，并创建空的模型索引。
 	definitions := &runtimeDefinitions{
 		conversationDefinitions: &conversation.ConversationDefinitions{
 			Agents:     slices.Clone(source.Agents),
 			Models:     slices.Clone(source.Models),
 			MCPServers: slices.Clone(source.MCPServers),
 			Hooks:      hook.NewHooks(hook.NewHooksOpt(slices.Clone(source.Hooks))),
-			Executors:  slices.Clone(source.Executors),
+			Executors:  executors,
 			Skills:     slices.Clone(source.Skills),
 		},
 		modelsByRef:        make(map[defs.ModelRef]*defs.ModelDefinition, len(source.Models)),
 		agentDefaultModels: make(map[string]defs.ModelRef, len(source.Agents)),
 	}
-	// 2. 按模型引用和 Agent 名称登记模型。
+	// 3. 按模型引用和 Agent 名称登记模型。
 	for _, model := range source.Models {
 		definitions.modelsByRef[model.Ref] = model
 	}
@@ -89,13 +95,15 @@ func newAgentInfos(agents []*agent.AgentDefinition) []AgentInfo {
 	return infos
 }
 
-// newExecutorDetails 按定义的顺序取出各 Executor 的说明和默认根目录。
-func newExecutorDetails(executors []*defs.ExecutorDefinition) []conversation.ExecutorDetails {
-	// 1. 按定义顺序提取 Executor 的标识、说明和工作目录。
+// newExecutorDetails 按列表顺序取出各 Executor 的种类、说明和默认根目录。
+func newExecutorDetails(executors []executor.Executor) []conversation.ExecutorDetails {
+	// 1. 按列表顺序提取 Executor 的标识、种类、说明和工作目录。
 	details := make([]conversation.ExecutorDetails, len(executors))
-	for index, definition := range executors {
+	for index, listed := range executors {
+		definition := listed.GetDefinition()
 		details[index] = conversation.ExecutorDetails{
 			ID:                 definition.ID,
+			Kind:               definition.Kind,
 			Description:        definition.Description,
 			WorkspaceDirectory: definition.WorkspaceDirectory,
 		}

@@ -97,6 +97,8 @@
     }
   },
   "jsonView": {
+    "expandAll": "全部展开",
+    "collapseAll": "全部折叠",
     "childCount_other": "{{count}} 项",
     "fold": "折叠",
     "unfold": "展开",
@@ -175,7 +177,8 @@
     },
     "notice": {
       "contextSummary": "上下文已压缩",
-      "forkedConversation": "从<source>来源对话</source>分叉",
+      "forkedFrom": "从『{{title}}』分叉",
+      "sideConversationFrom": "从『{{title}}』分出的旁支",
       "spawnedFrom": "子 Agent 从这里开始，之前的历史继承自",
       "modelChange": "模型从 {{previous}} 换成 {{model}}",
       "executorsChange": "Executor 从 {{previous}} 换成 {{executors}}",
@@ -184,6 +187,9 @@
       "file": "文件",
       "skillInstruction": "加载技能",
       "agentsInstruction": "加载目录规则",
+      "memoryIndex": "带上了记忆目录",
+      "memoryIndexTruncated": "超过 8 KiB，已截断",
+      "clientInstruction": "客户端指令",
       "turnInterrupted": "这一轮已中断",
       "toolResult": "工具结果（调用在更早的记录里）",
       "unknownItem": "未知类型的记录：{{kind}}",
@@ -332,6 +338,8 @@
         "list_commands": "查看命令",
         "apply_patch": "修改",
         "read_file": "读取",
+        "glob": "查找文件",
+        "grep": "搜索",
         "spawn_agent": "委派任务",
         "send_message": "发送消息",
         "wait_agent": "等待消息",
@@ -417,7 +425,8 @@
     "queue": "排队",
     "image": "图片",
     "contextMaterial": "附带材料",
-    "removeMaterial": "移除附带材料"
+    "removeMaterial": "移除附带材料",
+    "btwDescription": "开一个旁支提问，不影响当前对话"
   },
   "modelPicker": {
     "model": "模型",
@@ -436,6 +445,7 @@
     "directory": "工作目录",
     "directoryPlaceholder": "默认目录",
     "directorySuggestions": "目录候选",
+    "recentDirectories": "最近用过",
     "noDirectories": "没有匹配的子目录",
     "directoryInvalid": "工作目录不可用：{{detail}}"
   },
@@ -498,7 +508,26 @@
       "bodyFont": "正文字体",
       "headingFont": "标题字体",
       "systemFont": "系统字体",
-      "reset": "恢复默认外观"
+      "reset": "恢复默认外观",
+      "themeAndFonts": "主题与字体",
+      "body": "正文",
+      "code": "代码",
+      "terminal": "终端",
+      "fontSize": "字号",
+      "lineHeight": "行高",
+      "paragraphSpacing": "段落间距",
+      "paddingX": "水平内边距",
+      "paddingY": "垂直内边距",
+      "letterSpacing": "字间距",
+      "padding": "内容内边距",
+      "resetGroup": "恢复本组默认",
+      "preview": "实时预览",
+      "previewTitle": "对话与工作区",
+      "previewBody": "这里是一段正文：调整字号和行距，找到适合自己的阅读方式。",
+      "previewSecondParagraph": "第二段文字用于预览段落之间的距离。代码与终端保持独立设置。",
+      "previewCaption": "时间、说明和控件保持原有层级。",
+      "increase": "增大{{field}}",
+      "decrease": "减小{{field}}"
     },
     "sections": {
       "general": "通用",
@@ -506,7 +535,8 @@
       "executors": "Executor",
       "hooks": "Hook",
       "skills": "Skill",
-      "archived": "归档对话"
+      "archived": "归档对话",
+      "appearance": "外观"
     },
     "archived": {
       "search": "搜索归档对话"
@@ -569,6 +599,12 @@
       "deleted": "已删除模型服务「{{name}}」",
       "dirtyActions": "先应用或撤销未提交的修改。",
       "endpoints": "协议地址覆盖",
+      "headers": "请求头",
+      "headerName": "名称",
+      "headerValue": "值",
+      "addHeader": "添加请求头",
+      "removeHeader": "删除请求头",
+      "headersHint": "值可写 ${OPENVAALA_SESSION_ID} 等变量；值留空表示不发全局同名的 header。",
       "editModel": "编辑模型 {{name}}",
       "inherited": "继承（{{value}}）",
       "aliasRequired": "请填写模型别名",
@@ -654,5 +690,37 @@
     "actualSize": "100%",
     "close": "关闭图片预览",
     "failed": "图片加载失败"
+  },
+  "workspace": {
+    "sideConversation": "旁支",
+    "sideConversationTitle": "旁支 · {{question}}",
+    "sideConversationEnded": "旁支已结束",
+    "closeTab": "关闭标签页",
+    "areaActions": "区域操作",
+    "splitRight": "向右分栏",
+    "splitDown": "向下分栏",
+    "maximizeArea": "最大化此区域",
+    "restoreArea": "还原此区域",
+    "hiddenTabs": "更多标签页",
+    "resizeArea": "调整区域大小",
+    "newTerminal": "新终端",
+    "tabs": {
+      "title": "标签页",
+      "open": "标签页列表",
+      "close": "关闭标签页 {{name}}"
+    },
+    "terminal": {
+      "screen": "终端",
+      "restart": "重新启动",
+      "exited": "终端已退出，退出码 {{code}}",
+      "reconnecting": "连接已断开，正在重连",
+      "reset": "重置终端",
+      "endedWhenRestored": "终端已结束",
+      "keys": "终端按键",
+      "keyUp": "上",
+      "keyDown": "下",
+      "keyLeft": "左",
+      "keyRight": "右"
+    }
   }
 }

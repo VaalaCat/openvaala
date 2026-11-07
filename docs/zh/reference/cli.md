@@ -178,6 +178,8 @@ openvaala app --native    # 改为打开原生界面
 openvaala --native        # 同上
 ```
 
+安装包里的这个可执行文件叫 `openvaala`（macOS 上是 `OpenVaala`）。`go install github.com/VaalaCat/openvaala/cmd/openvaala-desktop@latest` 装上的是同一套命令，程序名叫 `openvaala-desktop`。见[安装](../getting-started/install.md)。
+
 在桌面端版本里，`tui` 启动终端界面。桌面窗口不接受 `--url`，它总是用本机的 Runtime 服务。见[桌面端](../guides/desktop.md)。
 
 ## 环境变量

@@ -2,6 +2,7 @@ package runtimeprotocol
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
@@ -47,7 +48,7 @@ func (e *JSONRPCError) Error() string {
 // ── JSON-RPC 错误码 ──
 
 // JSON-RPC 错误码：协议错误由连接产生，-32602 由参数解析、Executor 设置校验和分叉截取点校验产生；Runtime 返回的错误中，Session 忙为 -32001，
-// 对话不存在为 -32002，按 SessionID 找不到 Session 为 -32003，其余统一为 -32000。
+// 对话不存在为 -32002，按 SessionID 找不到 Session 为 -32003，终端不存在为 -32004，其余统一为 -32000。
 const (
 	ErrorCodeParse                = -32700
 	ErrorCodeInvalidRequest       = -32600
@@ -57,6 +58,7 @@ const (
 	ErrorCodeSessionBusy          = -32001
 	ErrorCodeConversationNotFound = -32002
 	ErrorCodeSessionNotFound      = -32003
+	ErrorCodeTerminalNotFound     = -32004
 )
 
 // ── OpenVaala 请求参数 ──
@@ -81,8 +83,10 @@ type CreateConversationParams struct {
 	ExecutorSettings defs.ExecutorSettings `json:"executor_settings"`
 	// Environment 为空时本机命令继承 serve 进程的环境。
 	Environment []string `json:"environment,omitempty"`
-	// Ephemeral 是否建临时对话？临时对话不装配，没有 Executor 和 Skill，executor_settings 原样记下但不生效，environment 忽略。
+	// Ephemeral 是否建临时对话？临时对话只在内存里，不进对话列表，没人用时丢弃。
 	Ephemeral bool `json:"ephemeral,omitempty"`
+	// WithoutExecutors 是否不装配 Executor 和 Skill？为 true 时 executor_settings 原样记下但不生效，environment 忽略。
+	WithoutExecutors bool `json:"without_executors,omitempty"`
 }
 
 // OpenConversationParams 是 conversation/open 的参数；Executor 设置取记录里的值，对话已在运行时忽略 environment，沿用首次打开时的。
@@ -179,7 +183,7 @@ type ListConversationsParams struct {
 // ForkConversationParams 是 conversation/fork 的参数。
 type ForkConversationParams struct {
 	ConversationID defs.ConversationID `json:"conversation_id"`
-	// BeforeTurnID 复制到这一轮之前（不含），LastTurnID 复制到这一轮（含）；最多给一个，都不给时复制全部已结束的轮次。
+	// BeforeTurnID 复制到这一轮之前（不含），LastTurnID 复制到这一轮（含）；最多给一个，都不给时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
 	BeforeTurnID defs.TurnID `json:"before_turn_id,omitempty"`
 	LastTurnID   defs.TurnID `json:"last_turn_id,omitempty"`
 	// Model 省略时照抄来源根 Session 的模型。
@@ -187,6 +191,8 @@ type ForkConversationParams struct {
 	// ExecutorSettings 是新对话的完整设置，和 Environment 一起按 conversation/create 的规则装配。
 	ExecutorSettings defs.ExecutorSettings `json:"executor_settings"`
 	Environment      []string              `json:"environment,omitempty"`
+	// Ephemeral 是否分叉成临时对话？临时对话只在内存里，不进对话列表，没人用时丢弃。
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 // SetConversationArchivedParams 是 conversation/setArchived 的参数：archived 为 true 时归档，false 时取消归档。
@@ -230,6 +236,13 @@ type WithdrawInputParams struct {
 	ConversationID defs.ConversationID `json:"conversation_id"`
 	ItemID         defs.ItemID         `json:"item_id"`
 	ReturnContent  bool                `json:"return_content"`
+}
+
+// AppendContextItemsParams 是 conversation/appendContextItems 的参数。
+type AppendContextItemsParams struct {
+	ConversationID defs.ConversationID `json:"conversation_id"`
+	// Items 可以是任何不需要模型调用、也不由运行时自己写入的种类，载荷必须有效；ID 由调用方生成，还没分配 turn_id 和 model_call_id。
+	Items []*defs.Item `json:"items"`
 }
 
 // SessionParams 用于定位对话内一个 Session 的方法：session/subscribe、session/unsubscribe、session/contextUsage、session/details。
@@ -276,7 +289,7 @@ type ListItemsParams struct {
 	Limit          int                 `json:"limit,omitempty"`
 }
 
-// TerminalOpenParams 是 terminal/open 的参数：在 executor_id 对应的 Executor 上为这条连接新开一个终端，shell 的起始目录是 directory。
+// TerminalOpenParams 是 terminal/open 的参数：在 executor_id 对应的 Executor 上新开一个终端，shell 的起始目录是 directory；打开后这条连接自动接入。
 type TerminalOpenParams struct {
 	// ExecutorID 为空时用 local Executor；virtual Executor 不支持终端。
 	ExecutorID string `json:"executor_id"`
@@ -287,9 +300,18 @@ type TerminalOpenParams struct {
 	Cols uint16 `json:"cols"`
 	// Environment 是客户端的环境变量（格式同 os.Environ），只给 local Executor 的 shell 用；为空时继承 serve 进程的环境。
 	Environment []string `json:"environment,omitempty"`
+	// ConversationID 是打开终端的对话，只决定标签页显示在哪。
+	ConversationID defs.ConversationID `json:"conversation_id,omitempty"`
 }
 
-// TerminalParams 是 terminal/close 的参数：结束这条连接打开的一个终端。
+// TerminalAttachParams 是 terminal/attach 的参数：把这条连接接入已有终端。
+type TerminalAttachParams struct {
+	TerminalID string `json:"terminal_id"`
+	// Cursor 是开始发送输出的字节位置，刷新后传 0。
+	Cursor uint64 `json:"cursor"`
+}
+
+// TerminalParams 是 terminal/close、terminal/reset 的参数：指定一个终端。
 type TerminalParams struct {
 	TerminalID string `json:"terminal_id"`
 }
@@ -371,6 +393,30 @@ type TerminalOpenResult struct {
 	TerminalID string `json:"terminal_id"`
 	ExecutorID string `json:"executor_id"`
 	Directory  string `json:"directory"`
+}
+
+// TerminalAttachResult 是 terminal/attach 的结果：终端的 Executor、起始目录和 PTY 当前尺寸。
+type TerminalAttachResult struct {
+	ExecutorID string `json:"executor_id"`
+	Directory  string `json:"directory"`
+	// Rows、Cols 是 PTY 当前尺寸，客户端先按它回放。
+	Rows uint16 `json:"rows"`
+	Cols uint16 `json:"cols"`
+}
+
+// TerminalListResult 是 terminal/subscribe 的结果，也是 terminal/listChanged 的参数：全部运行中的终端。
+type TerminalListResult struct {
+	Terminals []TerminalItem `json:"terminals"`
+}
+
+// TerminalItem 是一个运行中的终端。
+type TerminalItem struct {
+	TerminalID string    `json:"terminal_id"`
+	ExecutorID string    `json:"executor_id"`
+	Directory  string    `json:"directory"`
+	StartedAt  time.Time `json:"started_at"`
+	// ConversationID 是打开终端的对话，打开时没有指定对话则省略。
+	ConversationID defs.ConversationID `json:"conversation_id,omitempty"`
 }
 
 // SubmitInputResult 是 conversation/submitInput 的结果：这次输入的 ItemID。
@@ -596,16 +642,27 @@ type TerminalResizeParams struct {
 	Cols       uint16 `json:"cols"`
 }
 
-// TerminalOutputParams 是 serve 发给打开该终端的连接的 terminal/output 的参数：终端新产生的一批输出，JSON 里是 base64，按产生顺序送达。
+// TerminalOutputParams 是 serve 发给接入该终端的连接的 terminal/output 的参数：一段输出，JSON 里是 base64，按产生顺序送达。
 type TerminalOutputParams struct {
 	TerminalID string `json:"terminal_id"`
 	Data       []byte `json:"data"`
+	// NextCursor 是这段输出之后的位置，断网重连从这里续读。
+	NextCursor uint64 `json:"next_cursor"`
+	// Truncated 请求的位置已被丢弃，Data 从最早保留处开始？
+	Truncated bool `json:"truncated"`
+	// HasMore 接入时已有的输出还没发完？为 false 时客户端结束回放；之后的新输出都是 false。
+	HasMore bool `json:"has_more"`
 }
 
-// TerminalExitedParams 是 serve 发给打开该终端的连接的 terminal/exited 的参数：终端进程结束后发出一次，此后这个 terminal_id 不再有通知。
+// TerminalExitedParams 是 serve 发给接入该终端的连接的 terminal/exited 的参数：终端进程结束后发出一次，此后这个 terminal_id 不再有通知。
 type TerminalExitedParams struct {
 	TerminalID string `json:"terminal_id"`
 	ExitCode   int    `json:"exit_code"`
 	// Error 是进程没能取得退出码的原因（如远端连接断开），正常结束或被关闭时省略。
 	Error string `json:"error,omitempty"`
+}
+
+// TerminalsClosedParams 是 serve 发给订阅了终端列表的连接的 terminal/listClosed 的参数：订阅被 serve 关闭的原因，主动退订和断线不发。
+type TerminalsClosedParams struct {
+	Reason string `json:"reason"`
 }

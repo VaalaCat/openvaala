@@ -164,10 +164,12 @@ func newUpstreamModelsRequest(ctx context.Context, provider defs.ProviderConfig)
 		if provider.APIKey != "" {
 			request.Header.Set("x-api-key", provider.APIKey)
 		}
-		return request, nil
-	}
-	if provider.APIKey != "" {
+	} else if provider.APIKey != "" {
 		request.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	}
+	// 3. 最后写入 Provider 的 headers，同名的覆盖上面的鉴权头。
+	for name, value := range provider.Headers {
+		request.Header.Set(name, value)
 	}
 	return request, nil
 }

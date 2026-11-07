@@ -8,6 +8,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/spf13/cobra"
 )
@@ -37,7 +38,7 @@ func runACPCommand(ctx context.Context, args *AppArgs) (err error) {
 		return errors.New("ACP stdout must be closable")
 	}
 	// 2. 启动遥测（文本日志写 stderr）并放进 ctx，选择 serve，提示写 stderr；stdout 只写协议消息。
-	tel, shutdown, err := newTelemetry(ctx, args.Config, args.Version, args.Stderr)
+	tel, shutdown, err := newTelemetry(ctx, args.Config, args.Stderr)
 	if err != nil {
 		return err
 	}
@@ -58,7 +59,7 @@ func runACPCommand(ctx context.Context, args *AppArgs) (err error) {
 		telemetry: tel,
 		input:     input,
 		output:    output,
-		version:   args.Version,
+		version:   defs.GetBuildVersion(),
 	}
 	// 4. 运行 acpAgent；输入结束（EOF）或被取消时正常返回。
 	err = host.Run(ctx)

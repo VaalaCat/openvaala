@@ -121,9 +121,10 @@ func (a *agentImpl) handleToolCallEvent(event *llmkit.Event, modelCallID defs.Mo
 	if event.Type == llmkit.EventToolCallDelta && event.Delta != nil && event.Delta.ToolCall != nil {
 		delta := event.Delta.ToolCall
 		toolEvent = &llmkit.StreamingToolCall{
-			CallID:    delta.ID,
-			Name:      delta.Name,
-			Arguments: delta.Arguments,
+			CallID:       delta.ID,
+			Name:         delta.Name,
+			Arguments:    delta.Arguments,
+			ProviderData: delta.ProviderData,
 		}
 	}
 	if toolEvent == nil {
@@ -153,10 +154,13 @@ func (a *agentImpl) handleToolCallEvent(event *llmkit.Event, modelCallID defs.Mo
 		a.appendDraftItem(callItem)
 		events = append(events, a.newItemEvent(AgentEventItemStarted, callItem, nil))
 	}
-	// 3. 更新工具名；ToolCallEnd 和 ToolCallDelta 带完整参数，覆盖参数、标记 ready 并完成 Item；其他事件追加参数增量。
+	// 3. 更新工具名和厂商数据（事件带了就覆盖，所以 ToolCallEnd 的完整数据最终生效）；ToolCallEnd 和 ToolCallDelta 带完整参数，覆盖参数、标记 ready 并完成 Item；其他事件追加参数增量。
 	call := callItem.ToolCall
 	if toolEvent.Name != "" {
 		call.Name = toolEvent.Name
+	}
+	if toolEvent.ProviderData != nil {
+		call.ProviderData = defs.CloneToolCallProviderData(toolEvent.ProviderData)
 	}
 	if event.Type == llmkit.EventToolCallEnd || event.Type == llmkit.EventToolCallDelta {
 		call.Arguments = toolEvent.Arguments

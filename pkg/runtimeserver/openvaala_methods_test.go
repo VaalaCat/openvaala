@@ -1,6 +1,7 @@
 package runtimeserver_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -801,9 +802,9 @@ func TestOpenVaalaInitialize(t *testing.T) {
 				ProtocolVersion string `json:"protocol_version"`
 				ServerID        string `json:"server_id"`
 			}
-			h.dial(t).callResult(t, "initialize", map[string]any{"client_info": map[string]any{"name": "test"}, "protocol_version": "5"}, &result)
-			if result.ServerID != tt.serverID || result.ProtocolVersion != "5" {
-				t.Fatalf("initialize result = %+v, want server_id %q and protocol version 4", result, tt.serverID)
+			h.dial(t).callResult(t, "initialize", map[string]any{"client_info": map[string]any{"name": "test"}, "protocol_version": "6"}, &result)
+			if result.ServerID != tt.serverID || result.ProtocolVersion != "6" {
+				t.Fatalf("initialize result = %+v, want server_id %q and protocol version 6", result, tt.serverID)
 			}
 		})
 	}
@@ -924,11 +925,6 @@ func TestOpenVaalaConversationManagement(t *testing.T) {
 						name:   "boundary_conflict",
 						params: map[string]any{"before_turn_id": running, "last_turn_id": finished},
 						want:   conversation.ErrForkBoundaryConflict,
-					},
-					{
-						name:   "turn_running",
-						params: map[string]any{"last_turn_id": running},
-						want:   conversation.ErrForkTurnRunning,
 					},
 				} {
 					tt.params["conversation_id"], tt.params["executor_settings"] = source.ID, defs.ExecutorSettings{}
@@ -1330,8 +1326,8 @@ func TestOpenVaalaExecutorMethods(t *testing.T) {
 			name:   "list",
 			method: "executor/list",
 			wantResult: func(defaultDirectory string) string {
-				return `{"executors":[{"id":"local","description":"本机","workspace_directory":` + strconv.Quote(defaultDirectory) + `},` +
-					`{"id":"a","description":"虚拟","workspace_directory":"/workspace"}]}`
+				return `{"executors":[{"id":"local","kind":"local","description":"本机","workspace_directory":` + strconv.Quote(defaultDirectory) + `},` +
+					`{"id":"a","kind":"virtual","description":"虚拟","workspace_directory":"/workspace"}]}`
 			},
 		},
 		{
@@ -2915,55 +2911,64 @@ func TestOpenVaalaRunningConversations(t *testing.T) {
 	}
 }
 
-// TestOpenVaalaRunningConversationsClosed 检查 Runtime 停止时关闭通知和再次订阅的错误。
+// TestOpenVaalaRunningConversationsClosed 检查 Runtime 停止时运行集合订阅和终端列表订阅的关闭通知，以及再次订阅的错误。
 func TestOpenVaalaRunningConversationsClosed(t *testing.T) {
-	// 1. 分别在订阅前和订阅后停止真实 Runtime。
-	for _, subscribed := range []bool{false, true} {
-		t.Run(strconv.FormatBool(subscribed), func(t *testing.T) {
-			store, model := openServerStore(t), newServerModel(t)
-			rt, err := runtime.NewRuntime(newTestRuntimeOpt(store, model, t.TempDir()))
-			if err != nil {
-				t.Fatal(err)
-			}
-			ctx, cancel := context.WithCancel(t.Context())
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				_ = rt.Run(ctx)
-			}()
-			t.Cleanup(func() {
+	// 1. 分别对两种全局订阅，在订阅前和订阅后停止真实 Runtime。
+	for _, tt := range []struct {
+		name            string
+		subscribeMethod string
+		closedMethod    string
+	}{
+		{"running_conversations", "conversation/running/subscribe", "conversation/runningClosed"},
+		{"terminals", "terminal/subscribe", "terminal/listClosed"},
+	} {
+		for _, subscribed := range []bool{false, true} {
+			t.Run(tt.name+"/"+strconv.FormatBool(subscribed), func(t *testing.T) {
+				store, model := openServerStore(t), newServerModel(t)
+				rt, err := runtime.NewRuntime(newTestRuntimeOpt(store, model, t.TempDir()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					_ = rt.Run(ctx)
+				}()
+				t.Cleanup(func() {
+					cancel()
+					<-done
+				})
+				h := startTestServer(t, func(opt *runtimeserver.RuntimeServerOpt) { opt.Runtime = rt })
+				client := h.dial(t)
+				client.initialize(t)
+				if subscribed {
+					client.callResult(t, tt.subscribeMethod, map[string]any{}, nil)
+				}
+				// 2. 停止 Runtime，已有订阅收到只带原因的关闭通知。
 				cancel()
-				<-done
-			})
-			h := startTestServer(t, func(opt *runtimeserver.RuntimeServerOpt) { opt.Runtime = rt })
-			client := h.dial(t)
-			client.initialize(t)
-			if subscribed {
-				client.callResult(t, "conversation/running/subscribe", map[string]any{}, nil)
-			}
-			// 2. 停止 Runtime，已有订阅收到只带原因的关闭通知。
-			cancel()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Fatal("Runtime did not stop")
-			}
-			if subscribed {
-				messages := client.collectNotifications(t, isMethod("conversation/runningClosed"))
-				closed := messages[len(messages)-1]
-				var params map[string]string
-				if err := json.Unmarshal(closed.Params, &params); err != nil || len(params) != 1 || params["reason"] == "" {
-					t.Fatalf("closed params = %s, %v", closed.Params, err)
-				}
 				select {
-				case message := <-client.notifications:
-					t.Fatalf("event after closed = %+v", message)
-				case <-time.After(50 * time.Millisecond):
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Fatal("Runtime did not stop")
 				}
-			}
-			// 3. 旧登记已移除，再次订阅返回 Runtime 错误，而非重复订阅。
-			requireErrorCode(t, client.call(t, "conversation/running/subscribe", map[string]any{}), -32000, "runtime has stopped")
-		})
+				if subscribed {
+					messages := client.collectNotifications(t, isMethod(tt.closedMethod))
+					closed := messages[len(messages)-1]
+					var params map[string]string
+					if err := json.Unmarshal(closed.Params, &params); err != nil || len(params) != 1 || params["reason"] == "" {
+						t.Fatalf("closed params = %s, %v", closed.Params, err)
+					}
+					select {
+					case message := <-client.notifications:
+						t.Fatalf("event after closed = %+v", message)
+					case <-time.After(50 * time.Millisecond):
+					}
+				}
+				// 3. 旧登记已移除，再次订阅返回 Runtime 错误，而非重复订阅。
+				requireErrorCode(t, client.call(t, tt.subscribeMethod, map[string]any{}), -32000, "runtime has stopped")
+			})
+		}
 	}
 }
 
@@ -3041,7 +3046,7 @@ func TestOpenVaalaPendingInputs(t *testing.T) {
 	}
 }
 
-// TestOpenVaalaTerminal 检查终端的打开、输入输出、尺寸、退出，以及连接关闭后进程被结束。
+// TestOpenVaalaTerminal 检查终端的打开、接入、输入输出、尺寸、重置和退出，以及连接断开后 shell 继续运行。
 func TestOpenVaalaTerminal(t *testing.T) {
 	// 1. 列出终端各场景：每个场景在一条已初始化的连接和 serve 默认目录上运行。
 	tests := []struct {
@@ -3121,6 +3126,34 @@ func TestOpenVaalaTerminal(t *testing.T) {
 			},
 		},
 		{
+			// shell 开了作业控制，sleep 在自己的进程组里仍持有 PTY：terminal/close 也要在约 1 秒内成功，不等到 5 秒的上限。
+			name: "close_with_background_job",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				startBackgroundJob(t, client, terminal.TerminalID)
+				startedAt := time.Now()
+				client.callResult(t, "terminal/close", map[string]any{"terminal_id": terminal.TerminalID}, nil)
+				client.waitTerminalExited(t, terminal.TerminalID)
+				if elapsed := time.Since(startedAt); elapsed > 3*time.Second {
+					t.Fatalf("close with a background job took %v, want well under the 5s close limit", elapsed)
+				}
+			},
+		},
+		{
+			// shell 自己退出时后台作业仍持有 PTY：terminal/exited 也在约 1 秒内到达。
+			name: "exit_with_background_job",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				startBackgroundJob(t, client, terminal.TerminalID)
+				startedAt := time.Now()
+				client.writeTerminal(t, terminal.TerminalID, "exit\n")
+				client.waitTerminalExited(t, terminal.TerminalID)
+				if elapsed := time.Since(startedAt); elapsed > 3*time.Second {
+					t.Fatalf("exit with a background job took %v, want the terminal to end within about 1s", elapsed)
+				}
+			},
+		},
+		{
 			name: "close_unknown_terminal_succeeds",
 			run: func(t *testing.T, h *serverHarness, client *testClient) {
 				client.callResult(t, "terminal/close", map[string]any{"terminal_id": "gone"}, nil)
@@ -3145,25 +3178,327 @@ func TestOpenVaalaTerminal(t *testing.T) {
 			},
 		},
 		{
-			name: "connection_close_terminates_process",
+			// 连接断开只取消接入：shell 继续运行，断线期间的输出由新连接从 0 补齐。
+			name: "disconnect_keeps_shell",
 			run: func(t *testing.T, h *serverHarness, client *testClient) {
 				terminal := openTerminal(t, client, nil)
-				client.writeTerminal(t, terminal.TerminalID, "echo pid=$$\n")
+				client.writeTerminal(t, terminal.TerminalID, "echo pid=$$; while [ ! -e released ]; do sleep 0.05; done; echo woke-$((6*7))\n")
 				match := client.waitTerminalOutput(t, terminal.TerminalID, `pid=(\d+)`)
 				pid, err := strconv.Atoi(match[1])
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := syscall.Kill(pid, 0); err != nil {
-					t.Fatalf("shell %d is not running before the connection closes: %v", pid, err)
-				}
 				_ = client.conn.CloseNow()
-				deadline := time.Now().Add(5 * time.Second)
-				for syscall.Kill(pid, 0) == nil {
-					if time.Now().After(deadline) {
-						t.Fatalf("shell %d is still running after the connection closed", pid)
+				// 放行 shell，并等输出已经产生在 serve 里，再让新连接接入。
+				if err := os.WriteFile(filepath.Join(h.defaultDirectory, "released"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				held, err := h.runtime.GetTerminal(t.Context(), terminal.TerminalID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+					output, err := held.ReadOutput(t.Context(), 0, 0)
+					if err != nil {
+						t.Fatal(err)
 					}
-					time.Sleep(10 * time.Millisecond)
+					if strings.Contains(output.Text, "woke-42") {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("shell output = %q, want woke-42 after the connection closed", output.Text)
+					}
+				}
+				if err := syscall.Kill(pid, 0); err != nil {
+					t.Fatalf("shell %d is not running after the connection closed: %v", pid, err)
+				}
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, 0)
+				other.waitTerminalOutput(t, terminal.TerminalID, "woke-42")
+				other.writeTerminal(t, terminal.TerminalID, "echo still-$((6*7))\n")
+				other.waitTerminalOutput(t, terminal.TerminalID, "still-42")
+			},
+		},
+		{
+			name: "attach_unknown_terminal",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				requireErrorCode(t, client.call(t, "terminal/attach", map[string]any{"terminal_id": "gone", "cursor": 0}), -32004, "terminal not found")
+			},
+		},
+		{
+			name: "attach_beyond_latest_output_is_rejected",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				requireErrorCode(t, client.call(t, "terminal/attach", map[string]any{"terminal_id": terminal.TerminalID, "cursor": 1 << 40}), -32000, "is after the latest output")
+			},
+		},
+		{
+			name: "attach_to_finished_terminal",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				client.writeTerminal(t, terminal.TerminalID, "echo done-$((6*7)); exit 7\n")
+				if exited := client.waitTerminalExited(t, terminal.TerminalID); exited.ExitCode != 7 {
+					t.Fatalf("exited = %+v, want code 7", exited)
+				}
+				attachTerminal(t, client, terminal.TerminalID, 0)
+				data, outputs, exited := client.collectTerminalUntilExited(t, terminal.TerminalID)
+				if !bytes.Contains(data, []byte("done-42\r\n")) || outputs[len(outputs)-1].HasMore || exited.ExitCode != 7 || exited.Error != "" {
+					t.Fatalf("replay = %q, outputs = %+v, exited = %+v, want done-42 with no more output and exit code 7", data, outputs, exited)
+				}
+			},
+		},
+		{
+			// 光标已经是最新位置时，第一批输出仍然发出：data 为空、has_more 为 false，之后的新输出 has_more 也是 false。
+			name: "attach_first_output_may_be_empty",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				client.writeTerminal(t, terminal.TerminalID, "echo ready-$((6*7)); read\n")
+				_, outputs := client.collectTerminalStream(t, terminal.TerminalID, func(data []byte, _ runtimeprotocol.TerminalOutputParams) bool {
+					return bytes.Contains(data, []byte("ready-42\r\n"))
+				})
+				cursor := outputs[len(outputs)-1].NextCursor
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, cursor)
+				_, firstOutputs := other.collectTerminalStream(t, terminal.TerminalID, func([]byte, runtimeprotocol.TerminalOutputParams) bool { return true })
+				if first := firstOutputs[0]; len(first.Data) != 0 || first.HasMore || first.NextCursor != cursor || first.Truncated {
+					t.Fatalf("first output = %+v, want empty data at cursor %d with no more output", first, cursor)
+				}
+				client.writeTerminal(t, terminal.TerminalID, "\n")
+				_, later := other.collectTerminalStream(t, terminal.TerminalID, func(data []byte, _ runtimeprotocol.TerminalOutputParams) bool { return len(data) > 0 })
+				if last := later[len(later)-1]; last.HasMore {
+					t.Fatalf("output after attach = %+v, want has_more false", last)
+				}
+			},
+		},
+		{
+			// 输出超过一页（64 KiB）时分页回放：除最后一页外 has_more 都是 true，最后一页是 false。
+			name: "attach_pages_report_has_more",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				client.writeTerminal(t, terminal.TerminalID, "seq 1 40000; echo done-$((6*7))\n")
+				client.waitTerminalOutput(t, terminal.TerminalID, `done-42\r\n`)
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, 0)
+				_, outputs := other.collectTerminalStream(t, terminal.TerminalID, func(_ []byte, last runtimeprotocol.TerminalOutputParams) bool { return !last.HasMore })
+				if len(outputs) < 2 {
+					t.Fatalf("replay pages = %d, want 40000 numbers to span more than one page", len(outputs))
+				}
+				for index, page := range outputs[:len(outputs)-1] {
+					if !page.HasMore {
+						t.Fatalf("page %d of %d has_more = false, want true before the last page", index, len(outputs))
+					}
+				}
+				if outputs[len(outputs)-1].HasMore {
+					t.Fatal("last page has_more = true, want false")
+				}
+			},
+		},
+		{
+			name: "attach_returns_pty_size",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, map[string]any{"rows": 24, "cols": 80})
+				client.sendNotification(t, "terminal/resize", map[string]any{"terminal_id": terminal.TerminalID, "rows": 30, "cols": 100})
+				client.writeTerminal(t, terminal.TerminalID, "echo size=$(stty size)\n")
+				client.waitTerminalOutput(t, terminal.TerminalID, "size=30 100")
+				other := dialInitialized(t, h)
+				attached := attachTerminal(t, other, terminal.TerminalID, 0)
+				want := runtimeprotocol.TerminalAttachResult{ExecutorID: defs.LocalExecutorID, Directory: h.defaultDirectory, Rows: 30, Cols: 100}
+				if attached != want {
+					t.Fatalf("attach result = %+v, want %+v", attached, want)
+				}
+			},
+		},
+		{
+			// yes 一直在输出：回放不会因为输出源源不断而结束不了，接入的连接也能用 Ctrl+C 停住它。
+			name: "attach_while_output_keeps_flowing",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				client.writeTerminal(t, terminal.TerminalID, "yes\n")
+				client.collectTerminalStream(t, terminal.TerminalID, func(data []byte, last runtimeprotocol.TerminalOutputParams) bool {
+					return bytes.Contains(last.Data, []byte("y\r\ny\r\ny\r\n"))
+				})
+				_ = client.conn.CloseNow()
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, 0)
+				other.collectTerminalStream(t, terminal.TerminalID, func(_ []byte, last runtimeprotocol.TerminalOutputParams) bool { return !last.HasMore })
+				other.writeTerminal(t, terminal.TerminalID, "\x03")
+				other.writeTerminal(t, terminal.TerminalID, "echo stopped-$((6*7))\n")
+				marker := []byte("stopped-42\r\n")
+				other.collectTerminalStream(t, terminal.TerminalID, func(data []byte, last runtimeprotocol.TerminalOutputParams) bool {
+					return bytes.Contains(data[max(0, len(data)-len(last.Data)-len(marker)):], marker)
+				})
+				if after := other.drainTerminalOutput(t, terminal.TerminalID, 300*time.Millisecond); bytes.Contains(after, []byte("y\r\ny\r\n")) {
+					t.Fatalf("output after Ctrl+C = %q, want yes stopped", after[:min(len(after), 64)])
+				}
+			},
+		},
+		{
+			// 输出是二进制流：非 UTF-8 的随机字节经实时转发和从 0 回放都原样到达（stty -opost 关掉 PTY 的换行转换，才能和文件逐字节对照）。
+			name: "binary_output_round_trips",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				client.writeTerminal(t, terminal.TerminalID, "head -c 4096 /dev/urandom > rand.bin; echo made-$((6*7))\n")
+				client.waitTerminalOutput(t, terminal.TerminalID, "made-42")
+				want, err := os.ReadFile(filepath.Join(h.defaultDirectory, "rand.bin"))
+				if err != nil || len(want) != 4096 {
+					t.Fatalf("rand.bin = %d bytes, %v, want 4096 bytes", len(want), err)
+				}
+				client.writeTerminal(t, terminal.TerminalID, "stty -opost; printf 'BEGIN-MARK''-7f3a'; cat rand.bin; printf 'END-MARK''-7f3a'; stty opost\n")
+				endMarker := []byte("END-MARK-7f3a")
+				hasEnd := func(data []byte, _ runtimeprotocol.TerminalOutputParams) bool { return bytes.Contains(data, endMarker) }
+				live, _ := client.collectTerminalStream(t, terminal.TerminalID, hasEnd)
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, 0)
+				replayed, _ := other.collectTerminalStream(t, terminal.TerminalID, hasEnd)
+				for name, stream := range map[string][]byte{"live": live, "replayed": replayed} {
+					begin := bytes.Index(stream, []byte("BEGIN-MARK-7f3a"))
+					end := bytes.Index(stream, endMarker)
+					if begin < 0 || end < begin || !bytes.Equal(stream[begin+len("BEGIN-MARK-7f3a"):end], want) {
+						t.Fatalf("%s stream does not carry rand.bin unchanged (begin %d, end %d, %d bytes)", name, begin, end, len(stream))
+					}
+				}
+			},
+		},
+		{
+			name: "two_connections_receive_output",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, 0)
+				client.writeTerminal(t, terminal.TerminalID, "echo both-$((6*7))\n")
+				client.waitTerminalOutput(t, terminal.TerminalID, "both-42")
+				other.waitTerminalOutput(t, terminal.TerminalID, "both-42")
+			},
+		},
+		{
+			// 谁最后打字就用谁的窗口尺寸：输入前先把 PTY 改成这条连接最新的尺寸；打开者没发过 resize 时用打开时的尺寸。
+			name: "typing_switches_size",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, map[string]any{"rows": 24, "cols": 80})
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, 0)
+				other.sendNotification(t, "terminal/resize", map[string]any{"terminal_id": terminal.TerminalID, "rows": 40, "cols": 120})
+				other.writeTerminal(t, terminal.TerminalID, "echo size=$(stty size)\n")
+				other.waitTerminalOutput(t, terminal.TerminalID, "size=40 120")
+				client.writeTerminal(t, terminal.TerminalID, "echo size=$(stty size)\n")
+				client.waitTerminalOutput(t, terminal.TerminalID, "size=24 80")
+			},
+		},
+		{
+			// 前台程序不读输入，PTY 缓冲写满后写入卡住；这条连接的其他请求照常响应，也能关掉终端。
+			name: "stuck_write_keeps_requests_flowing",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				client.writeTerminal(t, terminal.TerminalID, "echo sleeping-$((6*7)); sleep 60\n")
+				client.waitTerminalOutput(t, terminal.TerminalID, "sleeping-42")
+				client.writeTerminal(t, terminal.TerminalID, strings.Repeat("x\n", 128<<10))
+				client.callResult(t, "conversation/list", map[string]any{}, nil)
+				client.callResult(t, "terminal/close", map[string]any{"terminal_id": terminal.TerminalID}, nil)
+				client.waitTerminalExited(t, terminal.TerminalID)
+			},
+		},
+		{
+			name: "close_from_other_connection",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, 0)
+				other.callResult(t, "terminal/close", map[string]any{"terminal_id": terminal.TerminalID}, nil)
+				for name, attached := range map[string]*testClient{"opener": client, "other": other} {
+					if exited := attached.waitTerminalExited(t, terminal.TerminalID); exited.Error != "" {
+						t.Fatalf("%s exited = %+v, want no error", name, exited)
+					}
+				}
+			},
+		},
+		{
+			// 重置后所有接入的连接都收到清屏序列；新连接从 0 接入只读到它和之后的输出。
+			name: "reset_clears_for_all",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				other := dialInitialized(t, h)
+				attachTerminal(t, other, terminal.TerminalID, 0)
+				client.writeTerminal(t, terminal.TerminalID, "echo before-$((6*7))\n")
+				client.waitTerminalOutput(t, terminal.TerminalID, "before-42")
+				other.waitTerminalOutput(t, terminal.TerminalID, "before-42")
+				client.callResult(t, "terminal/reset", map[string]any{"terminal_id": terminal.TerminalID}, nil)
+				hasClear := func(data []byte, _ runtimeprotocol.TerminalOutputParams) bool {
+					return bytes.Contains(data, []byte(terminalClearSequence))
+				}
+				client.collectTerminalStream(t, terminal.TerminalID, hasClear)
+				other.collectTerminalStream(t, terminal.TerminalID, hasClear)
+				fresh := dialInitialized(t, h)
+				attachTerminal(t, fresh, terminal.TerminalID, 0)
+				client.writeTerminal(t, terminal.TerminalID, "echo after-$((6*7))\n")
+				data, _ := fresh.collectTerminalStream(t, terminal.TerminalID, func(data []byte, _ runtimeprotocol.TerminalOutputParams) bool {
+					return bytes.Contains(data, []byte("after-42\r\n"))
+				})
+				if !bytes.HasPrefix(data, []byte(terminalClearSequence)) || bytes.Contains(data, []byte("before-42")) {
+					t.Fatalf("replay after reset = %q, want it to start with the clear sequence and drop earlier output", data)
+				}
+			},
+		},
+		{
+			// 重置前的位置已经被丢弃，但这不算溢出截断：收到清屏序列，truncated 为 false。
+			name: "reset_with_old_cursor",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				client.writeTerminal(t, terminal.TerminalID, "echo before-$((6*7))\n")
+				client.waitTerminalOutput(t, terminal.TerminalID, "before-42")
+				client.callResult(t, "terminal/reset", map[string]any{"terminal_id": terminal.TerminalID}, nil)
+				behind := dialInitialized(t, h)
+				attachTerminal(t, behind, terminal.TerminalID, 1)
+				_, outputs := behind.collectTerminalStream(t, terminal.TerminalID, func([]byte, runtimeprotocol.TerminalOutputParams) bool { return true })
+				if first := outputs[0]; !bytes.HasPrefix(first.Data, []byte(terminalClearSequence)) || first.Truncated || bytes.Contains(first.Data, []byte("before-42")) {
+					t.Fatalf("first output = %+v, want the clear sequence with truncated false", first)
+				}
+			},
+		},
+		{
+			name: "reset_unknown_terminal",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				requireErrorCode(t, client.call(t, "terminal/reset", map[string]any{"terminal_id": "gone"}), -32004, "terminal not found")
+			},
+		},
+		{
+			name: "subscribe_lists_terminals",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				response := client.callResult(t, "terminal/subscribe", map[string]any{}, nil)
+				if string(response.Result) != `{"terminals":[]}` {
+					t.Fatalf("initial list = %s, want an empty list", response.Result)
+				}
+				requireErrorCode(t, client.call(t, "terminal/subscribe", map[string]any{}), -32600, "already subscribed")
+				terminal := openTerminal(t, client, map[string]any{"conversation_id": "conversation-1"})
+				opened := client.waitTerminalList(t, func(list runtimeprotocol.TerminalListResult) bool { return len(list.Terminals) == 1 })
+				if item := opened.Terminals[0]; item.TerminalID != terminal.TerminalID || item.ExecutorID != defs.LocalExecutorID || item.Directory != h.defaultDirectory || item.ConversationID != "conversation-1" || item.StartedAt.IsZero() {
+					t.Fatalf("listed terminal = %+v, want %s in %s for conversation-1", item, terminal.TerminalID, h.defaultDirectory)
+				}
+				other := dialInitialized(t, h)
+				var secondList runtimeprotocol.TerminalListResult
+				other.callResult(t, "terminal/subscribe", map[string]any{}, &secondList)
+				if !reflect.DeepEqual(secondList, opened) {
+					t.Fatalf("second subscription list = %+v, want %+v", secondList, opened)
+				}
+				client.writeTerminal(t, terminal.TerminalID, "exit\n")
+				client.waitTerminalList(t, func(list runtimeprotocol.TerminalListResult) bool { return len(list.Terminals) == 0 })
+				other.callResult(t, "terminal/unsubscribe", map[string]any{}, nil)
+				other.callResult(t, "terminal/unsubscribe", map[string]any{}, nil)
+			},
+		},
+		{
+			name: "input_without_attachment_is_dropped",
+			run: func(t *testing.T, h *serverHarness, client *testClient) {
+				terminal := openTerminal(t, client, nil)
+				other := dialInitialized(t, h)
+				other.writeTerminal(t, terminal.TerminalID, "echo leaked-$((6*7))\n")
+				other.sendNotification(t, "terminal/resize", map[string]any{"terminal_id": terminal.TerminalID, "rows": 50, "cols": 150})
+				other.callResult(t, "conversation/list", map[string]any{}, nil)
+				client.writeTerminal(t, terminal.TerminalID, "echo sentinel-$((6*7)); stty size\n")
+				data, _ := client.collectTerminalStream(t, terminal.TerminalID, func(data []byte, _ runtimeprotocol.TerminalOutputParams) bool {
+					return bytes.Contains(data, []byte("sentinel-42\r\n24 80\r\n"))
+				})
+				if bytes.Contains(data, []byte("leaked-42")) {
+					t.Fatalf("output = %q, want no input from a connection that never attached", data)
 				}
 			},
 		},
@@ -3190,6 +3525,19 @@ func openTerminal(t *testing.T, client *testClient, params map[string]any) runti
 		t.Fatalf("terminal = %+v, want a terminal id", terminal)
 	}
 	return terminal
+}
+
+// startBackgroundJob 在终端的 bash 里显式开启作业控制并放一个 sleep 到后台，等它启动后返回；测试结束时结束这个 sleep。
+func startBackgroundJob(t *testing.T, client *testClient, terminalID string) {
+	t.Helper()
+	// 1. set -m 让后台作业进入自己的进程组；回显进程号，测试结束时清理。
+	client.writeTerminal(t, terminalID, "set -m; sleep 300 & echo bgpid=$!\n")
+	match := client.waitTerminalOutput(t, terminalID, `bgpid=(\d+)`)
+	pid, err := strconv.Atoi(match[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
 }
 
 // sendNotification 发送一条没有 id 的客户端通知。
@@ -3232,6 +3580,117 @@ func (c *testClient) waitTerminalOutput(t *testing.T, terminalID, pattern string
 		return match != nil
 	})
 	return match
+}
+
+// terminalClearSequence 是 serve 重置终端时写进输出流的清屏序列。
+const terminalClearSequence = "\x1b[0m\x1b(B\x1b[H\x1b[2J\x1b[3J"
+
+// dialInitialized 再连一条已初始化的连接，模拟同一 serve 上的另一个客户端。
+func dialInitialized(t *testing.T, h *serverHarness) *testClient {
+	t.Helper()
+	// 1. 建立连接并完成协议初始化。
+	client := h.dial(t)
+	client.initialize(t)
+	return client
+}
+
+// attachTerminal 通过 terminal/attach 把连接接入已有终端，从 cursor 起补发输出。
+func attachTerminal(t *testing.T, client *testClient, terminalID string, cursor uint64) runtimeprotocol.TerminalAttachResult {
+	t.Helper()
+	// 1. 发送请求并解析终端的 Executor、目录和 PTY 当前尺寸。
+	var attached runtimeprotocol.TerminalAttachResult
+	client.callResult(t, "terminal/attach", map[string]any{"terminal_id": terminalID, "cursor": cursor}, &attached)
+	return attached
+}
+
+// collectTerminalStream 累计指定终端的 terminal/output 数据，每收到一条就调用 done，返回 true 时结束；返回累计的字节和收到的全部输出通知。
+func (c *testClient) collectTerminalStream(t *testing.T, terminalID string, done func(data []byte, last runtimeprotocol.TerminalOutputParams) bool) (data []byte, outputs []runtimeprotocol.TerminalOutputParams) {
+	t.Helper()
+	// 1. 跳过其他通知和其他终端的输出，把该终端的输出按到达顺序累计。
+	c.collectNotifications(t, func(message clientMessage) bool {
+		if message.Method != "terminal/output" {
+			return false
+		}
+		var params runtimeprotocol.TerminalOutputParams
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			t.Fatal(err)
+		}
+		if params.TerminalID != terminalID {
+			return false
+		}
+		data = append(data, params.Data...)
+		outputs = append(outputs, params)
+		return done(data, params)
+	})
+	return data, outputs
+}
+
+// collectTerminalUntilExited 累计指定终端的输出，直到收到它的 terminal/exited。
+func (c *testClient) collectTerminalUntilExited(t *testing.T, terminalID string) (data []byte, outputs []runtimeprotocol.TerminalOutputParams, exited runtimeprotocol.TerminalExitedParams) {
+	t.Helper()
+	// 1. 读到该终端的 exited 为止，期间的输出按到达顺序累计。
+	messages := c.collectNotifications(t, func(message clientMessage) bool {
+		var params runtimeprotocol.TerminalExitedParams
+		return message.Method == "terminal/exited" && json.Unmarshal(message.Params, &params) == nil && params.TerminalID == terminalID
+	})
+	for _, message := range messages {
+		switch message.Method {
+		case "terminal/output":
+			var params runtimeprotocol.TerminalOutputParams
+			if err := json.Unmarshal(message.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			if params.TerminalID == terminalID {
+				data = append(data, params.Data...)
+				outputs = append(outputs, params)
+			}
+		case "terminal/exited":
+			if err := json.Unmarshal(message.Params, &exited); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return data, outputs, exited
+}
+
+// drainTerminalOutput 收集指定终端在 window 时间内的输出。
+func (c *testClient) drainTerminalOutput(t *testing.T, terminalID string, window time.Duration) []byte {
+	t.Helper()
+	// 1. 窗口内逐条读取通知，只累计该终端的输出。
+	var data []byte
+	deadline := time.After(window)
+	for {
+		select {
+		case message, open := <-c.notifications:
+			if !open {
+				return data
+			}
+			var params runtimeprotocol.TerminalOutputParams
+			if message.Method == "terminal/output" && json.Unmarshal(message.Params, &params) == nil && params.TerminalID == terminalID {
+				data = append(data, params.Data...)
+			}
+		case <-deadline:
+			return data
+		}
+	}
+}
+
+// waitTerminalList 等待 terminal/listChanged 的完整列表满足条件并返回它。
+func (c *testClient) waitTerminalList(t *testing.T, match func(runtimeprotocol.TerminalListResult) bool) runtimeprotocol.TerminalListResult {
+	t.Helper()
+	// 1. 逐条解析 terminal/listChanged，直到列表满足条件。
+	var list runtimeprotocol.TerminalListResult
+	c.collectNotifications(t, func(message clientMessage) bool {
+		if message.Method != "terminal/listChanged" {
+			return false
+		}
+		list = runtimeprotocol.TerminalListResult{}
+		if err := json.Unmarshal(message.Params, &list); err != nil {
+			t.Fatal(err)
+		}
+		return match(list)
+	})
+	return list
 }
 
 // waitTerminalExited 等待终端的 terminal/exited 通知并返回它的参数。

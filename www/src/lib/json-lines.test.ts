@@ -260,3 +260,52 @@ test("getVisibleJsonRows folds deep containers and honors toggles", () => {
     )
   }
 })
+
+test("global folding applies to nested containers and later values with local overrides", () => {
+  const cases = [
+    {
+      mode: "expanded" as const,
+      toggled: [] as JsonPath[],
+      folded: [] as JsonPath[],
+    },
+    {
+      mode: "expanded" as const,
+      toggled: [["a"]] as JsonPath[],
+      folded: [["a"]] as JsonPath[],
+    },
+    {
+      mode: "collapsed" as const,
+      toggled: [] as JsonPath[],
+      folded: [[]] as JsonPath[],
+    },
+    {
+      mode: "collapsed" as const,
+      toggled: [[]] as JsonPath[],
+      folded: [["a"], ["s"]] as JsonPath[],
+    },
+  ]
+  for (const value of [
+    { a: { b: [1] }, s: '{"x":{"y":1}}' },
+    { a: { b: [1, { newlyAdded: { text: "streamed" } }] }, s: '{"x":{"y":1}}' },
+  ]) {
+    const lines = formatJsonLines(value, {
+      expandedNestedPaths: new Set([getJsonPathKey(["s"])]),
+    })
+    for (const { mode, toggled, folded } of cases) {
+      const rows = getVisibleJsonRows(
+        lines,
+        2,
+        new Set(toggled.map(getJsonPathKey)),
+        mode
+      )
+      assert.deepEqual(
+        rows
+          .filter((row) => row.isFolded)
+          .map((row) => lines[row.lineIndex].path),
+        folded
+      )
+      if (mode === "expanded" && toggled.length === 0)
+        assert.equal(rows.length, lines.length)
+    }
+  }
+})

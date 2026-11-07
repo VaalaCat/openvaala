@@ -20,12 +20,13 @@ import (
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
+	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/skill"
-	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -74,6 +75,8 @@ type Config struct {
 		Token string `mapstructure:"token" yaml:"token"`
 		// WorkspaceDirectory 是新对话没指定目录时 local Executor 用的目录；为空时用 serve 的启动目录。支持 ~/ 开头。
 		WorkspaceDirectory string `mapstructure:"workspace_directory" yaml:"workspace_directory"`
+		// ConversationIdleTimeout 是已保存的对话没有订阅者、也没有 Turn 或后台命令在跑后，等多久停止运行实例；0 表示不停止。
+		ConversationIdleTimeout time.Duration `mapstructure:"conversation_idle_timeout" yaml:"conversation_idle_timeout" default:"30m"`
 	} `mapstructure:"server" yaml:"server"`
 	Client *struct {
 		// URL 是客户端命令（TUI、acp、app-server、codex）连接的 Runtime Server；为空时用本机 serve，没在跑就拉起。
@@ -83,6 +86,10 @@ type Config struct {
 		// PathMappings 把客户端路径换成 serve 路径，ACP、app-server 收发时转换，TUI 只转换启动时的 cwd；只能在配置文件中设置。
 		PathMappings PathMappings `mapstructure:"path_mappings" yaml:"path_mappings"`
 	} `mapstructure:"client" yaml:"client"`
+	HTTP *struct {
+		// Headers 是发给所有外部请求的 header 模板，按名覆盖内置默认；值为 "" 表示不发。只能在配置文件中设置。
+		Headers map[string]string `mapstructure:"headers" yaml:"headers"`
+	} `mapstructure:"http" yaml:"http"`
 	Telemetry *struct {
 		// LogLevel 是日志最低级别：debug、info、warn 或 error，同时作用于日志文件、stderr 与 OTLP。
 		LogLevel string `mapstructure:"log_level" yaml:"log_level" default:"info"`
@@ -97,6 +104,10 @@ type Config struct {
 		// otlp_endpoint 时随 trace 导出，日志与指标不含内容。开启时读到的敏感文件内容也可能经工具结果发往 OTLP 后端，不需要时设为 false。
 		CaptureContent bool `mapstructure:"capture_content" yaml:"capture_content" default:"true"`
 	} `mapstructure:"telemetry" yaml:"telemetry"`
+	// home 是加载这份配置用的用户主目录，加载后只读。
+	home string
+	// httpHeaders 是 http.headers 合并内置默认后的结果，加载后只读。
+	httpHeaders map[string]string
 	// agentDefinitions 是按名字索引的 Agent 配置，没有 default.yaml 时也有内置 default Agent；加载后只读。
 	agentDefinitions map[string]*AgentConfig
 	// models 是按引用索引的模型目录，加载后只读。
@@ -179,10 +190,17 @@ func LoadConfig(opt *LoadConfigOpt) (*Config, error) {
 	if home == "" {
 		home, _ = os.UserHomeDir()
 	}
+	cfg.home = home
 	if err := cfg.loadDefinitions(home); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// GetDataDirectory 返回主目录下的本机数据目录。
+func GetDataDirectory(home string) string {
+	// 1. 拼出 <home>/.local/share/openvaala。
+	return filepath.Join(home, ".local", "share", "openvaala")
 }
 
 // loadConfigSettings 解析并校验应用设置，返回设置和配置文件的绝对路径。
@@ -243,7 +261,7 @@ func loadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 		}
 	}
 
-	// 4. 解出最终设置并校验；默认值和环境变量里的字符串转成布尔和整数，转不了时报类型错误。
+	// 4. 解出最终设置并校验，通过后把 http.headers 合并进内置默认 header；默认值和环境变量里的字符串转成布尔和整数，转不了时报类型错误。
 	cfg := &Config{}
 	if err := settings.UnmarshalExact(cfg,
 		func(decoder *mapstructure.DecoderConfig) {
@@ -254,12 +272,18 @@ func loadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 	); err != nil {
 		return nil, "", &Error{
 			Path:   path,
-			Reason: "unknown field or invalid field type",
+			Reason: "unknown field or invalid field type: " + err.Error(),
 		}
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, "", fmt.Errorf("%s: %w", path, err)
 	}
+	// 没写 http 组时 HTTP 为 nil，按没有用户 header 处理。
+	var userHeaders map[string]string
+	if cfg.HTTP != nil {
+		userHeaders = cfg.HTTP.Headers
+	}
+	cfg.httpHeaders = httpclient.MergeHeaders(defaultHTTPHeaders, userHeaders)
 	// 5. 按配置文件位置展开实体目录和日志路径。
 	cfg.Agents.Directory = expandPath(cfg.Agents.Directory, opt.Home, filepath.Dir(path))
 	cfg.Models.Directory = expandPath(cfg.Models.Directory, opt.Home, filepath.Dir(path))
@@ -309,6 +333,9 @@ func (cfg *Config) Validate() error {
 	if strings.TrimSpace(cfg.Server.Listen) == "" {
 		return errors.New("server.listen must not be empty")
 	}
+	if cfg.Server.ConversationIdleTimeout < 0 {
+		return errors.New("server.conversation_idle_timeout must not be negative")
+	}
 	// 2. 检查客户端与服务端映射均为绝对路径，且各自没有重复目录。
 	clients, servers := map[string]bool{}, map[string]bool{}
 	for index, mapping := range cfg.Client.PathMappings {
@@ -342,7 +369,13 @@ func (cfg *Config) Validate() error {
 			return errors.New("telemetry.otlp_endpoint must be an http or https URL such as http://127.0.0.1:4318")
 		}
 	}
-	// 4. 检查模型默认窗口、输出上限、推理强度、合并角色和输入类型。
+	// 4. 检查 http.headers 里的变量都认识；没写 http 组时 HTTP 为 nil。
+	if cfg.HTTP != nil {
+		if err := validateHeaderTemplates(cfg.HTTP.Headers); err != nil {
+			return fmt.Errorf("http.headers.%w", err)
+		}
+	}
+	// 5. 检查模型默认窗口、输出上限、推理强度、合并角色和输入类型。
 	defaults := cfg.Models.Defaults
 	if defaults.ContextWindow <= 0 || defaults.MaxOutputTokens <= 0 {
 		return errors.New("models.defaults.context_window and max_output_tokens must be positive")
@@ -398,6 +431,12 @@ func (cfg *Config) GetTelemetryLogLevel() slog.Level {
 	return level
 }
 
+// GetHTTPHeaders 返回 http.headers 合并内置默认后的 header 模板副本。
+func (cfg *Config) GetHTTPHeaders() map[string]string {
+	// 1. 返回副本，调用方修改不影响保存的值。
+	return maps.Clone(cfg.httpHeaders)
+}
+
 // GetAgent 按名字返回 Agent 配置的副本。
 func (cfg *Config) GetAgent(name string) (*AgentConfig, error) {
 	// 1. 查找 Agent，没配置时返回错误，找到时返回副本。
@@ -423,6 +462,7 @@ func (cfg *Config) GetAgentDefinitions() []*agent.AgentDefinition {
 			ToolNames:    agentConfig.Tools,
 			SkillNames:   agentConfig.Skills,
 			MCPServerIDs: agentConfig.MCPServers,
+			MaxSteps:     agentConfig.MaxSteps,
 		}
 		definitions = append(definitions, definition.Clone())
 	}
@@ -498,6 +538,7 @@ func (cfg *Config) newModelDefinition(provider *defs.ProviderConfig, modelID str
 			EndpointPath: endpointPath,
 			APIKey:       provider.APIKey,
 			Model:        model.UpstreamModel,
+			Headers:      getTargetHeaders(httpclient.MergeHeaders(cfg.httpHeaders, provider.Headers)),
 		},
 		ContextWindow:   cmp.Or(model.ContextWindow, defaults.ContextWindow),
 		MaxOutputTokens: cmp.Or(model.MaxOutputTokens, defaults.MaxOutputTokens),
@@ -579,6 +620,11 @@ func (cfg *Config) GetMCPServers() []*mcpclient.ServerDefinition {
 		if len(executorIDs) == 0 {
 			executorIDs = []string{defs.LocalExecutorID}
 		}
+		// stdio 不发 HTTP 请求，没有 header；http、sse 用全局 header 加上自己的，同名的以自己的为准。
+		var headers map[string]string
+		if mcpclient.ServerTransportType(server.Type) != mcpclient.ServerTransportStdio {
+			headers = httpclient.MergeHeaders(cfg.httpHeaders, server.Headers)
+		}
 		servers = append(servers, &mcpclient.ServerDefinition{
 			ID:             server.ID,
 			Type:           mcpclient.ServerTransportType(server.Type),
@@ -586,7 +632,7 @@ func (cfg *Config) GetMCPServers() []*mcpclient.ServerDefinition {
 			Args:           slices.Clone(server.Args),
 			Env:            maps.Clone(server.Env),
 			URL:            server.URL,
-			Headers:        maps.Clone(server.Headers),
+			Headers:        headers,
 			ExecutorIDs:    executorIDs,
 			ToolNames:      slices.Clone(server.Tools),
 			Required:       server.Required,
@@ -612,18 +658,18 @@ func (cfg *Config) GetHooks() []*hook.HookDefinition {
 
 // GetRuntimeDefinitions 组装 Runtime 使用的整份定义：Executor、共用 skill、Agent、模型、MCP server 和 hook。
 func (cfg *Config) GetRuntimeDefinitions(ctx context.Context) (*runtime.Definitions, error) {
-	// 1. 先放 local 和内置 Executor，再按 ID 顺序追加 executors/ 里的 Executor。
-	localExecutor, err := cfg.getLocalExecutorDefinition()
+	// 1. 先放 local、内置 Executor 和 memory，再按 ID 顺序追加 executors/ 里的 Executor。
+	localExecutor, err := cfg.newLocalExecutor()
 	if err != nil {
 		return nil, err
 	}
-	builtinExecutor, err := getBuiltinExecutorDefinition()
+	builtinExecutor, err := newBuiltinExecutor()
 	if err != nil {
 		return nil, err
 	}
-	executors := []*defs.ExecutorDefinition{localExecutor, builtinExecutor}
+	executors := []executor.Executor{localExecutor, builtinExecutor, cfg.newMemoryExecutor()}
 	for _, executorConfig := range cfg.GetExecutors() {
-		executors = append(executors, getExecutorDefinition(executorConfig))
+		executors = append(executors, newConfiguredExecutor(executorConfig))
 	}
 	// 2. 加载共用 skill，和 Agent、模型、MCP server、hook、Executor 一起返回。
 	skills, err := cfg.loadSharedSkills(ctx, localExecutor, builtinExecutor)
@@ -635,13 +681,13 @@ func (cfg *Config) GetRuntimeDefinitions(ctx context.Context) (*runtime.Definiti
 		Models:     cfg.GetModels(),
 		MCPServers: cfg.GetMCPServers(),
 		Hooks:      cfg.GetHooks(),
-		Executors:  executors,
+		Executors:  executor.NewConfigExecutorProvider(executors),
 		Skills:     skills,
 	}, nil
 }
 
-// getLocalExecutorDefinition 生成 local Executor 的定义。
-func (cfg *Config) getLocalExecutorDefinition() (*defs.ExecutorDefinition, error) {
+// newLocalExecutor 创建 local Executor。
+func (cfg *Config) newLocalExecutor() (executor.Executor, error) {
 	// 1. 工作目录用 server.workspace_directory，没写时取 serve 的启动目录。
 	workspaceDirectory := cfg.Server.WorkspaceDirectory
 	if workspaceDirectory == "" {
@@ -650,25 +696,37 @@ func (cfg *Config) getLocalExecutorDefinition() (*defs.ExecutorDefinition, error
 			return nil, fmt.Errorf("locate working directory: %w", err)
 		}
 	}
-	return &defs.ExecutorDefinition{
+	return executor.NewLocalExecutor(&defs.ExecutorDefinition{
 		ID:                 defs.LocalExecutorID,
 		Kind:               defs.ExecutorKindLocal,
 		Description:        prompt.LocalExecutorDescription,
 		WorkspaceDirectory: workspaceDirectory,
-	}, nil
+	}), nil
+}
+
+// newMemoryExecutor 创建每个对话自带的 memory Executor：没有目录，不能当默认 Executor。
+func (cfg *Config) newMemoryExecutor() executor.Executor {
+	// 1. 记忆根目录是数据目录下的 memory，第一次写入时才建；工作区由 Conversation 按默认 Executor 打开。
+	return executor.NewMemoryExecutor(executor.NewMemoryExecutorOpt(&defs.ExecutorDefinition{
+		ID:          defs.MemoryExecutorID,
+		Kind:        defs.ExecutorKindMemory,
+		Description: prompt.MemoryExecutorDescription,
+	}, filepath.Join(GetDataDirectory(cfg.home), "memory")))
 }
 
 // loadSharedSkills 依次加载 skills/ 目录、内置目录和插件目录里的 skill，所有对话共用；同名的以先扫描到的为准。
-func (cfg *Config) loadSharedSkills(ctx context.Context, localExecutor, builtinExecutor *defs.ExecutorDefinition) ([]*skill.Skill, error) {
-	// 1. 创建本机工作区，以及装着内置文件的虚拟工作区。
-	localWorkspace, err := workspace.NewLocalWorkspace(workspace.NewLocalWorkspaceOpt(localExecutor.WorkspaceDirectory))
+func (cfg *Config) loadSharedSkills(ctx context.Context, localExecutor, builtinExecutor executor.Executor) ([]*skill.Skill, error) {
+	// 1. 打开本机工作区，以及装着内置文件的虚拟工作区，返回时关闭。
+	localWorkspace, err := localExecutor.NewWorkspace(ctx, &executor.NewWorkspaceRequest{RootDirectory: localExecutor.GetDefinition().WorkspaceDirectory})
 	if err != nil {
 		return nil, err
 	}
-	builtinWorkspace, err := workspace.NewVirtualWorkspace(workspace.NewVirtualWorkspaceOpt(builtinExecutor.WorkspaceDirectory, getVirtualFiles(builtinExecutor.Files)))
+	defer closeWorkspace(ctx, localWorkspace)
+	builtinWorkspace, err := builtinExecutor.NewWorkspace(ctx, &executor.NewWorkspaceRequest{})
 	if err != nil {
 		return nil, err
 	}
+	defer closeWorkspace(ctx, builtinWorkspace)
 	// 2. 先放 skills/ 目录，再放内置目录，两处的 skill 格式错误都报错。
 	directories := []skill.SkillDirectory{
 		{
@@ -849,6 +907,9 @@ func loadAgentDefinition(path string) (*AgentConfig, error) {
 	if strings.TrimSpace(definition.Instructions) == "" {
 		return nil, errors.New("agent instructions must not be empty")
 	}
+	if definition.MaxSteps < 0 {
+		return nil, errors.New("agent max_steps must not be negative")
+	}
 	if definition.Model != nil && definition.Model.Model == "" {
 		definition.Model.Model = "default"
 	}
@@ -885,7 +946,11 @@ func loadProviderDefinition(path string) (*defs.ProviderConfig, error) {
 			return nil, errors.New("invalid provider endpoints")
 		}
 	}
-	// 4. 检查模型列表、模型 ID 和协议；没写 upstream_model 时用模型 ID，写了空白时报错。
+	// 4. 检查 headers 里的变量都认识。
+	if err := validateHeaderTemplates(provider.Headers); err != nil {
+		return nil, fmt.Errorf("headers.%w", err)
+	}
+	// 5. 检查模型列表、模型 ID 和协议；没写 upstream_model 时用模型 ID，写了空白时报错。
 	if len(provider.Models) == 0 {
 		return nil, errors.New("provider models must not be empty")
 	}
@@ -916,7 +981,7 @@ func loadProviderDefinition(path string) (*defs.ProviderConfig, error) {
 
 // loadExecutorDefinition 读取并校验一个 Executor 文件。
 func loadExecutorDefinition(path, home string) (*ExecutorConfig, error) {
-	// 1. 读取配置，检查 ID 和文件名一致、不是保留的 local、client、openvaala，说明非空。
+	// 1. 读取配置，检查 ID 和文件名一致、不是保留的 local、client、openvaala、memory，说明非空。
 	definition := &ExecutorConfig{}
 	if err := readYAML(path, definition); err != nil {
 		return nil, err
@@ -925,7 +990,8 @@ func loadExecutorDefinition(path, home string) (*ExecutorConfig, error) {
 	if !isValidID(definition.ID) || definition.ID != name {
 		return nil, errors.New("executor id must be valid and match filename")
 	}
-	if definition.ID == defs.LocalExecutorID || definition.ID == defs.ClientExecutorID || definition.ID == BuiltinExecutorID {
+	if definition.ID == defs.LocalExecutorID || definition.ID == defs.ClientExecutorID || definition.ID == BuiltinExecutorID ||
+		definition.ID == defs.MemoryExecutorID {
 		return nil, fmt.Errorf("executor id %q is reserved", definition.ID)
 	}
 	if strings.TrimSpace(definition.Description) == "" {
@@ -1006,7 +1072,11 @@ func validateMCPServerConfig(definition *MCPServerConfig, executors map[string]*
 	default:
 		return fmt.Errorf("mcp server type %q is not supported; use stdio, http or sse", definition.Type)
 	}
-	// 3. 检查每个 Executor 是 local 或已配置的非 virtual Executor，内置 Executor 不能用。
+	// 3. 检查 headers 里的变量都认识。
+	if err := validateHeaderTemplates(definition.Headers); err != nil {
+		return fmt.Errorf("headers.%w", err)
+	}
+	// 4. 检查每个 Executor 是 local 或已配置的非 virtual Executor，内置 Executor 不能用。
 	for _, executorID := range definition.Executors {
 		if executorID == defs.LocalExecutorID {
 			continue
@@ -1022,7 +1092,7 @@ func validateMCPServerConfig(definition *MCPServerConfig, executors map[string]*
 			return fmt.Errorf("mcp server cannot run on executor %q", executorID)
 		}
 	}
-	// 4. 检查启动与工具调用超时均不为负数。
+	// 5. 检查启动与工具调用超时均不为负数。
 	if definition.StartupTimeoutSeconds < 0 || definition.ToolTimeoutSeconds < 0 {
 		return errors.New("mcp server startup_timeout_seconds and tool_timeout_seconds must not be negative")
 	}

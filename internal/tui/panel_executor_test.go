@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 )
 
@@ -143,6 +144,19 @@ func TestExecutorPanel(t *testing.T) {
 				}
 				if !reflect.DeepEqual(h.model.draftExecutorSettings, want) {
 					t.Fatalf("draft = %+v, want %+v", h.model.draftExecutorSettings, want)
+				}
+			},
+		},
+		{
+			// memory 能勾选可用，但不能当默认 Executor：Enter 在它上面什么都不做，面板保持打开。
+			name: "enter_on_memory_is_ignored",
+			run: func(t *testing.T, h *tuiHarness) {
+				opened := openPanel(h)
+				memory := conversation.ExecutorDetails{ID: defs.MemoryExecutorID, Kind: defs.ExecutorKindMemory, Description: "跨对话记忆"}
+				h.send(executorsLoadedMsg{executors: append(slices.Clone(testExecutors), memory)})
+				h.press("down", "down", "down", "enter")
+				if h.model.activePanel != opened || h.model.draftExecutorSettings.DefaultExecutorID != "" {
+					t.Fatalf("panel = %v, draft = %+v; want the panel kept open with no default chosen", h.model.activePanel, h.model.draftExecutorSettings)
 				}
 			},
 		},

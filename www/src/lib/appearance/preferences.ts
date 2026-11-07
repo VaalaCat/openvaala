@@ -7,6 +7,19 @@ export type AppearancePreferences = {
   theme: "stone" | "blue"
   bodyFont: "noto-serif" | "jetbrains-mono" | "system"
   headingFont: "noto-serif" | "jetbrains-mono" | "system"
+  body: { fontSize: number; lineHeight: number; paragraphSpacing: number }
+  code: {
+    fontSize: number
+    lineHeight: number
+    paddingX: number
+    paddingY: number
+  }
+  terminal: {
+    fontSize: number
+    lineHeight: number
+    letterSpacing: number
+    padding: number
+  }
 }
 
 export const defaultAppearance: AppearancePreferences = {
@@ -14,7 +27,30 @@ export const defaultAppearance: AppearancePreferences = {
   theme: "stone",
   bodyFont: "noto-serif",
   headingFont: "jetbrains-mono",
+  body: { fontSize: 14, lineHeight: 24, paragraphSpacing: 12 },
+  code: { fontSize: 12, lineHeight: 20, paddingX: 12, paddingY: 8 },
+  terminal: { fontSize: 13, lineHeight: 1.1, letterSpacing: 0, padding: 8 },
 }
+// 阅读和终端数值的可选范围、步长；菜单和已保存设置使用同一份尺度。
+export const appearanceNumberRanges = {
+  body: {
+    fontSize: { min: 10, max: 24, step: 1 },
+    lineHeight: { min: 16, max: 40, step: 2 },
+    paragraphSpacing: { min: 0, max: 32, step: 4 },
+  },
+  code: {
+    fontSize: { min: 10, max: 24, step: 1 },
+    lineHeight: { min: 16, max: 40, step: 2 },
+    paddingX: { min: 0, max: 32, step: 4 },
+    paddingY: { min: 0, max: 32, step: 4 },
+  },
+  terminal: {
+    fontSize: { min: 10, max: 24, step: 1 },
+    lineHeight: { min: 1, max: 1.6, step: 0.05 },
+    letterSpacing: { min: 0, max: 4, step: 0.5 },
+    padding: { min: 0, max: 32, step: 4 },
+  },
+} as const
 const choices = {
   mode: ["light", "dark", "system"],
   theme: ["stone", "blue"],
@@ -25,16 +61,39 @@ const choices = {
 // 解析已保存的外观，不认识的字段值使用对应默认值。
 export function parseAppearance(value: string): AppearancePreferences {
   // 1. 逐项读取合法选择。
-  const appearance = { ...defaultAppearance }
+  const appearance = {
+    ...defaultAppearance,
+    body: { ...defaultAppearance.body },
+    code: { ...defaultAppearance.code },
+    terminal: { ...defaultAppearance.terminal },
+  }
   try {
     const saved = JSON.parse(value) as unknown
     if (!saved || typeof saved !== "object") return appearance
-    for (const key of Object.keys(
-      appearance
-    ) as (keyof AppearancePreferences)[]) {
+    for (const key of Object.keys(choices) as (keyof typeof choices)[]) {
       const candidate = (saved as Record<string, unknown>)[key]
       if (typeof candidate === "string" && choices[key].includes(candidate))
         Object.assign(appearance, { [key]: candidate })
+    }
+    // 2. 数值逐字段校验，损坏字段不影响同组合法选择。
+    for (const group of ["body", "code", "terminal"] as const) {
+      const values = (saved as Record<string, unknown>)[group]
+      if (!values || typeof values !== "object") continue
+      for (const [key, { min, max, step }] of Object.entries(
+        appearanceNumberRanges[group]
+      )) {
+        const candidate = (values as Record<string, unknown>)[key]
+        if (
+          typeof candidate === "number" &&
+          Number.isFinite(candidate) &&
+          candidate >= min &&
+          candidate <= max &&
+          Math.abs(
+            (candidate - min) / step - Math.round((candidate - min) / step)
+          ) < 0.000001
+        )
+          Object.assign(appearance[group], { [key]: candidate })
+      }
     }
   } catch {
     // 用默认外观
@@ -69,7 +128,8 @@ export function initializeAppearance(): void {
   // 1. 订阅本机偏好和系统明暗变化。
   const media = window.matchMedia("(prefers-color-scheme: dark)")
   const applyAppearance = () => {
-    const { mode, theme, bodyFont, headingFont } = $appearance.get()
+    const { mode, theme, bodyFont, headingFont, body, code, terminal } =
+      $appearance.get()
     const root = document.documentElement
     root.classList.toggle(
       "dark",
@@ -78,6 +138,17 @@ export function initializeAppearance(): void {
     root.dataset.theme = theme
     root.dataset.bodyFont = bodyFont
     root.dataset.headingFont = headingFont
+    root.style.setProperty("--reading-font-size", `${body.fontSize}px`)
+    root.style.setProperty("--reading-line-height", `${body.lineHeight}px`)
+    root.style.setProperty(
+      "--reading-paragraph-spacing",
+      `${body.paragraphSpacing}px`
+    )
+    root.style.setProperty("--code-font-size", `${code.fontSize}px`)
+    root.style.setProperty("--code-line-height", `${code.lineHeight}px`)
+    root.style.setProperty("--code-padding-x", `${code.paddingX}px`)
+    root.style.setProperty("--code-padding-y", `${code.paddingY}px`)
+    root.style.setProperty("--terminal-padding", `${terminal.padding}px`)
   }
   media.addEventListener("change", applyAppearance)
   $appearance.subscribe(applyAppearance)
@@ -129,10 +200,10 @@ export const $conversationLayout = persistentAtom<Record<string, number>>(
   { encode: JSON.stringify, decode: parseLayout }
 )
 
-// 桌面对话页的右栏是否收起？再展开时按 $conversationLayout 的宽度恢复
+// 桌面对话页的右栏是否收起？默认收起，再展开时按 $conversationLayout 的宽度恢复
 export const $isRightPanelCollapsed = persistentAtom<boolean>(
   "openvaala.rightPanelCollapsed",
-  false,
+  true,
   { encode: String, decode: (value) => value === "true" }
 )
 

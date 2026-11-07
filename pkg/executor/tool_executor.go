@@ -479,7 +479,11 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, routed *routedToolCa
 
 // runToolHookEvent 运行一个工具 hook 事件，并转发运行记录。
 func (e *toolExecutorImpl) runToolHookEvent(ctx context.Context, environment ExecutionEnvironment, event *hook.HookEvent, events chan<- ExecutorEvent) *hook.HookOutcome {
-	// 1. 启动 hook 记录转发，把每条记录包成 ExecutionHookRunEvent 发出。
+	// 1. 不能跑命令的环境没法运行 hook 脚本，直接返回空结果。
+	if !environment.IsCommandSupported() {
+		return &hook.HookOutcome{}
+	}
+	// 2. 启动 hook 记录转发，把每条记录包成 ExecutionHookRunEvent 发出。
 	runUpdates := make(chan *defs.HookRun)
 	tasks := pool.New()
 	tasks.Go(func() {
@@ -487,7 +491,7 @@ func (e *toolExecutorImpl) runToolHookEvent(ctx context.Context, environment Exe
 			events <- &ExecutionHookRunEvent{Run: run}
 		}
 	})
-	// 2. 在指定环境运行 hook，关闭记录通道并等待转发结束。
+	// 3. 在指定环境运行 hook，关闭记录通道并等待转发结束。
 	outcome := e.opt.Hooks.RunEvent(ctx, &hook.HookEventRequest{
 		Event:      event,
 		ExecutorID: environment.GetID(),

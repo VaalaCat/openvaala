@@ -176,7 +176,6 @@ test.describe("pagination", () => {
     page,
     fixture,
   }) => {
-    await page.emulateMedia({ reducedMotion: "reduce" })
     await fixture.openApp(page)
     await page.goto(page.url() + "/c/" + longConversationID)
     const messages = getMessages(page)
@@ -196,36 +195,33 @@ test.describe("pagination", () => {
     // 长历史里每轮都有 sr-only 的复制状态文字，只有消息区滚动，整页不滚动
     await expectDocumentNotScrollable(page)
     const back = page.getByRole("button", { name: "回到底部", exact: true })
-    // 1. 减少动画（立即滚动）和有动画（平滑滚动）下，键盘都能回到底部并交还焦点。
-    for (const reducedMotion of ["reduce", "no-preference"] as const) {
-      await page.emulateMedia({ reducedMotion })
-      await expect(back).toHaveCount(0)
-      await scroller.hover()
-      await page.mouse.wheel(0, -500)
-      await expect(back).toBeVisible()
-      await back.focus()
-      await expect(back).toBeFocused()
-      await back.press("Enter")
-      await expect(messages).toBeFocused()
-      await expect
-        .poll(() =>
-          scroller.evaluate(
-            (node) => node.scrollHeight - node.clientHeight - node.scrollTop
-          )
+    // 1. 键盘回到底部，平滑滚动完成后按钮隐藏并交还焦点。
+    await expect(back).toHaveCount(0)
+    await scroller.hover()
+    await page.mouse.wheel(0, -500)
+    await expect(back).toBeVisible()
+    await back.focus()
+    await expect(back).toBeFocused()
+    await back.press("Enter")
+    await expect(messages).toBeFocused()
+    await expect
+      .poll(() =>
+        scroller.evaluate(
+          (node) => node.scrollHeight - node.clientHeight - node.scrollTop
         )
-        .toBeLessThanOrEqual(2)
-      await expect(back).toHaveCount(0)
-      // 2. 已隐藏按钮留在 DOM 退场，但键盘与程序聚焦均不能进入。
-      const hiddenBack = page.getByRole("button", {
-        name: "回到底部",
-        exact: true,
-        includeHidden: true,
-      })
-      await expect(hiddenBack).toBeDisabled()
-      await hiddenBack.evaluate((node) => node.focus())
-      await expect(messages).toBeFocused()
-      await expect(page.getByRole("tooltip")).toHaveCount(0)
-    }
+      )
+      .toBeLessThanOrEqual(2)
+    await expect(back).toHaveCount(0)
+    // 2. 已隐藏按钮留在 DOM 退场，但键盘与程序聚焦均不能进入。
+    const hiddenBack = page.getByRole("button", {
+      name: "回到底部",
+      exact: true,
+      includeHidden: true,
+    })
+    await expect(hiddenBack).toBeDisabled()
+    await hiddenBack.evaluate((node) => node.focus())
+    await expect(messages).toBeFocused()
+    await expect(page.getByRole("tooltip")).toHaveCount(0)
   })
 })
 

@@ -11,14 +11,14 @@ import (
 	"strings"
 
 	"github.com/VaalaCat/openvaala/internal/config"
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/spf13/cobra"
 )
 
-// CLIOpt 是命令树使用的标准输出、标准错误和程序版本。
+// CLIOpt 是命令树使用的标准输出和标准错误。
 type CLIOpt struct {
-	Stdout  io.Writer
-	Stderr  io.Writer
-	Version string
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
 // NewCLI 创建命令树，注册参数和子命令。
@@ -28,7 +28,7 @@ func NewCLI(opt *CLIOpt) *cobra.Command {
 	root := &cobra.Command{
 		Use:               "openvaala",
 		Short:             "OpenVaala terminal UI and runtime server",
-		Version:           opt.Version,
+		Version:           defs.GetBuildVersion(),
 		SilenceErrors:     true,
 		SilenceUsage:      true,
 		Args:              cobra.NoArgs,
@@ -67,18 +67,28 @@ func NewCLI(opt *CLIOpt) *cobra.Command {
 	return root
 }
 
+// LoadConfig 按命令的 --config-file 等参数加载配置，返回配置和加载用的选项。
+func LoadConfig(command *cobra.Command) (*config.Config, *config.LoadConfigOpt, error) {
+	// 1. 读取配置参数，加载配置。
+	opt, err := getConfigOpt(command)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg, err := config.LoadConfig(opt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load config: %w", err)
+	}
+	return cfg, opt, nil
+}
+
 // BuildCLIHandler 包装 handler 成 RunE：先加载配置、收集命令参数，再调用 handler。
 func BuildCLIHandler(handler func(context.Context, *AppArgs) error) func(*cobra.Command, []string) error {
 	// 1. 返回加载配置、收集参数后调用 handler 的 RunE。
 	return func(command *cobra.Command, arguments []string) error {
 		// 1. 加载配置。
-		opt, err := getConfigOpt(command)
+		cfg, opt, err := LoadConfig(command)
 		if err != nil {
 			return err
-		}
-		cfg, err := config.LoadConfig(opt)
-		if err != nil {
-			return fmt.Errorf("failed to load config: %w", err)
 		}
 		// 2. 收集标准流、配置路径和自动启动 serve 使用的参数。
 		args := &AppArgs{
@@ -87,7 +97,6 @@ func BuildCLIHandler(handler func(context.Context, *AppArgs) error) func(*cobra.
 			Stdin:          command.InOrStdin(),
 			Stdout:         command.OutOrStdout(),
 			Stderr:         command.ErrOrStderr(),
-			Version:        command.Root().Version,
 			CodexArguments: arguments,
 		}
 		if args.ConfigFlags, err = GetConfigFlags(command.Flags()); err != nil {

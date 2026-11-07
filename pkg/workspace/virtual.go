@@ -339,3 +339,9 @@ func (p *virtualProcessImpl) WriteTerminalInput([]byte) (int, error) {
 	// 1. 返回零字节和 ErrTTYInputUnsupported。
 	return 0, ErrTTYInputUnsupported
 }
+
+// Close 不持有需要释放的资源，总是返回 nil。
+func (w *virtualWorkspaceImpl) Close() error {
+	// 1. 返回 nil。
+	return nil
+}

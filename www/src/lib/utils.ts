@@ -16,6 +16,8 @@ export const cn = createCn({
             "caption",
             "token",
             "code",
+            "reading",
+            "code-reading",
           ],
         },
       ],

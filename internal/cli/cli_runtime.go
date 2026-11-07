@@ -234,6 +234,7 @@ func newRuntime(ctx context.Context, cfg *config.Config, tel *telemetry.Telemetr
 	opt := runtime.NewRuntimeOpt(storageOpt.Records, storageOpt.Logs, definitions)
 	opt.Telemetry = tel
 	opt.MaxImageBytes = cfg.Tools.MaxImageKB << 10
+	opt.SavedConversationIdleTimeout = cfg.Server.ConversationIdleTimeout
 	rt, err := runtime.NewRuntime(opt)
 	if err != nil {
 		return nil, nil, errors.Join(err, closeStorage())
@@ -248,7 +249,7 @@ func ensureDataDirectory() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("locate user directory: %w", err)
 	}
-	dataDirectory := filepath.Join(home, ".local", "share", "openvaala")
+	dataDirectory := config.GetDataDirectory(home)
 	if err := os.MkdirAll(dataDirectory, 0700); err != nil {
 		return "", fmt.Errorf("create data directory: %w", err)
 	}

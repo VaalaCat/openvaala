@@ -4,6 +4,7 @@ import { RpcError, rpcConnectionLostCode } from "../rpc-error"
 import {
   ErrorCodeInvalidRequest,
   ProtocolVersion,
+  type ClientNotificationParams,
   type ConversationID,
   type JSONRPCMessage,
   type MethodParams,
@@ -24,6 +25,7 @@ export interface RpcFrame {
   id?: number
   time: number
   size: number
+  // 终端输入输出帧带着键入内容和屏幕输出，不记 payload，只留方法、方向和字节数
   payload: unknown
 }
 
@@ -72,6 +74,11 @@ const defaultDeps: ServerConnectionDeps = {
 }
 const connectionAttemptTimeoutMs = 10_000
 const maxRpcLogFrames = 2000
+// 这两个方法的帧里是终端的原始数据，RPC 记录只留方法、方向和字节数
+const terminalDataMethods = new Set<string>([
+  "terminal/input",
+  "terminal/output",
+])
 const textEncoder = new TextEncoder()
 
 // ServerConnection 保存页面和一个 serve 之间的 WebSocket 连接：握手、请求与响应、通知分发、断线重连和 RPC 记录。
@@ -160,6 +167,19 @@ export class ServerConnection {
         new RpcError(rpcConnectionLostCode, "connection lost", method)
       )
     return this.sendRequest(socket, method, params)
+  }
+
+  // 发出一个不带编号的通知，不等回复；没连上时丢弃
+  notify<M extends keyof ClientNotificationParams>(
+    method: M,
+    params: ClientNotificationParams[M]
+  ): void {
+    const socket = this.socket
+    if (!socket || this.$state.get() !== "connected") return
+    const payload = { method, params }
+    const text = JSON.stringify(payload)
+    this.recordFrame("sent", text, payload, method)
+    socket.send(text)
   }
 
   // initialize 返回的 server_id；只在连上之后调用，之前调用直接抛错
@@ -472,7 +492,7 @@ export class ServerConnection {
     })
   }
 
-  // 记一帧到 RPC 记录，超过上限丢最早的；暂停时不记
+  // 记一帧到 RPC 记录，超过上限丢最早的；暂停时不记，终端数据帧不留 payload
   private recordFrame(
     direction: RpcFrame["direction"],
     text: string,
@@ -487,7 +507,7 @@ export class ServerConnection {
       id,
       time: Date.now(),
       size: textEncoder.encode(text).length,
-      payload,
+      payload: method && terminalDataMethods.has(method) ? undefined : payload,
     }
     const log = this.$rpcLog.get()
     this.$rpcLog.set(

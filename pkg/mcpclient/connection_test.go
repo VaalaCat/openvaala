@@ -2,10 +2,12 @@ package mcpclient
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -242,6 +244,59 @@ func waitForCondition(t *testing.T, timeout time.Duration, description string, c
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// recordedRequest 是请求记录代理收到的一次请求。
+type recordedRequest struct {
+	method string
+	// isToolCall 是否是 tools/call 的 JSON-RPC 请求？
+	isToolCall bool
+	header     http.Header
+}
+
+// requestRecorder 是记录经过代理的全部请求的列表。
+type requestRecorder struct {
+	mu       sync.Mutex
+	requests []recordedRequest
+}
+
+// getRequests 返回目前记录的全部请求。
+func (r *requestRecorder) getRequests() []recordedRequest {
+	// 1. 加锁复制记录。
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.requests)
+}
+
+// startRecordingProxy 启动记录每个请求 header 的代理，把请求原样转发给 targetURL，返回代理地址和记录。
+func startRecordingProxy(t *testing.T, targetURL string) (string, *requestRecorder) {
+	// 1. 创建指向目标的反向代理；SSE 和流式响应立即转发。
+	t.Helper()
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarder := httputil.NewSingleHostReverseProxy(target)
+	forwarder.FlushInterval = -1
+	// 2. 每个请求先读出请求体判断是否是 tools/call，记录 header 后还原请求体并转发。
+	recorder := &requestRecorder{}
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		recorder.mu.Lock()
+		recorder.requests = append(recorder.requests, recordedRequest{
+			method:     request.Method,
+			isToolCall: bytes.Contains(body, []byte(`"method":"tools/call"`)),
+			header:     request.Header.Clone(),
+		})
+		recorder.mu.Unlock()
+		forwarder.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(proxy.Close)
+	return proxy.URL, recorder
 }
 
 // settleDuration 是启动次数达到预期后再多等的时间，这段时间里不应再有新的启动。
@@ -629,6 +684,77 @@ func TestConnection(t *testing.T) {
 				}
 				if info := fixture.connection.GetInfo(); !strings.Contains(info.Error, "401") {
 					t.Fatalf("GetInfo().Error = %q, want the 401 status", info.Error)
+				}
+			},
+		},
+		{
+			name: "HTTP request carries session headers from ctx",
+			newDefinition: func(t *testing.T) *ServerDefinition {
+				proxyURL, recorder := startRecordingProxy(t, startFakeHTTPServer(t, binary, "-http"))
+				t.Cleanup(func() {
+					for _, request := range recorder.getRequests() {
+						if request.isToolCall {
+							if got := request.header.Get("Session-Id"); got != "session-1" {
+								t.Errorf("tools/call Session-Id = %q, want session-1", got)
+							}
+							if got := request.header.Get("X-Test"); got != "v" {
+								t.Errorf("tools/call X-Test = %q, want v", got)
+							}
+							return
+						}
+					}
+					t.Error("no tools/call request reached the server")
+				})
+				return &ServerDefinition{
+					ID:             "fake",
+					Type:           ServerTransportHTTP,
+					URL:            proxyURL,
+					Headers:        map[string]string{"Session-Id": "${OPENVAALA_SESSION_ID}", "X-Test": "v"},
+					StartupTimeout: 5 * time.Second,
+					ToolTimeout:    30 * time.Second,
+				}
+			},
+			run: func(t *testing.T, fixture *connectionTestFixture) {
+				if _, err := fixture.connection.GetTools(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				ctx := defs.ContextWithSessionCtxMeta(t.Context(), defs.SessionCtxMeta{SessionID: "session-1"})
+				if text := getTextContent(t, callTool(ctx, fixture.connection, "mcp__fake__echo", `{"text":"hi"}`)); text != "hi" {
+					t.Fatalf("echo = %q", text)
+				}
+			},
+		},
+		{
+			name: "empty header value is not sent",
+			newDefinition: func(t *testing.T) *ServerDefinition {
+				proxyURL, recorder := startRecordingProxy(t, startFakeHTTPServer(t, binary, "-http"))
+				t.Cleanup(func() {
+					requests := recorder.getRequests()
+					if len(requests) == 0 {
+						t.Error("no request reached the server")
+					}
+					for _, request := range requests {
+						if _, isSent := request.header["Session-Id"]; isSent {
+							t.Errorf("%s request sent Session-Id %q, want it omitted", request.method, request.header["Session-Id"])
+						}
+					}
+				})
+				return &ServerDefinition{
+					ID:             "fake",
+					Type:           ServerTransportHTTP,
+					URL:            proxyURL,
+					Headers:        map[string]string{"Session-Id": ""},
+					StartupTimeout: 5 * time.Second,
+					ToolTimeout:    30 * time.Second,
+				}
+			},
+			run: func(t *testing.T, fixture *connectionTestFixture) {
+				if _, err := fixture.connection.GetTools(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				ctx := defs.ContextWithSessionCtxMeta(t.Context(), defs.SessionCtxMeta{SessionID: "session-1"})
+				if text := getTextContent(t, callTool(ctx, fixture.connection, "mcp__fake__echo", `{"text":"hi"}`)); text != "hi" {
+					t.Fatalf("echo = %q", text)
 				}
 			},
 		},

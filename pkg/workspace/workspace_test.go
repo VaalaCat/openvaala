@@ -1110,6 +1110,51 @@ func TestTerminalSize(t *testing.T) {
 	}
 }
 
+// TestLocalTerminalResizeAtExit 验证本机 TTY 命令结束的同时不断改尺寸：命令结束前改尺寸成功或返回错误，结束后返回错误，-race 下不报数据竞争。
+func TestLocalTerminalResizeAtExit(t *testing.T) {
+	// 1. 逐项启动命令，命令运行期间在另一个 goroutine 里持续改尺寸，Wait 返回后再改一次。
+	for _, tt := range []struct {
+		name    string
+		command string
+	}{
+		{name: "resize_while_command_exits", command: "sleep 0.2"},
+		{name: "command_exits_without_output", command: "true"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newWorkspaceFixture(t, "local")
+			process, err := f.workspace.StartProcess(t.Context(), &workspace.ProcessRequest{
+				Command:   tt.command,
+				Directory: f.root,
+				TTY:       true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stopResizing, resizingDone := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(resizingDone)
+				for rows := uint16(30); ; rows++ {
+					select {
+					case <-stopResizing:
+						return
+					default:
+						_ = process.ResizeTerminal(rows%40+10, 100)
+					}
+				}
+			}()
+			code, err := waitProcess(t, process)
+			close(stopResizing)
+			<-resizingDone
+			if err != nil || code != 0 {
+				t.Fatalf("code = %d, err = %v", code, err)
+			}
+			if err := process.ResizeTerminal(30, 100); err == nil {
+				t.Fatal("ResizeTerminal after exit = nil, want an error")
+			}
+		})
+	}
+}
+
 // TestLocalTerminate 验证本机终止和关闭会结束整个命令进程组。
 func TestLocalTerminate(t *testing.T) {
 	// 1. 分别启动普通命令和 TTY 命令，读取后台进程 PID 后终止并核对已退出。

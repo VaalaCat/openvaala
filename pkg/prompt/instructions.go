@@ -10,10 +10,11 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/skill"
 )
 
-// local 和内置 Executor 给模型看的说明。
+// local、内置和 memory Executor 给模型看的说明。
 const (
 	LocalExecutorDescription   = "Agent 本机当前目录"
 	BuiltinExecutorDescription = "OpenVaala 内置的内存虚拟环境，可做临时工作，不影响真实磁盘；/skills 存放内置 skill；运行脚本用 bash <文件>，不能直接执行 ./脚本 或外部程序"
+	MemoryExecutorDescription  = "用于跨对话记忆：记下用户的偏好、项目约定和验证过的经验，供以后的对话读取；user/ 所有项目通用，project/ 只属于当前项目；只能读写文件，不能运行命令"
 )
 
 // 内置 default Agent 的用途说明和系统指令；配置里没有 default Agent 时使用，agents/default.yaml 没写的字段也沿用它们。
@@ -68,4 +69,17 @@ func FormatExecutorInstructions(executors []ExecutorEntry) string {
 		fmt.Fprintf(&instructions, "- %s: %s\n  workspace: %s\n", label, named.Description, named.WorkspaceDirectory)
 	}
 	return formatXMLBlock("openvaala-executors", instructions.String())
+}
+
+// FormatMemoryInstructions 生成 memory 可用时追加到系统指令里的记忆规则。
+func FormatMemoryInstructions() string {
+	// 1. 逐条写入 memory Executor 的使用规则。
+	var rules strings.Builder
+	rules.WriteString("memory Executor 的使用规则：\n")
+	rules.WriteString("每个目录里的 MEMORY.md 是目录：每个主题一行，写成「- [主题](文件名.md) — 一句能直接用的结论」，详情写在同一目录的主题文件里。\n")
+	rules.WriteString("每轮开始时两份 MEMORY.md 会自动放进上下文，主题文件按需用 read_file 或 grep 读。\n")
+	rules.WriteString("只记这几类：用户明确要求记住的、用户确认过的偏好和约定、验证过的操作经验（写明在什么条件下验证过）；不记任务进度、临时状态和自己的猜测。\n")
+	rules.WriteString("写之前先读 MEMORY.md：同一主题就更新原来的文件和那一行，不要重复追加；内容过时或被用户否定时，改掉或删掉。MEMORY.md 超过 8 KiB 时，合并相近的主题。\n")
+	rules.WriteString("这里只能读写文件，不能运行命令；用 apply_patch 修改，路径写相对路径，例如 project/testing.md。写入失败时要告诉用户没记住，不能说已经记下了。\n")
+	return formatXMLBlock("openvaala-memory", rules.String())
 }

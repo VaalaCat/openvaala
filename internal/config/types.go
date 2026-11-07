@@ -25,6 +25,15 @@ func (e *Error) Error() string {
 	return "configuration: " + location + ": " + e.Reason
 }
 
+// ── HTTP 内置默认请求头 ──
+
+// defaultHTTPHeaders 是发给所有外部请求的内置 header 模板；config.yaml 的 http.headers 按名覆盖，写成 "" 表示不发。
+var defaultHTTPHeaders = map[string]string{
+	"User-Agent":      "openvaala/${OPENVAALA_VERSION} (${OPENVAALA_OS}; ${OPENVAALA_ARCH})",
+	"Session-Id":      "${OPENVAALA_SESSION_ID}",
+	"Conversation-Id": "${OPENVAALA_CONVERSATION_ID}",
+}
+
 // ── Agent 文件配置 ──
 
 // defaultAgentName 是内置 default Agent 的名字，也是 run.agent_name 的默认值。
@@ -48,6 +57,8 @@ type AgentConfig struct {
 	Skills []string `yaml:"skills,omitempty"`
 	// MCPServers 是可用的 MCP server id；省略时全部可用（包括客户端连接带来的 MCP server），[] 表示不用 MCP。
 	MCPServers defs.OptionalStringList `yaml:"mcp_servers,omitempty"`
+	// MaxSteps 是一轮最多调用模型的次数；省略或 0 表示不限，不能为负。
+	MaxSteps int `yaml:"max_steps,omitempty"`
 }
 
 // AgentModelConfig 引用 Provider 中的模型别名。

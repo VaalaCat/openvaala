@@ -25,14 +25,6 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 )
 
-// SSHWorkspace 是经 SSH 访问的远端工作区：文件操作走 SFTP，命令在 exec 会话中由远端 bash 执行；
-// 连接在首次调用时建立，断开后由下一次调用重新建立。
-type SSHWorkspace interface {
-	Workspace
-	// Close 关闭当前连接；之后的调用返回 net.ErrClosed。可重复调用。
-	Close() error
-}
-
 // sshWorkspaceImpl 是远端机器上的工作区：并发调用共用一条连接，连接断开后由下一次调用重新拨号，Close 之后不再拨号。
 type sshWorkspaceImpl struct {
 	opt      *SSHWorkspaceOpt
@@ -72,7 +64,7 @@ func NewSSHWorkspaceOpt(rootDirectory, address, identityFile string) *SSHWorkspa
 }
 
 // NewSSHWorkspace 校验根目录并解析 SSH 地址，保存工作区配置。
-func NewSSHWorkspace(opt *SSHWorkspaceOpt) (SSHWorkspace, error) {
+func NewSSHWorkspace(opt *SSHWorkspaceOpt) (Workspace, error) {
 	// 1. 要求绝对根目录，解析用户名和端口并清理路径。
 	if opt == nil || !filepath.IsAbs(opt.RootDirectory) {
 		return nil, errors.New("ssh workspace requires an absolute root directory")

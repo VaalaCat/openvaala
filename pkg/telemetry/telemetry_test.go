@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
@@ -72,7 +73,7 @@ func TestTelemetryContext(t *testing.T) {
 		{
 			name: "identity_in_log_fields",
 			run: func(t *testing.T, ctx context.Context, p *telemetrytest.Pipeline) {
-				ctx = telemetry.ContextWithAttrs(ctx, telemetry.ConversationID("conv-1"), telemetry.SessionID("session-1"))
+				ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: "conv-1", SessionID: "session-1"})
 				telemetry.GetLogger(ctx).Info("session started")
 				records := p.GetLogRecords(t, "session started")
 				if len(records) != 1 || records[0]["gen_ai.conversation.id"] != "conv-1" || records[0]["openvaala.session.id"] != "session-1" {
@@ -83,8 +84,8 @@ func TestTelemetryContext(t *testing.T) {
 		{
 			name: "later_attr_with_same_key_wins",
 			run: func(t *testing.T, ctx context.Context, p *telemetrytest.Pipeline) {
-				parentCtx := telemetry.ContextWithAttrs(ctx, telemetry.SessionID("parent"), telemetry.AgentName("assistant"))
-				childCtx := telemetry.ContextWithAttrs(parentCtx, telemetry.SessionID("child"))
+				parentCtx := defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{SessionID: "parent", AgentName: "assistant"})
+				childCtx := defs.ContextWithSessionCtxMeta(parentCtx, defs.SessionCtxMeta{SessionID: "child"})
 				telemetry.GetLogger(childCtx).Info("child log")
 				telemetry.GetLogger(parentCtx).Info("parent log")
 				child, parent := p.GetLogRecords(t, "child log")[0], p.GetLogRecords(t, "parent log")[0]
@@ -94,16 +95,48 @@ func TestTelemetryContext(t *testing.T) {
 			},
 		},
 		{
-			name: "same_call_duplicate_key_keeps_last",
+			name: "empty_meta_fields_not_in_log_fields",
 			run: func(t *testing.T, ctx context.Context, p *telemetrytest.Pipeline) {
-				ctx = telemetry.ContextWithAttrs(ctx, telemetry.SessionID("a"), telemetry.SessionID("b"))
-				telemetry.GetLogger(ctx).Info("duplicate key")
-				records := p.GetLogRecords(t, "duplicate key")
-				if len(records) != 1 || records[0]["openvaala.session.id"] != "b" {
-					t.Fatalf("records = %v", records)
+				ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{SessionID: "session-1", AgentName: "assistant"})
+				telemetry.GetLogger(ctx).Info("root session")
+				record := p.GetLogRecords(t, "root session")[0]
+				for _, key := range []string{"gen_ai.conversation.id", "openvaala.parent_session.id"} {
+					if _, found := record[key]; found {
+						t.Fatalf("record = %v, want no %s", record, key)
+					}
+				}
+				if record["openvaala.session.id"] != "session-1" || record["gen_ai.agent.name"] != "assistant" {
+					t.Fatalf("record = %v", record)
+				}
+			},
+		},
+		{
+			name: "meta_after_attrs_overrides_identity_once",
+			run: func(t *testing.T, ctx context.Context, p *telemetrytest.Pipeline) {
+				ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{SessionID: "parent"})
+				ctx = telemetry.ContextWithAttrs(ctx, telemetry.ExecutorID("local"))
+				ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{SessionID: "child"})
+				telemetry.GetLogger(ctx).Info("child log")
+				record := p.GetLogRecords(t, "child log")[0]
+				if record["openvaala.session.id"] != "child" || record["openvaala.executor.id"] != "local" {
+					t.Fatalf("record = %v", record)
 				}
 				if count := strings.Count(p.GetLogText(), `"openvaala.session.id"`); count != 1 {
 					t.Fatalf("session id key appears %d times in %s, want once", count, p.GetLogText())
+				}
+			},
+		},
+		{
+			name: "same_call_duplicate_key_keeps_last",
+			run: func(t *testing.T, ctx context.Context, p *telemetrytest.Pipeline) {
+				ctx = telemetry.ContextWithAttrs(ctx, telemetry.ExecutorID("a"), telemetry.ExecutorID("b"))
+				telemetry.GetLogger(ctx).Info("duplicate key")
+				records := p.GetLogRecords(t, "duplicate key")
+				if len(records) != 1 || records[0]["openvaala.executor.id"] != "b" {
+					t.Fatalf("records = %v", records)
+				}
+				if count := strings.Count(p.GetLogText(), `"openvaala.executor.id"`); count != 1 {
+					t.Fatalf("executor id key appears %d times in %s, want once", count, p.GetLogText())
 				}
 			},
 		},

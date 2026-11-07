@@ -737,6 +737,11 @@ func contextKindItems() map[string]*defs.Item {
 			TurnID: contextTurnID,
 			Kind:   defs.ItemTurnInterrupted,
 		},
+		"client_instruction": {
+			TurnID:            contextTurnID,
+			Kind:              defs.ItemClientInstruction,
+			ClientInstruction: &defs.ClientInstruction{Text: "boundary"},
+		},
 		"hook_run": contextHookRun(defs.HookRun{
 			Event:             defs.HookEventSessionStart,
 			AdditionalContext: "branch main",
@@ -1039,6 +1044,52 @@ func TestItemsToLLMKitMessagesHookRun(t *testing.T) {
 	}
 }
 
+// TestItemsToLLMKitMessagesClientInstruction 检查客户端指令以 user 角色发给模型，缺少载荷时加载报错。
+func TestItemsToLLMKitMessagesClientInstruction(t *testing.T) {
+	// 1. 准备带正文的指令和缺载荷的指令。
+	tests := []struct {
+		name     string
+		item     *defs.Item
+		wantText string
+		wantErr  bool
+	}{
+		{
+			name:     "with_text",
+			item:     &defs.Item{TurnID: contextTurnID, Kind: defs.ItemClientInstruction, ClientInstruction: &defs.ClientInstruction{Text: "boundary"}},
+			wantText: "客户端指令\n\nboundary",
+		},
+		{
+			name:    "without_payload",
+			item:    &defs.Item{TurnID: contextTurnID, Kind: defs.ItemClientInstruction},
+			wantErr: true,
+		},
+	}
+	// 2. 加载并组装模型请求，比较角色和完整正文。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newAgentContext(t)
+			err := c.Load(&agent_context.ContextLoadParam{Items: []*defs.Item{tt.item}})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("Load() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, _, err := c.BuildModelRequest(nil)
+			if err != nil || len(req.Messages) != 1 {
+				t.Fatalf("BuildModelRequest() = %+v, %v", req, err)
+			}
+			got := req.Messages[0]
+			if got.Role != llmkit.RoleUser || len(got.Content) != 1 || got.Content[0].Text != tt.wantText {
+				t.Fatalf("message = %+v, want user %q", got, tt.wantText)
+			}
+		})
+	}
+}
+
 // TestItemsToLLMKitMessagesToolResultImages 检查工具图片的排列、占位和无效图片错误。
 func TestItemsToLLMKitMessagesToolResultImages(t *testing.T) {
 	// 1. 准备并行工具图片、不能看图、超过图片上限和无效图片的历史。
@@ -1320,6 +1371,10 @@ func TestIsSentToModel(t *testing.T) {
 			true,
 		},
 		{
+			"client_instruction",
+			true,
+		},
+		{
 			"hook_run",
 			true,
 		},
@@ -1388,6 +1443,10 @@ func TestGetContextCategory(t *testing.T) {
 		{
 			"turn_interrupted",
 			agent_context.ContextCategoryTurnInterrupted,
+		},
+		{
+			"client_instruction",
+			agent_context.ContextCategoryInstruction,
 		},
 		{
 			"hook_run",

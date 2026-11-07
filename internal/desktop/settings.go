@@ -152,7 +152,7 @@ func (d *Desktop) settingsView(c *ui.Context) {
 		*shown = d.page
 		*changed = c.Now()
 	}
-	if !changed.IsZero() && !kit.GetTheme(c).Motion.Reduced && !c.Preferences().ReduceMotion {
+	if !changed.IsZero() {
 		elapsed := c.Now().Sub(*changed)
 		if elapsed < panelFadeDuration {
 			page.Opacity(max(0, float32(elapsed)/float32(panelFadeDuration)))
@@ -259,7 +259,7 @@ func (d *Desktop) generalSettingsView(c *ui.Context) {
 			d.settingSelectView(c, "palette", d.t("palette"), &d.preferences.Palette, kit.SelectOpt{Options: selectOptions(palettes, labels)})
 		})
 	})
-	// 2. 界面：字体、动画和恢复默认。
+	// 2. 界面：字体和恢复默认。
 	fontNames := []string{"", "Noto Serif"}
 	fontLabels := []string{kit.FontSans, "Noto Serif"}
 	kit.SettingSection(c, d.t("settings.interface"), func() {
@@ -269,9 +269,6 @@ func (d *Desktop) generalSettingsView(c *ui.Context) {
 		kit.SettingRow(c, d.t("title.font"), d.t("title.font.hint"), func() {
 			d.settingSelectView(c, "title-font", d.t("title.font"), &d.preferences.TitleFont, kit.SelectOpt{Options: selectOptions(fontNames, fontLabels)})
 		})
-		kit.SettingRow(c, d.t("reduce.motion"), d.t("reduce.motion.hint"), func() {
-			kit.Switch(c.Key("reduce-motion"), &d.preferences.ReduceMotion, "").Label(d.t("reduce.motion"))
-		})
 		kit.SettingRow(c, d.t("restore.appearance.defaults"), "", func() {
 			if kit.Button(c, d.t("restore")).Label(d.t("restore.appearance.defaults")).Clicked() {
 				defaults := defaultPreferences()
@@ -279,7 +276,6 @@ func (d *Desktop) generalSettingsView(c *ui.Context) {
 				d.preferences.Palette = defaults.Palette
 				d.preferences.BodyFont = ""
 				d.preferences.TitleFont = ""
-				d.preferences.ReduceMotion = false
 				d.preferencesBroken = false
 			}
 		})
@@ -348,7 +344,7 @@ func (d *Desktop) executorsSettingsView(c *ui.Context) {
 	kit.SettingSection(c, d.t("settings.executors"), func() {
 		for _, executor := range d.executors {
 			source := "config.yaml"
-			if executor.ID == defs.LocalExecutorID || executor.ID == config.BuiltinExecutorID {
+			if executor.ID == defs.LocalExecutorID || executor.ID == config.BuiltinExecutorID || executor.ID == defs.MemoryExecutorID {
 				source = d.t("source.builtin")
 			}
 			d.settingsItemView(c, "executor:"+executor.ID, executor.ID, executor.Description, source, executor, func() {
@@ -517,9 +513,12 @@ func (d *Desktop) submitConfirmation() {
 		d.providerDraft = nil
 		d.providerBaseline = nil
 		d.confirmOpen = false
-		if request.Kind == "navigate" {
+		switch {
+		case request.Kind == "navigate":
 			d.navigate(request.Page)
-		} else {
+		case request.Conversation.ID == "":
+			d.openNewConversation()
+		default:
 			d.navigate("")
 			d.openConversation(request.Conversation.ID, request.Conversation.RootSessionID)
 		}

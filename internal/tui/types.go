@@ -407,7 +407,7 @@ type historyEntry struct {
 	group *stepGroup
 	// line 是单行提示按顺序的各段完整原文与样式：历史里截断成一行，展开视图里折行显示。
 	line []styledText
-	// instruction 是 Skill 或 AGENTS.md 指令 Item。
+	// instruction 是 Skill、AGENTS.md、记忆目录或客户端指令 Item。
 	instruction *defs.Item
 	// hookRun 是 hook 运行记录。
 	hookRun *defs.HookRun

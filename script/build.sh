@@ -157,7 +157,7 @@ for target_os in "${target_systems[@]}"; do
     fi
     printf '构建 %s/%s → %s\n' "$target_os" "$target_arch" "$binary"
     CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" GOWORK="$build_workspace" \
-      go build -mod=readonly -trimpath -ldflags "-X main.version=$version" \
+      go build -mod=readonly -trimpath -ldflags "-X github.com/VaalaCat/openvaala/pkg/defs.buildVersion=$version" \
         -o "$binary" ./cmd/openvaala
   done
 done

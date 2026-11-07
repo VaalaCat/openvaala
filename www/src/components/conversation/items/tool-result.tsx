@@ -1,7 +1,7 @@
 import { Wrench } from "lucide"
 import { useTranslation } from "react-i18next"
 import { JsonView } from "@/components/base/json-view"
-import { ImagePreview } from "@/components/base/image-preview"
+import { ImagePreviewStrip } from "@/components/base/image-preview"
 import { ItemNotice, ItemStatus } from "@/components/conversation/item-notice"
 import type { ItemRendererProps } from "@/lib/item-renderers"
 
@@ -23,18 +23,20 @@ export function ToolResultItem({ view }: ItemRendererProps) {
       details={
         <div className="flex flex-col gap-2">
           <JsonView value={view.item} maxHeight="24rem" />
-          <div className="flex flex-wrap gap-2">
-            {view.item.tool_result?.images?.map(
+          <ImagePreviewStrip
+            images={(view.item.tool_result?.images ?? []).flatMap(
               (image, index) =>
-                image && (
-                  <ImagePreview
-                    key={index}
-                    src={image.data_url}
-                    alt={image.alt ?? ""}
-                  />
-                )
+                image
+                  ? [
+                      {
+                        key: String(index),
+                        src: image.data_url,
+                        alt: image.alt,
+                      },
+                    ]
+                  : []
             )}
-          </div>
+          />
         </div>
       }
     >

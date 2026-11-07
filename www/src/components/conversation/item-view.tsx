@@ -26,7 +26,7 @@ import {
   forkConversationOptions,
 } from "@/lib/query/conversation"
 
-// 一条 Item 按 kind 显示；用户正文和会话最后的已结束回复可复制，主 Session 用户消息可重来。
+// 一条 Item 按 kind 显示；用户正文和各轮最后有文字的已保存模型回复可复制，主 Session 用户消息可重来。
 export const ItemView = memo(function ItemView({
   view,
   toolResult,

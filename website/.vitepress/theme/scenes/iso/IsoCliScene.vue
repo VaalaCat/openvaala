@@ -31,7 +31,7 @@ function getRowPath(b: number, length: number): string {
 </script>
 
 <template>
-  <SceneCanvas view-box="-160 -116 320 192" :period="8000">
+  <SceneCanvas view-box="-172 -129 320 192" :period="8000">
     <IsoSlab :at="screenAt" :size="screenSize" plane="wall-x" :radius="9" :insets="[[6, 6, screenSize[0] - 12, screenSize[1] - 12, 5]]" />
     <path
       v-for="row in outputRows"

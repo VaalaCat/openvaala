@@ -101,15 +101,19 @@ func (d *Desktop) handleClientEvent(event runtimeclient.ClientEvent) {
 				d.openConversation(d.readingTarget.ConversationID, d.readingTarget.SessionID)
 			}
 			d.loadConversations(true)
+			d.loadRecentConversations()
 			d.loadModels(d.readingTarget)
 			d.loadExecutors()
 			d.loadAgents()
 			client := d.client
 			d.tasks.Go(func() { _ = client.SubscribeRunningConversations(d.ctx) })
-			d.openFirstTerminal()
+			d.tasks.Go(func() { _ = client.SubscribeTerminals(d.ctx) })
+			d.attachReconnectingTerminals()
 		} else {
 			d.handleTerminalsDisconnected()
 		}
+	case *runtimeclient.TerminalsChanged:
+		d.handleTerminalsChanged(event)
 	case *runtimeclient.TerminalOutput:
 		d.handleTerminalOutput(event)
 	case *runtimeclient.TerminalExited:

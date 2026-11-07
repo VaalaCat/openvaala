@@ -352,10 +352,9 @@ func validateItem(item *defs.Item) error {
 	if err := item.ValidateSessionFork(); err != nil {
 		return fmt.Errorf("item %q: %w", item.ID, err)
 	}
-	// 2. 检查 Skill 和 AGENTS.md 指令类型、载荷及必填字段。
-	if (item.Kind == defs.ItemSkillInstruction) != (item.SkillInstruction != nil) ||
-		(item.Kind == defs.ItemAgentsInstruction) != (item.AgentsInstruction != nil) {
-		return fmt.Errorf("item %q: instruction kind and payload do not match", item.ID)
+	// 2. 检查 Skill、AGENTS.md 指令、记忆目录和客户端指令的类型与载荷，再检查它们的 TurnID 和必填字段。
+	if err := item.ValidateKindPayload(); err != nil {
+		return fmt.Errorf("item %q: %w", item.ID, err)
 	}
 	if instruction := item.SkillInstruction; instruction != nil {
 		if item.TurnID == "" || instruction.InputItemID == "" || instruction.Name == "" || instruction.Path == "" {
@@ -365,6 +364,11 @@ func validateItem(item *defs.Item) error {
 	if instruction := item.AgentsInstruction; instruction != nil {
 		if item.TurnID == "" || instruction.Executor == "" || instruction.Path == "" {
 			return fmt.Errorf("item %q: agents instruction requires a turn, executor and path", item.ID)
+		}
+	}
+	if index := item.MemoryIndex; index != nil {
+		if item.TurnID == "" || index.Path == "" {
+			return fmt.Errorf("item %q: memory index requires a turn and path", item.ID)
 		}
 	}
 	// 3. 检查模型和 Executor 切换记录。

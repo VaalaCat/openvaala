@@ -35,7 +35,7 @@ export function ItemStatus({
     "generating" | "running" | "failed" | "interrupted" | "blocked" | "stopped"
   label: string
 }) {
-  // 1. 状态选择图形与语义色，运行图标遵循减少动画设置。
+  // 1. 按状态选择图形与语义色。
   const Icon =
     state === "failed"
       ? CircleAlertIcon
@@ -147,7 +147,6 @@ export function ItemHeader({
                 ? ChevronRight
                 : icon
         }
-        reducedMotion="user"
         size={16}
         aria-hidden
         className="item-header-icon size-4 shrink-0"

@@ -1,122 +1,195 @@
 <script setup lang="ts">
-// iso-quickstart：一块平放的终端，提示符后光标逐键敲出命令；回车后输出逐行出现，
-// 新的提示符上光标停住闪烁。静态画面是命令和输出都已出现、光标停在新提示符上。
+// iso-quickstart：快速开始的三步沿一条线缆排开——安装包、模型芯片、对话卡片；芯片右上方是两家模型服务
+// （OpenAI、Claude），后面三个小圆点表示其他服务。安装包先落到地上；信号蓝数据包沿线缆走到模型芯片，
+// 芯片轻轻弹一下，同时一条分叉线缆把它接到两家模型服务上，表示模型已添加；数据包继续走到对话卡片，
+// 卡片上出现用户消息，回复逐行写出。静态画面是三步都已完成。
+import { computed } from "vue"
+import { useData } from "vitepress"
+import IsoCable from "../primitives/IsoCable.vue"
+import IsoPacket from "../primitives/IsoPacket.vue"
 import IsoSlab from "../primitives/IsoSlab.vue"
 import SceneCanvas from "../primitives/SceneCanvas.vue"
-import { getFaceLine, getFaceRoundedRect, getIsoPrism, getIsoTranslate, type Vec3 } from "../primitives/iso"
+import { getFaceLine, getFaceRoundedRect, getIsoPrism, project, type Vec3 } from "../primitives/iso"
 import { getShowStops, vTrack, type SceneStop } from "../primitives/motion"
 
-const deviceAt: Vec3 = [-96, -52, 0]
-const deviceSize: Vec3 = [192, 104, 12]
-const { getFacePoint } = getIsoPrism("floor", deviceAt, deviceSize, 12)
+const { localeIndex } = useData()
+const isZh = computed(() => localeIndex.value === "zh")
 
-const commandRow = 30
-const promptRow = 82
-const textStart = 32
-const step = "steps(1, end)"
+// 三个物体沿 x 轴排开，中心都在 y = 0 上。
+const boxAt: Vec3 = [-110, -18, 0]
+const boxSize: Vec3 = [36, 36, 28]
+const socketAt: Vec3 = [-24, -24, 0]
+const socketSize: Vec3 = [48, 48, 4]
+const chipAt: Vec3 = [-17, -17, 4]
+const chipSize: Vec3 = [34, 34, 6]
+const cardAt: Vec3 = [62, -30, 0]
+const cardSize: Vec3 = [72, 60, 5]
+const cardFace = getIsoPrism("floor", cardAt, cardSize, 9).getFacePoint
 
-// 命令按单词画成整条线，每次敲击多露出 7 个单位；光标同时跳到已敲出部分的末尾。
-const words: { a: number; length: number; keystrokes: number[] }[] = []
-const caretMoves: { at: number; a: number }[] = []
-let wordStart = textStart
-let typedAt = 0.08
-for (const length of [22, 10, 36]) {
-  const keystrokes: number[] = []
-  for (let typed = 7; typed < length + 7; typed += 7) {
-    keystrokes.push(typedAt)
-    caretMoves.push({ at: typedAt, a: wordStart + Math.min(typed, length) + 3 })
-    typedAt += 0.022
-  }
-  words.push({ a: wordStart, length, keystrokes })
-  wordStart += length + 6
-}
-const typedEnd = typedAt - 0.022
-const enterAt = typedEnd + 0.09
+// 两家模型服务排在芯片右上方，沿 x 方向错开；providerLinks 从插座背面分叉接到它们的前沿。
+const providerSize: Vec3 = [26, 22, 6]
+const providers = [
+  { label: "OpenAI", center: [-20, -80] as [number, number] },
+  { label: "Claude", center: [40, -80] as [number, number] },
+].map((provider) => ({
+  ...provider,
+  at: [provider.center[0] - providerSize[0] / 2, provider.center[1] - providerSize[1] / 2, 0] as Vec3,
+  labelAt: project([provider.center[0] - providerSize[0] / 2, provider.center[1] - providerSize[1] / 2, providerSize[2]]),
+}))
+const providerLinkY = -52
+const providerLinks: Vec3[][] = providers.map(({ center }) => [
+  [0, socketAt[1], 0],
+  [0, providerLinkY, 0],
+  [center[0], providerLinkY, 0],
+  [center[0], center[1] + providerSize[1] / 2, 0],
+])
+// 第二家服务后面三个小圆点表示其他服务，沿同一排继续排开。
+const moreProviderDots = [62, 69, 76].map((x) => project([x, -80, 0]))
 
-function getWordStops(word: { length: number; keystrokes: number[] }): SceneStop[] {
-  const stops: SceneStop[] = [[word.keystrokes[0] - 0.001, { opacity: 0, transform: "scale(0)", easing: step }]]
-  word.keystrokes.forEach((at, index) => {
-    const shown = Math.min(1, ((index + 1) * 7) / word.length)
-    stops.push([at, { opacity: 1, transform: `scale(${shown})`, easing: step }])
-  })
-  stops.push([0.94, { opacity: 1, transform: "scale(1)" }], [0.97, { opacity: 0, transform: "scale(1)" }])
-  return stops
-}
-
-const outputRows = [
-  { b: 46, length: 124, shownAt: enterAt + 0.04 },
-  { b: 57, length: 148, shownAt: enterAt + 0.09 },
-  { b: 68, length: 84, shownAt: enterAt + 0.14 },
+// 线缆只画两个物体之间露出来的两段，数据包沿同样的点走。
+const cableToChip: Vec3[] = [
+  [boxAt[0] + boxSize[0], 0, 0],
+  [socketAt[0], 0, 0],
 ]
-const newPromptAt = enterAt + 0.21
+const cableToCard: Vec3[] = [
+  [socketAt[0] + socketSize[0], 0, 0],
+  [cardAt[0], 0, 0],
+]
 
-// getCaretOffset 返回光标从静态位置（新提示符后）移到面上 (a, b) 的位移。
-function getCaretOffset(a: number, b: number): string {
-  const [x1, y1, z1] = getFacePoint(a, b)
-  const [x0, y0, z0] = getFacePoint(textStart, promptRow)
-  return getIsoTranslate([x1 - x0, y1 - y0, z1 - z0])
+// 时间线：安装包落地，数据包两段路程各走 packetSpan，到达的时刻物体弹一下。
+const boxLandAt = 0.1
+const packetSpan = 0.14
+const chipPacketAt = 0.16
+const chipReadyAt = chipPacketAt + packetSpan
+const cardPacketAt = 0.37
+const cardReadyAt = cardPacketAt + packetSpan
+
+// 安装包从上方落下，触底后轻轻一顿停稳；循环末尾慢慢升回起点，接上下一轮的下落。
+const boxLift = "translateY(-10px)"
+const boxDropStops: SceneStop[] = [
+  [0.02, { transform: boxLift, easing: "cubic-bezier(0.55, 0, 0.8, 0.3)" }],
+  [boxLandAt, { transform: "translateY(0px)" }],
+  [boxLandAt + 0.02, { transform: "translateY(-1.5px)" }],
+  [boxLandAt + 0.04, { transform: "translateY(0px)" }],
+  [0.92, { transform: "translateY(0px)", easing: "cubic-bezier(0.4, 0, 0.2, 1)" }],
+  [0.99, { transform: boxLift }],
+]
+
+// getArriveStops 让物体在数据包到达时轻轻弹起再落回。
+function getArriveStops(at: number): SceneStop[] {
+  return [
+    [at, { transform: "translateY(0px)" }],
+    [at + 0.025, { transform: "translateY(-4px)", easing: "ease-in" }],
+    [at + 0.06, { transform: "translateY(0px)" }],
+  ]
 }
 
-// 光标轨道：逐键跳动；敲完后闪两下，回车后隐藏，新提示符出现后停住闪烁。
-const caretStops: SceneStop[] = [[0, { opacity: 1, transform: getCaretOffset(textStart, commandRow), easing: step }]]
-for (const move of caretMoves) caretStops.push([move.at, { opacity: 1, transform: getCaretOffset(move.a, commandRow), easing: step }])
-const typedCaret = getCaretOffset(caretMoves[caretMoves.length - 1].a, commandRow)
-for (let at = typedEnd + 0.025, index = 0; at < enterAt; at += 0.025, index++) {
-  caretStops.push([at, { opacity: index % 2 === 0 ? 0 : 1, transform: typedCaret, easing: step }])
-}
-caretStops.push([enterAt, { opacity: 0, transform: typedCaret, easing: step }])
-for (let at = newPromptAt, index = 0; at < 0.94; at += 0.045, index++) {
-  caretStops.push([at, { opacity: index % 2 === 0 ? 1 : 0, transform: getCaretOffset(textStart, promptRow), easing: step }])
-}
-caretStops.push([0.94, { opacity: 0, transform: getCaretOffset(textStart, promptRow) }])
+// 对话卡片：用户消息先出现，回复三行依次从左向右写出。
+const userBubble = getFaceRoundedRect(cardFace, [34, 9, 30, 11, 5.5])
+const replyRows = [
+  { b: 30, length: 50, startAt: cardReadyAt + 0.1 },
+  { b: 39, length: 38, startAt: cardReadyAt + 0.18 },
+  { b: 48, length: 46, startAt: cardReadyAt + 0.26 },
+]
 
-const caretPath = getFaceRoundedRect(getFacePoint, [textStart, promptRow - 4.5, 5, 9, 0.8])
-const promptMark = (b: number) => getFaceLine(getFacePoint, [20, b, 4])
-const headerRule = getFaceLine(getFacePoint, [0, 17, deviceSize[0]])
+function getRowStops(startAt: number): SceneStop[] {
+  return [
+    [startAt - 0.001, { opacity: 0, transform: "scale(0)" }],
+    [startAt, { opacity: 1, transform: "scale(0)", easing: "linear" }],
+    [startAt + 0.06, { opacity: 1, transform: "scale(1)" }],
+    [0.93, { opacity: 1, transform: "scale(1)" }],
+    [0.96, { opacity: 0, transform: "scale(1)" }],
+  ]
+}
+
+// 每一步的标签右对齐写在物体前角的左下方，三条标签填在斜线左下方的空白里。
+const steps = computed(() => [
+  { label: isZh.value ? "1 安装" : "1 install", at: project([boxAt[0] + boxSize[0], boxAt[1] + boxSize[1], 0]) },
+  { label: isZh.value ? "2 添加模型" : "2 add a model", at: project([socketAt[0] + socketSize[0], socketAt[1] + socketSize[1], 0]) },
+  { label: isZh.value ? "3 开始对话" : "3 start a chat", at: project([cardAt[0] + cardSize[0], cardAt[1] + cardSize[1], 0]) },
+])
 </script>
 
 <template>
-  <SceneCanvas view-box="-146 -104 292 200" :period="10000">
-    <IsoSlab :at="deviceAt" :size="deviceSize" :radius="12" :insets="[[9, 7, 5, 5, 2.5], [16, 7, 5, 5, 2.5], [23, 7, 5, 5, 2.5]]" />
-    <path class="scene-wire scene-wire--lo" :d="headerRule" />
+  <SceneCanvas view-box="-160 -102 312 208" :period="10000">
+    <IsoCable :points="cableToChip" />
+    <IsoCable :points="cableToCard" />
+    <IsoPacket :points="cableToChip" :at="chipPacketAt" :span="packetSpan" />
+    <IsoPacket :points="cableToCard" :at="cardPacketAt" :span="packetSpan" />
 
-    <path class="iso-row command-row" :d="promptMark(commandRow)" />
-    <path
-      v-for="word in words"
-      :key="word.a"
-      v-track="getWordStops(word)"
-      class="typed-row"
-      :d="getFaceLine(getFacePoint, [word.a, commandRow, word.length])"
-    />
-    <path
-      v-for="row in outputRows"
-      :key="row.b"
-      v-track="getShowStops(row.shownAt, 0.94, 0.02)"
-      class="iso-row"
-      :d="getFaceLine(getFacePoint, [20, row.b, row.length])"
-    />
-    <path v-track="getShowStops(newPromptAt, 0.94, 0.002)" class="iso-row command-row" :d="promptMark(promptRow)" />
+    <g v-track="boxDropStops">
+      <IsoSlab :at="boxAt" :size="boxSize" :radius="4" has-corner-edge :rows="[[4, 18, 28]]" />
+    </g>
 
-    <path v-track="caretStops" class="caret" :d="caretPath" />
+    <g v-track="getShowStops(chipReadyAt + 0.02, 0.93, 0.03)">
+      <IsoCable v-for="(link, index) in providerLinks" :key="index" :points="link" :radius="6" />
+    </g>
+    <IsoSlab
+      v-for="provider in providers"
+      :key="provider.label"
+      :at="provider.at"
+      :size="providerSize"
+      :radius="5"
+      :insets="[[6, 6, 14, 10, 3]]"
+    />
+
+    <IsoSlab :at="socketAt" :size="socketSize" :radius="8" />
+    <g v-track="getArriveStops(chipReadyAt)">
+      <IsoSlab :at="chipAt" :size="chipSize" :radius="5" :insets="[[8, 8, 18, 18, 3]]" />
+    </g>
+
+    <g v-track="getArriveStops(cardReadyAt)">
+      <IsoSlab :at="cardAt" :size="cardSize" :radius="9" />
+      <path v-track="getShowStops(cardReadyAt + 0.03, 0.93, 0.03)" class="user-bubble" :d="userBubble" />
+      <path
+        v-for="row in replyRows"
+        :key="row.b"
+        v-track="getRowStops(row.startAt)"
+        class="reply-row"
+        :d="getFaceLine(cardFace, [9, row.b, row.length])"
+      />
+    </g>
+
+    <text
+      v-for="step in steps"
+      :key="step.label"
+      class="scene-label scene-label--ink"
+      :x="step.at[0] - 8"
+      :y="step.at[1] + 13"
+      text-anchor="end"
+    >
+      {{ step.label }}
+    </text>
+    <text
+      v-for="provider in providers"
+      :key="`label-${provider.label}`"
+      class="scene-label"
+      :x="provider.labelAt[0]"
+      :y="provider.labelAt[1] - 6"
+      text-anchor="middle"
+    >
+      {{ provider.label }}
+    </text>
+    <circle v-for="(dot, index) in moreProviderDots" :key="index" class="more-provider-dot" :cx="dot[0]" :cy="dot[1]" r="1.3" />
   </SceneCanvas>
 </template>
 
 <style scoped>
-.command-row {
+.more-provider-dot {
+  fill: var(--scene-mid);
+}
+
+.user-bubble {
+  fill: none;
   stroke: var(--scene-mid);
 }
 
-.typed-row {
+.reply-row {
   fill: none;
-  stroke: var(--scene-mid);
+  stroke: var(--scene-lo);
   stroke-width: 2;
   stroke-linecap: round;
   transform-box: fill-box;
   transform-origin: 0 0;
-}
-
-.caret {
-  fill: var(--scene-hi);
-  stroke: none;
 }
 </style>

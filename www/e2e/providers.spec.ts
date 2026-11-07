@@ -97,8 +97,7 @@ test(
   { tag: "@p1" },
   async ({ page, fixture }) => {
     // 1. 假模型的 /models 列出两个模型；打开设置里的模型服务列表。
-    // 本例核对增删和默认模型，不看动画：关闭动画省去弹层展开、收起的稳定等待。
-    await page.emulateMedia({ reducedMotion: "reduce" })
+
     await fixture.models(["e2e-model-a", "e2e-model-b"])
     await fixture.openApp(page)
     await page.getByRole("link", { name: "设置" }).click()
@@ -129,11 +128,34 @@ test(
     const addedRow = page.getByRole("link", { name: /e2e-added/ })
     await expect(addedRow).toContainText("2 个模型")
 
-    // 3. 设为默认：在默认模型里选它的模型，这一行带上「默认」。
-    await page.getByRole("combobox", { name: "模型" }).click()
-    await page.getByRole("option", { name: /e2e-model-a/ }).click()
-    await expectToast(page, "默认模型改成了 e2e-added/e2e-model-a")
-    await expect(addedRow).toContainText("默认")
+    // 3. 桌面用 Combobox、手机设置页用 Drawer，选择后真实保存默认模型。
+    for (const { width, modelID } of [
+      { width: 1280, modelID: "e2e-model-a" },
+      { width: 390, modelID: "e2e-model-b" },
+    ]) {
+      await page.setViewportSize({ width, height: 844 })
+      await page
+        .getByRole(width < 768 ? "button" : "combobox", {
+          name: "模型",
+          exact: true,
+        })
+        .click()
+      if (width < 768) {
+        const picker = page.getByRole("dialog", { name: "模型", exact: true })
+        await expect(picker).toHaveAttribute("data-slot", "drawer-popup")
+        await picker
+          .getByRole("searchbox", { name: "搜索模型", exact: true })
+          .fill(modelID)
+        await picker.getByRole("button", { name: new RegExp(modelID) }).click()
+        await expect(picker).toBeHidden()
+      } else {
+        await expect(page.locator('[data-slot="drawer-popup"]')).toHaveCount(0)
+        await page.getByRole("option", { name: new RegExp(modelID) }).click()
+      }
+      await expectToast(page, `默认模型改成了 e2e-added/${modelID}`)
+      await expect(addedRow).toContainText("默认")
+    }
+    await page.setViewportSize({ width: 1280, height: 844 })
 
     // 4. 删除：进编辑页，在危险操作里删除并确认，列表里没有它了。
     await addedRow.click()
@@ -152,7 +174,7 @@ test(
 )
 
 test("provider_disclosures_preserve_drafts", async ({ page, fixture }) => {
-  // 1. 展开地址覆盖，收起再打开后保留输入和触发器焦点；先看减少动画，再看有退出动画。
+  // 1. 展开地址覆盖，收起再打开后保留输入和触发器焦点。
   await openProviders(page, fixture)
   await page.getByRole("button", { name: "新增模型服务" }).first().click()
   const endpoints = page.getByRole("button", {
@@ -161,18 +183,15 @@ test("provider_disclosures_preserve_drafts", async ({ page, fixture }) => {
   })
   const endpoint = page.locator("#provider-endpoint-openai_chat")
   await endpoints.click()
-  for (const reducedMotion of ["reduce", "no-preference"] as const) {
-    await page.emulateMedia({ reducedMotion })
-    await endpoint.fill("https://example.com/custom-chat")
-    await expectClosingFieldUnfocusable(
-      endpoints,
-      "provider-endpoint-openai_chat"
-    )
-    await expect(endpoint).toHaveCount(0)
-    await expect(endpoints).toBeFocused()
-    await endpoints.press("Enter")
-    await expect(endpoint).toHaveValue("https://example.com/custom-chat")
-  }
+  await endpoint.fill("https://example.com/custom-chat")
+  await expectClosingFieldUnfocusable(
+    endpoints,
+    "provider-endpoint-openai_chat"
+  )
+  await expect(endpoint).toHaveCount(0)
+  await expect(endpoints).toBeFocused()
+  await endpoints.press("Enter")
+  await expect(endpoint).toHaveValue("https://example.com/custom-chat")
 
   // 2. 配置章节保持挂载，收起后不再进入键盘焦点顺序。
   const connection = page.getByRole("button", { name: "连接", exact: true })
@@ -214,8 +233,7 @@ test(
   { tag: "@p1" },
   async ({ page, fixture }) => {
     test.setTimeout(120_000)
-    // 本例核对字段往返，不看动画：关闭动画省去每次展开、收起的稳定等待。
-    await page.emulateMedia({ reducedMotion: "reduce" })
+
     const providerID = "e2e-fields"
     const list = async () =>
       callServer<ListProvidersResult>(fixture, "provider/list", {})
@@ -464,7 +482,6 @@ test(
     ).toBeVisible()
     const editor = await page.context().newPage()
     try {
-      await editor.emulateMedia({ reducedMotion: "reduce" })
       await openProviders(editor, fixture)
       await editor.getByRole("link", { name: /local/ }).click()
       await editor

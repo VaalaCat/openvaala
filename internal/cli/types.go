@@ -32,8 +32,6 @@ type AppArgs struct {
 	RuntimeURL string
 	// Stderr 接收 serve、acp 和 app-server 的文本日志，以及客户端的旧 serve 提示；codex 子进程使用它，正常退出后追加重连提示。TUI 不使用。
 	Stderr io.Writer
-	// Version 是程序版本，写入遥测的 service.version。
-	Version string
 	// IdleTimeout 是 serve 的隐藏参数 --idle-timeout：大于 0 时没有连接且没有 Turn 在执行这么久后 serve 自己退出；为 0 时常驻。
 	IdleTimeout time.Duration
 	// ConfigFlags 保存显式传入的配置文件、Agent 目录、模型目录和 Agent 名称，格式为 --name=value；仅配置文件转为绝对路径。自动启动 serve 时原样传入，不含 Codex 的 -c/--config。

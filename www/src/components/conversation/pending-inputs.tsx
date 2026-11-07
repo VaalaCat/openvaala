@@ -1,10 +1,5 @@
 import { useState } from "react"
-import {
-  AnimatePresence,
-  motion,
-  useIsPresent,
-  useReducedMotion,
-} from "motion/react"
+import { AnimatePresence, motion, useIsPresent } from "motion/react"
 import {
   ArrowUpIcon,
   ChevronRightIcon,
@@ -46,7 +41,6 @@ import { notifyFailure } from "@/lib/notify"
 // 在输入框上沿展示服务端待处理输入：标题行可折叠，收起时预览下一条；支持移动、取回及确认撤回。
 export function PendingInputs({ sync }: { sync: ConversationSync }) {
   const { t } = useTranslation()
-  const reducedMotion = useReducedMotion()
   const pending = useStore(sync.$pendingInputs)
   const followedSessionID = sync.getFollowedSessionID()
   const activeTurnID = useStore(sync.$sessions, { keys: [followedSessionID] })[
@@ -90,7 +84,7 @@ export function PendingInputs({ sync }: { sync: ConversationSync }) {
   const nextInput = pending.inputs[0]
   const pendingCount = String(pending.inputs.length)
   const transition = {
-    duration: reducedMotion ? 0 : 0.2,
+    duration: 0.2,
     ease: [0.22, 1, 0.36, 1] as const,
   }
   return (
@@ -121,7 +115,7 @@ export function PendingInputs({ sync }: { sync: ConversationSync }) {
                     />
                   }
                 >
-                  <ChevronRightIcon className="transition-transform duration-200 ease-out group-data-panel-open/pending-trigger:rotate-90 motion-reduce:transition-none" />
+                  <ChevronRightIcon className="transition-transform duration-200 ease-out group-data-panel-open/pending-trigger:rotate-90" />
                   {t("conversation.pending.title")}{" "}
                   <span className="shrink-0 color-muted tabular-nums">
                     <RotatingText
@@ -136,7 +130,7 @@ export function PendingInputs({ sync }: { sync: ConversationSync }) {
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
                         exit={{ opacity: 0 }}
-                        transition={{ duration: reducedMotion ? 0 : 0.16 }}
+                        transition={{ duration: 0.16 }}
                         className="flex min-w-0 flex-1 items-center gap-2 font-normal color-muted"
                       >
                         {nextInput.is_steer && (

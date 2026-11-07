@@ -19,6 +19,7 @@ import (
 	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/internal/modelcatalog"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
+	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
 	"github.com/VaalaCat/openvaala/www"
@@ -70,7 +71,7 @@ func newServeCommand() *cobra.Command {
 // runServeCommand 运行 serve：绑定端口、锁定数据目录、写连接文件，运行 Runtime 和 Runtime Server，返回前按相反顺序关闭。
 func runServeCommand(ctx context.Context, args *AppArgs) (err error) {
 	// 1. 启动遥测，返回时最后关闭。
-	tel, shutdownTelemetry, err := newTelemetry(ctx, args.Config, args.Version, args.Stderr)
+	tel, shutdownTelemetry, err := newTelemetry(ctx, args.Config, args.Stderr)
 	if err != nil {
 		return err
 	}
@@ -114,7 +115,8 @@ func runServeCommand(ctx context.Context, args *AppArgs) (err error) {
 	if err != nil {
 		return fmt.Errorf("locate cache directory: %w", err)
 	}
-	modelCatalog, err := modelcatalog.NewCatalog(modelcatalog.NewCatalogOpt(filepath.Join(cacheDirectory, "openvaala", "models-dev.json")))
+	catalogHTTPClient := httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt().WithHeaders(args.Config.GetHTTPHeaders()))
+	modelCatalog, err := modelcatalog.NewCatalog(modelcatalog.NewCatalogOpt(filepath.Join(cacheDirectory, "openvaala", "models-dev.json")).WithHTTPClient(catalogHTTPClient))
 	if err != nil {
 		return err
 	}

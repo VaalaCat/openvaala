@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
+	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/failsafe-go/failsafe-go"
@@ -28,7 +32,7 @@ type Agent interface {
 	Run(ctx context.Context, events chan<- *AgentEvent) (AgentResult, error)
 }
 
-// agentImpl 是一次 Turn 的 Agent，保存配置、本轮草稿、已读的目录规则和运行统计。
+// agentImpl 是一次 Turn 的 Agent，保存配置、本轮草稿、已读的目录规则和记忆目录，以及运行统计。
 type agentImpl struct {
 	opt *AgentOpt
 
@@ -40,8 +44,10 @@ type agentImpl struct {
 	draftItemIndexes map[*defs.Item]int
 	// draftItemFinishReason 记录已结束草稿的结束事件类型（完成或中断）；不在表里的草稿还没结束。
 	draftItemFinishReason map[*defs.Item]AgentEventType
-	// workspaceAgentsInstructions 按 Executor 保存本轮读到的工作区规则；键存在就表示已经读过，值可以为空。
+	// workspaceAgentsInstructions 按 Executor 保存本轮读到的全局和目录规则；键存在就表示已经读过，值可以为空。
 	workspaceAgentsInstructions map[string][]*defs.AgentsInstruction
+	// memoryIndexes 是本轮开始时读到的 MEMORY.md；文件不存在、读失败或内容为空时没有对应的项。
+	memoryIndexes []*defs.MemoryIndex
 	// turnStats 是本次运行的统计，随循环累计，Run 返回时交给调用方。
 	turnStats AgentStats
 }
@@ -67,7 +73,12 @@ type AgentOpt struct {
 	Hooks hook.Hooks
 	// Session 是本 Agent 运行所在的 Session，随 hook 事件交给脚本；ParentSessionID 非空表示子 Session，触发 SubagentStop。
 	Session defs.Session
+	// MaxSteps 是本轮最多调用模型的次数；0 表示不限。最后一步禁用工具并要求模型总结进度。
+	MaxSteps int
 }
+
+// maxMemoryIndexBytes 是每份 MEMORY.md 放进上下文的字节数上限。
+const maxMemoryIndexBytes = 8 << 10
 
 // maxStopHookContinuations 是 Stop、SubagentStop 连续拦下结束时，模型最多续跑的次数。
 const maxStopHookContinuations = 8
@@ -141,14 +152,15 @@ func (a *agentImpl) callModelUntilFinished(ctx context.Context) (finalModelCallI
 		}
 		return "", nil
 	}
-	// 3. 预读默认环境的工作区规则，读取失败则结束本轮。
+	// 3. 预读默认环境的工作区规则，读取失败则结束本轮；再读记忆目录，读失败只记日志，不影响本轮。
 	if len(a.opt.Environments) > 0 {
 		defaultEnvironment := a.opt.Environments[0]
 		if _, err := a.getWorkspaceAgentsInstructions(ctx, defaultEnvironment); err != nil {
 			return "", fmt.Errorf("load AGENTS.md from executor %q: %w", defaultEnvironment.GetID(), err)
 		}
 	}
-	// 4. 逐步循环：每步先检查取消，再读取补充输入、追加目录规则并按需压缩。
+	a.loadMemoryIndexes(ctx)
+	// 4. 逐步循环：每步先检查取消，再读取补充输入、追加目录规则和记忆目录并按需压缩。
 	// isTurnContinuedByStopHook 本轮是否被 Stop、SubagentStop 续跑过？变成 true 后不再改回。
 	isTurnContinuedByStopHook := false
 	// stopHookContinuations 是 Stop、SubagentStop 连续续跑的次数，执行工具后清零。
@@ -169,11 +181,17 @@ func (a *agentImpl) callModelUntilFinished(ctx context.Context) (finalModelCallI
 		if err := a.appendAgentsInstructions(instructions, ""); err != nil {
 			return "", err
 		}
+		if err := a.appendMemoryIndexes(""); err != nil {
+			return "", err
+		}
 		if _, err := a.compactContext(stepCtx, tools, false); err != nil {
 			return "", err
 		}
-		// 5. 重新追加被摘要覆盖的目录规则，再测量本步上下文、发送用量并组装请求。
+		// 5. 重新追加被摘要覆盖的目录规则和记忆目录，再测量本步上下文、发送用量并组装请求。
 		if err := a.appendAgentsInstructions(instructions, ""); err != nil {
+			return "", err
+		}
+		if err := a.appendMemoryIndexes(""); err != nil {
 			return "", err
 		}
 		_, err := a.measureContext(tools)
@@ -183,6 +201,18 @@ func (a *agentImpl) callModelUntilFinished(ctx context.Context) (finalModelCallI
 		req, inputThroughItemID, err := a.opt.Context.BuildModelRequest(tools)
 		if err != nil {
 			return "", fmt.Errorf("build model request: %w", err)
+		}
+		// 到达单轮上限的这一步禁用工具，并在请求末尾要求模型总结进度；提示不写进上下文。
+		isLastStep := a.opt.MaxSteps > 0 && step >= a.opt.MaxSteps
+		if isLastStep {
+			req.ToolChoice = &llmkit.ToolChoice{Type: "none"}
+			req.Messages = append(req.Messages, llmkit.Message{
+				Role: llmkit.RoleUser,
+				Content: []llmkit.ContentBlock{{
+					Type: llmkit.ContentTypeText,
+					Text: prompt.MaxStepsReachedInstructions,
+				}},
+			})
 		}
 		// 6. 调用普通模型，每次尝试都发送 ModelCallFinished；失败时把这次尝试里还没结束的草稿记为中断，临时错误按重试规则再试。
 		var modelCallID defs.ModelCallID
@@ -261,6 +291,9 @@ func (a *agentImpl) callModelUntilFinished(ctx context.Context) (finalModelCallI
 			if outcome.IsTurnStopped {
 				return modelCallID, nil
 			}
+			if isLastStep {
+				return modelCallID, nil
+			}
 			if outcome.IsBlocked {
 				if stopHookContinuations < maxStopHookContinuations {
 					stopHookContinuations++
@@ -278,7 +311,11 @@ func (a *agentImpl) callModelUntilFinished(ctx context.Context) (finalModelCallI
 			}
 			return modelCallID, nil
 		}
-		// 9. 有工具调用时清零续跑次数并执行工具；hook 要求结束就返回，否则进入下一步。
+		// 9. 最后一步仍有工具调用时不执行，给每个调用补错误结果后返回错误。
+		if isLastStep {
+			return "", a.rejectToolCalls(toolCalls)
+		}
+		// 10. 有工具调用时清零续跑次数并执行工具；hook 要求结束就返回，否则进入下一步。
 		stopHookContinuations = 0
 		isTurnStopped, err := a.execTools(stepCtx, toolCalls)
 		if err != nil {
@@ -654,7 +691,7 @@ func (a *agentImpl) readInputs(ctx context.Context, finish bool) (bool, error) {
 	}
 }
 
-// getWorkspaceAgentsInstructions 读取执行环境工作区里的 AGENTS.md 规则，并按 Executor 缓存在本轮。
+// getWorkspaceAgentsInstructions 读取执行环境的全局和目录规则，并按 Executor 缓存在本轮。
 func (a *agentImpl) getWorkspaceAgentsInstructions(ctx context.Context, environment executor.ExecutionEnvironment) ([]*defs.AgentsInstruction, error) {
 	// 1. 没有工作区时直接返回；本轮读过这个 Executor 的规则时返回缓存。
 	environmentWorkspace := environment.GetWorkspace()
@@ -676,6 +713,7 @@ func (a *agentImpl) getWorkspaceAgentsInstructions(ctx context.Context, environm
 			Executor: environmentID,
 			Path:     file.Path,
 			Text:     file.Text,
+			IsGlobal: file.IsGlobal,
 		})
 	}
 	return a.workspaceAgentsInstructions[environmentID], nil
@@ -698,6 +736,68 @@ func (a *agentImpl) appendAgentsInstructions(instructions []*defs.AgentsInstruct
 		// 2. 先追加上下文，再加入草稿并发送开始、完成事件。
 		if err := a.opt.Context.AppendItems(item); err != nil {
 			return fmt.Errorf("append agents instruction: %w", err)
+		}
+		a.appendDraftItem(item)
+		a.sendEvents([]*AgentEvent{a.newItemEvent(AgentEventItemStarted, item, nil), a.finishItemWithReason(item, AgentEventItemCompleted)})
+	}
+	return nil
+}
+
+// loadMemoryIndexes 在 Turn 开始时读 memory 环境的 user/MEMORY.md 和 project/MEMORY.md；
+// 没有 memory 环境时什么都不做，读失败只记 Warn。
+func (a *agentImpl) loadMemoryIndexes(ctx context.Context) {
+	// 1. 找 memory 环境，这个对话没有它就不读；memory 环境的工作区一定是记忆工作区。
+	environmentIndex := slices.IndexFunc(a.opt.Environments, func(environment executor.ExecutionEnvironment) bool {
+		return environment.GetID() == defs.MemoryExecutorID
+	})
+	if environmentIndex < 0 {
+		return
+	}
+	memoryWorkspace := a.opt.Environments[environmentIndex].GetWorkspace().(workspace.MemoryWorkspace)
+	// 2. 依次读两份目录：文件不存在什么都不放，读失败记 Warn，内容是空白也不放；项目记忆带上项目名。
+	for _, indexPath := range []string{"user/MEMORY.md", "project/MEMORY.md"} {
+		project := ""
+		if indexPath == "project/MEMORY.md" {
+			project = memoryWorkspace.GetProjectName()
+		}
+		content, err := memoryWorkspace.ReadFile(ctx, filepath.Join(memoryWorkspace.GetRootDirectory(), indexPath), 0, maxMemoryIndexBytes+1)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			telemetry.GetLogger(ctx).Warn("memory index read failed", "path", indexPath, "error", err)
+			continue
+		}
+		text, isTruncated := truncateMemoryIndex(content.Content, content.EOF)
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		a.memoryIndexes = append(a.memoryIndexes, &defs.MemoryIndex{
+			Path:        indexPath,
+			Project:     project,
+			Text:        text,
+			IsTruncated: isTruncated,
+		})
+	}
+}
+
+// appendMemoryIndexes 把上下文里还没有的记忆目录加入历史和草稿，并发送 Item 事件。
+func (a *agentImpl) appendMemoryIndexes(modelCallID defs.ModelCallID) error {
+	// 1. 按路径和项目跳过已加载的记忆目录，创建记忆目录 Item。
+	for _, index := range a.memoryIndexes {
+		if a.opt.Context.IsMemoryIndexLoaded(index.Path, index.Project) {
+			continue
+		}
+		item := &defs.Item{
+			ID:          defs.NewItemID(),
+			TurnID:      a.opt.TurnID,
+			ModelCallID: modelCallID,
+			Kind:        defs.ItemMemoryIndex,
+			MemoryIndex: index,
+		}
+		// 2. 先追加上下文，再加入草稿并发送开始、完成事件。
+		if err := a.opt.Context.AppendItems(item); err != nil {
+			return fmt.Errorf("append memory index: %w", err)
 		}
 		a.appendDraftItem(item)
 		a.sendEvents([]*AgentEvent{a.newItemEvent(AgentEventItemStarted, item, nil), a.finishItemWithReason(item, AgentEventItemCompleted)})

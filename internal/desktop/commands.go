@@ -22,6 +22,7 @@ const (
 	commandToggleBottomDock     = "toggle-bottom-dock"
 	commandTerminal             = "terminal"
 	commandNewTerminal          = "new-terminal"
+	commandResetTerminal        = "reset-terminal"
 	commandCompactContext       = "compact-context"
 	commandStop                 = "stop"
 	commandPreviousConversation = "previous-conversation"
@@ -81,6 +82,9 @@ func (d *Desktop) getCommands(c *ui.Context) []kit.Command {
 		kit.Command{ID: commandTerminal, Title: d.t("terminal.focus"), Group: terminalGroup, Keys: shortcutHint("`", false), Icon: kit.IconTerminal},
 		kit.Command{ID: commandNewTerminal, Title: d.t("terminal.new"), Group: terminalGroup, Icon: kit.IconPlus},
 	)
+	if tab := d.getSelectedTerminal(); tab != nil && tab.Phase == terminalRunning {
+		commands = append(commands, kit.Command{ID: commandResetTerminal, Title: d.t("terminal.reset"), Group: terminalGroup, Icon: kit.IconRotateCcw})
+	}
 	// 4. 视图与面板：面板名不带冒号，「Agent 面板」。
 	commands = append(commands,
 		kit.Command{ID: commandToggleSidebar, Title: d.t("toggle.sidebar"), Group: viewGroup, Keys: shortcutHint("B", false), Icon: kit.IconPanelLeft},
@@ -143,6 +147,8 @@ func (d *Desktop) runCommand(commandID string) {
 	case commandNewTerminal:
 		d.openPanel(panelTerminal)
 		d.openTerminal()
+	case commandResetTerminal:
+		d.resetTerminal(d.getSelectedTerminal())
 	// 3. 当前对话上的操作。
 	case commandCompactContext:
 		d.compactContext()

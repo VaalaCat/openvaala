@@ -20,8 +20,10 @@ const windowInsets: [number, number, number, number, number][] = [
 const frontShadow = getIsoPrism("floor", [frontWindowAt[0] + 4, frontWindowAt[1] + 4, 6], [windowSize[0], windowSize[1], 0], 8).silhouette
 
 const dockAt: Vec3 = [-62, 46, 6]
-const dockIcons = [0, 1, 2, 3, 4].map((index) => [7 + index * 22, 3, 9, 9, 2.5] as [number, number, number, number, number])
-const lightCenter = project([dockAt[0] + 7 + 2 * 22 + 4.5, dockAt[1] + 13.3, dockAt[2] + 5])
+const dockSize: Vec3 = [118, 18, 5]
+// 坞上五个图标沿 x 排开；运行指示灯在中间图标的正前方，和图标、坞的前沿各留出一点距离。
+const dockIcons = [0, 1, 2, 3, 4].map((index) => [7 + index * 22, 3, 9, 8, 2.5] as [number, number, number, number, number])
+const lightCenter = project([dockAt[0] + 7 + 2 * 22 + 4.5, dockAt[1] + 14.5, dockAt[2] + dockSize[2]])
 </script>
 
 <template>
@@ -37,15 +39,15 @@ const lightCenter = project([dockAt[0] + 7 + 2 * 22 + 4.5, dockAt[1] + 13.3, doc
     </g>
 
     <g v-track="getRiseStops(0.06, 0.93, 10)">
-      <IsoSlab :at="dockAt" :size="[118, 15, 5]" :radius="7" :insets="dockIcons" />
+      <IsoSlab :at="dockAt" :size="dockSize" :radius="7" :insets="dockIcons" />
     </g>
     <ellipse
       v-track="getShowStops(0.42, 0.93, 0.02)"
       class="dock-light"
       :cx="lightCenter[0]"
       :cy="lightCenter[1]"
-      rx="3"
-      ry="1.8"
+      rx="2.6"
+      ry="1.5"
     />
   </SceneCanvas>
 </template>

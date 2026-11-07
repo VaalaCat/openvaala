@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { RpcError } from "../rpc-error"
+import { formatRpcLogJsonl } from "../rpc-log"
 import { ProtocolVersion } from "./protocol.gen"
 import {
   ServerConnection,
@@ -258,6 +259,102 @@ test("call_fails_immediately_when_not_connected", async () => {
     assert.equal(
       harness.sockets.reduce((total, socket) => total + socket.sent.length, 0),
       sentBefore,
+      name
+    )
+  }
+})
+
+test("notify_sends_a_json_rpc_notification_without_id", async () => {
+  const harness = createHarness()
+  const { socket } = await start(harness)
+  harness.connection.notify("terminal/input", {
+    terminal_id: "t1",
+    data: "bHMK",
+  })
+  assert.deepEqual(JSON.parse(socket.sent[1]), {
+    method: "terminal/input",
+    params: { terminal_id: "t1", data: "bHMK" },
+  })
+  assert.equal(
+    harness.connection.$rpcLog.get().at(-1)?.method,
+    "terminal/input"
+  )
+})
+
+test("terminal_data_frames_are_logged_without_payload", async () => {
+  // 1. 终端输入和输出帧都只记方法、方向和字节数，别的帧照常记 payload。
+  const cases = [
+    {
+      name: "input sent by notify",
+      direction: "sent",
+      method: "terminal/input",
+      send: (harness: Harness) =>
+        harness.connection.notify("terminal/input", {
+          terminal_id: "t1",
+          data: "c2VjcmV0Cg==",
+        }),
+      wantPayload: false,
+    },
+    {
+      name: "output received",
+      direction: "received",
+      method: "terminal/output",
+      send: (_harness: Harness, socket: FakeWebSocket) =>
+        socket.receive({
+          method: "terminal/output",
+          params: { terminal_id: "t1", data: "c2VjcmV0Cg==" },
+        }),
+      wantPayload: false,
+    },
+    {
+      name: "other notification keeps payload",
+      direction: "received",
+      method: "turn/started",
+      send: (_harness: Harness, socket: FakeWebSocket) =>
+        socket.receive({
+          method: "turn/started",
+          params: { conversation_id: "c" },
+        }),
+      wantPayload: true,
+    },
+  ] as const
+  for (const tt of cases) {
+    const harness = createHarness()
+    const { socket } = await start(harness)
+    tt.send(harness, socket)
+
+    // 2. 最后一帧的方法、方向和字节数都在；终端数据帧没有 payload，导出的 JSONL 里也没有终端数据。
+    const frames = harness.connection.$rpcLog.get()
+    const frame = frames.at(-1)
+    assert.deepEqual(
+      [frame?.direction, frame?.method],
+      [tt.direction, tt.method],
+      tt.name
+    )
+    assert.ok((frame?.size ?? 0) > 0, tt.name)
+    assert.equal(frame?.payload !== undefined, tt.wantPayload, tt.name)
+    assert.equal(
+      formatRpcLogJsonl(frames).includes("c2VjcmV0Cg=="),
+      false,
+      tt.name
+    )
+  }
+})
+
+test("notify_is_dropped_when_not_connected", () => {
+  const harness = createHarness()
+  harness.connection.run()
+  const cases = ["connecting", "reconnecting"] as const
+  for (const name of cases) {
+    if (name === "reconnecting") harness.sockets[0].drop()
+    harness.connection.notify("terminal/resize", {
+      terminal_id: "t1",
+      rows: 24,
+      cols: 80,
+    })
+    assert.equal(
+      harness.sockets.reduce((total, socket) => total + socket.sent.length, 0),
+      0,
       name
     )
   }

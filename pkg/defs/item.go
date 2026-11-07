@@ -23,6 +23,8 @@ const (
 	ItemExecutorsChange   ItemKind = "executors_change"
 	ItemSkillInstruction  ItemKind = "skill_instruction"
 	ItemAgentsInstruction ItemKind = "agents_instruction"
+	ItemMemoryIndex       ItemKind = "memory_index"
+	ItemClientInstruction ItemKind = "client_instruction"
 	ItemHookRun           ItemKind = "hook_run"
 	// ItemTurnInterrupted 由 Turn 在以 interrupted 结束时写在本轮最后；没有载荷，TurnID 说明是哪一轮。
 	ItemTurnInterrupted ItemKind = "turn_interrupted"
@@ -47,6 +49,8 @@ type Item struct {
 	ExecutorsChange   *ExecutorsChange   `json:"executors_change,omitempty"`
 	SkillInstruction  *SkillInstruction  `json:"skill_instruction,omitempty"`
 	AgentsInstruction *AgentsInstruction `json:"agents_instruction,omitempty"`
+	MemoryIndex       *MemoryIndex       `json:"memory_index,omitempty"`
+	ClientInstruction *ClientInstruction `json:"client_instruction,omitempty"`
 	HookRun           *HookRun           `json:"hook_run,omitempty"`
 }
 
@@ -60,11 +64,30 @@ type SkillInstruction struct {
 	Text        string `json:"text"`
 }
 
-// AgentsInstruction 是某个 Executor 上一份 AGENTS.md 的路径和正文。
+// AgentsInstruction 是某个 Executor 上一份 AGENTS.md 的路径、正文和适用范围。
 type AgentsInstruction struct {
 	Executor string `json:"executor"`
 	Path     string `json:"path"`
 	Text     string `json:"text"`
+	// IsGlobal 是否为适用于本 Executor 全部工作区的用户级规则？
+	IsGlobal bool `json:"is_global,omitempty"`
+}
+
+// MemoryIndex 是 Turn 开始时从 memory Executor 读进上下文的一份 MEMORY.md。
+type MemoryIndex struct {
+	// Path 是 memory Executor 里的路径：user/MEMORY.md 或 project/MEMORY.md。
+	Path string `json:"path"`
+	// Project 是项目记忆所属的项目：项目记忆目录相对记忆根目录的路径，例如 projects/local/-tmp-x；用户级记忆为空。
+	Project string `json:"project,omitempty"`
+	// Text 最多 8 KiB，超出时在最后一个完整行处截断。
+	Text string `json:"text"`
+	// IsTruncated 是否截断过？
+	IsTruncated bool `json:"is_truncated,omitempty"`
+}
+
+// ClientInstruction 是客户端写进上下文的一段指令，例如旁支的「之前的历史只作参考，别接着做」。
+type ClientInstruction struct {
+	Text string `json:"text"`
 }
 
 // ContextSummary 是压缩上下文时生成的累积历史摘要。
@@ -72,6 +95,54 @@ type ContextSummary struct {
 	Text string `json:"text"`
 	// CoveredThroughItemID 是摘要覆盖到的最后一条原始 Item，包含它本身。
 	CoveredThroughItemID ItemID `json:"covered_through_item_id"`
+}
+
+// ValidateKindPayload 检查 Skill、AGENTS.md、记忆目录和客户端指令的种类与载荷对得上，以及客户端指令有正文；不检查 TurnID。
+func (item *Item) ValidateKindPayload() error {
+	// 1. 这四种指令的种类和载荷必须同时存在。
+	if (item.Kind == ItemSkillInstruction) != (item.SkillInstruction != nil) ||
+		(item.Kind == ItemAgentsInstruction) != (item.AgentsInstruction != nil) ||
+		(item.Kind == ItemMemoryIndex) != (item.MemoryIndex != nil) ||
+		(item.Kind == ItemClientInstruction) != (item.ClientInstruction != nil) {
+		return fmt.Errorf("instruction kind and payload do not match")
+	}
+	// 2. 客户端指令的正文不能为空。
+	if item.ClientInstruction != nil && item.ClientInstruction.Text == "" {
+		return fmt.Errorf("client instruction requires text")
+	}
+	return nil
+}
+
+// ValidateContextItem 检查客户端注入的 Item：没有 TurnID 和 ModelCallID 时也能写入日志、转成模型消息。
+func (item *Item) ValidateContextItem() error {
+	// 1. 先检查指令类 Item 的种类与载荷。
+	if err := item.ValidateKindPayload(); err != nil {
+		return err
+	}
+	// 2. 按种类检查载荷；需要模型调用或只由运行时写入的种类、未知种类一律拒绝。
+	switch item.Kind {
+	case ItemMessage:
+		if err := item.ValidateInputMessage(); err != nil {
+			return err
+		}
+		from := item.Message.From
+		if from == nil || (from.Kind != IdentityUser && from.Kind != IdentityAgent) {
+			return fmt.Errorf("context message requires a user or agent sender")
+		}
+	case ItemHookRun:
+		if item.HookRun == nil {
+			return fmt.Errorf("context hook run requires a payload")
+		}
+	case ItemSkillInstruction, ItemAgentsInstruction, ItemMemoryIndex, ItemClientInstruction:
+		// 载荷已由 ValidateKindPayload 检查。
+	case ItemReasoning, ItemToolCall, ItemToolResult, ItemModelError:
+		return fmt.Errorf("context item kind %q requires a model call", item.Kind)
+	case ItemContextSummary, ItemSessionFork, ItemModelChange, ItemExecutorsChange, ItemTurnInterrupted:
+		return fmt.Errorf("context item kind %q is written by the runtime", item.Kind)
+	default:
+		return fmt.Errorf("unknown context item kind %q", item.Kind)
+	}
+	return nil
 }
 
 // ValidateContextSummary 检查摘要 Item 的类型、ID 和载荷。

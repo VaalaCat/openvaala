@@ -50,11 +50,11 @@ openvaala app-server --listen ws://127.0.0.1:4500
 
 ## 哪些能对应，哪些不能
 
-- **Thread** 就是对话；每个子 Agent 显示为单独的 thread。开始、恢复、分叉、归档、改名、删除、压缩、补充和中断都能用。
+- **Thread** 就是对话；每个子 Agent 显示为单独的 thread。开始、恢复、分叉、归档、改名、删除、压缩、补充和中断都能用，`/btw`、`/side` 旁支对话也能用。
 - Codex 里列出的**模型**就是你的 OpenVaala 模型（`provider/model`），带着各自的推理强度。在 Codex 里选的模型或强度只对这条连接生效，不会写进你的配置。
 - **审批和沙箱模式**会被忽略。OpenVaala 运行工具不征求确认，并把沙箱报告为完全访问；见[审批](../configuration/tools.md#审批)。
 - **图片**可以用 data URL 或本地图片文件附加。
-- **不支持：** 动态工具、ephemeral 分叉、Codex 插件和应用，以及权限配置档。
+- **不支持：** 动态工具、Codex 插件和应用，以及权限配置档。
 - **路径：** 配置了 [`client.path_mappings`](../configuration/overview.md#client) 时，thread 的工作目录会转换；命令和文件改动 Item 里的路径按服务器上的原样显示。
 
 用的 Agent 是 `run.agent_name`（或 `--agent`）；它的工具、skill 和 MCP server 在 OpenVaala 里配置，不在 Codex 里。

@@ -34,10 +34,4 @@
 .logo-mark-cursor {
   animation: caret-blink 1.6s steps(1, end) infinite;
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .logo-mark-cursor {
-    animation: none;
-  }
-}
 </style>

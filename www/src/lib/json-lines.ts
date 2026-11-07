@@ -55,17 +55,22 @@ export interface JsonRow {
   isFolded: boolean
 }
 
-// 按折叠状态挑出要显示的行：层级不小于 defaultExpandDepth 的对象和数组默认折叠，按 JSON 展开的字符串默认展开，
-// toggledFoldPaths 里的节点与默认相反；折叠的节点只显示开头行，接着从收尾行之后继续
+export type JsonFoldMode = "default" | "expanded" | "collapsed"
+
+// 按展开基准与逐节点选择挑出显示行；默认按深度折叠，全部操作覆盖所有容器和后续新增节点。
 export function getVisibleJsonRows(
   lines: JsonLine[],
   defaultExpandDepth: number,
-  toggledFoldPaths: Set<string>
+  toggledFoldPaths: Set<string>,
+  foldMode: JsonFoldMode = "default"
 ): JsonRow[] {
   const rows: JsonRow[] = []
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
     const { depth, path, foldEnd, isNestedJSON } = lines[lineIndex]
-    const isFoldedByDefault = depth >= defaultExpandDepth && !isNestedJSON
+    const isFoldedByDefault =
+      foldMode === "default"
+        ? depth >= defaultExpandDepth && !isNestedJSON
+        : foldMode === "collapsed"
     const isFolded =
       foldEnd !== undefined &&
       isFoldedByDefault !== toggledFoldPaths.has(getJsonPathKey(path))

@@ -5,6 +5,7 @@ import (
 	"maps"
 	"path"
 	"slices"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/VaalaCat/mygo-kit"
@@ -13,7 +14,16 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
+	"github.com/VaalaCat/openvaala/pkg/storage"
+	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/egoist/mygo/ui"
+)
+
+const (
+	// recentConversationLimit 是读取多少条最近更新的对话，用来预填新对话和列出最近用过的目录。
+	recentConversationLimit = 50
+	// recentDirectoryLimit 是目录候选里「最近用过」最多列出的目录数。
+	recentDirectoryLimit = 5
 )
 
 // loadExecutors 查询只读执行环境列表；失败用通知说明，新对话的 Executor 下拉退回只有 local。
@@ -56,7 +66,55 @@ func (d *Desktop) loadAgents() {
 	})
 }
 
-// getSelectableExecutors 返回可作为工作位置的 Executor：不含内置的 openvaala 虚拟环境；列表还没读到时只有 local。
+// loadRecentConversations 读取最近更新的未归档对话；弱依赖，失败只记 Warn 日志，保持原有的最近对话和新对话表单。
+func (d *Desktop) loadRecentConversations() {
+	// 1. 记录请求序号。
+	if d.client == nil {
+		return
+	}
+	d.recentConversationsRequest++
+	requestID := d.recentConversationsRequest
+	client := d.client
+	request := runtimeclient.ListConversationsRequest{Limit: recentConversationLimit, Order: storage.Order{By: storage.OrderByUpdatedAt, Direction: storage.DirectionDesc}}
+	// 2. 后台读取，只接受仍是最新的请求结果。
+	d.tasks.Go(func() {
+		page, err := client.ListConversations(d.ctx, &request)
+		d.window.Update(func() {
+			if d.closed || requestID != d.recentConversationsRequest {
+				return
+			}
+			if err != nil {
+				telemetry.GetLogger(d.ctx).Warn("load recent conversations failed", "error", err)
+				return
+			}
+			conversations := make([]defs.Conversation, len(page.Conversations))
+			for index, entry := range page.Conversations {
+				conversations[index] = entry.Conversation
+			}
+			d.handleRecentConversationsLoaded(conversations)
+		})
+	})
+}
+
+// handleRecentConversationsLoaded 保存最近对话；用户还没动过新对话表单、也没打开对话时，用最近一个对话的工作位置预填表单。
+func (d *Desktop) handleRecentConversationsLoaded(conversations []defs.Conversation) {
+	// 1. 保存最近对话，目录候选用它。
+	d.recentConversations = conversations
+	// 2. 表单还是初始的 local 加空目录、没有打开对话时预填。
+	if len(conversations) == 0 || d.conversation.ID != "" || d.newExecutor != defs.LocalExecutorID || d.newDirectory != "" {
+		return
+	}
+	d.setNewLocation(getWorkLocation(conversations[0]))
+}
+
+// setNewLocation 设置新对话表单的 Executor 和目录，清掉属于上一个位置的目录错误和候选。
+func (d *Desktop) setNewLocation(executorID, directory string) {
+	d.newExecutor, d.newDirectory = executorID, directory
+	d.directoryError = nil
+	d.directoryListing, d.directoryEditing = directoryListing{}, directoryEditing{}
+}
+
+// getSelectableExecutors 返回可作为工作位置的 Executor：不含内置的 openvaala 虚拟环境，含 memory（它要出现在可用开关里）；列表还没读到时只有 local。
 func (d *Desktop) getSelectableExecutors() []conversation.ExecutorDetails {
 	// 1. openvaala 只存放内置 Skill，不是工作位置。
 	executors := slices.DeleteFunc(slices.Clone(d.executors), func(executor conversation.ExecutorDetails) bool { return executor.ID == config.BuiltinExecutorID })
@@ -66,10 +124,16 @@ func (d *Desktop) getSelectableExecutors() []conversation.ExecutorDetails {
 	return executors
 }
 
+// getDefaultExecutorChoices 返回可选作默认 Executor 的选项：可作为工作位置的 Executor 里去掉 memory，它只能当可用的 Executor。
+func (d *Desktop) getDefaultExecutorChoices() []conversation.ExecutorDetails {
+	// 1. memory 没有工作目录，服务端也拒绝把它设为默认。
+	return slices.DeleteFunc(d.getSelectableExecutors(), func(executor conversation.ExecutorDetails) bool { return executor.Kind == defs.ExecutorKindMemory })
+}
+
 // newConversationFields 绘制新对话的工作位置表单：Agent、Executor 和目录，每个控件都有标签。
 func (d *Desktop) newConversationFields(c *ui.Context) {
 	t := kit.GetTheme(c)
-	executors := d.getSelectableExecutors()
+	executors := d.getDefaultExecutorChoices()
 	ui.Column(c).Width(320).Gap(t.Space(4)).Children(func() {
 		// 1. Agent：有 agent/list 时是可搜索的下拉，否则是带标签的文本框。
 		d.newAgentField(c)
@@ -129,7 +193,7 @@ func (d *Desktop) newAgentField(c *ui.Context) {
 	})
 }
 
-// directoryField 绘制带标签的目录输入框：输入时给子目录建议，失焦时解析成绝对路径；
+// directoryField 绘制带标签的目录输入框：点击或打字时给建议（最近用过的目录在前，其后是子目录），失焦时解析成绝对路径；
 // isDialog 为真时编辑的是对话工作位置弹窗里 executorID 的目录，否则是新对话的目录。
 func (d *Desktop) directoryField(c *ui.Context, key string, isDialog bool, executorID string, directory *string) {
 	// 1. 解析失败显示在字段下方，输入框用危险色边线。
@@ -145,14 +209,18 @@ func (d *Desktop) directoryField(c *ui.Context, key string, isDialog bool, execu
 			input.SetTextSelection(end, end)
 			editing.IsCaretAtEndRequested = false
 		}
-		// 2. 内容改过之后开始给建议；失焦时清掉建议，并把目录解析成绝对路径。
+		// 2. 点击输入框或打字时开始给建议，弹窗自动聚焦和 Tab 切入不打开；失焦时清掉建议，并把目录解析成绝对路径。
+		clicked := input.Clicked()
 		switch focused := input.Focused(); {
 		case focused:
 			if !editing.IsFocused || editing.ExecutorID != executorID {
-				editing.ExecutorID, editing.IsSuggesting = executorID, false
+				editing.ExecutorID, editing.IsSuggesting, editing.IsTyped = executorID, false, false
+			}
+			if clicked {
+				editing.IsSuggesting = true
 			}
 			if input.Changed() {
-				editing.IsSuggesting, d.directoryError = true, nil
+				editing.IsSuggesting, editing.IsTyped, d.directoryError = true, true, nil
 			}
 		case editing.IsFocused:
 			resolving := editing.ExecutorID == executorID && *directory != ""
@@ -163,15 +231,22 @@ func (d *Desktop) directoryField(c *ui.Context, key string, isDialog bool, execu
 			}
 		}
 		editing.IsFocused = input.Focused()
-		// 3. 建议是上级目录的子目录里名称以输入末段开头的那些，选中后进入下一层。
+		// 3. 建议先是最近用过的目录（显示目录名和完整路径，打过字后只留以输入开头的），再是上级目录的子目录里名称以输入末段开头的那些。
 		open := editing.IsFocused && editing.IsSuggesting
 		parent, prefix := splitDirectoryInput(*directory)
 		if open {
 			d.loadDirectoryListing(executorID, parent)
 		}
 		listing := d.directoryListing
-		names := []string{}
+		recents := getRecentDirectories(d.recentConversations, executorID, recentDirectoryLimit)
+		if editing.IsTyped {
+			recents = slices.DeleteFunc(recents, func(recent string) bool { return !strings.HasPrefix(recent, strings.TrimSpace(*directory)) })
+		}
 		opt := kit.CompletionOpt{Open: open, Loading: listing.Loading, Empty: d.t("no.subdirectories")}
+		for _, recent := range recents {
+			opt.Items = append(opt.Items, kit.CompletionItem{Icon: kit.IconFolder, Title: path.Base(recent), Description: recent})
+		}
+		names := []string{}
 		for _, name := range listing.Names {
 			if len(name) >= len(prefix) && name[:len(prefix)] == prefix {
 				names = append(names, name)
@@ -181,8 +256,14 @@ func (d *Desktop) directoryField(c *ui.Context, key string, isDialog bool, execu
 		if listing.Err != nil {
 			opt.Error = d.getErrorMessage(listing.Err)
 		}
-		if selected := kit.CompletionMenu(c, input, input, opt); selected >= 0 && selected < len(names) {
-			*directory = path.Join(listing.Directory, names[selected]) + "/"
+		// 4. 选中最近用过的目录直接填入，选中子目录进入下一层。
+		switch selected := kit.CompletionMenu(c, input, input, opt); {
+		case selected >= 0 && selected < len(recents):
+			*directory = recents[selected]
+			editing.IsSuggesting, editing.IsCaretAtEndRequested = false, true
+			c.AnimationFrame()
+		case selected >= len(recents) && selected < len(recents)+len(names):
+			*directory = path.Join(listing.Directory, names[selected-len(recents)]) + "/"
 			editing.IsSuggesting, editing.IsCaretAtEndRequested = false, true
 			c.AnimationFrame()
 		}
@@ -253,10 +334,7 @@ func (d *Desktop) openWorkLocation() {
 	d.locationTab = 0
 	d.locationError, d.directoryError = nil, nil
 	d.directoryListing, d.directoryEditing = directoryListing{}, directoryEditing{}
-	d.locationDefault = d.conversation.ExecutorSettings.DefaultExecutorID
-	if d.locationDefault == "" {
-		d.locationDefault = "local"
-	}
+	d.locationDefault, _ = getWorkLocation(d.conversation)
 	d.locationDirectories = maps.Clone(d.conversation.ExecutorSettings.WorkspaceDirectories)
 	if d.locationDirectories == nil {
 		d.locationDirectories = map[string]string{}
@@ -304,10 +382,10 @@ func (d *Desktop) workLocationTab(c *ui.Context) {
 		agent := d.getSessionInfo().Session.AgentName
 		return kit.TextInputWith(c.Key("location-agent"), &agent, kit.InputOpt{ReadOnly: true})
 	})
-	// 2. 默认 Executor 只能从可用的 Executor 里选。
+	// 2. 默认 Executor 只能从可用的、不是 memory 的 Executor 里选。
 	executors := d.getSelectableExecutors()
 	ids, description, selected := []string{}, "", 0
-	for _, executor := range executors {
+	for _, executor := range d.getDefaultExecutorChoices() {
 		if !d.locationAvailable[executor.ID] && executor.ID != d.locationDefault {
 			continue
 		}

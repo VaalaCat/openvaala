@@ -40,7 +40,7 @@ function getFlipStops(flipAt: number): SceneStop[] {
 </script>
 
 <template>
-  <SceneCanvas view-box="-196 -104 392 196" :period="10000">
+  <SceneCanvas view-box="-196 -111 392 196" :period="10000">
     <!-- 后面两张配置文件，只露出边缘 -->
     <IsoSlab :at="[sheetAt[0] - 22, sheetAt[1] - 22, 0]" :size="sheetSize" :radius="12" />
     <IsoSlab :at="[sheetAt[0] - 11, sheetAt[1] - 11, 0]" :size="sheetSize" :radius="12" />

@@ -1,15 +1,15 @@
 <script setup lang="ts">
 // iso-models：一块底板上有三个插口，代表三种模型协议；三枚芯片依次从左上方滑入插口，
-// 每插好一枚，插口旁的信号蓝指示灯就移到它那里亮一下。
+// 每插好一枚，插口旁的信号蓝指示灯就移到它那里亮一下，芯片左上方同时出现协议名。
 import IsoSlab from "../primitives/IsoSlab.vue"
 import SceneCanvas from "../primitives/SceneCanvas.vue"
 import { getIsoTranslate, project, type Vec3 } from "../primitives/iso"
-import { vTrack, type SceneStop } from "../primitives/motion"
+import { getShowStops, vTrack, type SceneStop } from "../primitives/motion"
 
 const boardAt: Vec3 = [-34, -118, 0]
 const boardSize: Vec3 = [76, 236, 10]
 const chipSize: Vec3 = [46, 46, 8]
-const slideDistance = 70
+const slideDistance = 60
 
 // 三个协议芯片沿 y 方向排开；dockAt 是芯片插好的时刻。
 const chips = [
@@ -22,7 +22,7 @@ function getChipAt(b: number): Vec3 {
   return [boardAt[0] + 15, boardAt[1] + b, boardSize[2]]
 }
 
-// 标签放在芯片滑入方向（左上）的空白处。
+// 标签放在芯片滑入方向（左上）的空白处，不随芯片滑动，插好时才出现。
 function getLabelPosition(b: number) {
   const [x, y, z] = getChipAt(b)
   const [sx, sy] = project([x - 8, y + chipSize[1] / 2, z + chipSize[2]])
@@ -56,7 +56,7 @@ const lightStops: SceneStop[] = chips.flatMap((chip, index) => {
 </script>
 
 <template>
-  <SceneCanvas view-box="-214 -112 428 218" :period="10000">
+  <SceneCanvas view-box="-211 -112 360 218" :period="10000">
     <IsoSlab
       :at="boardAt"
       :size="boardSize"
@@ -66,10 +66,18 @@ const lightStops: SceneStop[] = chips.flatMap((chip, index) => {
 
     <g v-for="chip in chips" :key="chip.label" v-track="getSlideStops(chip.dockAt)">
       <IsoSlab :at="getChipAt(chip.b)" :size="chipSize" :radius="6" :insets="[[10, 10, 26, 26, 4]]" />
-      <text class="scene-label scene-label--ink" :x="getLabelPosition(chip.b).x" :y="getLabelPosition(chip.b).y" text-anchor="end">
-        {{ chip.label }}
-      </text>
     </g>
+    <text
+      v-for="chip in chips"
+      :key="`label-${chip.label}`"
+      v-track="getShowStops(chip.dockAt, 0.9, 0.03)"
+      class="scene-label scene-label--ink"
+      :x="getLabelPosition(chip.b).x"
+      :y="getLabelPosition(chip.b).y"
+      text-anchor="end"
+    >
+      {{ chip.label }}
+    </text>
 
     <ellipse
       v-track="lightStops"

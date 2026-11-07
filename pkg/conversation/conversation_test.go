@@ -26,8 +26,10 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
+	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
@@ -103,11 +105,12 @@ func TestConversationCreateAndGet(t *testing.T) {
 							ModelID:    "test",
 						},
 					}},
-					Models: []*defs.ModelDefinition{newTestModel(&llmkit.Target{Model: "test"}, 0)},
+					Models:    []*defs.ModelDefinition{newTestModel(&llmkit.Target{Model: "test"}, 0)},
+					Executors: newTestExecutorProvider(nil),
 				},
 			}
 			// 2. 创建对话，保存失败时检查没返回实例、根失败时也没保存对话记录。
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if failure == "root" || failure == "conversation" {
 				if err == nil || c != nil {
 					t.Fatal("partial creation succeeded")
@@ -188,9 +191,9 @@ func TestConversationRejectsInvalidConfiguration(t *testing.T) {
 			case "nil_opt":
 				opt = nil
 			case "executor_without_id":
-				opt.Definitions.Executors = newTestExecutors("")
+				opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors(""))
 			case "duplicate_executor":
-				opt.Definitions.Executors = newTestExecutors("local", "local")
+				opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local", "local"))
 			case "no_agents":
 				opt.Definitions.Agents = nil
 			case "no_models":
@@ -210,7 +213,7 @@ func TestConversationRejectsInvalidConfiguration(t *testing.T) {
 				rootAgentName = "missing"
 			}
 			// 2. 创建对话，检查错误内容以及根 Session 尚未保存。
-			c, err := CreateConversation(t.Context(), rootAgentName, defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), rootAgentName, defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err == nil || c != nil || mutation.sessionSaved {
 				t.Fatal("invalid configuration started creating persistent records")
 			}
@@ -571,8 +574,10 @@ func TestConversationEnvironments(t *testing.T) {
 				mutation := &conversationMutation{Mutation: store.mutation}
 				opt.Mutation = mutation
 				// 默认 Executor 的根目录不存在，装配失败。
-				opt.Definitions.Executors[0].WorkspaceDirectory = filepath.Join(t.TempDir(), "missing")
-				c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+				missing := newLocalTestExecutor(t, "local")
+				missing.GetDefinition().WorkspaceDirectory = filepath.Join(t.TempDir(), "missing")
+				opt.Definitions.Executors = newTestExecutorProvider([]executor.Executor{missing})
+				c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 				if err == nil || c != nil {
 					t.Fatalf("CreateConversation() = %v, %v; want an environment error", c, err)
 				}
@@ -591,14 +596,14 @@ func TestConversationEnvironments(t *testing.T) {
 		{
 			name: "root_and_child_share_environments",
 			run: func(t *testing.T, store *conversationStore, model *conversationModel, opt *ConversationOpt, pidPath string) {
-				c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+				c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 				if err != nil {
 					t.Fatal(err)
 				}
 				h := startTestConversation(t, store, model, c)
 				details, err := c.GetSessionDetails(t.Context(), c.GetRootSessionID())
-				if err != nil || len(details.Executors) != len(opt.Definitions.Executors) {
-					t.Fatalf("executors = %+v, %v; want %d", details.Executors, err, len(opt.Definitions.Executors))
+				if err != nil || len(details.Executors) != 1 {
+					t.Fatalf("executors = %+v, %v; want local only", details.Executors, err)
 				}
 				h.input(t, session.SessionInputModeNormal, "delegate")
 				receiveModelRequest(t, model).reply <- spawnResponse("spawn", "review", "check A")
@@ -635,7 +640,7 @@ func TestConversationEnvironments(t *testing.T) {
 		{
 			name: "environments_stop_after_sessions",
 			run: func(t *testing.T, store *conversationStore, model *conversationModel, opt *ConversationOpt, pidPath string) {
-				c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+				c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -662,7 +667,7 @@ func TestConversationEnvironments(t *testing.T) {
 			pidPath := filepath.Join(t.TempDir(), "fake.pid")
 			server := newFakeMCPServerDefinition(t, "fake", "local")
 			server.Args = []string{"-pidfile", pidPath}
-			opt.Definitions.Executors = []*defs.ExecutorDefinition{newLocalTestExecutor(t, "local")}
+			opt.Definitions.Executors = newTestExecutorProvider([]executor.Executor{newLocalTestExecutor(t, "local")})
 			opt.Definitions.MCPServers = []*mcpclient.ServerDefinition{server}
 			tt.run(t, store, model, opt, pidPath)
 		})
@@ -692,7 +697,7 @@ func TestConversationReconfigure(t *testing.T) {
 		{
 			name: "set_executor_settings_in_place",
 			run: func(t *testing.T, h *conversationHarness, newDefinitions func() *ConversationDefinitions) {
-				localDirectory := h.impl().config.Load().definitions.Executors[0].WorkspaceDirectory
+				localDirectory := h.impl().config.Load().executors[0].GetDefinition().WorkspaceDirectory
 				settings, err := h.c.SetExecutorSettings(t.Context(), defs.ExecutorSettings{ExecutorIDs: []string{"other"}})
 				if err != nil {
 					t.Fatalf("SetExecutorSettings() error = %v", err)
@@ -906,15 +911,15 @@ func TestConversationReconfigure(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// 2. 用 local 和 virtual 两个执行环境启动对话，执行设置、定义或并发变更。
 			store, model := openConversationDAO(t), newConversationModel(t)
-			executors := append([]*defs.ExecutorDefinition{newLocalTestExecutor(t, "local")}, newTestExecutors("other")...)
+			executors := append([]executor.Executor{newLocalTestExecutor(t, "local")}, newTestExecutors("other")...)
 			newDefinitions := func() *ConversationDefinitions {
 				definitions := conversationDefinitions(model)
-				definitions.Executors = executors
+				definitions.Executors = newTestExecutorProvider(executors)
 				return definitions
 			}
 			opt := conversationOpt(store, model)
 			opt.Definitions = newDefinitions()
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1045,9 +1050,9 @@ func TestConversationReopenUsesSavedAgent(t *testing.T) {
 // collaborationToolNames 是每个对话的 Session 固定带有的协作工具名，多个测试按它推算期望的工具集合。
 var collaborationToolNames = []string{"spawn_agent", "send_message", "interrupt_agent", "list_agents", "read_session_history", "wait_agent"}
 
-// allLocalToolNames 是测试环境 local 不按名单过滤时的全部内置工具名：执行环境带的 read_file、apply_patch，加上 Session 为有工作区的
+// allLocalToolNames 是测试环境 local 不按名单过滤时的全部内置工具名：执行环境带的 read_file、apply_patch、glob、grep，加上 Session 为有工作区的
 // 执行环境建的五个命令工具。
-var allLocalToolNames = []string{"read_file", "apply_patch", "bash", "read_command_output", "write_stdin", "stop_command", "list_commands"}
+var allLocalToolNames = []string{"read_file", "apply_patch", "glob", "grep", "bash", "read_command_output", "write_stdin", "stop_command", "list_commands"}
 
 // TestConversationAgentTools 检查根 Agent、子 Agent 和重新打开后的子 Agent 按 ToolNames 拿到的工具。
 func TestConversationAgentTools(t *testing.T) {
@@ -1080,9 +1085,9 @@ func TestConversationAgentTools(t *testing.T) {
 			model := newConversationModel(t)
 			// local 带 read_file、apply_patch 和命令工具；assistant 不写 ToolNames，worker 只选 read_file。
 			opt := conversationOpt(store, model)
-			opt.Definitions.Executors = newTestExecutors("local")
+			opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
 			opt.Definitions.Agents[1].ToolNames = []string{"read_file"}
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1166,10 +1171,10 @@ func TestConversationAgentToolAndSkillNames(t *testing.T) {
 			opt.Definitions.Agents[0].ToolNames = tt.toolNames
 			opt.Definitions.Agents[0].SkillNames = tt.skillNames
 			if tt.hasExecutors {
-				opt.Definitions.Executors = newTestExecutors("local")
+				opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
 			}
 			// 2. 检查无效名称在保存前报错，无环境时模型只收到协作工具。
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if tt.wantErr != "" {
 				if err == nil || err.Error() != tt.wantErr || mutation.sessionSaved {
 					t.Fatalf("CreateConversation() error = %v, sessionSaved = %v; want %q before saving", err, mutation.sessionSaved, tt.wantErr)
@@ -1241,7 +1246,7 @@ func TestConversationAgentSkills(t *testing.T) {
 				}
 				opt.Definitions.Agents[1].SkillNames = []string{"beta"}
 			}
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1320,7 +1325,7 @@ func TestConversationSystemInstructions(t *testing.T) {
 			store, model := openConversationDAO(t), newConversationModel(t)
 			opt := conversationOpt(store, model)
 			opt.Definitions.Agents[0].Instructions = "Keep 100% <literal>\nnext"
-			opt.Definitions.Executors = newTestExecutors("local")
+			opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
 			want := "Keep 100% <literal>\nnext"
 			if tt.catalogs {
 				opt.Definitions.Skills = []*skill.Skill{{
@@ -1328,7 +1333,7 @@ func TestConversationSystemInstructions(t *testing.T) {
 					Description: "Alpha 技能",
 					Path:        "/skills/alpha/SKILL.md",
 				}}
-				opt.Definitions.Executors = newTestExecutors("local", "sandbox")
+				opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local", "sandbox"))
 				want += "\n<openvaala-skills>\n以下 skill 为特定任务提供说明。任务符合某项描述时，先用 read_file 完整读取它的 SKILL.md 再行动（条目带 executor 时，调用 read_file 传入同一 executor）；SKILL.md 中的相对路径以其所在目录为基准。\n- alpha: Alpha 技能\n  path: /skills/alpha/SKILL.md\n</openvaala-skills>"
 			}
 			want += "\n<openvaala-executors>\nExecutor 是工具实际运行的环境（一台机器或一个虚拟环境），各自有独立的文件系统和命令行：读写文件和运行命令只作用于所选 Executor，不同 Executor 之间的文件互不可见。可在多个 Executor 上运行的工具带有 executor 参数，用它选择执行位置；省略时使用参数说明中的默认 Executor。\n修改文件前，先用 read_file 读取目标文件，收到结果后再修改。\n- local（默认）: local 测试环境\n  workspace: /workspace/local\n"
@@ -1337,7 +1342,7 @@ func TestConversationSystemInstructions(t *testing.T) {
 			}
 			want += "</openvaala-executors>"
 			// 2. 启动对话并提交输入，核对模型收到的完整系统消息。
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1379,8 +1384,8 @@ func TestConversationExecutorInstructions(t *testing.T) {
 				Description: "Alpha 技能",
 				Path:        "/skills/alpha/SKILL.md",
 			}}
-			opt.Definitions.Executors = newTestExecutors(tt.executorIDs...)
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors(tt.executorIDs...))
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1403,6 +1408,215 @@ func TestConversationExecutorInstructions(t *testing.T) {
 				t.Fatalf("executor instructions or parameter missing: %s", text)
 			}
 		})
+	}
+}
+
+// newMemoryTestExecutors 返回 virtual 的 local、buildbox 和内置的 memory，顺序同加载配置时的 local、memory、自定义 Executor。
+func newMemoryTestExecutors(memoryDirectory string) []executor.Executor {
+	// 1. local、memory、buildbox 依次排列；memory 没有目录。
+	executors := newTestExecutors("local", "buildbox")
+	return []executor.Executor{executors[0], newMemoryTestExecutor(memoryDirectory), executors[1]}
+}
+
+// newMemoryTestExecutor 创建记忆根目录为 memoryDirectory 的 memory Executor。
+func newMemoryTestExecutor(memoryDirectory string) executor.Executor {
+	// 1. 用内置的 memory 定义创建 Executor。
+	return executor.NewMemoryExecutor(executor.NewMemoryExecutorOpt(&defs.ExecutorDefinition{
+		ID:          defs.MemoryExecutorID,
+		Kind:        defs.ExecutorKindMemory,
+		Description: prompt.MemoryExecutorDescription,
+	}, memoryDirectory))
+}
+
+// TestConversationMemoryExecutor 检查 memory 环境是否出现由对话的可用 Executor 决定，项目记忆跟着默认 Executor 走。
+func TestConversationMemoryExecutor(t *testing.T) {
+	// 1. 列出关掉记忆、默认开着、默认 Executor 不是 local 的场景。
+	tests := []struct {
+		name     string
+		settings defs.ExecutorSettings
+		// wantProjectDirectory 是项目记忆目录相对记忆根目录的路径；为空表示这个对话没有 memory 环境。
+		wantProjectDirectory string
+		// wantExecutorEnum 是 executor 参数的取值范围；为空表示只有一个环境，工具没有 executor 参数。
+		wantExecutorEnum string
+		// wantCommandExecutorEnum 是命令工具 executor 参数的取值范围，不含 memory；为空表示不检查。
+		wantCommandExecutorEnum string
+		// wantExecutorIDs 是对话详情里的 Executor，按顺序。
+		wantExecutorIDs []string
+		// hasChildAgent 是否再检查子 Agent 的 Session 也带着 memory？
+		hasChildAgent bool
+	}{
+		{
+			name:            "memory_not_in_executor_ids",
+			settings:        defs.ExecutorSettings{ExecutorIDs: []string{"local"}},
+			wantExecutorIDs: []string{"local"},
+		},
+		{
+			name:                    "empty_executor_ids_enable_memory",
+			wantProjectDirectory:    filepath.Join("projects", "local", "-workspace-local"),
+			wantExecutorEnum:        `"enum":["local","buildbox","memory"]`,
+			wantExecutorIDs:         []string{"local", "buildbox", "memory"},
+			hasChildAgent:           true,
+			wantCommandExecutorEnum: `"enum":["local","buildbox"]`,
+		},
+		{
+			name:                 "memory_follows_first_available_executor",
+			settings:             defs.ExecutorSettings{ExecutorIDs: []string{"memory", "buildbox"}},
+			wantProjectDirectory: filepath.Join("projects", "buildbox", "-workspace-buildbox"),
+			wantExecutorEnum:     `"enum":["buildbox","memory"]`,
+			wantExecutorIDs:      []string{"buildbox", "memory"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 2. 记忆根目录下放好两份 MEMORY.md，按设置创建对话并发第一条输入。
+			store, model := openConversationDAO(t), newConversationModel(t)
+			opt := conversationOpt(store, model)
+			memoryDirectory := t.TempDir()
+			executors := newMemoryTestExecutors(memoryDirectory)
+			opt.Definitions.Executors = newTestExecutorProvider(executors)
+			writeTestFile(t, filepath.Join(memoryDirectory, "user", "MEMORY.md"), "- 回复用中文")
+			if tt.wantProjectDirectory != "" {
+				writeTestFile(t, filepath.Join(memoryDirectory, tt.wantProjectDirectory, "MEMORY.md"), "- 测试用 table-driven")
+			}
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, tt.settings, defs.ExecutorSettings{}, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := startTestConversation(t, store, model, c)
+			details, err := c.GetSessionDetails(t.Context(), c.GetRootSessionID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var executorIDs []string
+			for _, details := range details.Executors {
+				executorIDs = append(executorIDs, details.ID)
+				definitionIndex := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == details.ID })
+				if definitionIndex < 0 || details.Kind == "" || details.Kind != executors[definitionIndex].GetDefinition().Kind {
+					t.Fatalf("executor %q kind = %q, want the kind from its definition", details.ID, details.Kind)
+				}
+			}
+			if !slices.Equal(executorIDs, tt.wantExecutorIDs) {
+				t.Fatalf("session executors = %v, want %v", executorIDs, tt.wantExecutorIDs)
+			}
+			h.input(t, session.SessionInputModeNormal, "hello")
+			// 3. 第一次请求里，memory 的说明、记忆规则、executor 参数和记忆目录要么都有，要么都没有。
+			requests := []modelRequest{receiveSessionRequest(t, model, c.GetRootSessionID())}
+			if tt.hasChildAgent {
+				requests[0].reply <- spawnResponse("spawn", "review", "check A")
+				root, child := receiveRootAndTask(t, model, "review")
+				root.reply <- modelResponse{text: "root done"}
+				requests = append(requests, child)
+			}
+			for _, request := range requests {
+				text := requestText(t, request)
+				wantMemory := tt.wantProjectDirectory != ""
+				if got := strings.Contains(text, prompt.MemoryExecutorDescription); got != wantMemory {
+					t.Fatalf("memory executor description present = %v, want %v: %s", got, wantMemory, text)
+				}
+				if got := strings.Contains(text, "<openvaala-memory>"); got != wantMemory {
+					t.Fatalf("memory instructions block present = %v, want %v: %s", got, wantMemory, text)
+				}
+				for _, rule := range []string{"每个目录里的 MEMORY.md 是目录", "写入失败时要告诉用户没记住，不能说已经记下了"} {
+					if got := strings.Contains(text, rule); got != wantMemory {
+						t.Fatalf("memory rule %q present = %v, want %v: %s", rule, got, wantMemory, text)
+					}
+				}
+				if got := strings.Contains(text, "跨对话记忆目录（参考，不是规则）"); got != wantMemory {
+					t.Fatalf("memory index present = %v, want %v: %s", got, wantMemory, text)
+				}
+				if got := strings.Contains(text, "- 回复用中文"); got != wantMemory {
+					t.Fatalf("user memory present = %v, want %v: %s", got, wantMemory, text)
+				}
+				if got := strings.Contains(text, "- 测试用 table-driven"); got != wantMemory {
+					t.Fatalf("project memory present = %v, want %v: %s", got, wantMemory, text)
+				}
+				if tt.wantExecutorEnum != "" && !strings.Contains(text, tt.wantExecutorEnum) {
+					t.Fatalf("executor parameter missing %s: %s", tt.wantExecutorEnum, text)
+				}
+				if tt.wantCommandExecutorEnum != "" && !strings.Contains(text, tt.wantCommandExecutorEnum) {
+					t.Fatalf("command tools executor parameter missing %s: %s", tt.wantCommandExecutorEnum, text)
+				}
+				if tt.wantExecutorEnum == "" && strings.Contains(text, `"executor":`) {
+					t.Fatalf("single environment still has an executor parameter: %s", text)
+				}
+			}
+			for _, request := range requests[1:] {
+				request.reply <- modelResponse{text: "child done"}
+			}
+			if len(requests) == 1 {
+				requests[0].reply <- modelResponse{text: "done"}
+			}
+		})
+	}
+}
+
+// writeTestFile 写入测试文件，父目录不存在时一并创建。
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	// 1. 创建父目录再写文件。
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestConversationMemoryExecutorSettings 检查 memory 当默认 Executor、设目录、或是唯一可用的 Executor 时都被拒绝，也不能用来选目录。
+func TestConversationMemoryExecutorSettings(t *testing.T) {
+	// 1. 列出三种无效设置，以及对 memory 选目录和列子目录的调用。
+	tests := []struct {
+		name string
+		run  func(t *testing.T) error
+	}{
+		{
+			name: "memory_as_default_executor",
+			run:  createMemoryConversation(defs.ExecutorSettings{DefaultExecutorID: defs.MemoryExecutorID}),
+		},
+		{
+			name: "memory_with_workspace_directory",
+			run: createMemoryConversation(defs.ExecutorSettings{
+				WorkspaceDirectories: map[string]string{defs.MemoryExecutorID: "/memory"},
+			}),
+		},
+		{
+			name: "memory_is_the_only_executor",
+			run:  createMemoryConversation(defs.ExecutorSettings{ExecutorIDs: []string{defs.MemoryExecutorID}}),
+		},
+		{
+			name: "resolve_workspace_directory",
+			run: func(t *testing.T) error {
+				_, err := ResolveWorkspaceDirectory(t.Context(), newMemoryTestExecutors(t.TempDir()), defs.MemoryExecutorID, "/", "")
+				return err
+			},
+		},
+		{
+			name: "list_workspace_directories",
+			run: func(t *testing.T) error {
+				_, err := GetWorkspaceDirectories(t.Context(), newMemoryTestExecutors(t.TempDir()), defs.MemoryExecutorID, "/", "")
+				return err
+			},
+		},
+	}
+	// 2. 每项都要返回 ErrInvalidExecutorSettings。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.run(t); !errors.Is(err, ErrInvalidExecutorSettings) {
+				t.Fatalf("error = %v, want %v", err, ErrInvalidExecutorSettings)
+			}
+		})
+	}
+}
+
+// createMemoryConversation 返回用给定设置创建带 memory Executor 的对话、并交回创建错误的测试函数。
+func createMemoryConversation(settings defs.ExecutorSettings) func(t *testing.T) error {
+	// 1. 记忆根目录用临时目录，创建对话并返回创建的错误。
+	return func(t *testing.T) error {
+		store, model := openConversationDAO(t), newConversationModel(t)
+		opt := conversationOpt(store, model)
+		opt.Definitions.Executors = newTestExecutorProvider(newMemoryTestExecutors(t.TempDir()))
+		_, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, settings, defs.ExecutorSettings{}, opt)
+		return err
 	}
 }
 
@@ -1752,8 +1966,9 @@ func reopenTestConversation(t *testing.T, c Conversation, opt *ConversationOpt) 
 
 // conversationDefinitions 返回测试用的 Agent 和模型定义，模型都指向受控模型服务。
 func conversationDefinitions(model *conversationModel) *ConversationDefinitions {
-	// 1. 创建 assistant、worker 两个 Agent 和四个模型定义，填写测试连接、窗口和强度。
+	// 1. 创建 assistant、worker 两个 Agent 和四个模型定义，填写测试连接、窗口和强度；默认没有 Executor。
 	return &ConversationDefinitions{
+		Executors: newTestExecutorProvider(nil),
 		Agents: []*agent.AgentDefinition{
 			{
 				Name:         "assistant",
@@ -1833,7 +2048,7 @@ func newTestModel(target *llmkit.Target, window int) *defs.ModelDefinition {
 func createTestConversation(t *testing.T, store *conversationStore, model *conversationModel) Conversation {
 	t.Helper()
 	// 1. 用默认模型和空的 Executor 设置创建对话，失败时结束测试。
-	c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, conversationOpt(store, model))
+	c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, conversationOpt(store, model))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2064,17 +2279,17 @@ func requestToolNames(request modelRequest) []string {
 	return names
 }
 
-// newLocalTestExecutor 创建使用临时根目录和 HOME 的 local Executor 定义。
-func newLocalTestExecutor(t *testing.T, id string) *defs.ExecutorDefinition {
+// newLocalTestExecutor 创建使用临时根目录和 HOME 的 local Executor。
+func newLocalTestExecutor(t *testing.T, id string) executor.Executor {
 	t.Helper()
 	// 1. 把 HOME 设为临时目录，工作区根目录用另一个临时目录。
 	t.Setenv("HOME", t.TempDir())
-	return &defs.ExecutorDefinition{
+	return executor.NewLocalExecutor(&defs.ExecutorDefinition{
 		ID:                 id,
 		Kind:               defs.ExecutorKindLocal,
 		Description:        id + " 测试环境",
 		WorkspaceDirectory: t.TempDir(),
-	}
+	})
 }
 
 // newFakeMCPServerDefinition 创建分配给指定 Executor 的测试 MCP server 定义。
@@ -2167,19 +2382,25 @@ func waitMCPServerConnected(t *testing.T, c Conversation, executorID, serverID s
 	}
 }
 
-// newTestExecutors 按顺序创建指定 ID 的 virtual Executor 定义。
-func newTestExecutors(ids ...string) []*defs.ExecutorDefinition {
-	// 1. 按传入 ID 创建 virtual 定义，根目录为 /workspace/<id>。
-	executors := make([]*defs.ExecutorDefinition, len(ids))
+// newTestExecutors 按顺序创建指定 ID 的 virtual Executor。
+func newTestExecutors(ids ...string) []executor.Executor {
+	// 1. 按传入 ID 创建 virtual Executor，根目录为 /workspace/<id>。
+	executors := make([]executor.Executor, len(ids))
 	for index, id := range ids {
-		executors[index] = &defs.ExecutorDefinition{
+		executors[index] = executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
 			ID:                 id,
 			Kind:               defs.ExecutorKindVirtual,
 			Description:        id + " 测试环境",
 			WorkspaceDirectory: "/workspace/" + id,
-		}
+		}, nil))
 	}
 	return executors
+}
+
+// newTestExecutorProvider 把 Executor 列表包成 ExecutorProvider。
+func newTestExecutorProvider(executors []executor.Executor) executor.ExecutorProvider {
+	// 1. 所有对话共用这份列表。
+	return executor.NewConfigExecutorProvider(executors)
 }
 
 // requestText 把模型请求编码成不转义 HTML 字符的 JSON 文本。
@@ -2558,7 +2779,7 @@ func TestConversationListSessionInfosReportsUsageAndWindow(t *testing.T) {
 			model := newConversationModel(t)
 			opt := conversationOpt(store, model)
 			opt.Definitions.Models[0].ContextWindow = 8000 // worker-model 的窗口为 0。
-			created, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			created, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2821,7 +3042,7 @@ func TestConversationGetSessionDetails(t *testing.T) {
 				localExecutor = newLocalTestExecutor(t, "local")
 				opt.Definitions.MCPServers = []*mcpclient.ServerDefinition{newFakeMCPServerDefinition(t, tt.mcpServer, "local")}
 			}
-			opt.Definitions.Executors = append([]*defs.ExecutorDefinition{localExecutor}, newTestExecutors("sandbox")...)
+			opt.Definitions.Executors = newTestExecutorProvider(append([]executor.Executor{localExecutor}, newTestExecutors("sandbox")...))
 			opt.Definitions.Skills = []*skill.Skill{
 				{
 					Name:        "alpha",
@@ -2848,7 +3069,7 @@ func TestConversationGetSessionDetails(t *testing.T) {
 			opt.Definitions.Agents[0].MCPServerIDs = tt.mcpServerIDs
 			// 握手永远不完成的 server 启动超时 20 秒：打开对话若等它，会远超 10 秒。
 			openStart := time.Now()
-			created, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			created, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2941,11 +3162,13 @@ func TestConversationGetSessionDetails(t *testing.T) {
 			wantExecutors := []ExecutorDetails{
 				{
 					ID:                 "local",
+					Kind:               localExecutor.GetDefinition().Kind,
 					Description:        "local 测试环境",
-					WorkspaceDirectory: localExecutor.WorkspaceDirectory,
+					WorkspaceDirectory: localExecutor.GetDefinition().WorkspaceDirectory,
 				},
 				{
 					ID:                 "sandbox",
+					Kind:               defs.ExecutorKindVirtual,
 					Description:        "sandbox 测试环境",
 					WorkspaceDirectory: "/workspace/sandbox",
 				},
@@ -3205,7 +3428,7 @@ func TestConversationCreateWithModel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store, model := openConversationDAO(t), newConversationModel(t)
-			c, err := CreateConversation(t.Context(), "assistant", tt.request, defs.ExecutorSettings{}, defs.ExecutorSettings{}, conversationOpt(store, model))
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", tt.request, defs.ExecutorSettings{}, defs.ExecutorSettings{}, conversationOpt(store, model))
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("CreateConversation() = %v, want error containing %q", err, tt.wantErr)
@@ -3376,11 +3599,11 @@ func TestConversationHookStartSource(t *testing.T) {
 			stub := &conversationHooksStub{}
 			newOpt := func() *ConversationOpt {
 				opt := conversationOpt(store, model)
-				opt.Definitions.Executors = newTestExecutors("local")
+				opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
 				opt.Definitions.Hooks = stub
 				return opt
 			}
-			c, err := CreateConversation(t.Context(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, newOpt())
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, newOpt())
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -15,7 +15,7 @@ import (
 )
 
 // forkBoundarySentinels 是服务端以 -32602 返回、消息里带着原文的分叉截取点错误。
-var forkBoundarySentinels = []error{conversation.ErrForkBoundaryConflict, conversation.ErrForkTurnNotFound, conversation.ErrForkTurnRunning}
+var forkBoundarySentinels = []error{conversation.ErrForkBoundaryConflict, conversation.ErrForkTurnNotFound}
 
 // getResponseError 将服务端错误转为可识别的 Runtime 错误，或附带方法名的协议错误。
 func getResponseError(method string, responseErr *ResponseError) error {
@@ -90,4 +90,20 @@ var itemEventTypes = map[string]agent.AgentEventType{
 	"item/delta":       agent.AgentEventItemDelta,
 	"item/completed":   agent.AgentEventItemCompleted,
 	"item/interrupted": agent.AgentEventItemInterrupted,
+}
+
+// newRunningConversationsChanged 把运行中对话集合的订阅结果变成事件；result 为 nil 表示集合未知。
+func newRunningConversationsChanged(result *runtime.RunningConversations, err error) ClientEvent {
+	if result == nil {
+		return &RunningConversationsChanged{Err: err}
+	}
+	return &RunningConversationsChanged{IsKnown: true, ConversationIDs: result.ConversationIDs}
+}
+
+// newTerminalsChanged 把运行中终端列表的订阅结果变成事件；result 为 nil 表示列表未知。
+func newTerminalsChanged(result *runtimeprotocol.TerminalListResult, err error) ClientEvent {
+	if result == nil {
+		return &TerminalsChanged{Err: err}
+	}
+	return &TerminalsChanged{IsKnown: true, Terminals: result.Terminals}
 }

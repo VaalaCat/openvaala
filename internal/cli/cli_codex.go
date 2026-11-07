@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/VaalaCat/openvaala/internal/appserver"
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/spf13/cobra"
 )
@@ -137,7 +138,7 @@ func runCodexCommand(ctx context.Context, args *AppArgs) (err error) {
 	// 2. 收到 SIGHUP 时取消 ctx；启动只写日志文件和 OTLP 的遥测，放进 ctx 给后续日志使用。
 	ctx, stopHangup := signal.NotifyContext(ctx, syscall.SIGHUP)
 	defer stopHangup()
-	tel, shutdown, err := newTelemetry(ctx, args.Config, args.Version, nil)
+	tel, shutdown, err := newTelemetry(ctx, args.Config, nil)
 	if err != nil {
 		return err
 	}
@@ -163,7 +164,7 @@ func runCodexCommand(ctx context.Context, args *AppArgs) (err error) {
 	defer func() { _ = listener.Close() }()
 	// 5. 创建并运行 AppServer；Codex 退出后停止并等待它。
 	opt := appserver.NewAppServerOpt(&runtimeServerLocatorImpl{args: args}, args.Config.Run.AgentName)
-	opt.Version = args.Version
+	opt.Version = defs.GetBuildVersion()
 	opt.ConfigDirectory = filepath.Dir(args.ConfigPath)
 	opt.Telemetry = tel
 	opt.PathMappings = args.Config.Client.PathMappings

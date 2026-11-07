@@ -24,6 +24,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor/tools"
+	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/session"
@@ -302,10 +303,13 @@ func getACPConfigOptions(models []*defs.ModelDefinition, selected defs.ModelSele
 			Options:      acp.SessionConfigSelectOptions{Ungrouped: &options},
 		}})
 	}
-	// 3. 存在 Executor 列表时添加选项，第一个 Executor 作为当前默认值。
+	// 3. 存在 Executor 列表时添加选项，第一个 Executor 作为当前默认值；memory 不能当默认 Executor，不列出。
 	if len(executors) > 0 {
 		options := acp.SessionConfigSelectOptionsUngrouped{}
 		for _, details := range executors {
+			if details.Kind == defs.ExecutorKindMemory {
+				continue
+			}
 			option := acp.SessionConfigSelectOption{
 				Name:  details.ID,
 				Value: acp.SessionConfigValueId(details.ID),
@@ -415,8 +419,8 @@ func getACPMCPServerName(server acp.McpServer) (name string, isSupported bool) {
 }
 
 // getACPClientMCPTransport 按编辑器给的配置，创建连接本机 MCP server 的传输。
-func getACPClientMCPTransport(server acp.McpServer, directory string, environment []string) mcp.Transport {
-	// 1. stdio 在 directory 下运行命令，环境是 environment 加上配置的变量；HTTP 和 SSE 给每个请求加上配置的请求头。
+func getACPClientMCPTransport(server acp.McpServer, directory string, environment []string, httpHeaders map[string]string) mcp.Transport {
+	// 1. stdio 在 directory 下运行命令，环境是 environment 加上配置的变量；HTTP 和 SSE 带上 httpHeaders 和编辑器配置的请求头。
 	switch {
 	case server.Stdio != nil:
 		command := exec.Command(server.Stdio.Command, server.Stdio.Args...)
@@ -429,30 +433,25 @@ func getACPClientMCPTransport(server acp.McpServer, directory string, environmen
 	case server.Http != nil:
 		return &mcp.StreamableClientTransport{
 			Endpoint:   server.Http.Url,
-			HTTPClient: &http.Client{Transport: &acpHeaderRoundTripper{headers: server.Http.Headers}},
+			HTTPClient: newACPEditorHTTPClient(httpHeaders, server.Http.Headers),
 		}
 	case server.Sse != nil:
 		return &mcp.SSEClientTransport{
 			Endpoint:   server.Sse.Url,
-			HTTPClient: &http.Client{Transport: &acpHeaderRoundTripper{headers: server.Sse.Headers}},
+			HTTPClient: newACPEditorHTTPClient(httpHeaders, server.Sse.Headers),
 		}
 	}
 	panic("ACP MCP server is not stdio, http or sse")
 }
 
-// acpHeaderRoundTripper 给发出的每个请求加上编辑器为 MCP server 配置的 headers，同名的覆盖原有的值。
-type acpHeaderRoundTripper struct {
-	headers []acp.HttpHeader
-}
-
-// RoundTrip 为请求添加编辑器配置的请求头后发送。
-func (r *acpHeaderRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	// 1. 复制请求，覆盖同名请求头，再交给默认 HTTP 传输。
-	request = request.Clone(request.Context())
-	for _, header := range r.headers {
-		request.Header.Set(header.Name, header.Value)
+// newACPEditorHTTPClient 创建访问编辑器 MCP server 的 HTTP 客户端：编辑器配置的请求头覆盖 httpHeaders 里的同名条目。
+func newACPEditorHTTPClient(httpHeaders map[string]string, editorHeaders []acp.HttpHeader) *http.Client {
+	// 1. 把编辑器的请求头列表转成 map，与全局请求头合并后交给统一客户端。
+	editorHeaderMap := make(map[string]string, len(editorHeaders))
+	for _, header := range editorHeaders {
+		editorHeaderMap[header.Name] = header.Value
 	}
-	return http.DefaultTransport.RoundTrip(request)
+	return httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt().WithHeaders(httpclient.MergeHeaders(httpHeaders, editorHeaderMap)))
 }
 
 // getACPToolKind 按工具名称返回编辑器显示的工具种类。

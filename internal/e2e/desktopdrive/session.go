@@ -66,7 +66,7 @@ func runStartCommand(arguments []string) error {
 		desktopBinary = absolute
 	case !*skipBuild:
 		fmt.Println("building desktop (tags desktop_e2e)...")
-		build := exec.Command("go", "build", "-tags", "desktop_e2e", "-ldflags", "-X main.version=desktopdrive", "-o", desktopBinary, "github.com/VaalaCat/openvaala/cmd/openvaala-desktop")
+		build := exec.Command("go", "build", "-tags", "desktop_e2e", "-ldflags", "-X github.com/VaalaCat/openvaala/pkg/defs.buildVersion=desktopdrive", "-o", desktopBinary, "github.com/VaalaCat/openvaala/cmd/openvaala-desktop")
 		if output, err := build.CombinedOutput(); err != nil {
 			return fmt.Errorf("build desktop: %w\n%s", err, output)
 		}

@@ -15,6 +15,7 @@ import { ConfigurationChangeDialog } from "@/components/base/configuration-chang
 import { RequestError } from "@/components/base/request-error"
 import { RenameConversationDialog } from "@/components/conversation-list/rename-conversation-dialog"
 import { useServerConnection } from "@/components/server-connection-provider"
+import { useConversationWorkspaces } from "@/hooks/use-conversation-workspaces"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -40,14 +41,11 @@ import {
 export function ConversationActions({
   conversation,
   name,
-  isOpened,
   trigger,
 }: {
   conversation: Conversation
   // 对话的显示名，没有标题时是「新对话」
   name: string
-  // 页面正打开着这个对话吗？
-  isOpened: boolean
   trigger: ReactElement
 }) {
   const { t } = useTranslation()
@@ -158,7 +156,6 @@ export function ConversationActions({
       <DeleteConversationDialog
         conversation={conversation}
         name={name}
-        isOpened={isOpened}
         open={dialog === "delete"}
         onOpenChange={(open) => setDialog(open ? "delete" : undefined)}
       />
@@ -170,13 +167,11 @@ export function ConversationActions({
 function DeleteConversationDialog({
   conversation,
   name,
-  isOpened,
   open,
   onOpenChange,
 }: {
   conversation: Conversation
   name: string
-  isOpened: boolean
   open: boolean
   onOpenChange(open: boolean): void
 }) {
@@ -185,6 +180,7 @@ function DeleteConversationDialog({
   const connected = useStore(connection.$state) === "connected"
   const navigate = useNavigate()
   const { search } = useLocation()
+  const workspaces = useConversationWorkspaces()
   const remove = useMutation(deleteConversationOptions(connection))
   function handleOpenChange(next: boolean) {
     if (!next) remove.reset()
@@ -195,6 +191,9 @@ function DeleteConversationDialog({
       onSuccess: () => {
         handleOpenChange(false)
         notifySuccess(t("conversationList.delete.success", { name }))
+        const isOpened =
+          workspaces.$currentConversationID.get() === conversation.id
+        workspaces.forget(conversation.id)
         if (isOpened)
           void navigate({
             pathname: getServerPath(connection.getServerID()),

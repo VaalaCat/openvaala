@@ -18,6 +18,16 @@ You do not have to wait for a turn to finish. A message you send while the agent
 - **Queue** — the message waits and starts the next turn.
 - **Jump the queue** — the running turn is interrupted and this message is handled next.
 
+<!-- scene: input-queue | A message sent during a turn can steer it, wait for the next turn, or jump the queue -->
+```text
+steer           turn 1   model ─ tool ─┬─ model ─ … ─ done
+                                       └ your message is read here
+queue           turn 1   model ─ tool ─ model ─ done
+                turn 2                                your message ─ …
+jump the queue  turn 1   model ─ tool ╳ interrupted, output kept
+                turn 2                your message ─ …
+```
+
 Messages that are waiting can still be changed: take one back to edit it, withdraw it, hand a queued message to the running turn, or make it jump the queue. Your messages are always handled before messages from subagents. Waiting messages are kept in memory only, so they are lost if the runtime server stops.
 
 | Client | Steer | Queue | Interrupt |
@@ -41,13 +51,24 @@ An agent can hand parts of a task to *subagents* with the `spawn_agent` tool, fo
 - reports back to its parent automatically every time it finishes a turn;
 - can start subagents of its own.
 
+<!-- scene: subagents | Subagents run in parallel and report back after every turn -->
+```text
+                     parent agent
+          spawn_agent ×3 │   ▲ each reports back after a turn
+       ┌─────────────────┼───┴─────────────┐
+       ▼                 ▼                 ▼
+   subagent          subagent          subagent
+   own context       own context       own context
+       └──── same executors and working directories ────┘
+```
+
 The parent can message, wait for, interrupt and inspect its subagents with the [collaboration tools](../configuration/tools.md#collaboration-tools). You can follow them in `/agents` in the terminal UI and the **Agents** tab in the web UI; in Codex each subagent is its own thread.
 
 ![The Agents tab showing a tree of subagents in the web UI](../images/web-subagents.png)
 
 ## Fork, rewind, archive and delete
 
-- **Fork** copies a conversation into a new one, so you can try a different direction and keep the original. Only the root agent's history is copied — not subagents, queued messages or the archived state. The terminal UI's `/fork` copies everything up to the latest turn.
+- **Fork** copies a conversation into a new one, so you can try a different direction and keep the original. Only the root agent's history is copied — not subagents, queued messages or the archived state. The terminal UI's `/fork` copies everything up to the latest turn. If the agent is still working on a turn, the part already saved is copied too, and that turn shows as interrupted in the new conversation.
 - **Rewind** is a fork that stops just before one of your earlier messages and puts that message back in the composer for you to edit and resend. Use `/rewind` (or Esc twice on an empty composer) in the terminal UI, or **Restart from here** in the web UI. The original conversation stays as it was.
 
 <!-- scene: conversation-fork | Fork copies the history; rewind copies it up to one of your messages -->

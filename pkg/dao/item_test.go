@@ -1231,9 +1231,9 @@ func TestGetLastOrdinal(t *testing.T) {
 	}
 }
 
-// TestInstructionItemsPersist 检查 Skill 和 AGENTS.md 指令保存。
+// TestInstructionItemsPersist 检查 Skill、目录、全局 AGENTS.md 指令、记忆目录和客户端指令保存。
 func TestInstructionItemsPersist(t *testing.T) {
-	// 1. 分别追加两种指令并回读，检查所属 Turn、指令种类和完整载荷。
+	// 1. 分别追加指令并回读，检查所属 Turn、指令种类和完整载荷。
 	for _, item := range []*defs.Item{
 		{
 			ID:     "skill",
@@ -1257,8 +1257,36 @@ func TestInstructionItemsPersist(t *testing.T) {
 				Text:     "run tests",
 			},
 		},
+		{
+			ID:     "global_agents",
+			TurnID: "turn",
+			Kind:   defs.ItemAgentsInstruction,
+			AgentsInstruction: &defs.AgentsInstruction{
+				Executor: "remote",
+				Path:     "/home/tester/.agents/AGENTS.md",
+				Text:     "global preferences",
+				IsGlobal: true,
+			},
+		},
+		{
+			ID:     "memory",
+			TurnID: "turn",
+			Kind:   defs.ItemMemoryIndex,
+			MemoryIndex: &defs.MemoryIndex{
+				Path:        "project/MEMORY.md",
+				Project:     "projects/local/-repo",
+				Text:        "- 测试用 table-driven",
+				IsTruncated: true,
+			},
+		},
+		{
+			ID:                "client",
+			TurnID:            "turn",
+			Kind:              defs.ItemClientInstruction,
+			ClientInstruction: &defs.ClientInstruction{Text: "boundary"},
+		},
 	} {
-		t.Run(string(item.Kind), func(t *testing.T) {
+		t.Run(string(item.ID), func(t *testing.T) {
 			query, mutation, _ := openDAO(t)
 			conversationID, sessionID := defs.NewConversationID(), defs.NewSessionID()
 			if _, err := mutation.AppendItems(t.Context(), conversationID, sessionID, item); err != nil {
@@ -1282,6 +1310,113 @@ func TestInstructionItemsPersist(t *testing.T) {
 			}
 			if item.AgentsInstruction != nil && *got.AgentsInstruction != *item.AgentsInstruction {
 				t.Fatal("agents contents changed")
+			}
+			if item.MemoryIndex != nil && *got.MemoryIndex != *item.MemoryIndex {
+				t.Fatal("memory index contents changed")
+			}
+			if item.ClientInstruction != nil && *got.ClientInstruction != *item.ClientInstruction {
+				t.Fatal("client instruction contents changed")
+			}
+		})
+	}
+}
+
+// TestMemoryIndexItemValidation 检查记忆目录 Item 的类型和载荷对不上、缺 Turn 或缺路径时拒绝保存。
+func TestMemoryIndexItemValidation(t *testing.T) {
+	// 1. 列出四种无效 Item，每种都要在追加时返回错误。
+	tests := []struct {
+		name    string
+		item    *defs.Item
+		wantErr string
+	}{
+		{
+			name: "kind_without_payload",
+			item: &defs.Item{
+				ID:     "memory",
+				TurnID: "turn",
+				Kind:   defs.ItemMemoryIndex,
+			},
+			wantErr: "kind and payload do not match",
+		},
+		{
+			name: "payload_with_other_kind",
+			item: &defs.Item{
+				ID:          "memory",
+				TurnID:      "turn",
+				Kind:        defs.ItemAgentsInstruction,
+				MemoryIndex: &defs.MemoryIndex{Path: "user/MEMORY.md"},
+			},
+			wantErr: "kind and payload do not match",
+		},
+		{
+			name: "missing_path",
+			item: &defs.Item{
+				ID:          "memory",
+				TurnID:      "turn",
+				Kind:        defs.ItemMemoryIndex,
+				MemoryIndex: &defs.MemoryIndex{Text: "- 回复用中文"},
+			},
+			wantErr: "memory index requires a turn and path",
+		},
+		{
+			name: "missing_turn",
+			item: &defs.Item{
+				ID:          "memory",
+				Kind:        defs.ItemMemoryIndex,
+				MemoryIndex: &defs.MemoryIndex{Path: "user/MEMORY.md"},
+			},
+			wantErr: "memory index requires a turn and path",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, mutation, _ := openDAO(t)
+			_, err := mutation.AppendItems(t.Context(), defs.NewConversationID(), defs.NewSessionID(), tt.item)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("AppendItems() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestClientInstructionItemValidation 检查客户端指令 Item 的种类和载荷对不上、正文为空时拒绝保存，以及合法的保存。
+func TestClientInstructionItemValidation(t *testing.T) {
+	// 1. 列出缺载荷、载荷挂在别的种类上、正文为空和合法的样例。
+	tests := []struct {
+		name    string
+		item    *defs.Item
+		wantErr string
+	}{
+		{
+			name:    "kind_without_payload",
+			item:    &defs.Item{ID: "i1", TurnID: "t1", Kind: defs.ItemClientInstruction},
+			wantErr: "instruction kind and payload do not match",
+		},
+		{
+			name:    "payload_with_other_kind",
+			item:    &defs.Item{ID: "i1", TurnID: "t1", Kind: defs.ItemMemoryIndex, MemoryIndex: &defs.MemoryIndex{Path: "user/MEMORY.md"}, ClientInstruction: &defs.ClientInstruction{Text: "boundary"}},
+			wantErr: "instruction kind and payload do not match",
+		},
+		{
+			name:    "empty_text",
+			item:    &defs.Item{ID: "i1", TurnID: "t1", Kind: defs.ItemClientInstruction, ClientInstruction: &defs.ClientInstruction{}},
+			wantErr: "client instruction requires text",
+		},
+		{
+			name: "valid",
+			item: &defs.Item{ID: "i1", TurnID: "t1", Kind: defs.ItemClientInstruction, ClientInstruction: &defs.ClientInstruction{Text: "boundary"}},
+		},
+	}
+	// 2. 逐项追加，检查错误文本。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, mutation, _ := openDAO(t)
+			_, err := mutation.AppendItems(t.Context(), defs.NewConversationID(), defs.NewSessionID(), tt.item)
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("AppendItems() error = %v", err)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+				t.Fatalf("AppendItems() error = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}

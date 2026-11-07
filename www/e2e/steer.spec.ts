@@ -293,57 +293,54 @@ test("composer_main_button_keeps_dom_and_position", async ({
   const stop = page.getByRole("button", { name: "中断", exact: true })
   const main = await stop.elementHandle()
   const bounds = (await stop.boundingBox())!
-  // 2. 有动画和减少动画下，同一主按钮都原位在发送和停止间切换。
-  for (const reducedMotion of ["no-preference", "reduce"] as const) {
-    await page.emulateMedia({ reducedMotion })
-    // 有内容时原位变为发送，排队按钮完整占位但主按钮不移动。
-    await getComposer(page).fill("尚未发送的内容")
-    const send = page.getByRole("button", { name: "发送", exact: true })
-    const queueButton = page.getByRole("button", { name: "排队", exact: true })
-    await expect(send).toBeEnabled()
-    await expect(queueButton).toBeEnabled()
-    await expect(queueButton).toHaveCSS("width", "32px")
-    await expect(queueButton).toHaveCSS("height", "32px")
-    await expect(send).toHaveCSS("width", "32px")
-    await expect(send).toHaveCSS("height", "32px")
-    expect(
-      await main!.evaluate(
-        (element) =>
-          element.isConnected && element.getAttribute("aria-label") === "发送"
-      )
-    ).toBe(true)
-    await expect
-      .poll(async () => {
-        const queued = (await queueButton.boundingBox())!
-        const sent = (await send.boundingBox())!
-        return Math.round(sent.x - queued.x - queued.width)
-      })
-      .toBe(4)
-    expect((await send.boundingBox())!.x).toBeCloseTo(bounds.x, 1)
-    // 清空时立即变回停止，退出中的排队按钮不可交互。
-    await getComposer(page).fill("")
-    await expect(stop).toBeEnabled()
-    expect(
-      await main!.evaluate(
-        (element) =>
-          element.isConnected && element.getAttribute("aria-label") === "中断"
-      )
-    ).toBe(true)
-    const exitingQueue = page.locator('button[aria-label="排队"]')
-    // 一次读完退出中的排队按钮；动画很快结束时它可能已不在 DOM。
-    const exitingStates = await exitingQueue.evaluateAll((buttons) =>
-      buttons.map((button) => ({
-        inert: button.closest("[inert]") !== null,
-        disabled:
-          (button as HTMLButtonElement).disabled ||
-          button.getAttribute("aria-disabled") === "true",
-      }))
+  // 2. 同一主按钮原位在发送和停止间切换。
+  // 有内容时原位变为发送，排队按钮完整占位但主按钮不移动。
+  await getComposer(page).fill("尚未发送的内容")
+  const send = page.getByRole("button", { name: "发送", exact: true })
+  const queueButton = page.getByRole("button", { name: "排队", exact: true })
+  await expect(send).toBeEnabled()
+  await expect(queueButton).toBeEnabled()
+  await expect(queueButton).toHaveCSS("width", "32px")
+  await expect(queueButton).toHaveCSS("height", "32px")
+  await expect(send).toHaveCSS("width", "32px")
+  await expect(send).toHaveCSS("height", "32px")
+  expect(
+    await main!.evaluate(
+      (element) =>
+        element.isConnected && element.getAttribute("aria-label") === "发送"
     )
-    for (const state of exitingStates)
-      expect(state).toEqual({ inert: true, disabled: true })
-    await expect(exitingQueue).toHaveCount(0)
-    expect((await stop.boundingBox())!.x).toBeCloseTo(bounds.x, 1)
-  }
+  ).toBe(true)
+  await expect
+    .poll(async () => {
+      const queued = (await queueButton.boundingBox())!
+      const sent = (await send.boundingBox())!
+      return Math.round(sent.x - queued.x - queued.width)
+    })
+    .toBe(4)
+  expect((await send.boundingBox())!.x).toBeCloseTo(bounds.x, 1)
+  // 清空时立即变回停止，退出中的排队按钮不可交互。
+  await getComposer(page).fill("")
+  await expect(stop).toBeEnabled()
+  expect(
+    await main!.evaluate(
+      (element) =>
+        element.isConnected && element.getAttribute("aria-label") === "中断"
+    )
+  ).toBe(true)
+  const exitingQueue = page.locator('button[aria-label="排队"]')
+  // 一次读完退出中的排队按钮；动画很快结束时它可能已不在 DOM。
+  const exitingStates = await exitingQueue.evaluateAll((buttons) =>
+    buttons.map((button) => ({
+      inert: button.closest("[inert]") !== null,
+      disabled:
+        (button as HTMLButtonElement).disabled ||
+        button.getAttribute("aria-disabled") === "true",
+    }))
+  )
+  for (const state of exitingStates)
+    expect(state).toEqual({ inert: true, disabled: true })
+  await expect(exitingQueue).toHaveCount(0)
+  expect((await stop.boundingBox())!.x).toBeCloseTo(bounds.x, 1)
   await stop.click()
 })
 
@@ -373,7 +370,8 @@ for (const mode of ["normal", "steer"] as const) {
         await getComposer(page).press("Enter")
         await expect(getComposer(page)).toHaveValue("")
       }
-      const rows = page.locator("[data-pending-input]")
+      // 先开的对话标签页还挂着，只看当前显示的这一个。
+      const rows = page.locator("[data-pending-input]:visible")
       await expect(rows).toHaveCount(1)
       conversations.push({
         path: new URL(page.url()).pathname,
@@ -389,7 +387,7 @@ for (const mode of ["normal", "steer"] as const) {
         pending.locator(`[data-pending-input="${target.itemID}"]`)
       ).toBeVisible()
       await expect(pending).toHaveCount(1)
-      await expect(page.locator("[data-pending-input]")).toHaveCount(1)
+      await expect(page.locator("[data-pending-input]:visible")).toHaveCount(1)
       await expect(pending.locator("[data-pending-input]")).toHaveAttribute(
         "data-pending-input",
         target.itemID

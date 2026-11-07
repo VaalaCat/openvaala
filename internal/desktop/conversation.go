@@ -209,7 +209,8 @@ func (d *Desktop) conversationRowView(c *ui.Context, conv defs.Conversation, now
 	d.handleMenuClosed(closed)
 	// 4. 悬停提示完整目录；标题被截断时一并带上完整标题。
 	full, _ := c.MeasureText(0, ui.Span{Text: title})
-	if tip := getConversationTooltip(title, getConversationDirectory(conv), row.Bounds().W > 0 && full > row.Bounds().W-t.Space(6)); tip != "" {
+	_, directory := getWorkLocation(conv)
+	if tip := getConversationTooltip(title, directory, row.Bounds().W > 0 && full > row.Bounds().W-t.Space(6)); tip != "" {
 		kit.Tooltip(c, row, tip)
 	}
 	if row.Clicked() {
@@ -282,6 +283,18 @@ func (d *Desktop) startNewConversation() {
 		d.confirmOpen = true
 		return
 	}
+	d.openNewConversation()
+}
+
+// openNewConversation 打开空白新对话：正在看对话时，新对话的 Executor 和目录照抄它；同时刷新最近对话。
+func (d *Desktop) openNewConversation() {
+	// 1. 正在看对话时照抄它的默认 Executor 和目录。
+	if d.conversation.ID != "" {
+		d.setNewLocation(getWorkLocation(d.conversation))
+	}
+	// 2. 刷新最近对话；已经照抄的预填不会被覆盖。
+	d.loadRecentConversations()
+	// 3. 离开设置页，打开空白新对话。
 	d.navigate("")
 	d.openConversation("", "")
 }
@@ -948,11 +961,7 @@ func (d *Desktop) getWorkLocationExecutor() (executorID, directory string) {
 	// 1. 新对话用表单的值。
 	executorID, directory = d.newExecutor, d.newDirectory
 	if d.conversation.ID != "" {
-		executorID = d.conversation.ExecutorSettings.DefaultExecutorID
-		if executorID == "" {
-			executorID = "local"
-		}
-		directory = d.conversation.ExecutorSettings.WorkspaceDirectories[executorID]
+		executorID, directory = getWorkLocation(d.conversation)
 	}
 	if directory == "" {
 		directory = getDefaultDirectory(d.executors, executorID)
@@ -1136,7 +1145,7 @@ func (d *Desktop) setConversationArchived(conv defs.Conversation, archived bool)
 	})
 }
 
-// forkConversation 建立新对话：beforeTurnID 为空时复制完整已结束历史，否则复制到该 Turn 之前（不含）。
+// forkConversation 建立新对话：beforeTurnID 为空时复制到最后一条已保存的内容，否则复制到该 Turn 之前（不含）。
 func (d *Desktop) forkConversation(conv defs.Conversation, beforeTurnID defs.TurnID) {
 	client := d.client
 	d.tasks.Go(func() {
@@ -1232,20 +1241,11 @@ func getConversationGroup(updatedAt int64, now time.Time) string {
 	}
 }
 
-// getConversationDirectory 返回对话默认 Executor 的工作目录；没有记录目录时返回空串。
-func getConversationDirectory(conv defs.Conversation) string {
-	executor := conv.ExecutorSettings.DefaultExecutorID
-	if executor == "" {
-		executor = "local"
-	}
-	return conv.ExecutorSettings.WorkspaceDirectories[executor]
-}
-
 // getConversationSubtitle 返回侧栏第二行：默认 Executor 的工作目录名与相对时间。
 func getConversationSubtitle(conv defs.Conversation, now time.Time, translate func(string) string) string {
 	// 1. 没有记录目录时只显示相对时间。
 	relative := formatRelativeTime(conv.UpdatedAt, now, translate)
-	directory := getConversationDirectory(conv)
+	_, directory := getWorkLocation(conv)
 	if directory == "" {
 		return relative
 	}

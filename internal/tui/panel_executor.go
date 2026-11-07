@@ -86,7 +86,8 @@ func (p *executorPanel) handleKey(m *tuiModel, msg tea.KeyPressMsg) (panelKeyRes
 		}
 		return panelKeyHandled, nil
 	case key == "enter":
-		if len(filtered) == 0 {
+		// memory 不能当默认 Executor。
+		if len(filtered) == 0 || filtered[p.list.selected].Kind == defs.ExecutorKindMemory {
 			return panelKeyHandled, nil
 		}
 		return panelKeyClosed, m.setExecutorSettings(p.conversationID, p.getSubmittedSettings(m.executors, filtered[p.list.selected].ID))

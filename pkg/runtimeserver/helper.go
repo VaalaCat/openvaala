@@ -15,6 +15,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/storage"
+	"github.com/VaalaCat/openvaala/pkg/terminal"
 	"github.com/coder/websocket"
 )
 
@@ -40,12 +41,11 @@ func getJSONRPCError(err error) *runtimeprotocol.JSONRPCError {
 	if errors.As(err, &protocolErr) {
 		return protocolErr
 	}
-	// 2. Executor 设置无效和分叉截取点错误用 -32602，Session 忙用 -32001，对话或 Session 不存在分别用 -32002、-32003。
+	// 2. Executor 设置无效和分叉截取点错误用 -32602，Session 忙用 -32001，对话、Session 或终端不存在分别用 -32002、-32003、-32004。
 	switch {
 	case errors.Is(err, conversation.ErrInvalidExecutorSettings),
 		errors.Is(err, conversation.ErrForkBoundaryConflict),
-		errors.Is(err, conversation.ErrForkTurnNotFound),
-		errors.Is(err, conversation.ErrForkTurnRunning):
+		errors.Is(err, conversation.ErrForkTurnNotFound):
 		return newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams, err.Error())
 	case errors.Is(err, session.ErrSessionBusy):
 		return newJSONRPCError(runtimeprotocol.ErrorCodeSessionBusy, err.Error())
@@ -53,6 +53,8 @@ func getJSONRPCError(err error) *runtimeprotocol.JSONRPCError {
 		return newJSONRPCError(runtimeprotocol.ErrorCodeConversationNotFound, err.Error())
 	case errors.Is(err, runtime.ErrSessionNotFound):
 		return newJSONRPCError(runtimeprotocol.ErrorCodeSessionNotFound, err.Error())
+	case errors.Is(err, terminal.ErrTerminalNotFound):
+		return newJSONRPCError(runtimeprotocol.ErrorCodeTerminalNotFound, "terminal not found")
 	}
 	// 3. 其余错误用 -32000。
 	return newJSONRPCError(runtimeprotocol.ErrorCodeRuntime, err.Error())
@@ -165,6 +167,22 @@ func toStreamingItems(items []runtime.StreamingItem) []runtimeprotocol.Streaming
 		}
 	}
 	return result
+}
+
+// getTerminalItems 将运行中的终端转换为响应条目，没有终端时是空切片。
+func getTerminalItems(runningTerminals []runtime.RunningTerminal) []runtimeprotocol.TerminalItem {
+	// 1. 按原顺序复制终端编号、Executor、目录、启动时间和所属对话。
+	items := make([]runtimeprotocol.TerminalItem, len(runningTerminals))
+	for index, running := range runningTerminals {
+		items[index] = runtimeprotocol.TerminalItem{
+			TerminalID:     running.Info.ID,
+			ExecutorID:     running.Info.EnvironmentID,
+			Directory:      running.Info.Directory,
+			StartedAt:      running.Info.StartedAt,
+			ConversationID: running.ConversationID,
+		}
+	}
+	return items
 }
 
 // getErrorText 读取错误文本。

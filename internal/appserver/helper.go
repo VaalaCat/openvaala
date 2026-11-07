@@ -73,7 +73,7 @@ func getCodexError(err error, threadID string) *codexError {
 
 // getThreadForkError 将分叉截取点错误转换为 Codex 错误。
 func getThreadForkError(err error, params codexThreadForkParams) *codexError {
-	// 1. 将两个截取点冲突、轮次不存在和轮次未结束转换为 -32600，填写请求里的轮次 ID。
+	// 1. 将两个截取点冲突和轮次不存在转换为 -32600，填写请求里的轮次 ID。
 	switch {
 	case errors.Is(err, conversation.ErrForkBoundaryConflict):
 		return &codexError{
@@ -90,14 +90,49 @@ func getThreadForkError(err error, params codexThreadForkParams) *codexError {
 			errorCodeInvalidRequest,
 			"lastTurnId '" + params.LastTurnID + "' was not found in the source thread",
 		}
-	case errors.Is(err, conversation.ErrForkTurnRunning):
-		return &codexError{
-			errorCodeInvalidRequest,
-			"lastTurnId '" + params.LastTurnID + "' identifies an in-progress turn",
-		}
 	}
 	// 2. 其他错误按普通请求错误转换。
 	return getCodexError(err, params.ThreadID)
+}
+
+// newClientInstructionItem 创建一条带文字的客户端指令 Item，ID 新生成，TurnID 由 Session 开始下一轮时分配。
+func newClientInstructionItem(text string) *defs.Item {
+	// 1. 生成 Item ID，填写种类和正文。
+	return &defs.Item{
+		ID:                defs.NewItemID(),
+		Kind:              defs.ItemClientInstruction,
+		ClientInstruction: &defs.ClientInstruction{Text: text},
+	}
+}
+
+// getClientInstructionItems 把 thread/inject_items 的条目转成客户端指令 Item：每条 user 或 developer 的 message 按顺序拼接
+// input_text 的文字成一条指令；任一条是其他种类、解析失败或没有文字时整批返回 -32602。
+func getClientInstructionItems(rawItems []json.RawMessage) ([]*defs.Item, error) {
+	// 1. 逐条解析条目，只认 user 和 developer 的 message。
+	unsupported := &codexError{
+		errorCodeInvalidParams,
+		"thread/inject_items only supports user and developer message items",
+	}
+	items := make([]*defs.Item, 0, len(rawItems))
+	for _, rawItem := range rawItems {
+		var injected codexInjectedItem
+		if err := json.Unmarshal(rawItem, &injected); err != nil ||
+			injected.Type != "message" || (injected.Role != "user" && injected.Role != "developer") {
+			return nil, unsupported
+		}
+		// 2. 按顺序直接拼接 input_text 的文字，没有文字的消息（例如只有图片）整批拒绝，否则生成一条客户端指令。
+		var text strings.Builder
+		for _, content := range injected.Content {
+			if content.Type == "input_text" {
+				text.WriteString(content.Text)
+			}
+		}
+		if text.Len() == 0 {
+			return nil, unsupported
+		}
+		items = append(items, newClientInstructionItem(text.String()))
+	}
+	return items, nil
 }
 
 // newCodexResponse 创建请求响应，包含结果或转换后的错误。

@@ -26,9 +26,11 @@ run:
 #     Authorization: Bearer <token>
 # listen 是 serve 的监听地址；token 为空时先复用连接文件中的令牌，两者均为空时由 serve 自动生成。
 # workspace_directory 是新对话没指定目录时 local Executor 用的目录，为空时用 serve 的启动目录，支持 ~/ 开头，必须是绝对路径。
+# conversation_idle_timeout 是已保存的对话没人查看时多久后停止，0s 表示不停止，改了要重启 serve。
 # server:
 #   listen: 127.0.0.1:8790
 #   workspace_directory: ~/code
+#   conversation_idle_timeout: 30m
 # TUI、acp、app-server 和 codex 默认连接本机 serve；设置 url 或 OPENVAALA_CLIENT_URL 后连接指定的 serve。
 # token 是连接远端 serve 的令牌，url 自带 ?token= 时以 url 为准。
 # path_mappings 把客户端路径换成对应的 serve 路径，按完整目录名匹配，多条命中时取最长的一条。

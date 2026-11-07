@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"maps"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
@@ -215,7 +217,7 @@ func TestConfigFiles(t *testing.T) {
 		mcpServers []*mcpclient.ServerDefinition
 		hooks      []*hook.HookDefinition
 		skills     []*skill.Skill
-		executors  []*defs.ExecutorDefinition
+		executors  []executor.Executor
 		// providers、defaultModel 是 ListProviders 的结果。
 		providers    []defs.ProviderConfig
 		defaultModel defs.ModelRef
@@ -226,14 +228,15 @@ func TestConfigFiles(t *testing.T) {
 		if definitions == nil {
 			return configFilesResult{err: err}
 		}
+		executors, executorsErr := definitions.Executors.GetExecutors(ctx, "")
 		return configFilesResult{
 			agents:     definitions.Agents,
 			models:     definitions.Models,
 			mcpServers: definitions.MCPServers,
 			hooks:      definitions.Hooks,
 			skills:     definitions.Skills,
-			executors:  definitions.Executors,
-			err:        err,
+			executors:  executors,
+			err:        errors.Join(err, executorsErr),
 		}
 	}
 	// 每个用例在 <root>/home 下布置 files（相对配置所在目录）；useDefaultConfigPath 为 true 时不指定配置路径，
@@ -952,10 +955,10 @@ func TestConfigFiles(t *testing.T) {
 			},
 			check: func(t *testing.T, _ string, _ *config.ConfigFiles, result configFilesResult) {
 				var ids []string
-				for _, executor := range result.executors {
-					ids = append(ids, executor.ID)
+				for _, listed := range result.executors {
+					ids = append(ids, listed.GetDefinition().ID)
 				}
-				if want := []string{defs.LocalExecutorID, config.BuiltinExecutorID, "extra"}; !slices.Equal(ids, want) {
+				if want := []string{defs.LocalExecutorID, config.BuiltinExecutorID, defs.MemoryExecutorID, "extra"}; !slices.Equal(ids, want) {
 					t.Fatalf("returned executor ids = %v, want %v", ids, want)
 				}
 			},

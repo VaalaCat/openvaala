@@ -1915,9 +1915,9 @@ func TestContextTurnInterrupted(t *testing.T) {
 	}
 }
 
-// TestInstructionItemsUseOrdinaryHistory 检查 skill、目录规则和覆盖它们的摘要都按普通历史发给模型。
+// TestInstructionItemsUseOrdinaryHistory 检查 skill、目录规则、记忆目录和覆盖它们的摘要都按普通历史发给模型。
 func TestInstructionItemsUseOrdinaryHistory(t *testing.T) {
-	// 1. 分别加载 skill 和目录规则，检查用户消息、规则识别、副本和摘要替换。
+	// 1. 分别加载 skill、目录规则和记忆目录，检查用户消息、规则识别、副本和摘要替换。
 	for _, tt := range []struct {
 		name string
 		item *defs.Item
@@ -1958,6 +1958,17 @@ func TestInstructionItemsUseOrdinaryHistory(t *testing.T) {
 				},
 			},
 		},
+		{
+			"memory_index",
+			&defs.Item{
+				Kind: defs.ItemMemoryIndex,
+				MemoryIndex: &defs.MemoryIndex{
+					Path:        "user/MEMORY.md",
+					Text:        "- 回复用中文",
+					IsTruncated: true,
+				},
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			model := newTestModel(&llmkit.Target{}, 0)
@@ -1982,9 +1993,16 @@ func TestInstructionItemsUseOrdinaryHistory(t *testing.T) {
 			if c.IsAgentsInstructionLoaded("local", "/repo/AGENTS.md") != wantLoaded || c.IsAgentsInstructionLoaded("remote", "/repo/AGENTS.md") {
 				t.Fatal("incorrect rule identity")
 			}
-			if tt.item.AgentsInstruction != nil {
+			wantMemoryLoaded := tt.item.Kind == defs.ItemMemoryIndex
+			if c.IsMemoryIndexLoaded("user/MEMORY.md", "") != wantMemoryLoaded || c.IsMemoryIndexLoaded("project/MEMORY.md", "") {
+				t.Fatal("incorrect memory index identity")
+			}
+			switch {
+			case tt.item.AgentsInstruction != nil:
 				tt.item.AgentsInstruction.Text = "mutated"
-			} else {
+			case tt.item.MemoryIndex != nil:
+				tt.item.MemoryIndex.Text = "mutated"
+			default:
 				tt.item.SkillInstruction.Text = "mutated"
 			}
 			req, _, err = c.BuildModelRequest(nil)
@@ -2003,12 +2021,51 @@ func TestInstructionItemsUseOrdinaryHistory(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if c.IsAgentsInstructionLoaded("local", "/repo/AGENTS.md") {
+			if c.IsAgentsInstructionLoaded("local", "/repo/AGENTS.md") || c.IsMemoryIndexLoaded("user/MEMORY.md", "") {
 				t.Fatal("summary text counted as a loaded rule")
 			}
 			req, _, err = c.BuildModelRequest(nil)
 			if err != nil || len(req.Messages) != 1 || !strings.Contains(req.Messages[0].Content[0].Text, "rules at /repo/AGENTS.md") {
 				t.Fatalf("summary = %+v, %v", req, err)
+			}
+		})
+	}
+}
+
+// TestIsMemoryIndexLoaded 检查记忆目录按路径和项目一起判断：同一路径的另一个项目不算已加载。
+func TestIsMemoryIndexLoaded(t *testing.T) {
+	// 1. 历史里有用户级记忆和项目 A 的项目记忆。
+	const projectA, projectB = "projects/local/-repo-a", "projects/local/-repo-b"
+	items := []*defs.Item{
+		{ID: "user", TurnID: contextTurnID, Kind: defs.ItemMemoryIndex, MemoryIndex: &defs.MemoryIndex{Path: "user/MEMORY.md", Text: "- 回复用中文"}},
+		{ID: "project", TurnID: contextTurnID, Kind: defs.ItemMemoryIndex, MemoryIndex: &defs.MemoryIndex{Path: "project/MEMORY.md", Project: projectA, Text: "- 测试用 table-driven"}},
+	}
+	tests := []struct {
+		name    string
+		path    string
+		project string
+		want    bool
+	}{
+		{name: "user_memory", path: "user/MEMORY.md", want: true},
+		{name: "project_a_memory", path: "project/MEMORY.md", project: projectA, want: true},
+		{name: "project_b_memory", path: "project/MEMORY.md", project: projectB, want: false},
+		{name: "project_memory_without_project", path: "project/MEMORY.md", want: false},
+		{name: "user_memory_with_project", path: "user/MEMORY.md", project: projectA, want: false},
+		{name: "unknown_path", path: "other/MEMORY.md", want: false},
+	}
+	// 2. 加载历史后逐项判断。
+	model := newTestModel(&llmkit.Target{}, 0)
+	c, err := agent_context.NewAgentContext(agent_context.NewAgentContextOpt(contextSessionID, contextTurnID, &compactClient{}, model, model))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Load(&agent_context.ContextLoadParam{Items: items}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := c.IsMemoryIndexLoaded(tt.path, tt.project); got != tt.want {
+				t.Fatalf("IsMemoryIndexLoaded(%q, %q) = %v, want %v", tt.path, tt.project, got, tt.want)
 			}
 		})
 	}

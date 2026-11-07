@@ -30,6 +30,8 @@ type ExecutionEnvironment interface {
 	GetMCPTools(ctx context.Context, serverIDs defs.OptionalStringList) ([]Tool, error)
 	// GetMCPServers 返回各 MCP 连接此刻的情况；还没连上的连接也立刻返回。
 	GetMCPServers() []mcpclient.ConnectionInfo
+	// IsCommandSupported 这个环境能不能跑命令？不能时 Session 不给它建命令工具，工具调用也不跑 hook。
+	IsCommandSupported() bool
 	// Run 运行各 MCP 连接直到 ctx 结束，全部断开后返回 ctx.Err()；某个连接运行出错时返回它的错误，没有 MCP 连接时直接返回 nil。只能调用一次。
 	Run(ctx context.Context) error
 }
@@ -50,16 +52,19 @@ type ExecutionEnvironmentOpt struct {
 	// MCPServers 由 Conversation 填入本对话 Agent 会用到的 server；只取 ExecutorIDs 里含本环境 ID 的，
 	// NewExecutionEnvironment 按本环境的工作区为它们创建连接，Run 之后才开始连。
 	MCPServers []*mcpclient.ServerDefinition
+	// IsCommandSupported 这个环境能不能跑命令？默认能；memory 这类只能读写文件的环境不能。
+	IsCommandSupported bool
 }
 
 // NewExecutionEnvironmentOpt 保存执行环境标识、说明、工作区和工具。
 func NewExecutionEnvironmentOpt(id, description string, environmentWorkspace workspace.Workspace, tools ...Tool) *ExecutionEnvironmentOpt {
-	// 1. 保存环境信息并复制工具列表。
+	// 1. 保存环境信息并复制工具列表；默认能跑命令。
 	return &ExecutionEnvironmentOpt{
-		ID:          id,
-		Description: description,
-		Workspace:   environmentWorkspace,
-		Tools:       slices.Clone(tools),
+		ID:                 id,
+		Description:        description,
+		Workspace:          environmentWorkspace,
+		Tools:              slices.Clone(tools),
+		IsCommandSupported: true,
 	}
 }
 
@@ -67,6 +72,13 @@ func NewExecutionEnvironmentOpt(id, description string, environmentWorkspace wor
 func (o *ExecutionEnvironmentOpt) WithMCPServers(servers []*mcpclient.ServerDefinition) *ExecutionEnvironmentOpt {
 	// 1. 复制并保存 server 列表。
 	o.MCPServers = slices.Clone(servers)
+	return o
+}
+
+// WithoutCommands 标记这个环境不能跑命令并返回本配置；memory 环境使用。
+func (o *ExecutionEnvironmentOpt) WithoutCommands() *ExecutionEnvironmentOpt {
+	// 1. 关闭命令支持。
+	o.IsCommandSupported = false
 	return o
 }
 
@@ -88,8 +100,10 @@ func NewExecutionEnvironment(opt *ExecutionEnvironmentOpt) (ExecutionEnvironment
 		}
 		connections = append(connections, connection)
 	}
+	savedOpt := NewExecutionEnvironmentOpt(opt.ID, opt.Description, opt.Workspace, opt.Tools...).WithMCPServers(opt.MCPServers)
+	savedOpt.IsCommandSupported = opt.IsCommandSupported
 	return &executionEnvironmentImpl{
-		opt:            NewExecutionEnvironmentOpt(opt.ID, opt.Description, opt.Workspace, opt.Tools...).WithMCPServers(opt.MCPServers),
+		opt:            savedOpt,
 		mcpConnections: connections,
 	}, nil
 }
@@ -161,6 +175,12 @@ func (e *executionEnvironmentImpl) GetMCPTools(ctx context.Context, serverIDs de
 func (e *executionEnvironmentImpl) GetMCPServers() []mcpclient.ConnectionInfo {
 	// 1. 读取各连接的状态。
 	return getConnectionInfos(e.mcpConnections)
+}
+
+// IsCommandSupported 返回环境能不能跑命令。
+func (e *executionEnvironmentImpl) IsCommandSupported() bool {
+	// 1. 读取配置中的命令支持。
+	return e.opt.IsCommandSupported
 }
 
 // getMCPTools 并发读取各连接提供的 MCP 工具。

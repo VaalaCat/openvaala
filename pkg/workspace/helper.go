@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/creack/pty"
@@ -133,6 +134,24 @@ func newPollableTerminal(terminal *os.File) (*os.File, error) {
 		return nil, err
 	}
 	return os.NewFile(uintptr(fd), terminal.Name()), nil
+}
+
+// setTerminalSize 在 PTY master 上设置行列数；经 SyscallConn 与 Close 同步，master 已关闭时返回错误，不改变文件的阻塞模式。
+func setTerminalSize(terminal *os.File, size *pty.Winsize) error {
+	// 1. 在 Control 持有 fd 期间调用 TIOCSWINSZ。
+	connection, err := terminal.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var ioctlErr error
+	if err := connection.Control(func(fd uintptr) {
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(size))); errno != 0 {
+			ioctlErr = errno
+		}
+	}); err != nil {
+		return err
+	}
+	return ioctlErr
 }
 
 // parseSSHAddress 从 [user@]host[:port] 解析出 SSH 用户名和 host:port。
@@ -260,4 +279,17 @@ func GetFileText(ctx context.Context, source Workspace, path string) (string, er
 		}
 		offset += int64(len(part.Content))
 	}
+}
+
+// splitMemoryPath 把清理后的记忆工作区路径拆成第一段名字和后面的相对路径；根目录的名字为空。
+func splitMemoryPath(cleaned string) (name, relative string) {
+	// 1. 去掉开头的 /，按第一个 / 拆开。
+	name, relative, _ = strings.Cut(strings.TrimPrefix(cleaned, "/"), "/")
+	return name, relative
+}
+
+// isMemoryTopDirectory 清理后的路径是不是记忆工作区的根目录、user 目录或 project 目录？
+func isMemoryTopDirectory(cleaned string) bool {
+	// 1. 这三个目录由记忆工作区自己提供，不对应可以删除或覆盖的真实文件。
+	return cleaned == "/" || cleaned == "/user" || cleaned == "/project"
 }

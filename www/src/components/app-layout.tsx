@@ -1,14 +1,17 @@
 import { OverflowTooltip } from "@/components/base/overflow-tooltip"
-import { Fragment, Suspense, useEffect, useState } from "react"
+import {
+  Fragment,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react"
 import { Link, Outlet, useLocation, useMatch } from "react-router"
 import { useTranslation } from "react-i18next"
+import { useQuery } from "@tanstack/react-query"
 import { useStore } from "@nanostores/react"
-import {
-  AnimatePresence,
-  LayoutGroup,
-  motion,
-  useReducedMotion,
-} from "motion/react"
+import { AnimatePresence, LayoutGroup, motion } from "motion/react"
 import { PlusIcon, SettingsIcon } from "lucide-react"
 import {
   Breadcrumb,
@@ -46,13 +49,19 @@ import {
 import { ConversationList } from "@/components/conversation-list/conversation-list"
 import { useServerConnection } from "@/components/server-connection-provider"
 import { ServerConnectionControl } from "@/components/server-connection-control"
+import type { ConversationID } from "@/lib/api/protocol.gen"
 import { $isSidebarOpen } from "@/lib/appearance/preferences"
 import {
   getConversationListSearch,
   getServerPath,
   getSettingsPath,
 } from "@/lib/paths"
+import { conversationOptions } from "@/lib/query/conversation"
 import { cn } from "@/lib/utils"
+import {
+  getWorkLocationSettings,
+  type NewConversationLocationState,
+} from "@/lib/work-location"
 
 // 左栏加页面区；页面通过 outlet context 登记标题和面包屑父级，顶栏和文档标题跟着显示；
 // 自己排版的整页（对话页）用 PageActions 把控件放进顶栏右侧
@@ -61,7 +70,7 @@ export function AppLayout() {
   const location = useLocation()
   const conversationRoute = useMatch("/s/:serverID/c/:conversationID/*")
   const isSidebarOpen = useStore($isSidebarOpen)
-  const reduceMotion = useReducedMotion()
+  const viewportRef = useRef<HTMLDivElement>(null)
   const [navigation, setNavigation] = useState<PageNavigation | null>(null)
   const [pageActionsTarget, setPageActionsTarget] =
     useState<HTMLDivElement | null>(null)
@@ -72,15 +81,36 @@ export function AppLayout() {
   useEffect(() => {
     document.title = title + " OpenVaala"
   }, [title])
+  useLayoutEffect(() => {
+    // 1. 页面框跟随软键盘和浏览器栏留下的可见区域，手动缩放时保留布局。
+    const viewport = window.visualViewport
+    if (!viewport) return
+    const container = viewportRef.current!
+    const updateViewport = () => {
+      if (viewport.scale !== 1) return
+      container.style.height = `${viewport.height}px`
+      container.style.top = `${viewport.offsetTop}px`
+    }
+    updateViewport()
+    viewport.addEventListener("resize", updateViewport)
+    viewport.addEventListener("scroll", updateViewport)
+    // 2. 离开应用布局时停止跟随可见区域。
+    return () => {
+      viewport.removeEventListener("resize", updateViewport)
+      viewport.removeEventListener("scroll", updateViewport)
+    }
+  }, [])
   return (
     <LayoutGroup id="app-navigation">
       <SidebarProvider
+        ref={viewportRef}
+        className="fixed inset-x-0 top-0 h-dvh min-h-0"
         open={isSidebarOpen}
         onOpenChange={(open) => $isSidebarOpen.set(open)}
       >
-        <AppSidebar />
-        {/* 页面区固定为视口高度，页面在下面的区域里滚动；对话页这样的整页布局能占满剩余高度 */}
-        <SidebarInset className="h-svh min-w-0">
+        <AppSidebar conversationID={conversationRoute?.params.conversationID} />
+        {/* 页面区填满可见区域，只有下面的内容区滚动。 */}
+        <SidebarInset className="h-full min-h-0 min-w-0">
           <header className="relative z-10 flex h-10 shrink-0 items-center gap-2 border-b bg-background px-4">
             <Tooltip>
               <TooltipTrigger
@@ -97,9 +127,9 @@ export function AppLayout() {
             </Tooltip>
             <MobileServerConnectionControl />
             <motion.div
-              layout={reduceMotion ? false : "position"}
+              layout="position"
               transition={{
-                duration: reduceMotion ? 0 : 0.2,
+                duration: 0.2,
                 ease: "easeInOut",
               }}
               className="min-w-0 flex-1"
@@ -172,9 +202,9 @@ export function AppLayout() {
               </Breadcrumb>
             </motion.div>
             <motion.div
-              layout={reduceMotion ? false : "position"}
+              layout="position"
               transition={{
-                duration: reduceMotion ? 0 : 0.2,
+                duration: 0.2,
                 ease: "easeInOut",
               }}
               ref={setPageActionsTarget}
@@ -214,12 +244,23 @@ function MobileServerConnectionControl() {
   )
 }
 
-// 左栏显示 serve 连接状态、新对话入口、未归档对话和设置入口。
-function AppSidebar() {
+// 左栏显示 serve 连接状态、新对话入口、未归档对话和设置入口；
+// 正在看对话时，新对话入口带上这个对话的工作位置作为新对话页的预填。
+function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
   const { t } = useTranslation()
   const { setOpenMobile, isMobile, openMobile } = useSidebar()
   const connection = useServerConnection()
   const { pathname, search } = useLocation()
+  const viewedConversation = useQuery({
+    ...conversationOptions(connection, conversationID ?? ""),
+    enabled: !!conversationID,
+  })
+  const newConversationState: NewConversationLocationState | undefined =
+    viewedConversation.data
+      ? {
+          preset: getWorkLocationSettings(viewedConversation.data.conversation),
+        }
+      : undefined
   const serveName = window.location.host
   // 收起的桌面左栏靠 tooltip 显示名字；手机抽屉里不包 tooltip，
   // 否则抽屉打开时获得焦点的按钮带着隐藏的 tooltip，第一次 Esc 只关掉它
@@ -263,6 +304,7 @@ function AppSidebar() {
                       pathname: getServerPath(connection.getServerID()),
                       search: getConversationListSearch(search),
                     }}
+                    state={newConversationState}
                   />
                 }
                 tooltip={getTooltip(t("conversationList.newConversation"))}

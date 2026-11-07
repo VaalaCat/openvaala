@@ -4,8 +4,10 @@ package desktop
 import (
 	"context"
 	"errors"
+	"net/http"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/cli"
@@ -14,7 +16,9 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/hook"
+	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
@@ -91,6 +95,8 @@ type Desktop struct {
 	executorsLoading              bool
 	newExecutor                   string
 	newDirectory                  string
+	recentConversations           []defs.Conversation
+	recentConversationsRequest    uint64
 	directoryError                error
 	directoryRequest              uint64
 	directoryListing              directoryListing
@@ -176,18 +182,28 @@ type Desktop struct {
 	locationError                 error
 	locationSaving                bool
 	images                        map[string]*imageResource
+	imageHTTPClient               *http.Client // 下载 Markdown 里的网络图片：带 http.headers，允许跨域重定向，超时 20 秒
 	imagePreview                  string
 	imagePreviewOpen              bool
 	imagePreviewState             kit.ImagePreviewState
 	terminals                     []*terminalTab
 	selectedTerminal              string
 	terminalSequence              int
+	// runningTerminals 是 serve 上全部运行中的终端；terminalsKnown 为 false 时列表尚未取得，不代表没有终端。
+	runningTerminals []runtimeprotocol.TerminalItem
+	terminalsKnown   bool
+	// openingTerminalRequests 是还没返回的 terminal/open 请求数，大于 0 时运行列表不加标签；
+	// closingTerminalIDs 是 terminal/close 请求还没返回的终端，运行列表不把它们加回成标签。
+	openingTerminalRequests int
+	closingTerminalIDs      []string
 }
 
-// DesktopOpt 指定本机服务启动参数与可选的偏好文件路径。
+// DesktopOpt 指定本机服务启动参数、可选的偏好文件路径和图片下载带的 header。
 type DesktopOpt struct {
 	RuntimeServerStart cli.RuntimeServerStartOpt
 	PreferencesPath    string
+	// HTTPHeaders 是配置里的 http.headers（已合并内置默认）；原生界面自己下载 Markdown 里的网络图片时带上。
+	HTTPHeaders map[string]string
 }
 
 // NewDesktop 校验并保存桌面启动参数。
@@ -196,7 +212,10 @@ func NewDesktop(opt *DesktopOpt) (*Desktop, error) {
 	if opt == nil || opt.RuntimeServerStart.Executable == "" {
 		return nil, errors.New("desktop requires a runtime executable")
 	}
-	return &Desktop{opt: *opt}, nil
+	// 2. 建立图片下载客户端，整个桌面进程共用。
+	imageHTTPClient := httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt().WithHeaders(opt.HTTPHeaders).WithCrossOriginRedirect())
+	imageHTTPClient.Timeout = 20 * time.Second
+	return &Desktop{opt: *opt, imageHTTPClient: imageHTTPClient}, nil
 }
 
 // Run 在主 goroutine 运行窗口，退出后取消并等待桌面任务。

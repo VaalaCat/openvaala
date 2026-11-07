@@ -23,9 +23,12 @@ func TestCommandList(t *testing.T) {
 		{"fixed", func(d *Desktop) {}, []string{commandNewConversation, commandSearch, commandSettings, commandToggleSidebar, commandToggleRightDock, commandToggleBottomDock, "panel.agent", "panel.context", "panel.turns", "panel.rpc", "panel.debug"}, []string{commandCompactContext, commandStop}},
 		{"idle conversation", func(d *Desktop) { openIdleConversation(d, "") }, []string{commandCompactContext}, []string{commandStop}},
 		{"running turn", func(d *Desktop) { openIdleConversation(d, "turn") }, []string{commandStop}, []string{commandCompactContext}},
+		{"running terminal", func(d *Desktop) { addTerminalTab(d, "terminal-1", "a", terminalRunning) }, []string{commandResetTerminal}, nil},
+		{"exited terminal", func(d *Desktop) { addTerminalTab(d, "terminal-1", "a", terminalExited) }, nil, []string{commandResetTerminal}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			d := testDesktop()
+			t.Cleanup(d.closeTerminalStates)
 			tt.prepare(d)
 			ids := map[string]bool{}
 			for _, command := range d.getCommands(nil) {

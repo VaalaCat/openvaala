@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,12 +20,15 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
+	"gopkg.in/yaml.v3"
 )
 
 // buildDesktopOnce 编译带原生自动化入口和完整 CLI 的桌面程序，本包测试共用该产物。
@@ -45,7 +50,7 @@ var buildDesktopOnce = sync.OnceValues(func() (string, error) {
 	}
 	// 2. 使用已有测试构建目录和 race 设置，自动化只进入本次测试程序。
 	binary := filepath.Join(e2eBuildDirectory, "openvaala-desktop")
-	arguments := []string{"build", "-tags", "desktop_e2e", "-ldflags", "-X main.version=desktop-e2e", "-o", binary}
+	arguments := []string{"build", "-tags", "desktop_e2e", "-ldflags", "-X github.com/VaalaCat/openvaala/pkg/defs.buildVersion=desktop-e2e", "-o", binary}
 	if isRaceEnabled() {
 		arguments = append(arguments, "-race")
 	}
@@ -1519,6 +1524,197 @@ func TestDesktopGUITerminal(t *testing.T) {
 	a.waitFocusedKey(t, window, "terminal-2")
 }
 
+// severableProxy 是桌面和 serve 之间的 TCP 转发：Sever 切断全部已建立的连接并拒绝新连接，Restore 之后新连接重新转发。
+type severableProxy struct {
+	listener net.Listener
+	upstream string
+	// isSevered 是否正在切断？
+	isSevered atomic.Bool
+	// connections 是转发中的两端连接。
+	connections syncmap.SyncMap[net.Conn, struct{}]
+}
+
+// newSeverableProxy 在本机随机端口监听，把每条连接转发到 upstream（host:port）。
+func newSeverableProxy(t *testing.T, upstream string) *severableProxy {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := &severableProxy{listener: listener, upstream: upstream}
+	go proxy.serve()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		proxy.Sever()
+	})
+	return proxy
+}
+
+// serve 接受连接并各自转发，直到监听关闭。
+func (p *severableProxy) serve() {
+	for {
+		client, err := p.listener.Accept()
+		if err != nil {
+			return
+		}
+		go p.forward(client)
+	}
+}
+
+// forward 把一条客户端连接接到 serve 上，两个方向各复制一次，任一方向结束就关闭两端。
+func (p *severableProxy) forward(client net.Conn) {
+	if p.isSevered.Load() {
+		_ = client.Close()
+		return
+	}
+	upstream, err := net.Dial("tcp", p.upstream)
+	if err != nil {
+		_ = client.Close()
+		return
+	}
+	p.connections.Store(client, struct{}{})
+	p.connections.Store(upstream, struct{}{})
+	// 切断可能发生在登记之前，登记后再确认一次。
+	if p.isSevered.Load() {
+		p.Sever()
+	}
+	closeBoth := sync.OnceFunc(func() {
+		_ = client.Close()
+		_ = upstream.Close()
+		p.connections.Delete(client)
+		p.connections.Delete(upstream)
+	})
+	go func() {
+		_, _ = io.Copy(upstream, client)
+		closeBoth()
+	}()
+	_, _ = io.Copy(client, upstream)
+	closeBoth()
+}
+
+// Sever 关闭全部转发中的连接，之后新连接一到就被关闭。
+func (p *severableProxy) Sever() {
+	p.isSevered.Store(true)
+	p.connections.Range(func(connection net.Conn, _ struct{}) bool {
+		_ = connection.Close()
+		return true
+	})
+}
+
+// Restore 恢复转发。
+func (p *severableProxy) Restore() {
+	p.isSevered.Store(false)
+}
+
+// startServeBehindProxy 单独启动 serve，把本机连接文件里的地址换成可切断的代理，桌面经文件发现服务时连的是代理；测试结束前换回原文件，serve stop 照常工作。
+func startServeBehindProxy(t *testing.T, binary, config string) *severableProxy {
+	t.Helper()
+	// 1. 启动 serve，等连接文件出现。
+	stopServeOnCleanup(t, binary, config)
+	startE2EProcess(t, binary, config, []string{"serve"}, false)
+	infoPath := filepath.Join(filepath.Dir(config), ".local", "state", "openvaala", "runtime-server.yaml")
+	var original []byte
+	for deadline := time.Now().Add(e2eTimeout); ; time.Sleep(100 * time.Millisecond) {
+		var err error
+		if original, err = os.ReadFile(infoPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("serve did not start")
+		}
+	}
+	var connection struct {
+		URL string `yaml:"url"`
+	}
+	if err := yaml.Unmarshal(original, &connection); err != nil {
+		t.Fatal(err)
+	}
+	serveURL, err := url.Parse(connection.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2. 代理转发到 serve，文件里的地址换成代理的；清理按后进先出，先换回原文件。
+	proxy := newSeverableProxy(t, serveURL.Host)
+	serveURL.Host = proxy.listener.Addr().String()
+	if err := os.WriteFile(infoPath, []byte(strings.Replace(string(original), connection.URL, serveURL.String(), 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.WriteFile(infoPath, original, 0o600) })
+	return proxy
+}
+
+// TestDesktopGUITerminalReconnect 检查桌面和 serve 的连接断开再恢复后，终端仍是原来的 shell：断线期间的输出补齐、没有多开终端，重置终端后屏幕清空并重画提示符。
+func TestDesktopGUITerminalReconnect(t *testing.T) {
+	// 1. 桌面经可切断的代理连 serve；固定 bash，它收到窗口尺寸变化会重画提示符。
+	binary := requireDesktopDisplay(t)
+	t.Setenv("SHELL", "/bin/bash")
+	model := newE2EModel(t)
+	config := writeDesktopE2EConfig(t, model.server.URL)
+	proxy := startServeBehindProxy(t, binary, config)
+	_, a, window := startDesktopGUI(t, binary, config)
+	a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Role == "popUpButton" && fmt.Sprint(n.Key) == "model" && !slices.Contains(n.States, "disabled")
+	})
+	a.press(t, window, "终端")
+	terminal := a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Role == "group" && strings.HasPrefix(fmt.Sprint(n.Key), "terminal-") && n.Label == "终端"
+	})
+	a.call(t, "act", map[string]any{"window": window, "id": terminal.ID, "action": "focus"}, nil)
+	a.call(t, "idle", map[string]any{"window": window, "timeout": 5000}, nil)
+	screenHas := func(texts ...string) func(desktopAutomationNode) bool {
+		return func(n desktopAutomationNode) bool {
+			return n.Key == terminal.Key && !slices.ContainsFunc(texts, func(text string) bool { return !strings.Contains(n.Value, text) })
+		}
+	}
+	// 2. 记下 shell 的进程号，再发一条断线期间才会有输出的命令。
+	a.waitNode(t, window, screenHas("$"))
+	a.typeText(t, window, "echo pid-$$")
+	a.pressKey(t, window, "Enter")
+	pidPattern := regexp.MustCompile(`pid-(\d+)`)
+	shellPID := pidPattern.FindStringSubmatch(a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Key == terminal.Key && pidPattern.MatchString(n.Value)
+	}).Value)[1]
+	a.typeText(t, window, "echo begin-$((6*7)); sleep 4; echo gap-$((6*7))")
+	a.pressKey(t, window, "Enter")
+	// 看到 begin-42 说明回车已经到达 shell，之后切断连接，sleep 结束时桌面一定处在断线中。
+	a.waitNode(t, window, screenHas("begin-42"))
+	// 3. 切断连接：终端显示重连说明；shell 在断线期间输出 gap-42。
+	proxy.Sever()
+	a.waitLabel(t, window, "连接已断开，正在重连")
+	time.Sleep(4 * time.Second)
+	// 4. 恢复连接：重连说明消失，断线期间的输出补齐，输出里是原来的 shell，没有多开终端。
+	proxy.Restore()
+	a.waitNodeAbsent(t, window, func(n desktopAutomationNode) bool { return n.Label == "连接已断开，正在重连" })
+	a.waitNode(t, window, screenHas("gap-42"))
+	// 回放的最后一批输出到达后 100ms 内终端丢弃输入；屏幕上看不到回放何时结束，等过这段安静期再输入。
+	time.Sleep(500 * time.Millisecond)
+	a.typeText(t, window, "echo again-$$")
+	a.pressKey(t, window, "Enter")
+	a.waitNode(t, window, screenHas("again-"+shellPID))
+	terminals := 0
+	for _, node := range a.getNodes(t, window) {
+		if node.Role == "group" && strings.HasPrefix(fmt.Sprint(node.Key), "terminal-") && node.Label == "终端" {
+			terminals++
+		}
+	}
+	if terminals != 1 {
+		t.Fatalf("terminal groups after reconnect = %d, want 1", terminals)
+	}
+	a.capture(t, window, "terminal-reconnected")
+	// 5. 命令面板的「重置终端」：旧内容消失，shell 因两次尺寸变化重画提示符。
+	a.call(t, "menu", map[string]any{"window": window, "path": []string{"转到", "命令面板"}}, nil)
+	a.focusTextField(t, window, "command-search")
+	a.typeText(t, window, "重置终端")
+	// 过滤生效（别的命令消失）后 Enter 才执行第一项。
+	a.waitNodeAbsent(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "command-new-conversation" })
+	a.waitNode(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "command-reset-terminal" })
+	a.pressKey(t, window, "Enter")
+	a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Key == terminal.Key && strings.Contains(n.Value, "$") && !strings.Contains(n.Value, "gap-42") && !strings.Contains(n.Value, "pid-")
+	})
+	a.capture(t, window, "terminal-reset")
+}
+
 // TestDesktopGUIConversationSwitch 检查快速切换后，两条真实外部连接的并发输入只更新当前阅读目标。
 func TestDesktopGUIConversationSwitch(t *testing.T) {
 	if runtime.GOOS == "linux" && os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
@@ -1933,7 +2129,7 @@ func TestDesktopGUIAlignment(t *testing.T) {
 	}
 	a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "button" && n.Label == "恢复默认外观" })
 	var titleXs []float64
-	for _, label := range []string{"外观", "配色", "减少动画", "恢复默认外观"} {
+	for _, label := range []string{"外观", "配色", "完成时发送系统通知", "恢复默认外观"} {
 		row := a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "text" && n.Label == label && n.Bounds.X > 250 })
 		titleXs = append(titleXs, row.Bounds.X)
 	}
@@ -1941,7 +2137,9 @@ func TestDesktopGUIAlignment(t *testing.T) {
 	for _, find := range []func(n desktopAutomationNode) bool{
 		func(n desktopAutomationNode) bool { return n.Role == "radioGroup" && fmt.Sprint(n.Key) == "appearance" },
 		func(n desktopAutomationNode) bool { return n.Role == "popUpButton" && fmt.Sprint(n.Key) == "palette" },
-		func(n desktopAutomationNode) bool { return n.Role == "switch" && fmt.Sprint(n.Key) == "reduce-motion" },
+		func(n desktopAutomationNode) bool {
+			return n.Role == "switch" && fmt.Sprint(n.Key) == "notify-on-finish"
+		},
 		func(n desktopAutomationNode) bool { return n.Role == "button" && n.Label == "恢复默认外观" },
 	} {
 		node := a.waitNode(t, window, find)

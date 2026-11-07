@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
@@ -50,7 +49,7 @@ func (d *Desktop) itemsView(c *ui.Context) {
 				container := ui.Column(c).Grow(1).MaxWidth(conversationColumnWidth).Gap(t.Space(2))
 				view := items[row.Index]
 				// 首次实时到达才渐显；历史与重连快照不设置到达时间。
-				if arrived := view.ArrivedAt; !arrived.IsZero() && !t.Motion.Reduced && !c.Preferences().ReduceMotion {
+				if arrived := view.ArrivedAt; !arrived.IsZero() {
 					elapsed := c.Now().Sub(arrived)
 					if elapsed < itemFadeDuration {
 						container.Opacity(max(0, float32(elapsed)/float32(itemFadeDuration)))
@@ -227,6 +226,21 @@ func (d *Desktop) itemView(c *ui.Context, view viewItem, results map[string]*def
 		if value := item.AgentsInstruction; value != nil {
 			d.activityItem(c, key, view, kit.ActivityCardOpt{Icon: kit.IconFileText, Title: d.t("agents.loaded"), Summary: value.Path}, nil, func() {
 				d.instructionSource(c, value.Path, value.Executor)
+				d.markdownView(c, value.Text, false)
+			})
+		}
+	case defs.ItemClientInstruction:
+		if value := item.ClientInstruction; value != nil {
+			d.activityItem(c, key, view, kit.ActivityCardOpt{Icon: kit.IconMessageSquare, Title: d.t("client.instruction")}, nil, func() { d.markdownView(c, value.Text, false) })
+		}
+	case defs.ItemMemoryIndex:
+		if value := item.MemoryIndex; value != nil {
+			d.activityItem(c, key, view, kit.ActivityCardOpt{Icon: kit.IconBrain, Title: d.t("memory.loaded"), Summary: value.Path}, nil, func() {
+				d.instructionSource(c, value.Path, defs.MemoryExecutorID)
+				if value.IsTruncated {
+					t := kit.GetTheme(c)
+					t.TextRole(ui.Text(c, d.t("memory.truncated")), kit.TextCaption).TextColor(t.Colors.Muted)
+				}
 				d.markdownView(c, value.Text, false)
 			})
 		}
@@ -563,7 +577,7 @@ func (d *Desktop) loadImage(url string) {
 			request, e := http.NewRequestWithContext(d.ctx, http.MethodGet, url, nil)
 			err = e
 			if err == nil {
-				response, e := (&http.Client{Timeout: 20 * time.Second}).Do(request)
+				response, e := d.imageHTTPClient.Do(request)
 				err = e
 				if err == nil {
 					if response.StatusCode != http.StatusOK {

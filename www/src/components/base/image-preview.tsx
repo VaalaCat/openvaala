@@ -17,6 +17,28 @@ import {
 } from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
 
+// 图片排成一行，超出容器宽度时横向滚动；每张缩略图保留预览和重试操作。
+export function ImagePreviewStrip({
+  images,
+}: {
+  images: { key: string; src: string; alt?: string }[]
+}) {
+  // 1. 按传入顺序显示限高缩略图，空列表不占位置。
+  if (images.length === 0) return null
+  return (
+    <div
+      data-image-strip
+      className="flex max-w-full min-w-0 items-start gap-2 overflow-x-auto p-1"
+    >
+      {images.map((image) => (
+        <div key={image.key} className="max-w-full shrink-0">
+          <ImagePreview src={image.src} alt={image.alt} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // 图片缩略图与预览：打开时适应窗口，可切换原尺寸双向滚动，关闭后回到触发处。
 export function ImagePreview({
   src,

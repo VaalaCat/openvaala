@@ -1,0 +1,138 @@
+@reference "../../index.css";
+
+/* 面板标签栏：工作区每个区域的标签栏（flexlayout 生成）和右栏的页签栏（TabBar）共用这一份样式。
+   外观是连续的面板：36px 高、面板底色，标签平铺，选中的标签用内容底色并盖住栏的底线，和下面的内容连成一片 */
+.tab-bar,
+.workspace-layout .flexlayout__tabset_tabbar_outer {
+  @apply text-ui;
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: stretch;
+  box-sizing: border-box;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  border: 0;
+  background: var(--sidebar);
+}
+/* 整条栏的底线，和工作区各区域的标签栏在同一高度 */
+.tab-bar::after,
+.workspace-layout .flexlayout__tabset_tabbar_outer::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 1px;
+  background: var(--border);
+}
+
+/* 标签：右侧一条竖线；未选中是面板底色、弱化文字加底线，选中是内容底色、正文文字、没有底线，悬停换悬停底色 */
+.tab-bar [role="tab"],
+.workspace-layout .flexlayout__tabset_tabbar_outer [role="tab"] {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 36px;
+  margin: 0;
+  gap: 8px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--sidebar);
+  color: var(--muted-foreground);
+  outline: none;
+  box-shadow: none;
+}
+/* 右栏的标签：左右各 12px、不收缩；工作区的标签在 workspace.css 里自己定内边距和收缩，要给关闭按钮留位置 */
+.tab-bar [role="tab"] {
+  flex: 0 0 auto;
+  padding: 0 12px;
+}
+.tab-bar [role="tab"]:hover,
+.workspace-layout .flexlayout__tabset_tabbar_outer [role="tab"]:hover {
+  background: var(--sidebar-accent);
+  color: var(--foreground);
+}
+.tab-bar [role="tab"][aria-selected="true"],
+.workspace-layout
+  .flexlayout__tabset_tabbar_outer
+  [role="tab"][aria-selected="true"] {
+  background: var(--background);
+  color: var(--foreground);
+  border-bottom-color: transparent;
+}
+.tab-bar [role="tab"]:focus-visible,
+.workspace-layout .flexlayout__tabset_tabbar_outer [role="tab"]:focus-visible {
+  outline: 1px solid var(--ring);
+  outline-offset: -1px;
+}
+.tab-bar [role="tab"] svg,
+.workspace-layout .flexlayout__tabset_tabbar_outer [role="tab"] svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+/* 标签栏右端的操作区：不收缩，自带面板底色和底线，标签只能在它左边的宽度里滚动或收窄 */
+.tab-bar-actions,
+.workspace-layout .flexlayout__tab_toolbar {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex: none;
+  align-items: center;
+  box-sizing: border-box;
+  height: 36px;
+  padding: 0 4px;
+  gap: 0;
+  background: var(--sidebar);
+  border-bottom: 1px solid var(--border);
+}
+/* 操作区里的按钮：28px 的透明小图标按钮，悬停才有底色 */
+.tab-bar-actions button,
+.workspace-layout .flexlayout__tab_toolbar_button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+}
+.tab-bar-actions button:hover,
+.tab-bar-actions button[aria-expanded="true"],
+.workspace-layout .flexlayout__tab_toolbar_button:hover,
+.workspace-layout .flexlayout__tab_toolbar_button[aria-expanded="true"] {
+  background: var(--sidebar-accent);
+  color: var(--foreground);
+}
+.tab-bar-actions button svg,
+.workspace-layout .flexlayout__tab_toolbar_button svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* TabBar 里放标签的横向滚动区：不显示滚动条 */
+.tab-bar-strip {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.tab-bar-strip [role="tablist"] {
+  display: flex;
+  align-items: stretch;
+  width: max-content;
+  min-width: 100%;
+  height: 100%;
+  padding: 0;
+  gap: 0;
+  justify-content: flex-start;
+  background: transparent;
+}

@@ -60,7 +60,7 @@ type appServerConnection struct {
 	clientDefaultReasoningEffort string
 	// loadedThreads 是本连接加载的 Thread，键是 Thread id：根 Thread 用 ConversationID，子 Thread 用 SessionID。
 	loadedThreads map[string]*connectionThread
-	// lastLoadedRootThreadID 是本连接最近加载的根 Thread，不算临时 Thread（它的对话没有 Skill）；skills/list 用它的对话。
+	// lastLoadedRootThreadID 是本连接最近加载的根 Thread，不算临时 Thread；skills/list 用它的对话。
 	lastLoadedRootThreadID string
 	// childThreadConversations 记下子 Thread（子 SessionID）属于哪个对话：开始跟随一个 Thread 时记下首次同步时对话里的全部子 Session，
 	// 之后根 Thread 发现新的子 Session 时补上；本连接没见过的 Thread id 由 getHistoryThread 去 serve 按 SessionID 找到子 Session 时也补上。
@@ -322,6 +322,12 @@ func (c *appServerConnection) handleRequest(ctx context.Context, request codexMe
 			return nil, err
 		}
 		return c.forkThread(ctx, request.ID, params)
+	case "thread/inject_items":
+		var params codexThreadInjectItemsParams
+		if err := decodeCodexParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		return c.injectThreadItems(ctx, params)
 	case "thread/archive", "thread/unarchive":
 		var params codexThreadParams
 		if err := decodeCodexParams(request.Params, &params); err != nil {
@@ -664,19 +670,21 @@ func (c *appServerConnection) reloadMcpServers(ctx context.Context) (any, error)
 
 // startThread 创建对话并跟随根 Thread，响应后发送开始通知。
 func (c *appServerConnection) startThread(ctx context.Context, requestID json.RawMessage, params codexThreadStartParams) (any, error) {
-	// 1. 拒绝动态工具，填写 Agent 和临时对话标记。
+	// 1. 拒绝动态工具，填写 Agent；临时只决定存在内存里，environments 给了空数组才不装配 Executor。
 	if len(params.DynamicTools) > 0 {
 		return nil, &codexError{
 			errorCodeInvalidParams,
 			"dynamicTools are not supported",
 		}
 	}
+	isWithoutExecutors := params.Environments != nil && len(*params.Environments) == 0
 	request := &runtimeclient.CreateConversationRequest{
-		AgentName: c.agentName,
-		Ephemeral: params.Ephemeral,
+		AgentName:        c.agentName,
+		Ephemeral:        params.Ephemeral,
+		WithoutExecutors: isWithoutExecutors,
 	}
-	// 2. 非临时对话使用映射后的 local 工作目录，选择目录内的模型和强度。
-	if !params.Ephemeral {
+	// 2. 装配 Executor 的对话使用映射后的 local 工作目录，选择目录内的模型和强度。
+	if !isWithoutExecutors {
 		if serverPath, ok := c.getLocalWorkspaceDirectory(ctx, params.Cwd); ok {
 			request.ExecutorSettings.WorkspaceDirectories = map[string]string{defs.LocalExecutorID: serverPath}
 		}
@@ -702,7 +710,7 @@ func (c *appServerConnection) startThread(ctx context.Context, requestID json.Ra
 		c.lastLoadedRootThreadID = thread.threadID
 	}
 	// 5. 先发送打开响应，再发送 thread/started，释放 Thread 暂存通知。
-	c.send(ctx, newCodexResponse(requestID, newCodexThreadOpenResult(opened.thread), nil))
+	c.send(ctx, newCodexResponse(requestID, newCodexThreadOpenResult(opened.thread, opened.hasExecutors), nil))
 	c.sendNotification(ctx, "thread/started", codexThreadStartedNotification{Thread: opened.thread})
 	close(opened.delivered)
 	return codexResponseHandedOver{}, nil
@@ -745,30 +753,25 @@ func (c *appServerConnection) resumeThread(ctx context.Context, requestID json.R
 		return nil, err
 	}
 	// 4. 先发送响应，再释放 Thread 暂存的通知。
-	c.send(ctx, newCodexResponse(requestID, newCodexThreadOpenResult(opened.thread), nil))
+	c.send(ctx, newCodexResponse(requestID, newCodexThreadOpenResult(opened.thread, opened.hasExecutors), nil))
 	close(opened.delivered)
 	return codexResponseHandedOver{}, nil
 }
 
 // forkThread 复制根 Thread 对话并跟随新 Thread，响应后发送开始通知。
 func (c *appServerConnection) forkThread(ctx context.Context, requestID json.RawMessage, params codexThreadForkParams) (any, error) {
-	// 1. 拒绝临时分叉，读取来源根对话。
-	if params.Ephemeral {
-		return nil, &codexError{
-			errorCodeInvalidParams,
-			"ephemeral thread/fork is not supported",
-		}
-	}
+	// 1. 读取来源根对话。
 	source, err := c.getRootThreadConversation(ctx, params.ThreadID, "thread/fork")
 	if err != nil {
 		return nil, err
 	}
-	// 2. 填写截取点和来源的 Executor 设置；请求带 cwd 时复制来源的目录设置，再替换其中的 local 目录。
+	// 2. 填写截取点、是否临时和来源的 Executor 设置；请求带 cwd 时复制来源的目录设置，再替换其中的 local 目录。
 	request := &runtimeclient.ForkConversationRequest{
 		ConversationID:   source.ID,
 		BeforeTurnID:     defs.TurnID(params.BeforeTurnID),
 		LastTurnID:       defs.TurnID(params.LastTurnID),
 		ExecutorSettings: source.ExecutorSettings,
+		Ephemeral:        params.Ephemeral,
 	}
 	if serverPath, ok := c.getLocalWorkspaceDirectory(ctx, params.Cwd); ok {
 		directories := make(map[string]string, len(source.ExecutorSettings.WorkspaceDirectories)+1)
@@ -784,19 +787,50 @@ func (c *appServerConnection) forkThread(ctx context.Context, requestID json.Raw
 	if err != nil {
 		return nil, getThreadForkError(err, params)
 	}
-	// 4. 跟随新根 Thread，按需读到跟随起点的历史。
-	thread := c.newThread(ctx, string(record.ID), record.ID, record.RootSessionID, "", params.ExcludeTurns, false)
+	// 4. 带开发者指令时，跟随之前把它写进分叉的下一轮上下文；写失败时分叉留给 serve 回收。
+	if params.DeveloperInstructions != "" {
+		err = c.client.AppendContextItems(ctx, &runtimeclient.AppendContextItemsRequest{
+			ConversationID: record.ID,
+			Items:          []*defs.Item{newClientInstructionItem(params.DeveloperInstructions)},
+		})
+		if err != nil {
+			return nil, getCodexError(err, string(record.ID))
+		}
+	}
+	// 5. 跟随新根 Thread，按需读到跟随起点的历史。
+	thread := c.newThread(ctx, string(record.ID), record.ID, record.RootSessionID, "", params.ExcludeTurns, params.Ephemeral)
 	opened, err := c.followThreadWithTurns(ctx, thread)
 	if err != nil {
 		return nil, err
 	}
-	// 5. 先发送响应，再发送不带 turns 的开始通知，释放暂存通知。
-	c.send(ctx, newCodexResponse(requestID, newCodexThreadOpenResult(opened.thread), nil))
+	// 6. 先发送响应，再发送不带 turns 的开始通知，释放暂存通知。
+	c.send(ctx, newCodexResponse(requestID, newCodexThreadOpenResult(opened.thread, opened.hasExecutors), nil))
 	started := opened.thread
 	started.Turns = []codexTurn{}
 	c.sendNotification(ctx, "thread/started", codexThreadStartedNotification{Thread: started})
 	close(opened.delivered)
 	return codexResponseHandedOver{}, nil
+}
+
+// injectThreadItems 把 Responses API 格式的 user、developer 消息写进根 Thread 的下一轮上下文，不启动 Turn。
+func (c *appServerConnection) injectThreadItems(ctx context.Context, params codexThreadInjectItemsParams) (any, error) {
+	// 1. 检查根 Thread，把全部条目转成客户端指令；任一条不是 user 或 developer 消息时整批拒绝。
+	source, err := c.getRootThreadConversation(ctx, params.ThreadID, "thread/inject_items")
+	if err != nil {
+		return nil, err
+	}
+	items, err := getClientInstructionItems(params.Items)
+	if err != nil {
+		return nil, err
+	}
+	// 2. 一次交给 serve，成功后返回空对象。
+	if err := c.client.AppendContextItems(ctx, &runtimeclient.AppendContextItemsRequest{
+		ConversationID: source.ID,
+		Items:          items,
+	}); err != nil {
+		return nil, getCodexError(err, params.ThreadID)
+	}
+	return codexEmptyObjectResult{}, nil
 }
 
 // followThreadWithTurns 跟随 Thread，客户端不自己翻页时读出跟随起点及之前的历史。
@@ -817,8 +851,8 @@ func (c *appServerConnection) followThreadWithTurns(ctx context.Context, thread 
 			return opened, getCodexError(err, thread.threadID)
 		}
 	}
-	// 3. 根 Thread 记为最近加载，返回打开结果。
-	if thread.isRootThread() {
+	// 3. 非临时根 Thread 记为最近加载，返回打开结果。
+	if thread.isRootThread() && !thread.isEphemeral {
 		c.lastLoadedRootThreadID = thread.threadID
 	}
 	return opened, nil

@@ -14,7 +14,7 @@ export const MarkdownView = memo(function MarkdownView({
 }) {
   return (
     <Streamdown
-      className="markdown-view space-y-3 text-body"
+      className="markdown-view text-reading"
       isAnimating={isStreaming}
       controls={false}
       linkSafety={{ enabled: false }}
@@ -49,7 +49,7 @@ const markdownComponents: Components = {
     </a>
   ),
   inlineCode: ({ children }) => (
-    <code className="bg-muted px-1 text-code">{children}</code>
+    <code className="bg-muted px-1 text-code-reading">{children}</code>
   ),
   code: ({ className, children }) => (
     <CodeView

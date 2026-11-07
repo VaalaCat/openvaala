@@ -31,6 +31,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
@@ -872,16 +873,22 @@ func TestClient(t *testing.T) {
 			name: "list_executors_and_resolve_directory",
 			run: func(t *testing.T, h *clientHarness) {
 				// 1. 查询 Executor，核对默认目录和配置顺序。
+				definedExecutors, err := h.definitions.Executors.GetExecutors(t.Context(), "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				serveDirectory := definedExecutors[0].GetDefinition().WorkspaceDirectory
 				executors, err := h.client.ListExecutors(t.Context())
-				serveDirectory := h.definitions.Executors[0].WorkspaceDirectory
 				wantExecutors := []conversation.ExecutorDetails{
 					{
 						ID:                 "local",
+						Kind:               defs.ExecutorKindLocal,
 						Description:        "本机",
 						WorkspaceDirectory: serveDirectory,
 					},
 					{
 						ID:                 "openvaala",
+						Kind:               defs.ExecutorKindVirtual,
 						Description:        "内置",
 						WorkspaceDirectory: "/workspace",
 					},
@@ -1130,18 +1137,6 @@ func TestClient(t *testing.T) {
 						},
 						sentinel: conversation.ErrForkBoundaryConflict,
 						wantText: conversation.ErrForkBoundaryConflict.Error(),
-					},
-					{
-						name: "fork_turn_running",
-						trigger: func() error {
-							_, err := h.client.ForkConversation(t.Context(), &runtimeclient.ForkConversationRequest{
-								ConversationID: busy.ID,
-								LastTurnID:     runningTurnID,
-							})
-							return err
-						},
-						sentinel: conversation.ErrForkTurnRunning,
-						wantText: conversation.ErrForkTurnRunning.Error(),
 					},
 					{
 						name: "session_busy",
@@ -1645,17 +1640,134 @@ func TestClientTerminal(t *testing.T) {
 	}
 }
 
-// waitTerminalOutput 累计终端的输出事件直到包含 want。
-func (h *clientHarness) waitTerminalOutput(t *testing.T, terminalID, want string) {
+// waitTerminalOutput 累计终端的输出事件直到包含 want，返回最后一批输出之后的位置。
+func (h *clientHarness) waitTerminalOutput(t *testing.T, terminalID, want string) (nextCursor uint64) {
 	t.Helper()
 	// 1. 拼接该终端的 TerminalOutput 数据，直到累计输出包含目标文本。
 	var output strings.Builder
 	h.collectEvents(t, func(event runtimeclient.ClientEvent) bool {
 		if terminalOutput, ok := event.(*runtimeclient.TerminalOutput); ok && terminalOutput.TerminalID == terminalID {
 			output.Write(terminalOutput.Data)
+			nextCursor = terminalOutput.NextCursor
 		}
 		return strings.Contains(output.String(), want)
 	})
+	return nextCursor
+}
+
+// waitTerminals 等到终端列表已知且满足条件，返回这份列表。
+func (h *clientHarness) waitTerminals(t *testing.T, match func(terminals []runtimeprotocol.TerminalItem) bool) []runtimeprotocol.TerminalItem {
+	t.Helper()
+	events := h.collectEvents(t, func(event runtimeclient.ClientEvent) bool {
+		changed, ok := event.(*runtimeclient.TerminalsChanged)
+		return ok && changed.IsKnown && match(changed.Terminals)
+	})
+	return events[len(events)-1].(*runtimeclient.TerminalsChanged).Terminals
+}
+
+// hasTerminal 列表里是否有 terminalID 这个终端？
+func hasTerminal(terminals []runtimeprotocol.TerminalItem, terminalID string) bool {
+	return slices.ContainsFunc(terminals, func(item runtimeprotocol.TerminalItem) bool { return item.TerminalID == terminalID })
+}
+
+// TestClientTerminals 检查终端列表订阅、断线后接回和重置：初始列表、列表变化、serve 关闭订阅后恢复、终端在断线后继续运行并从已收到的位置续读。
+func TestClientTerminals(t *testing.T) {
+	for _, action := range []string{"live", "reconnect", "list_closed"} {
+		t.Run(action, func(t *testing.T) {
+			t.Setenv("SHELL", "/bin/bash")
+			h := startClientHarness(t, clientTestToken)
+			h.collectEvents(t, isConnectionState(runtimeclient.ConnectionConnected))
+			// 1. 重复订阅合并为一次请求，初始列表已知且为空。
+			for range 2 {
+				if err := h.client.SubscribeTerminals(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if initial := h.waitTerminals(t, func([]runtimeprotocol.TerminalItem) bool { return true }); len(initial) != 0 {
+				t.Fatalf("initial terminals = %v", initial)
+			}
+			subscriptions := 0
+			for _, frame := range h.proxy.getUpstreamFrames() {
+				if strings.Contains(frame, `"method":"terminal/subscribe"`) {
+					subscriptions++
+				}
+			}
+			if subscriptions != 1 {
+				t.Fatalf("duplicate subscriptions = %d", subscriptions)
+			}
+			// 2. 打开带对话的终端后，列表交付它，并带着打开它的对话。
+			opened, err := h.client.OpenTerminal(t.Context(), &runtimeclient.TerminalOpenRequest{Rows: 24, Cols: 80, ConversationID: "conversation-1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			listed := h.waitTerminals(t, func(terminals []runtimeprotocol.TerminalItem) bool { return hasTerminal(terminals, opened.TerminalID) })
+			if len(listed) != 1 || listed[0].ConversationID != "conversation-1" || listed[0].ExecutorID != defs.LocalExecutorID {
+				t.Fatalf("listed = %+v", listed)
+			}
+			if err := h.client.WriteTerminal(opened.TerminalID, []byte("echo hi-$((20+22))\n")); err != nil {
+				t.Fatal(err)
+			}
+			cursor := h.waitTerminalOutput(t, opened.TerminalID, "hi-42")
+			// 3. 断线或订阅被关闭后列表先变成未知，恢复后终端仍在列表里。
+			switch action {
+			case "reconnect":
+				h.proxy.cut()
+			case "list_closed":
+				h.proxy.injectDownstream(t, map[string]any{"method": "terminal/listClosed", "params": map[string]string{"reason": "test closed"}})
+			}
+			if action != "live" {
+				h.collectEvents(t, func(event runtimeclient.ClientEvent) bool {
+					changed, ok := event.(*runtimeclient.TerminalsChanged)
+					return ok && !changed.IsKnown && changed.Err != nil
+				})
+				h.waitTerminals(t, func(terminals []runtimeprotocol.TerminalItem) bool { return hasTerminal(terminals, opened.TerminalID) })
+			}
+			// 4. 重连后新连接没有接入，从已收到的位置接回：第一批从该位置接着发且不截断，之后的输出继续到达；从 0 接回则重放全部输出。
+			if action == "reconnect" {
+				attached, err := h.client.AttachTerminal(t.Context(), opened.TerminalID, cursor)
+				if err != nil || attached.ExecutorID != defs.LocalExecutorID || attached.Rows != 24 || attached.Cols != 80 {
+					t.Fatalf("AttachTerminal = %+v, %v", attached, err)
+				}
+				events := h.collectEvents(t, func(event runtimeclient.ClientEvent) bool {
+					terminalOutput, ok := event.(*runtimeclient.TerminalOutput)
+					return ok && terminalOutput.TerminalID == opened.TerminalID
+				})
+				first := events[len(events)-1].(*runtimeclient.TerminalOutput)
+				if first.NextCursor != cursor+uint64(len(first.Data)) || first.Truncated || first.HasMore || strings.Contains(string(first.Data), "hi-42") {
+					t.Fatalf("first batch after reconnect = %+v", first)
+				}
+				if err := h.client.WriteTerminal(opened.TerminalID, []byte("echo again-$((1+1))\n")); err != nil {
+					t.Fatal(err)
+				}
+				h.waitTerminalOutput(t, opened.TerminalID, "again-2")
+				if _, err := h.client.AttachTerminal(t.Context(), opened.TerminalID, 0); err != nil {
+					t.Fatal(err)
+				}
+				h.waitTerminalOutput(t, opened.TerminalID, "hi-42")
+			}
+			// 5. 重置后接入的连接收到清屏序列；关闭后列表不再有它；终端不存在时接入和重置返回 -32004。
+			if err := h.client.ResetTerminal(t.Context(), opened.TerminalID); err != nil {
+				t.Fatal(err)
+			}
+			h.waitTerminalOutput(t, opened.TerminalID, "\x1b[2J")
+			if err := h.client.CloseTerminal(t.Context(), opened.TerminalID); err != nil {
+				t.Fatal(err)
+			}
+			h.waitTerminals(t, func(terminals []runtimeprotocol.TerminalItem) bool { return !hasTerminal(terminals, opened.TerminalID) })
+			for name, call := range map[string]func() error{
+				"attach": func() error {
+					_, err := h.client.AttachTerminal(t.Context(), "missing", 0)
+					return err
+				},
+				"reset": func() error { return h.client.ResetTerminal(t.Context(), "missing") },
+			} {
+				var responseErr *runtimeclient.ResponseError
+				if err := call(); !errors.As(err, &responseErr) || responseErr.Code != runtimeprotocol.ErrorCodeTerminalNotFound {
+					t.Fatalf("%s missing terminal = %v", name, err)
+				}
+			}
+		})
+	}
 }
 
 // TestClientConfigurationMethods 检查模型配置和模型目录请求的参数及结果。
@@ -2598,20 +2710,20 @@ func startClientHarness(t *testing.T, token string, configure ...func(*runtimese
 				DefaultReasoningEffort: "low",
 			},
 		},
-		Executors: []*defs.ExecutorDefinition{
-			{
+		Executors: executor.NewConfigExecutorProvider([]executor.Executor{
+			executor.NewLocalExecutor(&defs.ExecutorDefinition{
 				ID:                 defs.LocalExecutorID,
 				Kind:               defs.ExecutorKindLocal,
 				Description:        "本机",
 				WorkspaceDirectory: root,
-			},
-			{
+			}),
+			executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
 				ID:                 "openvaala",
 				Kind:               defs.ExecutorKindVirtual,
 				Description:        "内置",
 				WorkspaceDirectory: "/workspace",
-			},
-		},
+			}, nil)),
+		}),
 	})
 	rt, err := runtime.NewRuntime(opt)
 	if err != nil {

@@ -13,7 +13,7 @@ export function ModelErrorItem({ view }: ItemRendererProps) {
       icon={CircleAlert}
       tone="destructive"
       details={
-        <p className="text-body wrap-anywhere whitespace-pre-wrap color-destructive">
+        <p className="text-reading wrap-anywhere whitespace-pre-wrap color-destructive">
           {error?.code ? error.code + ": " : ""}
           {error?.message}
         </p>

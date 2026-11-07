@@ -9,7 +9,13 @@ import { existsSync } from "node:fs"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { test as base, expect, type Locator, type Page } from "@playwright/test"
+import {
+  test as base,
+  expect,
+  type Locator,
+  type Page,
+  type WebSocketRoute,
+} from "@playwright/test"
 
 // 写配置、起 serve、等健康检查通过的最长时间
 const fixtureStartTimeout = 60_000
@@ -149,12 +155,13 @@ export class WebUIFixture {
     }
   }
 
-  // 用 openvaala web 打印的那种带 token 的地址打开页面，等它连上 serve、进入新对话页；origin 默认是回环地址
+  // 用 openvaala web 打印的那种带 token 的地址打开页面，等它连上 serve、进入工作区；origin 默认是回环地址。
+  // 同一个浏览器里已有保存的工作区时，地址会跟到恢复出来的对话标签页，否则是新对话页
   async openApp(page: Page, origin = this.state.url): Promise<void> {
     await page.goto(
       origin + "/web/v1/#token=" + encodeURIComponent(this.state.token)
     )
-    await expect(page).toHaveURL(/\/web\/v1\/s\/[^/]+$/)
+    await expect(page).toHaveURL(/\/web\/v1\/s\/[^/]+(?:\/c\/[^/]+)?$/)
   }
 
   private async post(path: string, body: unknown): Promise<unknown> {
@@ -281,17 +288,90 @@ export async function expectDocumentNotScrollable(page: Page): Promise<void> {
   ).toBe(0)
 }
 
-// 在新对话页发出第一条消息，等跳到新对话
+// 新对话页的工作位置换回 local 的默认根目录：Executor 不是 local 时选 local，目录不为空时清空。
+// 新对话页会预填最近对话的位置，同一个 worker 的用例共用一个 serve，预填会来自别的用例留下的对话
+export async function chooseDefaultWorkLocation(page: Page): Promise<void> {
+  // 1. 工作位置在预填结束后才出现；宽屏的 Executor 是下拉，窄屏是抽屉。
+  const executor = page
+    .getByRole("combobox", { name: "Executor", exact: true })
+    .or(page.getByRole("button", { name: "Executor", exact: true }))
+  await expect(executor).toBeVisible()
+  if ((await executor.innerText()).trim() !== "local") {
+    await executor.click()
+    await page
+      .getByRole("option", { name: /^local/ })
+      .or(
+        page
+          .getByRole("dialog", { name: "Executor", exact: true })
+          .getByRole("button", { name: /^local/ })
+      )
+      .click()
+    await expect(executor).toHaveText("local")
+  }
+  // 2. 目录留空就是 local 的默认根目录；清空会打开候选，按 Esc 关掉。
+  const directory = page.getByRole("combobox", {
+    name: "工作目录",
+    exact: true,
+  })
+  if (await directory.inputValue()) {
+    await directory.fill("")
+    await page.keyboard.press("Escape")
+    await expect(page.getByRole("listbox")).toHaveCount(0)
+  }
+}
+
+// 在新对话页发出第一条消息，等跳到新对话；对话建在 local 的默认根目录里
 export async function startConversation(page: Page, text: string) {
-  // 1. 不在对话页时等新对话页标题出现再输入，切换中残留的旧对话输入框不会收到文字。
-  if (!/\/c\/[^/]+$/.test(page.url()))
+  // 1. 不在对话页时等新对话页标题出现，切换中残留的旧对话输入框不会收到文字；再换回默认工作位置。
+  if (!/\/c\/[^/]+$/.test(page.url())) {
     await expect(
       page.getByRole("heading", { name: "新对话", level: 1 })
     ).toBeVisible()
+    await chooseDefaultWorkLocation(page)
+  }
+  // 2. 发出第一条消息。
+  await startConversationAtCurrentLocation(page, text)
+}
+
+// 用新对话页上现在的工作位置发出第一条消息，等跳到新对话；用例自己选好工作位置时用它
+export async function startConversationAtCurrentLocation(
+  page: Page,
+  text: string
+) {
+  // 1. 输入并发送，等地址换成新对话、消息出现。
   await getComposer(page).fill(text)
   await getComposer(page).press("Enter")
   await expect(page).toHaveURL(/\/c\/[^/]+$/)
   await expect(getMessages(page).getByText(text, { exact: true })).toBeVisible()
+}
+
+// 桌面的右栏默认收起：要看右栏页签的用例先用顶栏的开关展开它
+export async function openRightPanel(page: Page): Promise<void> {
+  const toggle = page.getByRole("button", { name: "切换对话详情" })
+  if ((await toggle.getAttribute("aria-pressed")) !== "true")
+    await toggle.click()
+  await expect(toggle).toHaveAttribute("aria-pressed", "true")
+}
+
+// 记下页面发出的 JSON-RPC 请求的方法和对话，按发出的顺序
+export function recordRequests(
+  page: Page
+): { method: string; conversationID?: string }[] {
+  const requests: { method: string; conversationID?: string }[] = []
+  page.on("websocket", (socket) =>
+    socket.on("framesent", ({ payload }) => {
+      const request = JSON.parse(String(payload)) as {
+        method?: string
+        params?: { conversation_id?: string }
+      }
+      if (request.method)
+        requests.push({
+          method: request.method,
+          conversationID: request.params?.conversation_id,
+        })
+    })
+  )
+  return requests
 }
 
 // 通过稳定 Item 标识定位包含给定内容的记录，不依赖原始数据操作。
@@ -331,4 +411,79 @@ export async function openTurnRaw(turn: Locator): Promise<Locator> {
     if (path.length === 2 && path[0] === "items") await item.press("Enter")
   }
   return raw
+}
+
+// 代理页面到 serve 的 WebSocket，让用例决定何时断开、何时允许重连；要在 openApp 之前调用
+export async function controlConnection(page: Page) {
+  let isHeld = false
+  let live: WebSocketRoute | undefined
+  await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
+    // 断开期间的重连尝试立即失败，页面按退避继续重试。
+    if (isHeld) {
+      void socket.close()
+      return
+    }
+    live = socket
+    socket.connectToServer()
+  })
+  return {
+    // 断开当前连接，之后的重连一直失败，直到调用 allowReconnect 或 reconnect
+    async disconnect(): Promise<void> {
+      isHeld = true
+      await live!.close()
+      await expect(
+        page.getByRole("button", { name: "重连", exact: true })
+      ).toBeVisible()
+    },
+    // 允许重连：页面按退避自己连上，不碰页面，键盘焦点留在原处
+    async allowReconnect(): Promise<void> {
+      isHeld = false
+      await expect(
+        page.getByRole("button", { name: "已连接", exact: true })
+      ).toBeVisible({ timeout: 20_000 })
+    },
+    // 允许重连并点「重连」跳过退避立即重试，等页面回到已连接；点击会把键盘焦点交给按钮
+    async reconnect(): Promise<void> {
+      isHeld = false
+      // 退避等待刚好结束时页面已经自己连上，按钮不在了。
+      await page
+        .getByRole("button", { name: "重连", exact: true })
+        .click({ timeout: 3000 })
+        .catch(() => undefined)
+      await expect(
+        page.getByRole("button", { name: "已连接", exact: true })
+      ).toBeVisible()
+    },
+  }
+}
+
+// 在终端里粘贴一段文字：括号粘贴模式开着时，前台程序收到的是 ESC[200~ 文字 ESC[201~
+export async function pasteIntoTerminal(
+  page: Page,
+  text: string
+): Promise<void> {
+  await page
+    .locator(".xterm-helper-textarea:visible")
+    .evaluate((node, text) => {
+      const data = new DataTransfer()
+      data.setData("text/plain", text)
+      node.dispatchEvent(
+        new ClipboardEvent("paste", {
+          clipboardData: data,
+          bubbles: true,
+          cancelable: true,
+        })
+      )
+    }, text)
+}
+
+// 关掉所有终端标签页，结束 serve 上的 shell；终端归 serve 持有，页面关掉后 shell 还在运行，用例结束时用它清理
+export async function closeTerminalTabs(page: Page): Promise<void> {
+  const closeButtons = page
+    .locator('[role="tab"][id^="flexlayout-tabbutton-"]')
+    .getByTitle("关闭标签页")
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if ((await closeButtons.count()) === 0) return
+    await closeButtons.last().click()
+  }
 }

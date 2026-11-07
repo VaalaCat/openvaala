@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/VaalaCat/openvaala/internal/appserver"
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -156,10 +157,10 @@ func runAppServerCommand(ctx context.Context, args *AppArgs) (err error) {
 		return err
 	}
 	if args.PrintAppServerStartupConfig {
-		return appserver.WriteStartupConfig(args.Stdout, args.Version)
+		return appserver.WriteStartupConfig(args.Stdout, defs.GetBuildVersion())
 	}
 	// 2. 启动遥测，收到了不用的 codex 参数时记一条 Debug 日志。
-	tel, shutdown, err := newTelemetry(ctx, args.Config, args.Version, args.Stderr)
+	tel, shutdown, err := newTelemetry(ctx, args.Config, args.Stderr)
 	if err != nil {
 		return err
 	}
@@ -172,7 +173,7 @@ func runAppServerCommand(ctx context.Context, args *AppArgs) (err error) {
 		args:         args,
 		noticeOutput: args.Stderr,
 	}, args.Config.Run.AgentName)
-	opt.Version = args.Version
+	opt.Version = defs.GetBuildVersion()
 	opt.ConfigDirectory = filepath.Dir(args.ConfigPath)
 	opt.Telemetry = tel
 	opt.PathMappings = args.Config.Client.PathMappings

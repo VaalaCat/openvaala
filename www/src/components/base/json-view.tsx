@@ -1,8 +1,15 @@
 import { memo, useCallback, useMemo, useState, type CSSProperties } from "react"
 import { ChevronRightIcon } from "lucide-react"
+import { FoldVertical, UnfoldVertical } from "lucide"
+import { MorphIcon } from "morphicons/react"
 import { useTranslation } from "react-i18next"
 import { CodeTokens } from "@/components/base/code-view"
 import { Button } from "@/components/ui/button"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { CopyButton } from "@/components/base/copy-button"
 import { OutputBlock } from "@/components/base/output-block"
 import { useHighlightedLines, type HighlightedLine } from "@/lib/highlighter"
@@ -11,6 +18,7 @@ import {
   getJsonCopyText,
   getJsonPathKey,
   getVisibleJsonRows,
+  type JsonFoldMode,
   type JsonLine,
 } from "@/lib/json-lines"
 import { cn } from "@/lib/utils"
@@ -46,6 +54,7 @@ export function JsonView({
     () => new Set<string>()
   )
   const [isShowingAllRows, setIsShowingAllRows] = useState(false)
+  const [foldMode, setFoldMode] = useState<JsonFoldMode>("default")
   const lines = useMemo(
     () => formatJsonLines(value, { expandedNestedPaths, expandedStringPaths }),
     [value, expandedNestedPaths, expandedStringPaths]
@@ -55,10 +64,16 @@ export function JsonView({
   const highlighted = useHighlightedLines(text, "json", !isStreaming)
 
   const rows = useMemo(
-    () => getVisibleJsonRows(lines, defaultExpandDepth, toggledFoldPaths),
-    [lines, defaultExpandDepth, toggledFoldPaths]
+    () =>
+      getVisibleJsonRows(lines, defaultExpandDepth, toggledFoldPaths, foldMode),
+    [lines, defaultExpandDepth, toggledFoldPaths, foldMode]
   )
   const visibleRows = isShowingAllRows ? rows : rows.slice(0, maxInitialRows)
+  const isFullyExpanded =
+    visibleRows.length === rows.length && rows.every((row) => !row.isFolded)
+  const foldLabel = isFullyExpanded
+    ? t("jsonView.collapseAll")
+    : t("jsonView.expandAll")
 
   const handleToggleFold = useCallback((line: JsonLine) => {
     setToggledFoldPaths((paths) => toggleKey(paths, getJsonPathKey(line.path)))
@@ -79,8 +94,39 @@ export function JsonView({
       copyValue={copyValue}
       maxHeight={maxHeight}
       heightMode={heightMode}
+      toolbar={
+        lines.some((line) => line.foldEnd !== undefined) && (
+          <Tooltip>
+            <TooltipTrigger
+              delay={600}
+              closeOnClick
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={foldLabel}
+                  onClick={() => {
+                    setFoldMode(isFullyExpanded ? "collapsed" : "expanded")
+                    setToggledFoldPaths(new Set())
+                    setIsShowingAllRows(!isFullyExpanded)
+                  }}
+                />
+              }
+            >
+              <MorphIcon
+                icon={isFullyExpanded ? FoldVertical : UnfoldVertical}
+                size={16}
+                aria-hidden
+              />
+            </TooltipTrigger>
+            <TooltipContent className="text-caption">
+              {foldLabel}
+            </TooltipContent>
+          </Tooltip>
+        )
+      }
     >
-      <div className="w-max min-w-full py-2 text-code">
+      <div className="w-max min-w-full code-padding text-code-reading">
         {visibleRows.map(({ lineIndex, isFolded }) => {
           const line = lines[lineIndex]
           const pathKey = getJsonPathKey(line.path)
@@ -163,7 +209,7 @@ const JsonRowView = memo(function JsonRowView({
             : t("jsonView.fold")
           : undefined
       }
-      className="group/row flex min-h-5 items-center outline-none hover:bg-muted focus-visible:bg-muted"
+      className="json-row group/row flex items-center outline-none hover:bg-muted focus-visible:bg-muted"
       onClick={(event) => {
         if (
           line.foldEnd === undefined ||
@@ -182,7 +228,7 @@ const JsonRowView = memo(function JsonRowView({
         }
       }}
     >
-      <span className="sticky left-0 z-10 flex size-5 shrink-0 items-center justify-center bg-background group-hover/row:bg-muted">
+      <span className="json-row-control sticky left-0 z-10 flex shrink-0 items-center justify-center bg-background group-hover/row:bg-muted">
         {line.foldEnd !== undefined && (
           <ChevronRightIcon
             className={cn("size-3 color-muted", !isFolded && "rotate-90")}
@@ -243,7 +289,7 @@ const JsonRowView = memo(function JsonRowView({
             value={getJsonCopyText(line.value)}
             label={t("jsonView.copyNode")}
             size="icon-xs"
-            className="size-5 color-muted"
+            className="json-row-control color-muted"
           />
         )}
       </div>

@@ -97,6 +97,8 @@
     }
   },
   "jsonView": {
+    "expandAll": "Expand all",
+    "collapseAll": "Collapse all",
     "childCount_one": "{{count}} item",
     "childCount_other": "{{count}} items",
     "fold": "Collapse",
@@ -176,7 +178,8 @@
     },
     "notice": {
       "contextSummary": "Context compacted",
-      "forkedConversation": "Forked from the <source>source conversation</source>",
+      "forkedFrom": "Forked from “{{title}}”",
+      "sideConversationFrom": "Side conversation branched from “{{title}}”",
       "spawnedFrom": "Sub-agent starts here; earlier history is inherited from",
       "modelChange": "Model changed from {{previous}} to {{model}}",
       "executorsChange": "Executors changed from {{previous}} to {{executors}}",
@@ -185,6 +188,9 @@
       "file": "File",
       "skillInstruction": "Load skill",
       "agentsInstruction": "Load directory rules",
+      "memoryIndex": "Loaded memory index",
+      "memoryIndexTruncated": "Truncated at 8 KiB",
+      "clientInstruction": "Client instruction",
       "turnInterrupted": "This turn was interrupted",
       "toolResult": "Tool result (the call is in earlier history)",
       "unknownItem": "Unknown record kind: {{kind}}",
@@ -340,6 +346,8 @@
         "list_commands": "List commands",
         "apply_patch": "Edit",
         "read_file": "Read",
+        "glob": "Find files",
+        "grep": "Search",
         "spawn_agent": "Delegate task",
         "send_message": "Send message",
         "wait_agent": "Wait for message",
@@ -427,7 +435,8 @@
     "queue": "Queue",
     "image": "Image",
     "contextMaterial": "Attached context",
-    "removeMaterial": "Remove attached context"
+    "removeMaterial": "Remove attached context",
+    "btwDescription": "Ask in a side conversation without touching this one"
   },
   "modelPicker": {
     "model": "Model",
@@ -446,6 +455,7 @@
     "directory": "Working directory",
     "directoryPlaceholder": "Default directory",
     "directorySuggestions": "Directory suggestions",
+    "recentDirectories": "Recently used",
     "noDirectories": "No matching subdirectories",
     "directoryInvalid": "Working directory unavailable: {{detail}}"
   },
@@ -509,7 +519,26 @@
       "bodyFont": "Body font",
       "headingFont": "Heading font",
       "systemFont": "System font",
-      "reset": "Reset appearance"
+      "reset": "Reset appearance",
+      "themeAndFonts": "Theme and fonts",
+      "body": "Body",
+      "code": "Code",
+      "terminal": "Terminal",
+      "fontSize": "Font size",
+      "lineHeight": "Line height",
+      "paragraphSpacing": "Paragraph spacing",
+      "paddingX": "Horizontal padding",
+      "paddingY": "Vertical padding",
+      "letterSpacing": "Letter spacing",
+      "padding": "Content padding",
+      "resetGroup": "Reset group",
+      "preview": "Live preview",
+      "previewTitle": "Conversations and workspace",
+      "previewBody": "Adjust the font size and line height to make reading comfortable for you.",
+      "previewSecondParagraph": "This second paragraph shows the distance between paragraphs. Code and terminal settings stay independent.",
+      "previewCaption": "Time, descriptions and controls keep their existing hierarchy.",
+      "increase": "Increase {{field}}",
+      "decrease": "Decrease {{field}}"
     },
     "sections": {
       "general": "General",
@@ -517,7 +546,8 @@
       "executors": "Executors",
       "hooks": "Hooks",
       "skills": "Skills",
-      "archived": "Archived conversations"
+      "archived": "Archived conversations",
+      "appearance": "Appearance"
     },
     "archived": {
       "search": "Search archived conversations"
@@ -582,6 +612,12 @@
       "deleted": "Deleted model provider “{{name}}”",
       "dirtyActions": "Apply or revert your unsaved changes first.",
       "endpoints": "Protocol endpoint overrides",
+      "headers": "Request headers",
+      "headerName": "Name",
+      "headerValue": "Value",
+      "addHeader": "Add header",
+      "removeHeader": "Remove header",
+      "headersHint": "Values may use variables such as ${OPENVAALA_SESSION_ID}. An empty value stops the global header with the same name.",
       "editModel": "Edit model {{name}}",
       "inherited": "Inherit ({{value}})",
       "aliasRequired": "Enter a model alias",
@@ -669,5 +705,37 @@
     "actualSize": "100%",
     "close": "Close image preview",
     "failed": "Image failed to load"
+  },
+  "workspace": {
+    "sideConversation": "Side",
+    "sideConversationTitle": "Side · {{question}}",
+    "sideConversationEnded": "The side conversation has ended",
+    "closeTab": "Close tab",
+    "areaActions": "Area actions",
+    "splitRight": "Split right",
+    "splitDown": "Split down",
+    "maximizeArea": "Maximize this area",
+    "restoreArea": "Restore this area",
+    "hiddenTabs": "More tabs",
+    "resizeArea": "Resize area",
+    "newTerminal": "New terminal",
+    "tabs": {
+      "title": "Tabs",
+      "open": "Tab list",
+      "close": "Close tab {{name}}"
+    },
+    "terminal": {
+      "screen": "Terminal",
+      "restart": "Restart",
+      "exited": "The terminal exited with code {{code}}",
+      "reconnecting": "Disconnected, reconnecting",
+      "reset": "Reset terminal",
+      "endedWhenRestored": "The terminal has ended",
+      "keys": "Terminal keys",
+      "keyUp": "Up",
+      "keyDown": "Down",
+      "keyLeft": "Left",
+      "keyRight": "Right"
+    }
   }
 }

@@ -37,7 +37,7 @@ func runTUICommand(ctx context.Context, args *AppArgs) (err error) {
 		return errTUIRequiresTerminal
 	}
 	// 2. 启动只写日志文件和 OTLP 的遥测，放进 ctx 给后续日志使用。
-	tel, shutdownTelemetry, err := newTelemetry(ctx, args.Config, args.Version, nil)
+	tel, shutdownTelemetry, err := newTelemetry(ctx, args.Config, nil)
 	if err != nil {
 		return err
 	}

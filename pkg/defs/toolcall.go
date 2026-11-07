@@ -33,6 +33,9 @@ func (tool *ToolDefinition) ToLLMKit() *llmkit.Tool {
 // LocalExecutorID 是 OpenVaala 自带的本机 Executor 的 ID；配置文件里不能用这个 ID。
 const LocalExecutorID = "local"
 
+// MemoryExecutorID 是内置的记忆 Executor 的 ID；配置文件里不能用这个 ID。
+const MemoryExecutorID = "memory"
+
 // ClientExecutorID 是对话里客户端登记的 MCP server 所属的虚拟 Executor 的 ID；配置文件里不能用这个 ID。
 const ClientExecutorID = "client"
 
@@ -70,26 +73,30 @@ type ToolCall struct {
 	Arguments string `json:"arguments"`
 	// Status 为空时参数还在生成。
 	Status ToolCallStatus `json:"status,omitempty"`
+	// ProviderData 是模型厂商附在这次调用上的签名等数据；下一次请求原样还给 llmkit，否则 Gemini 等会拒绝或丢失签名。
+	ProviderData *llmkit.ToolCallProviderData `json:"provider_data,omitempty"`
 }
 
 // ToLLMKit 将工具调用转换为 llmkit 的工具调用。
 func (call *ToolCall) ToLLMKit() *llmkit.ToolCall {
-	// 1. 复制 CallID、工具名和完整参数。
+	// 1. 复制 CallID、工具名、完整参数，以及深拷贝后的厂商数据。
 	return &llmkit.ToolCall{
-		ID:        call.CallID,
-		Name:      call.Name,
-		Arguments: call.Arguments,
+		ID:           call.CallID,
+		Name:         call.Name,
+		Arguments:    call.Arguments,
+		ProviderData: CloneToolCallProviderData(call.ProviderData),
 	}
 }
 
 // FromLLMKit 读取模型发出的完整工具调用。
 func (call *ToolCall) FromLLMKit(modelCall *llmkit.ToolCall) {
-	// 1. 复制调用 ID、工具名和参数，将状态设为 ready。
+	// 1. 复制调用 ID、工具名、参数和深拷贝后的厂商数据，将状态设为 ready。
 	*call = ToolCall{
-		CallID:    modelCall.ID,
-		Name:      modelCall.Name,
-		Arguments: modelCall.Arguments,
-		Status:    ToolCallReady,
+		CallID:       modelCall.ID,
+		Name:         modelCall.Name,
+		Arguments:    modelCall.Arguments,
+		Status:       ToolCallReady,
+		ProviderData: CloneToolCallProviderData(modelCall.ProviderData),
 	}
 }
 

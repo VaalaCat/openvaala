@@ -168,4 +168,6 @@ type AgentDefinition struct {
 	SkillNames []string
 	// MCPServerIDs 是可用的 MCP server id；nil 表示全部可用，[] 表示不用 MCP。
 	MCPServerIDs defs.OptionalStringList
+	// MaxSteps 是一轮最多调用模型的次数；0 表示不限。
+	MaxSteps int
 }

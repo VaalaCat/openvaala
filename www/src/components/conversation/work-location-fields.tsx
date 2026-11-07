@@ -20,7 +20,9 @@ import {
   ComboboxGroup,
   ComboboxInput,
   ComboboxItem,
+  ComboboxLabel,
   ComboboxList,
+  ComboboxSeparator,
   ComboboxTrigger,
 } from "@/components/ui/combobox"
 import {
@@ -46,6 +48,7 @@ import { LatticeLoader } from "@/components/base/lattice-loader"
 import { useIsDesktop } from "@/hooks/use-is-desktop"
 import type { WorkLocation } from "@/hooks/use-work-location"
 import type { ExecutorDetails } from "@/lib/api/protocol.gen"
+import { recentConversationsOptions } from "@/lib/query/conversation"
 import {
   getDirectorySearch,
   workspaceDirectoriesOptions,
@@ -56,6 +59,21 @@ import {
   shouldShowLoadError,
 } from "@/lib/rpc-error"
 import { cn } from "@/lib/utils"
+import { getRecentDirectories, recentDirectoryLimit } from "@/lib/work-location"
+
+// 目录下拉里最近用过的一项，值是绝对路径
+interface RecentDirectoryChoice {
+  kind: "recent"
+  directory: string
+}
+
+// 目录下拉里当前层的一个子目录，值是目录名
+interface SubdirectoryChoice {
+  kind: "subdirectory"
+  name: string
+}
+
+type DirectoryChoice = RecentDirectoryChoice | SubdirectoryChoice
 
 // 新对话和对话设置共用 Executor 选择、可手填的目录和目录候选。
 export function WorkLocationFields({
@@ -123,7 +141,9 @@ function ExecutorPicker({
   const anchor = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState("")
-  const filtered = executors.filter((executor) =>
+  // memory 只能当可用的 Executor，不能当默认 Executor
+  const choices = executors.filter((executor) => executor.kind !== "memory")
+  const filtered = choices.filter((executor) =>
     [executor.id, executor.description, executor.workspace_directory]
       .join(" ")
       .toLowerCase()
@@ -233,7 +253,7 @@ function ExecutorPicker({
   // 3. Combobox 弹层独立于短触发器宽度，按名称、说明和目录筛选。
   return (
     <Combobox<ExecutorDetails>
-      items={executors}
+      items={choices}
       value={location.executor ?? null}
       itemToStringLabel={(executor) => executor.id}
       isItemEqualToValue={(executor, value) => executor.id === value.id}
@@ -287,7 +307,7 @@ function ExecutorPicker({
   )
 }
 
-// 目录可直接输入；候选仅在打开后读取，同层末段名称在前端过滤。
+// 目录可直接输入；候选仅在打开后读取，同层末段名称在前端过滤；上方「最近用过」列出这个 Executor 最近对话的目录。
 function DirectoryField({ location }: { location: WorkLocation }) {
   // 1. 以已保存目录为起点查询一个层级，不保留第二份目录缓存。
   const { t } = useTranslation()
@@ -307,9 +327,9 @@ function DirectoryField({ location }: { location: WorkLocation }) {
       (query.state.status !== "error" ||
         !shouldShowLoadError(query.state.error)),
   })
-  const names = (directories.data?.directories ?? []).filter((name) =>
-    name.startsWith(keyword)
-  )
+  const subdirectoryChoices = (directories.data?.directories ?? [])
+    .filter((name) => name.startsWith(keyword))
+    .map((name): SubdirectoryChoice => ({ kind: "subdirectory", name }))
   const directoryErrorDetail = getRpcErrorDetail(location.directoryError)
   const directoryErrorText = !location.directoryError
     ? undefined
@@ -317,7 +337,26 @@ function DirectoryField({ location }: { location: WorkLocation }) {
       ? t("workLocation.directoryInvalid", { detail: directoryErrorDetail })
       : getRpcErrorMessage(location.directoryError, t)
 
-  // 2. 选中目录后进入下一层；候选失败仍保留输入和局部重试。
+  // 2. 最近对话读不到时不显示「最近用过」；用户打过字后才按输入前缀过滤，预填值和点选的值显示全部。
+  const recentConversations = useQuery(recentConversationsOptions(connection))
+  const recentChoices = getRecentDirectories(
+    (recentConversations.data?.conversations ?? []).map(
+      (entry) => entry.conversation
+    ),
+    location.executorID!,
+    recentDirectoryLimit
+  )
+    .filter(
+      (recentDirectory) =>
+        !location.isDirectoryTyped ||
+        recentDirectory.startsWith(location.directory.trim())
+    )
+    .map((recentDirectory): RecentDirectoryChoice => ({
+      kind: "recent",
+      directory: recentDirectory,
+    }))
+
+  // 3. 点最近用过的目录直接填入并关闭，点子目录进入下一层；候选失败仍保留输入和局部重试。
   return (
     <Field
       className="min-w-48 flex-1 gap-1"
@@ -326,8 +365,8 @@ function DirectoryField({ location }: { location: WorkLocation }) {
       <FieldLabel htmlFor={id} className="sr-only text-ui">
         {t("workLocation.directory")}
       </FieldLabel>
-      <Combobox<string>
-        items={names}
+      <Combobox<DirectoryChoice>
+        items={[...recentChoices, ...subdirectoryChoices]}
         filter={null}
         value={null}
         inputValue={location.directory}
@@ -343,10 +382,19 @@ function DirectoryField({ location }: { location: WorkLocation }) {
           if (details.reason === "input-change") location.setDirectory(value)
           else details.cancel()
         }}
-        onValueChange={(name) => {
-          if (name && directories.data)
+        onValueChange={(choice) => {
+          if (!choice) return
+          if (choice.kind === "recent") {
+            location.chooseDirectory(choice.directory)
+            setOpen(false)
+            return
+          }
+          if (directories.data)
             location.setDirectory(
-              directories.data.directory.replace(/\/$/, "") + "/" + name + "/"
+              directories.data.directory.replace(/\/$/, "") +
+                "/" +
+                choice.name +
+                "/"
             )
         }}
       >
@@ -391,7 +439,7 @@ function DirectoryField({ location }: { location: WorkLocation }) {
           )}
         </ComboboxInput>
         <ComboboxContent
-          className="w-80 min-w-0 text-body"
+          className="w-[max(--spacing(80),var(--anchor-width))] min-w-0 text-body"
           aria-label={t("workLocation.directorySuggestions")}
         >
           {directories.isFetching && (
@@ -423,14 +471,42 @@ function DirectoryField({ location }: { location: WorkLocation }) {
           >
             {t("workLocation.noDirectories")}
           </ComboboxEmpty>
-          <ComboboxList className="p-1">
+          {/* 列表最高到可用高度（弹层里没有搜索框，不用给它留位置）；候选加载完顶满可用高度后，下方放不下才会翻到上方 */}
+          <ComboboxList className="max-h-[min(--spacing(63),var(--available-height))] p-1">
+            {recentChoices.length > 0 && (
+              <ComboboxGroup>
+                <ComboboxLabel className="text-caption">
+                  {t("workLocation.recentDirectories")}
+                </ComboboxLabel>
+                {recentChoices.map((choice) => (
+                  <ComboboxItem
+                    key={choice.directory}
+                    value={choice}
+                    className="text-table"
+                  >
+                    <OverflowTooltip
+                      render={<span className="min-w-0 truncate" />}
+                    >
+                      {choice.directory}
+                    </OverflowTooltip>
+                  </ComboboxItem>
+                ))}
+              </ComboboxGroup>
+            )}
+            {recentChoices.length > 0 && subdirectoryChoices.length > 0 && (
+              <ComboboxSeparator className="my-1" />
+            )}
             <ComboboxGroup>
-              {names.map((name) => (
-                <ComboboxItem key={name} value={name} className="text-table">
+              {subdirectoryChoices.map((choice) => (
+                <ComboboxItem
+                  key={choice.name}
+                  value={choice}
+                  className="text-table"
+                >
                   <OverflowTooltip
                     render={<span className="min-w-0 truncate" />}
                   >
-                    {name}/
+                    {choice.name}/
                   </OverflowTooltip>
                 </ComboboxItem>
               ))}

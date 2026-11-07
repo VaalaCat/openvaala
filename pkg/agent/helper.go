@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
 )
@@ -113,4 +115,27 @@ func getItemIDs(items []*defs.Item) []string {
 		ids = append(ids, string(item.ID))
 	}
 	return ids
+}
+
+// truncateMemoryIndex 把读到的 MEMORY.md 截到 maxMemoryIndexBytes 以内：超出时在最后一个换行符处截断，
+// 没有换行符时退到最后一个完整的 UTF-8 字符；isEndOfFile 表示 content 是否读到了文件末尾；返回正文和是否截断过。
+func truncateMemoryIndex(content []byte, isEndOfFile bool) (string, bool) {
+	// 1. 不超过上限时原样返回。
+	if len(content) <= maxMemoryIndexBytes {
+		return string(content), false
+	}
+	// 2. 上限处正好是行尾：就在上限处截断，不丢最后一整行；后面只剩这个换行符时，文件没有被截断。
+	if content[maxMemoryIndexBytes] == '\n' {
+		return string(content[:maxMemoryIndexBytes]), !isEndOfFile
+	}
+	// 3. 优先在上限以内的最后一个换行符处截断，保证以完整的一行结尾。
+	if cut := bytes.LastIndexByte(content[:maxMemoryIndexBytes], '\n'); cut >= 0 {
+		return string(content[:cut]), true
+	}
+	// 4. 没有换行符时，从上限处往回退到一个字符的开头，不把多字节字符截成两半。
+	cut := maxMemoryIndexBytes
+	for cut > 0 && !utf8.RuneStart(content[cut]) {
+		cut--
+	}
+	return string(content[:cut]), true
 }

@@ -14,7 +14,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/storage"
 )
 
-// TestForkConversation 检查不同截取点、带摘要的历史、再次分叉和换模型时，分叉出的对话记录、Turn 和历史。
+// TestForkConversation 检查不同截取点、还在运行的轮次、带摘要的历史、再次分叉、换模型和读写不同存储时，分叉出的对话记录、Turn 和历史。
 func TestForkConversation(t *testing.T) {
 	// 1. 列出截取点、摘要、再次分叉、换模型和各种截取错误的预期结果。
 	compacted := []forkSourceStep{forkStepTurn, forkStepTurn, forkStepCompact, forkStepTurn, forkStepTurn}
@@ -23,9 +23,13 @@ func TestForkConversation(t *testing.T) {
 		steps   []forkSourceStep
 		request func(source forkSource) *ForkConversationRequest
 		wantErr error
+		// separateTarget 为 true 时分叉写进另一个存储，来源存储只读。
+		separateTarget bool
 		// wantTurns 是复制过去的来源轮次数（从第一轮起）；成功时都检查新对话的记录、Turn 记录和接起来的历史。
 		wantTurns int
-		check     func(t *testing.T, store *conversationStore, opt *ConversationOpt, source forkSource, forked defs.Conversation)
+		// wantItemsOfRunningTurn 大于 0 时，检查分叉里来源还在运行的那一轮已保存的 Item 都复制过去了。
+		wantItemsOfRunningTurn int
+		check                  func(t *testing.T, sourceStore, targetStore *conversationStore, opt *ConversationOpt, source forkSource, forked defs.Conversation)
 	}{
 		{
 			name:  "no_summary",
@@ -37,8 +41,8 @@ func TestForkConversation(t *testing.T) {
 				}
 			},
 			wantTurns: 2,
-			check: func(t *testing.T, store *conversationStore, _ *ConversationOpt, _ forkSource, forked defs.Conversation) {
-				if first := readFirstLogItem(t, store, forked.ID, forked.RootSessionID); first.Kind == defs.ItemSessionFork {
+			check: func(t *testing.T, _, targetStore *conversationStore, _ *ConversationOpt, _ forkSource, forked defs.Conversation) {
+				if first := readFirstLogItem(t, targetStore, forked.ID, forked.RootSessionID); first.Kind == defs.ItemSessionFork {
 					t.Fatalf("first log line = %+v, want a copied Item", first)
 				}
 				if forked.MessageCount != 4 {
@@ -47,12 +51,74 @@ func TestForkConversation(t *testing.T) {
 			},
 		},
 		{
-			name:  "all_ended_turns",
+			name:  "no_boundary_copies_running_turn",
 			steps: []forkSourceStep{forkStepTurn, forkStepTurn, forkStepRunning},
 			request: func(source forkSource) *ForkConversationRequest {
 				return &ForkConversationRequest{Source: source.record}
 			},
+			wantTurns:              3,
+			wantItemsOfRunningTurn: 3,
+		},
+		{
+			name:  "last_turn_id_may_be_running",
+			steps: []forkSourceStep{forkStepTurn, forkStepTurn, forkStepRunning},
+			request: func(source forkSource) *ForkConversationRequest {
+				return &ForkConversationRequest{
+					Source:     source.record,
+					LastTurnID: source.turnIDs[2],
+				}
+			},
+			wantTurns:              3,
+			wantItemsOfRunningTurn: 3,
+		},
+		{
+			name:  "last_turn_id_before_running_turn",
+			steps: []forkSourceStep{forkStepTurn, forkStepTurn, forkStepRunning},
+			request: func(source forkSource) *ForkConversationRequest {
+				return &ForkConversationRequest{
+					Source:     source.record,
+					LastTurnID: source.turnIDs[1],
+				}
+			},
 			wantTurns: 2,
+		},
+		{
+			name:  "before_turn_id_stops_at_running_turn",
+			steps: []forkSourceStep{forkStepTurn, forkStepTurn, forkStepRunning},
+			request: func(source forkSource) *ForkConversationRequest {
+				return &ForkConversationRequest{
+					Source:       source.record,
+					BeforeTurnID: source.turnIDs[2],
+				}
+			},
+			wantTurns: 2,
+		},
+		{
+			name:  "source_and_fork_use_different_stores",
+			steps: []forkSourceStep{forkStepTurn, forkStepTurn, forkStepRunning},
+			request: func(source forkSource) *ForkConversationRequest {
+				return &ForkConversationRequest{Source: source.record}
+			},
+			separateTarget:         true,
+			wantTurns:              3,
+			wantItemsOfRunningTurn: 3,
+			check: func(t *testing.T, sourceStore, targetStore *conversationStore, _ *ConversationOpt, source forkSource, forked defs.Conversation) {
+				// 分叉的对话、Session、Turn 和 Item 只出现在目标存储；来源存储里只有来源对话，Item 数不变。
+				requireConversationIDs(t, sourceStore, source.record.ID)
+				requireConversationIDs(t, targetStore, forked.ID)
+				if turns := listForkTestTurns(t, sourceStore, forked.RootSessionID); len(turns) != 0 {
+					t.Fatalf("source store holds fork Turns %+v", turns)
+				}
+				if items := listSessionItems(t, sourceStore, forked.ID, forked.RootSessionID); len(items) != 0 {
+					t.Fatalf("source store holds fork Items %v", getItemIDs(items))
+				}
+				if items := listSessionItems(t, sourceStore, source.record.ID, source.record.RootSessionID); len(items) != source.itemCount {
+					t.Fatalf("source Items = %d, want %d", len(items), source.itemCount)
+				}
+				if turns := listForkTestTurns(t, targetStore, source.record.RootSessionID); len(turns) != 0 {
+					t.Fatalf("target store holds source Turns %+v", turns)
+				}
+			},
 		},
 		{
 			name:  "with_summary",
@@ -64,14 +130,14 @@ func TestForkConversation(t *testing.T) {
 				}
 			},
 			wantTurns: 5,
-			check: func(t *testing.T, store *conversationStore, _ *ConversationOpt, source forkSource, forked defs.Conversation) {
-				sourceItems := listSessionItems(t, store, source.record.ID, source.record.RootSessionID)
+			check: func(t *testing.T, sourceStore, targetStore *conversationStore, _ *ConversationOpt, source forkSource, forked defs.Conversation) {
+				sourceItems := listSessionItems(t, sourceStore, source.record.ID, source.record.RootSessionID)
 				summary := sourceItems[slices.IndexFunc(sourceItems, func(item *defs.Item) bool { return item.Kind == defs.ItemContextSummary })]
 				// 来源开头没有 SessionFork 记录，对外序号就是行号。
 				boundaryOrdinal := int64(slices.IndexFunc(sourceItems, func(item *defs.Item) bool {
 					return item.ID == summary.ContextSummary.CoveredThroughItemID
 				}) + 1)
-				first := readFirstLogItem(t, store, forked.ID, forked.RootSessionID)
+				first := readFirstLogItem(t, targetStore, forked.ID, forked.RootSessionID)
 				want := &defs.SessionFork{
 					SourceSessionID:      source.record.RootSessionID,
 					SourceConversationID: source.record.ID,
@@ -80,8 +146,8 @@ func TestForkConversation(t *testing.T) {
 				if first.Kind != defs.ItemSessionFork || !reflect.DeepEqual(first.SessionFork, want) || first.TurnID != "" {
 					t.Fatalf("first log line = %+v %+v, want marker %+v", first, first.SessionFork, want)
 				}
-				sourceContext := getContextItemIDs(t, store, source.record.ID, source.record.RootSessionID)
-				if forkedContext := getContextItemIDs(t, store, forked.ID, forked.RootSessionID); !slices.Equal(forkedContext, sourceContext) {
+				sourceContext := getContextItemIDs(t, sourceStore, source.record.ID, source.record.RootSessionID)
+				if forkedContext := getContextItemIDs(t, targetStore, forked.ID, forked.RootSessionID); !slices.Equal(forkedContext, sourceContext) {
 					t.Fatalf("forked context = %v, want %v", forkedContext, sourceContext)
 				}
 				if forked.MessageCount != 8 {
@@ -99,10 +165,11 @@ func TestForkConversation(t *testing.T) {
 				}
 			},
 			wantTurns: 5,
-			check: func(t *testing.T, store *conversationStore, opt *ConversationOpt, source forkSource, forked defs.Conversation) {
+			check: func(t *testing.T, sourceStore, targetStore *conversationStore, opt *ConversationOpt, source forkSource, forked defs.Conversation) {
 				// 再次分叉只复制第一轮：这一轮在首次分叉里由 SessionFork 指向来源，要从来源历史里读出来，原样写进新日志。
 				second, err := ForkConversation(t.Context(), &ForkConversationRequest{
 					Source:       forked,
+					SourceQuery:  targetStore.query,
 					BeforeTurnID: source.turnIDs[1],
 				}, opt)
 				if err != nil {
@@ -111,14 +178,14 @@ func TestForkConversation(t *testing.T) {
 				if second.ForkedFromID != forked.ID {
 					t.Fatalf("ForkedFromID = %s, want %s", second.ForkedFromID, forked.ID)
 				}
-				want := getItemIDs(getTurnItems(listSessionItems(t, store, source.record.ID, source.record.RootSessionID), source.turnIDs[:1]))
-				if got := getItemIDs(listSessionItems(t, store, second.ID, second.RootSessionID)); len(want) == 0 || !slices.Equal(got, want) {
+				want := getItemIDs(getTurnItems(listSessionItems(t, sourceStore, source.record.ID, source.record.RootSessionID), source.turnIDs[:1]))
+				if got := getItemIDs(listSessionItems(t, targetStore, second.ID, second.RootSessionID)); len(want) == 0 || !slices.Equal(got, want) {
 					t.Fatalf("second fork Items = %v, want first source Turn %v", got, want)
 				}
-				if first := readFirstLogItem(t, store, second.ID, second.RootSessionID); first.Kind == defs.ItemSessionFork {
+				if first := readFirstLogItem(t, targetStore, second.ID, second.RootSessionID); first.Kind == defs.ItemSessionFork {
 					t.Fatalf("second fork first log line = %+v, want a copied Item", first)
 				}
-				getContextItemIDs(t, store, second.ID, second.RootSessionID)
+				getContextItemIDs(t, targetStore, second.ID, second.RootSessionID)
 			},
 		},
 		{
@@ -135,8 +202,8 @@ func TestForkConversation(t *testing.T) {
 				}
 			},
 			wantTurns: 1,
-			check: func(t *testing.T, store *conversationStore, opt *ConversationOpt, source forkSource, forked defs.Conversation) {
-				root, _, err := store.query.GetSession(t.Context(), forked.ID, forked.RootSessionID)
+			check: func(t *testing.T, sourceStore, targetStore *conversationStore, opt *ConversationOpt, source forkSource, forked defs.Conversation) {
+				root, _, err := targetStore.query.GetSession(t.Context(), forked.ID, forked.RootSessionID)
 				if want := (defs.ModelSelection{
 					Ref: defs.ModelRef{
 						ProviderID: "test",
@@ -147,7 +214,8 @@ func TestForkConversation(t *testing.T) {
 					t.Fatalf("root Model = %+v %v, want %+v", root.Model, err, want)
 				}
 				_, err = ForkConversation(t.Context(), &ForkConversationRequest{
-					Source: source.record,
+					Source:      source.record,
+					SourceQuery: sourceStore.query,
 					Model: defs.ModelSelection{Ref: defs.ModelRef{
 						ProviderID: "test",
 						ModelID:    "missing",
@@ -156,7 +224,7 @@ func TestForkConversation(t *testing.T) {
 				if err == nil || err.Error() != "model test/missing is not configured" {
 					t.Fatalf("fork with unconfigured model err = %v", err)
 				}
-				requireConversationIDs(t, store, source.record.ID, forked.ID)
+				requireConversationIDs(t, targetStore, source.record.ID, forked.ID)
 			},
 		},
 		{
@@ -183,17 +251,6 @@ func TestForkConversation(t *testing.T) {
 			wantErr: ErrForkTurnNotFound,
 		},
 		{
-			name:  "last_turn_running",
-			steps: []forkSourceStep{forkStepTurn, forkStepRunning},
-			request: func(source forkSource) *ForkConversationRequest {
-				return &ForkConversationRequest{
-					Source:     source.record,
-					LastTurnID: source.turnIDs[1],
-				}
-			},
-			wantErr: ErrForkTurnRunning,
-		},
-		{
 			name:  "nothing_before_first_turn",
 			steps: []forkSourceStep{forkStepTurn, forkStepTurn},
 			request: func(source forkSource) *ForkConversationRequest {
@@ -211,8 +268,13 @@ func TestForkConversation(t *testing.T) {
 			model := newConversationModel(t)
 			store := openConversationDAO(t)
 			source := newForkSource(t, store, model, tt.steps)
-			opt := conversationOpt(store, model)
+			target := store
+			if tt.separateTarget {
+				target = openConversationDAO(t)
+			}
+			opt := conversationOpt(target, model)
 			request := tt.request(source)
+			request.SourceQuery = store.query
 			forked, err := ForkConversation(t.Context(), request, opt)
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
@@ -226,7 +288,7 @@ func TestForkConversation(t *testing.T) {
 			}
 
 			// 3. 检查新对话和根 Session 已保存，且 ID 和来源不同。
-			saved, found, err := store.query.GetConversation(t.Context(), forked.ID)
+			saved, found, err := target.query.GetConversation(t.Context(), forked.ID)
 			saved.UpdatedAt = 0
 			want := defs.Conversation{
 				ID:               forked.ID,
@@ -239,14 +301,14 @@ func TestForkConversation(t *testing.T) {
 			if err != nil || !found || !reflect.DeepEqual(saved, want) || !reflect.DeepEqual(forked, want) || forked.RootSessionID == source.record.RootSessionID {
 				t.Fatalf("saved = %+v %v %v, returned %+v, want %+v", saved, found, err, forked, want)
 			}
-			root, found, err := store.query.GetSession(t.Context(), forked.ID, forked.RootSessionID)
+			root, found, err := target.query.GetSession(t.Context(), forked.ID, forked.RootSessionID)
 			if err != nil || !found || root.AgentName != "assistant" || root.ParentSessionID != "" || root.ConversationID != forked.ID {
 				t.Fatalf("root Session = %+v %v %v", root, found, err)
 			}
 
 			// 4. 检查复制的 Turn 只换了对话、Session 和保存时间，用量照抄。
 			sourceTurns := listForkTestTurns(t, store, source.record.RootSessionID)[:tt.wantTurns]
-			forkedTurns := listForkTestTurns(t, store, forked.RootSessionID)
+			forkedTurns := listForkTestTurns(t, target, forked.RootSessionID)
 			if len(forkedTurns) != len(sourceTurns) {
 				t.Fatalf("forked Turns = %+v, want %d", forkedTurns, len(sourceTurns))
 			}
@@ -261,12 +323,18 @@ func TestForkConversation(t *testing.T) {
 
 			// 5. 检查新对话读出的历史（SessionFork 指向的部分也读出来）和来源保留轮次一致，再执行用例自己的检查。
 			wantItems := getTurnItems(listSessionItems(t, store, source.record.ID, source.record.RootSessionID), source.turnIDs[:tt.wantTurns])
-			gotItems := listSessionItems(t, store, forked.ID, forked.RootSessionID)
+			gotItems := listSessionItems(t, target, forked.ID, forked.RootSessionID)
 			if len(wantItems) == 0 || !reflect.DeepEqual(withoutUpdatedAt(gotItems), withoutUpdatedAt(wantItems)) {
 				t.Fatalf("forked Items = %v, want %v", getItemIDs(gotItems), getItemIDs(wantItems))
 			}
+			if tt.wantItemsOfRunningTurn > 0 {
+				runningItems := getTurnItems(gotItems, source.turnIDs[len(source.turnIDs)-1:])
+				if len(runningItems) != tt.wantItemsOfRunningTurn {
+					t.Fatalf("forked running Turn Items = %v, want %d", getItemIDs(runningItems), tt.wantItemsOfRunningTurn)
+				}
+			}
 			if tt.check != nil {
-				tt.check(t, store, opt, source, forked)
+				tt.check(t, store, target, opt, source, forked)
 			}
 		})
 	}
@@ -280,7 +348,8 @@ const (
 	forkStepTurn forkSourceStep = "turn"
 	// forkStepCompact 手动压缩一次，单独占一轮。
 	forkStepCompact forkSourceStep = "compact"
-	// forkStepRunning 停止对话后直接写一条 running Turn 记录，当作还没结束的一轮；只能是最后一步。
+	// forkStepRunning 停止对话后直接写一条 running Turn 记录和它已保存的三条 Item（用户输入、Agent 回复、没有结果的工具调用），
+	// 当作还没结束的一轮；只能是最后一步。
 	forkStepRunning forkSourceStep = "running"
 )
 
@@ -290,6 +359,8 @@ type forkSource struct {
 	record defs.Conversation
 	// turnIDs 是各步的 TurnID。
 	turnIDs []defs.TurnID
+	// itemCount 是来源根 Session 已保存的 Item 总数。
+	itemCount int
 }
 
 // newForkSource 按步骤执行来源对话，停止后写入各轮用量和标题。
@@ -316,11 +387,17 @@ func newForkSource(t *testing.T, store *conversationStore, model *conversationMo
 			turnIDs = append(turnIDs, turnID)
 		case forkStepRunning:
 			h.stop(t)
+			turnID := defs.NewTurnID()
+			logged, err := store.mutation.AppendItems(t.Context(), c.GetID(), c.GetRootSessionID(), getRunningTurnItems(turnID)...)
+			if err != nil {
+				t.Fatal(err)
+			}
 			running := defs.Turn{
-				ID:             defs.NewTurnID(),
+				ID:             turnID,
 				ConversationID: c.GetID(),
 				SessionID:      c.GetRootSessionID(),
 				Status:         defs.TurnStatusRunning,
+				ItemsRange:     defs.TurnItemRange{FirstOrdinal: uint64(logged[0].Ordinal)},
 			}
 			if err := store.mutation.SetTurn(t.Context(), running); err != nil {
 				t.Fatal(err)
@@ -355,9 +432,27 @@ func newForkSource(t *testing.T, store *conversationStore, model *conversationMo
 		t.Fatal(err)
 	}
 	return forkSource{
-		record:  record,
-		turnIDs: turnIDs,
+		record:    record,
+		turnIDs:   turnIDs,
+		itemCount: len(listSessionItems(t, store, record.ID, record.RootSessionID)),
 	}
+}
+
+// getRunningTurnItems 返回还在运行的轮次已保存的三条 Item：用户输入、Agent 回复和一个还没有结果的工具调用。
+func getRunningTurnItems(turnID defs.TurnID) []*defs.Item {
+	// 1. 依次创建用户输入、带模型调用 ID 的 Agent 回复和状态为 ready 的工具调用。
+	modelCallID := defs.NewModelCallID()
+	reply := historyMessage(defs.NewItemID(), turnID, "我先看看")
+	reply.ModelCallID = modelCallID
+	reply.Message.From = &defs.Address{Kind: defs.IdentityAgent, ID: "assistant"}
+	call := &defs.Item{
+		ID:          defs.NewItemID(),
+		TurnID:      turnID,
+		ModelCallID: modelCallID,
+		Kind:        defs.ItemToolCall,
+		ToolCall:    &defs.ToolCall{CallID: "running-call", Name: "bash", Arguments: "{}", Status: defs.ToolCallReady},
+	}
+	return []*defs.Item{historyMessage(defs.NewItemID(), turnID, "长任务"), reply, call}
 }
 
 // listForkTestTurns 按 TurnID 正序读出 Session 的全部 Turn 记录。
@@ -473,7 +568,7 @@ func TestForkRejectsMissingSourceHistory(t *testing.T) {
 			model, store := newConversationModel(t), openConversationDAO(t)
 			source := newForkSource(t, store, model, steps)
 			opt := conversationOpt(store, model)
-			forked, err := ForkConversation(t.Context(), &ForkConversationRequest{Source: source.record}, opt)
+			forked, err := ForkConversation(t.Context(), &ForkConversationRequest{Source: source.record, SourceQuery: store.query}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -481,7 +576,7 @@ func TestForkRejectsMissingSourceHistory(t *testing.T) {
 			if err := store.logs.Delete(t.Context(), storage.StreamPath(forked.ID), storage.StreamID(forked.RootSessionID)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := ForkConversation(t.Context(), &ForkConversationRequest{Source: forked}, opt); err == nil {
+			if _, err := ForkConversation(t.Context(), &ForkConversationRequest{Source: forked, SourceQuery: store.query}, opt); err == nil {
 				t.Fatal("published fork without source Items")
 			}
 			requireConversationIDs(t, store, source.record.ID, forked.ID)

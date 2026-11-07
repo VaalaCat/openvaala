@@ -12,12 +12,11 @@ import (
 )
 
 type preferences struct {
-	Language     string `json:"language"`
-	Theme        string `json:"theme"`
-	Palette      string `json:"palette"`
-	BodyFont     string `json:"body_font"`
-	TitleFont    string `json:"title_font"`
-	ReduceMotion bool   `json:"reduce_motion"`
+	Language  string `json:"language"`
+	Theme     string `json:"theme"`
+	Palette   string `json:"palette"`
+	BodyFont  string `json:"body_font"`
+	TitleFont string `json:"title_font"`
 	// NotifyOnFinish 为真时，窗口不在前台的对话完成后发系统通知。
 	NotifyOnFinish bool               `json:"notify_on_finish"`
 	Width          int                `json:"width"`

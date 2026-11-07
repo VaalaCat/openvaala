@@ -19,6 +19,9 @@ import type {
 // 新对话固定用的 Agent，和 TUI 缺省的 run.agent_name 一致
 export const newConversationAgentName = "default"
 
+// 最近更新的对话取多少条
+const recentConversationLimit = 50
+
 // ConversationListFilter 是对话列表的搜索词、归档、排序等条件；翻页游标由 queryFn 按页补上
 export type ConversationListFilter = Omit<ListConversationsParams, "cursor">
 
@@ -46,6 +49,22 @@ export function conversationOptions(
     queryKey: [connection.getServerID(), "conversations", conversationID],
     queryFn: () =>
       connection.call("conversation/read", { conversation_id: conversationID }),
+  })
+}
+
+// 最近更新的对话（最多 recentConversationLimit 条，不含归档）：新对话页用第一条预填工作位置，目录下拉用它们列出最近用过的目录。
+// key 在对话列表之下，建对话、改设置之后随列表一起过期
+export function recentConversationsOptions(connection: ServerConnection) {
+  return queryOptions({
+    queryKey: [connection.getServerID(), "conversations", "recent"],
+    queryFn: () =>
+      connection.call("conversation/list", {
+        archived: false,
+        order: { by: "updated_at", direction: "desc" },
+        limit: recentConversationLimit,
+      }),
+    // 读失败后，目录框挂载时不重新请求；失败只是不显示预填和「最近用过」
+    retryOnMount: false,
   })
 }
 
@@ -92,7 +111,7 @@ export function renameConversationOptions(connection: ServerConnection) {
   })
 }
 
-// 分叉带上来源对话的 Executor 设置；beforeTurnID 和 lastTurnID 最多给一个，都不给时复制全部已结束的轮次
+// 分叉带上来源对话的 Executor 设置；beforeTurnID 和 lastTurnID 最多给一个，都不给时复制到最后一条已保存的内容，包括还在运行的轮次已保存的部分
 export function forkConversationOptions(connection: ServerConnection) {
   return mutationOptions({
     mutationFn: (variables: {

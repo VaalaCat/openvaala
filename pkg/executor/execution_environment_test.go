@@ -251,6 +251,39 @@ func (f *environmentFixture) newToolExecutor(t *testing.T, serverIDs defs.Option
 	return toolExecutor
 }
 
+// TestExecutionEnvironmentCommandSupport 验证环境默认能跑命令，WithoutCommands 之后不能，创建后保留这个标记。
+func TestExecutionEnvironmentCommandSupport(t *testing.T) {
+	// 1. 列出默认和不能跑命令的配置。
+	tests := []struct {
+		name string
+		opt  *executor.ExecutionEnvironmentOpt
+		want bool
+	}{
+		{
+			name: "default_supports_commands",
+			opt:  executor.NewExecutionEnvironmentOpt("local", "本机", nil),
+			want: true,
+		},
+		{
+			name: "without_commands",
+			opt:  executor.NewExecutionEnvironmentOpt("memory", "记忆", nil).WithoutCommands(),
+			want: false,
+		},
+	}
+	// 2. 创建环境，核对 IsCommandSupported。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			environment, err := executor.NewExecutionEnvironment(tt.opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := environment.IsCommandSupported(); got != tt.want {
+				t.Fatalf("IsCommandSupported() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestExecutionEnvironmentMCPTools 验证环境的 MCP 筛选、依赖失败和连接停止。
 func TestExecutionEnvironmentMCPTools(t *testing.T) {
 	// 1. 准备测试 server 与工作区配置。

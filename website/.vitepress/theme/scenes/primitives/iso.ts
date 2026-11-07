@@ -150,8 +150,11 @@ export function getRoundedPolylinePath(points: Vec3[], cornerRadius = 8): string
 }
 
 // getRounded2dPath 在平面折线的拐角处倒圆，流程图连线和等轴测线缆共用。
-export function getRounded2dPath(points: Vec2[], cornerRadius = 8): string {
+export function getRounded2dPath(inputPoints: Vec2[], cornerRadius = 8): string {
+  // 1. 去掉和前一个点重合的点，例如岔口正对目标时那段长度为 0 的竖线。
+  const points = inputPoints.filter((point, index) => index === 0 || point[0] !== inputPoints[index - 1][0] || point[1] !== inputPoints[index - 1][1])
   if (points.length < 2) return ""
+  // 2. 逐个拐角倒圆。
   let path = `M${round(points[0][0])} ${round(points[0][1])}`
   for (let index = 1; index < points.length - 1; index++) {
     const [px, py] = points[index - 1]

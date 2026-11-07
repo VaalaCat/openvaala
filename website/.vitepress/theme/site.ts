@@ -151,10 +151,3 @@ export function useAppearanceMode() {
 
   return { mode, setMode }
 }
-
-// ---------- 动效 ----------
-
-// isReducedMotion 判断用户是否要求减少动效？
-export function isReducedMotion(): boolean {
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches
-}

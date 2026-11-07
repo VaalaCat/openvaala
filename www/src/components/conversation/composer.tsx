@@ -12,12 +12,7 @@ import {
 import { ListEndIcon, PlusIcon, XIcon } from "lucide-react"
 import { ArrowUp, Square } from "lucide"
 import { MorphIcon } from "morphicons/react"
-import {
-  AnimatePresence,
-  motion,
-  useIsPresent,
-  useReducedMotion,
-} from "motion/react"
+import { AnimatePresence, motion, useIsPresent } from "motion/react"
 import { useStore } from "@nanostores/react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
@@ -55,13 +50,18 @@ import {
   getImageBytes,
   readImageAsDataURL,
 } from "@/lib/attachments"
-import { getSlashToken, shouldSubmitOnKeyDown } from "@/lib/composer-keys"
+import {
+  getSideConversationQuestion,
+  getSlashToken,
+  shouldSubmitOnKeyDown,
+} from "@/lib/composer-keys"
 import {
   $drafts,
   getDraft,
   getDraftKey,
   newConversationDraftID,
   removeSentContent,
+  removeSentText,
   getDraftText,
   replaceDraftText,
   setDraft,
@@ -72,7 +72,8 @@ import { getRpcErrorMessage } from "@/lib/rpc-error"
 import { cn } from "@/lib/utils"
 
 export type ComposerProps =
-  // 对话页：提交到这个对话；isRunning 时可以补充、排队、插队和中断
+  // 对话页：提交到这个对话；isRunning 时可以补充、排队、插队和中断。
+  // 给了 onSideConversation 才有内置的 /btw：输入以 /btw 开头时调用它开旁支，成功后清掉输入框里的文字，失败时抛错、文字保留
   | {
       serverID: string
       conversationID: ConversationID
@@ -81,6 +82,9 @@ export type ComposerProps =
       isRunning: boolean
       sessionControls: ReactNode
       contextUsage: ReactNode
+      onSideConversation?(question: string): Promise<void>
+      // 输入框挂上时是否直接获得焦点
+      autoFocus?: boolean
     }
   // 新对话页：建对话并提交第一条输入；返回 false 时页面已在字段旁写明没提交的原因，其他失败抛错。
   // 斜杠补全按还没建的对话的 Agent 和 Executor 设置查 skill
@@ -94,9 +98,10 @@ export type ComposerProps =
 // 输入完整草稿、补全 Skill，并发送或排队；成功后只移除已发送的内容。
 export function Composer(props: ComposerProps) {
   const { t } = useTranslation()
-  const reducedMotion = useReducedMotion()
   const connection = useServerConnection()
   const sync = "sync" in props ? props.sync : undefined
+  const onSideConversation =
+    "sync" in props ? props.onSideConversation : undefined
   const isRunning = "sync" in props && props.isRunning
   const serverID = props.serverID
   const draftID =
@@ -138,16 +143,22 @@ export function Composer(props: ComposerProps) {
       draftKey: string
       sync?: ConversationSync
       create?: (content: Content[]) => Promise<boolean>
+      // 输入是 /btw 命令时开旁支，不当作普通输入发送
+      openSideConversation?: () => Promise<void>
       content: Content[]
       mode: SessionInputMode
     }): Promise<boolean> => {
+      if (variables.openSideConversation) {
+        await variables.openSideConversation()
+        return true
+      }
       if (!variables.sync) return variables.create!(variables.content)
       await variables.sync.submitInput(variables.content, variables.mode)
       return true
     },
   })
 
-  // 1. 斜杠补全：光标所在的词以 / 开头时按前缀匹配 skill；Esc 收起，再改文字时重新出现。
+  // 1. 斜杠补全：光标所在的词以 / 开头时按前缀匹配 skill；对话页的输入开头还有内置的 /btw，排在 skill 前面；Esc 收起，再改文字时重新出现。
   const listboxID = useId()
   const [cursor, setCursor] = useState(0)
   const [isSlashDismissed, setIsSlashDismissed] = useState(false)
@@ -170,8 +181,22 @@ export function Composer(props: ComposerProps) {
     ),
     enabled: !!slashToken && isReady && isConnected,
   })
+  const builtinCommands: SkillInfo[] =
+    onSideConversation && slashToken?.start === 0
+      ? [
+          {
+            name: "btw",
+            description: t("composer.btwDescription"),
+            path: "",
+            executor: "",
+          },
+        ]
+      : []
   const matches = slashToken
-    ? matchSkills(skills.data ?? [], slashToken.prefix)
+    ? matchSkills(
+        [...builtinCommands, ...(skills.data ?? [])],
+        slashToken.prefix
+      )
     : []
   const isSlashOpen =
     isReady &&
@@ -216,6 +241,9 @@ export function Composer(props: ComposerProps) {
     if (!canSubmit) return
     // 1. 保存本次发出的内容引用，不改写空白、材料和图片顺序。
     const content = draft.content
+    const sideQuestion = onSideConversation
+      ? getSideConversationQuestion(text)
+      : undefined
     // 2. 提交；新对话页已在字段旁说明没提交的原因时，不提示也不清空。
     let isSubmitted: boolean
     try {
@@ -224,6 +252,10 @@ export function Composer(props: ComposerProps) {
         sync,
         create:
           "onCreateAndSubmit" in props ? props.onCreateAndSubmit : undefined,
+        openSideConversation:
+          sideQuestion === undefined
+            ? undefined
+            : () => onSideConversation!(sideQuestion),
         content,
         mode,
       })
@@ -232,11 +264,19 @@ export function Composer(props: ComposerProps) {
       return
     }
     if (!isSubmitted) return
-    // 3. 发送期间又追加的文字和新加的图片留着，只去掉已发出的部分。
+    // 3. 发送期间又追加的文字和新加的图片留着，只去掉已发出的部分；/btw 只用了文字，图片和材料都留着。
+    const latest = getDraft(serverID, draftID)
     setDraft(
       serverID,
       draftID,
-      removeSentContent(getDraft(serverID, draftID), content)
+      sideQuestion === undefined
+        ? removeSentContent(latest, content)
+        : {
+            content: replaceDraftText(
+              latest.content,
+              removeSentText(getDraftText(latest.content), text)
+            ),
+          }
     )
     if (targetRef.current === draftKey) setAttachmentError(undefined)
   }
@@ -409,7 +449,7 @@ export function Composer(props: ComposerProps) {
               initial={{ height: 0, opacity: 0 }}
               animate={{ height: "auto", opacity: 1 }}
               exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: reducedMotion ? 0 : 0.2 }}
+              transition={{ duration: 0.2 }}
               className="order-first w-full overflow-hidden"
             >
               <AttachmentStrip
@@ -475,6 +515,7 @@ export function Composer(props: ComposerProps) {
           value={text}
           aria-label={t("composer.label")}
           placeholder={t("composer.placeholder")}
+          autoFocus={"autoFocus" in props && props.autoFocus}
           aria-autocomplete="list"
           aria-controls={isSlashOpen ? listboxID : undefined}
           aria-activedescendant={
@@ -568,7 +609,7 @@ function ConversationSyncError({ sync }: { sync: ConversationSync }) {
   return <RequestError error={error} />
 }
 
-// 斜杠补全列表：查 skill 时显示加载格点、失败时写原因，否则列出匹配的 skill；点选不让输入框失去焦点
+// 斜杠补全列表：先列出匹配的内置命令和 skill，查 skill 时在后面显示加载格点、失败时写原因；点选不让输入框失去焦点
 function SlashSkillList({
   id,
   skills,
@@ -592,6 +633,25 @@ function SlashSkillList({
       aria-label={t("composer.skills")}
       className="absolute inset-x-0 bottom-full z-20 mb-2 max-h-64 overflow-y-auto border bg-popover p-1 text-popover-foreground shadow-md"
     >
+      {matches.map((skill, index) => (
+        <div
+          key={skill.name}
+          id={id + "-" + index}
+          role="option"
+          aria-selected={index === highlighted}
+          className="flex cursor-default flex-col px-2 py-1 aria-selected:bg-accent aria-selected:text-accent-foreground"
+          onMouseDown={(event) => event.preventDefault()}
+          onMouseEnter={() => onHighlight(index)}
+          onClick={() => onPick(skill)}
+        >
+          <span className="text-table wrap-anywhere">/{skill.name}</span>
+          {skill.description && (
+            <span className="truncate text-caption color-muted">
+              {skill.description}
+            </span>
+          )}
+        </div>
+      ))}
       {skills.isPending ? (
         <div className="flex items-center gap-2 px-2 py-2 text-caption color-muted">
           <LatticeLoader aria-hidden />
@@ -601,27 +661,7 @@ function SlashSkillList({
         <p className="px-2 py-2 text-caption wrap-anywhere color-destructive">
           {getRpcErrorMessage(skills.error, t)}
         </p>
-      ) : (
-        matches.map((skill, index) => (
-          <div
-            key={skill.name}
-            id={id + "-" + index}
-            role="option"
-            aria-selected={index === highlighted}
-            className="flex cursor-default flex-col px-2 py-1 aria-selected:bg-accent aria-selected:text-accent-foreground"
-            onMouseDown={(event) => event.preventDefault()}
-            onMouseEnter={() => onHighlight(index)}
-            onClick={() => onPick(skill)}
-          >
-            <span className="text-table wrap-anywhere">/{skill.name}</span>
-            {skill.description && (
-              <span className="truncate text-caption color-muted">
-                {skill.description}
-              </span>
-            )}
-          </div>
-        ))
-      )}
+      ) : null}
     </div>
   )
 }
@@ -745,7 +785,6 @@ function SendControls({
           <span className="relative flex size-4 items-center justify-center">
             <MorphIcon
               icon={showStop ? Square : ArrowUp}
-              reducedMotion="user"
               size={16}
               aria-hidden
               className={isLoading ? "invisible" : undefined}
@@ -774,14 +813,13 @@ function QueueButton({
 }) {
   const { t } = useTranslation()
   const isPresent = useIsPresent()
-  const reducedMotion = useReducedMotion()
   // 1. 按内容宽度展开或收起按钮及右侧间距，主按钮留在原处。
   return (
     <motion.div
       initial={{ width: 0, opacity: 0 }}
       animate={{ width: "auto", opacity: 1 }}
       exit={{ width: 0, opacity: 0 }}
-      transition={{ duration: reducedMotion ? 0 : 0.2 }}
+      transition={{ duration: 0.2 }}
       className="shrink-0"
       inert={!isPresent}
       aria-hidden={!isPresent}

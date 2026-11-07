@@ -61,7 +61,7 @@ test("manual_reconnect_preserves_content_and_draft", async ({
   const dot = pending.getByRole("img")
   await expect(dot).toHaveCSS("transform", "none")
   await page.emulateMedia({ reducedMotion: "reduce" })
-  await expect(rotation).toHaveCSS("animation-name", "none")
+  await expect(rotation).toHaveCSS("animation-name", "spin")
   await expect.poll(() => !!heldSocket).toBe(true)
 
   // 3. 本次失败即停止旋转，下一次点击跳过退避并恢复原数据。

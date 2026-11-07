@@ -206,6 +206,211 @@ func TestItemFromLLMKitRejectsCompositeMessage(t *testing.T) {
 	}
 }
 
+// TestItemValidateKindPayload 检查四种指令的种类和载荷对应，以及客户端指令的正文，不要求 TurnID。
+func TestItemValidateKindPayload(t *testing.T) {
+	// 1. 准备种类和载荷配套、缺载荷、载荷挂在别的种类上、正文为空和不带 TurnID 的样例。
+	tests := []struct {
+		name    string
+		item    *defs.Item
+		wantErr string
+	}{
+		{
+			name: "message_without_instruction_payload",
+			item: &defs.Item{ID: "m", TurnID: "t", Kind: defs.ItemMessage},
+		},
+		{
+			name: "skill_instruction",
+			item: &defs.Item{ID: "i", Kind: defs.ItemSkillInstruction, SkillInstruction: &defs.SkillInstruction{}},
+		},
+		{
+			name:    "skill_instruction_without_payload",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemSkillInstruction},
+			wantErr: "instruction kind and payload do not match",
+		},
+		{
+			name:    "agents_instruction_payload_on_other_kind",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemMessage, AgentsInstruction: &defs.AgentsInstruction{}},
+			wantErr: "instruction kind and payload do not match",
+		},
+		{
+			name: "memory_index",
+			item: &defs.Item{ID: "i", Kind: defs.ItemMemoryIndex, MemoryIndex: &defs.MemoryIndex{}},
+		},
+		{
+			name: "client_instruction_without_turn",
+			item: &defs.Item{ID: "i", Kind: defs.ItemClientInstruction, ClientInstruction: &defs.ClientInstruction{Text: "boundary"}},
+		},
+		{
+			name:    "client_instruction_without_payload",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemClientInstruction},
+			wantErr: "instruction kind and payload do not match",
+		},
+		{
+			name:    "client_instruction_payload_on_other_kind",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemMemoryIndex, MemoryIndex: &defs.MemoryIndex{}, ClientInstruction: &defs.ClientInstruction{Text: "boundary"}},
+			wantErr: "instruction kind and payload do not match",
+		},
+		{
+			name:    "client_instruction_with_empty_text",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemClientInstruction, ClientInstruction: &defs.ClientInstruction{}},
+			wantErr: "client instruction requires text",
+		},
+	}
+	// 2. 逐项比较错误文本。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.item.ValidateKindPayload()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("ValidateKindPayload() error = %v", err)
+			case tt.wantErr != "" && (err == nil || err.Error() != tt.wantErr):
+				t.Fatalf("ValidateKindPayload() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestItemValidateContextItem 检查客户端注入的 Item：载荷有效的种类通过，需要模型调用、只由运行时写入或未知的种类被拒绝。
+func TestItemValidateContextItem(t *testing.T) {
+	// 1. 准备各种类的有效样例，以及缺载荷、缺发送方、需要模型调用和只由运行时写入的样例。
+	newMessage := func(from *defs.Address) *defs.Item {
+		return &defs.Item{
+			ID:   "i",
+			Kind: defs.ItemMessage,
+			Message: &defs.Message{
+				From:    from,
+				Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: "你好"}}},
+			},
+		}
+	}
+	tests := []struct {
+		name    string
+		item    *defs.Item
+		wantErr string
+	}{
+		{
+			name: "client_instruction",
+			item: &defs.Item{ID: "i", Kind: defs.ItemClientInstruction, ClientInstruction: &defs.ClientInstruction{Text: "boundary"}},
+		},
+		{
+			name: "skill_instruction",
+			item: &defs.Item{ID: "i", Kind: defs.ItemSkillInstruction, SkillInstruction: &defs.SkillInstruction{}},
+		},
+		{
+			name: "agents_instruction",
+			item: &defs.Item{ID: "i", Kind: defs.ItemAgentsInstruction, AgentsInstruction: &defs.AgentsInstruction{}},
+		},
+		{
+			name: "memory_index",
+			item: &defs.Item{ID: "i", Kind: defs.ItemMemoryIndex, MemoryIndex: &defs.MemoryIndex{}},
+		},
+		{
+			name: "hook_run",
+			item: &defs.Item{ID: "i", Kind: defs.ItemHookRun, HookRun: &defs.HookRun{}},
+		},
+		{
+			name: "user_message",
+			item: newMessage(&defs.Address{Kind: defs.IdentityUser}),
+		},
+		{
+			name: "agent_message",
+			item: newMessage(&defs.Address{Kind: defs.IdentityAgent, ID: "s"}),
+		},
+		{
+			name:    "client_instruction_without_payload",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemClientInstruction},
+			wantErr: "instruction kind and payload do not match",
+		},
+		{
+			name:    "message_without_payload",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemMessage},
+			wantErr: "input item must be a message",
+		},
+		{
+			name:    "message_without_content",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemMessage, Message: &defs.Message{From: &defs.Address{Kind: defs.IdentityUser}}},
+			wantErr: "input message requires content",
+		},
+		{
+			name:    "message_without_sender",
+			item:    newMessage(nil),
+			wantErr: "context message requires a user or agent sender",
+		},
+		{
+			name:    "message_with_unsupported_sender",
+			item:    newMessage(&defs.Address{Kind: "system"}),
+			wantErr: "context message requires a user or agent sender",
+		},
+		{
+			name:    "hook_run_without_payload",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemHookRun},
+			wantErr: "context hook run requires a payload",
+		},
+		{
+			name:    "reasoning_needs_model_call",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemReasoning, Reasoning: &defs.Reasoning{}},
+			wantErr: `context item kind "reasoning" requires a model call`,
+		},
+		{
+			name:    "tool_call_needs_model_call",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemToolCall, ToolCall: &defs.ToolCall{CallID: "c", Name: "n"}},
+			wantErr: `context item kind "tool_call" requires a model call`,
+		},
+		{
+			name:    "tool_result_needs_model_call",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemToolResult, ToolResult: &defs.ToolResult{CallID: "c"}},
+			wantErr: `context item kind "tool_result" requires a model call`,
+		},
+		{
+			name:    "model_error_needs_model_call",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemModelError, ModelError: &defs.ModelError{Message: "e"}},
+			wantErr: `context item kind "model_error" requires a model call`,
+		},
+		{
+			name:    "context_summary_written_by_runtime",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemContextSummary},
+			wantErr: `context item kind "context_summary" is written by the runtime`,
+		},
+		{
+			name:    "session_fork_written_by_runtime",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemSessionFork},
+			wantErr: `context item kind "session_fork" is written by the runtime`,
+		},
+		{
+			name:    "model_change_written_by_runtime",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemModelChange},
+			wantErr: `context item kind "model_change" is written by the runtime`,
+		},
+		{
+			name:    "executors_change_written_by_runtime",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemExecutorsChange},
+			wantErr: `context item kind "executors_change" is written by the runtime`,
+		},
+		{
+			name:    "turn_interrupted_written_by_runtime",
+			item:    &defs.Item{ID: "i", Kind: defs.ItemTurnInterrupted},
+			wantErr: `context item kind "turn_interrupted" is written by the runtime`,
+		},
+		{
+			name:    "unknown_kind",
+			item:    &defs.Item{ID: "i", Kind: "mystery"},
+			wantErr: `unknown context item kind "mystery"`,
+		},
+	}
+	// 2. 逐项比较错误文本。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.item.ValidateContextItem()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("ValidateContextItem() error = %v", err)
+			case tt.wantErr != "" && (err == nil || err.Error() != tt.wantErr):
+				t.Fatalf("ValidateContextItem() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // TestItemClonePreservesIdentity 检查 Item 副本保留身份和保存时间。
 func TestItemClonePreservesIdentity(t *testing.T) {
 	// 1. 创建带执行身份的消息并检查副本全部字段。
@@ -226,6 +431,16 @@ func TestItemClonePreservesIdentity(t *testing.T) {
 	}
 	if got := item.Clone(); !reflect.DeepEqual(got, item) {
 		t.Fatalf("Clone() = %#v, want %#v", got, item)
+	}
+	// 2. 客户端指令的副本与原 Item 互不影响。
+	instruction := &defs.Item{ID: "i", Kind: defs.ItemClientInstruction, ClientInstruction: &defs.ClientInstruction{Text: "boundary"}}
+	got := instruction.Clone()
+	if !reflect.DeepEqual(got, instruction) {
+		t.Fatalf("Clone() = %#v, want %#v", got, instruction)
+	}
+	got.ClientInstruction.Text = "mutated"
+	if instruction.ClientInstruction.Text != "boundary" {
+		t.Fatalf("Clone() shares the client instruction: %#v", instruction.ClientInstruction)
 	}
 }
 

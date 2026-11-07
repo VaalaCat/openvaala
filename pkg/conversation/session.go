@@ -125,8 +125,8 @@ func (c *conversationImpl) notifyParent(config *conversationConfig, child defs.S
 	}
 	// 3. 通知失败且这套配置的 Session 还没停止时记警告；已经停止时直接丢弃消息。
 	if err != nil && config.sessionsCtx.Err() == nil {
-		telemetry.GetLogger(telemetry.ContextWithAttrs(config.sessionsCtx,
-			telemetry.SessionID(string(child.ID)), telemetry.ParentSessionID(string(child.ParentSessionID)))).
+		telemetry.GetLogger(defs.ContextWithSessionCtxMeta(config.sessionsCtx,
+			defs.SessionCtxMeta{SessionID: child.ID, ParentSessionID: child.ParentSessionID})).
 			Warn("notify parent session failed", "error", err)
 	}
 }

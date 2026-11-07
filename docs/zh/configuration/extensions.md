@@ -1,11 +1,12 @@
 # 扩展
 
-这一页介绍怎么用 skill、项目说明、MCP server、hook 和插件来扩展 Agent。
+这一页介绍怎么用 skill、项目说明、记忆、MCP server、hook 和插件来扩展 Agent。
 
 | 你想要…… | 用 |
 | --- | --- |
 | 给 Agent 一些可复用的经验，需要时才加载 | [Skill](#skill) |
 | 告诉 Agent 一个项目是怎么运作的 | [项目说明](#项目说明) |
+| 让 Agent 换了对话也记得之前的事 | [记忆](#记忆) |
 | 从外部服务添加工具 | [MCP server](#mcp-server) |
 | 在固定时刻运行你自己的脚本，比如拦下某个命令、格式化代码 | [Hook](#hook) |
 | 一步装好一组 skill、hook 和 MCP server | [插件](#插件) |
@@ -61,12 +62,24 @@ skill 在对话打开或重新配置时查找。添加 skill 后，重新加载�
 
 把项目约定（怎么构建、怎么跑测试、哪些地方别动）写进 `AGENTS.md` 文件。OpenVaala 会替你读取，不需要任何配置。
 
-- 每一轮开始时，Agent 会收到默认 Executor 上从工作目录所在 Git 仓库的根目录到工作目录本身，沿途每一层的 `AGENTS.md`。不在 Git 仓库里时，只读工作目录的 `AGENTS.md`。
-- Agent 读取更深层目录里的文件时，工作目录到这个文件之间的 `AGENTS.md` 也会加进来。其他 Executor 上的 `AGENTS.md`，在 Agent 第一次在那里用工具之后加进来。
-- 越深的文件优先级越高；你直接提出的要求比它们都优先。
+- 对所有项目都适用的规则，放在 `~/.agents/AGENTS.md`。`~` 是 Executor 所在机器的用户主目录：本机是运行 serve 的用户，SSH 是远端登录用户；virtual 没有主目录，跳过全局规则。
+- 每一轮开始时，先读取默认 Executor 的全局规则，再读取从工作目录所在 Git 仓库的根目录到工作目录本身，沿途每一层的 `AGENTS.md`。不在 Git 仓库里时，项目规则只读工作目录这一份。
+- Agent 读取更深层目录里的文件时，工作目录到这个文件之间的 `AGENTS.md` 也会加进来。其他 Executor 的全局和项目规则，在 Agent 第一次在那里成功使用工具之后加载，不提前访问。
+- 项目目录规则优先于全局规则，越深的目录规则优先级越高；你直接提出的要求比它们都优先。
 - 每个文件只进上下文一次，上下文压缩之后会重新加回来。
+- 全局文件不存在时跳过；查询主目录或读取全局文件失败时记录警告，继续加载项目规则和运行对话，下轮再尝试。
 
-只读取名为 `AGENTS.md` 的文件；`CLAUDE.md` 和主目录里的文件都不读。对所有项目都适用的指导，写在 Agent 的 `instructions` 里。
+只读取名为 `AGENTS.md` 的文件；不会把 `~/AGENTS.md`、`~/.config/openvaala/AGENTS.md` 或 `CLAUDE.md` 当作全局规则自动加载。仅针对某个 Agent 的指导仍可写在它的 `instructions` 里。修改规则后，新对话会读到新内容；已有对话中已经加载的规则不会每轮替换。
+
+## 记忆
+
+Agent 能在不同对话之间记住事情，比如「这个项目的测试用 table-driven」「回复用中文」。不需要任何配置。
+
+- 记忆是运行 Runtime 服务那台机器上的普通 Markdown 文件，存在 `~/.local/share/openvaala/memory/` 下，分两份：`user/` 对所有对话生效；`projects/<默认 Executor>/<工作目录>/` 对默认 Executor 和工作目录相同的对话生效，工作目录里的 `/` 换成 `-` 作为目录名。
+- Agent 通过内置的 [`memory` Executor](executors.md#内置-executor) 读写记忆，它把这两个目录映射成 `user/` 和 `project/`。记忆从不放在远端机器上，所以 SSH 对话看到的是同一份。
+- 每一轮开始时，`user/MEMORY.md` 和 `project/MEMORY.md` 会放进上下文，每份最多 8 KiB，更长的在最后一个完整行处截断。这两个文件是目录，每个主题一行，Agent 需要时再去读它链接的主题文件。和 `AGENTS.md` 一样，每个文件只进上下文一次，上下文压缩之后会重新加回来。文件不存在时跳过；读取失败时记录警告，这一轮照常进行。
+- 你可以直接查看、修改或删除这些文件。新的一轮会读到改动；已经在上下文里的目录不会每轮替换。
+- 想在某个对话里关掉记忆，到**对话设置 → Executor**（终端界面用 `/executor`）里取消勾选 `memory`，读和写一起停。
 
 ## MCP server
 
@@ -96,7 +109,7 @@ headers:
 - `id`：必填，和文件名一致。只能用字母、数字、`-` 和 `_`，不能包含 `__`。
 - `type`：`stdio`、`http` 或 `sse`。
 - `command`、`args`、`env`：用于 `stdio`。`command` 必填。`env` 叠加在继承的环境变量上。不能写 `url` 和 `headers`。
-- `url`、`headers`：用于 `http` 和 `sse`。`url` 必须是 `http(s)` 地址。不能写 `command`、`args` 和 `env`。
+- `url`、`headers`：用于 `http` 和 `sse`。`url` 必须是 `http(s)` 地址。不能写 `command`、`args` 和 `env`。`headers` 随发给这个 server 的每个请求一起发出。`config.yaml` 的 `http.headers` 里有同名条目时，以这里的为准，写成 `""` 就不再发。值里可以用[`http`](overview.md#http)一节介绍的 `${OPENVAALA_...}` 变量。MCP 协议自己设置的请求头（例如 `Content-Type` 和 `Accept`）不能被覆盖。
 - `executors`：在哪些 Executor 上运行；默认 `[local]`。每个 id 都必须是 `local`，或者 `executors/` 里不是 `virtual` 类型的 Executor。内置的 `openvaala` Executor 不能运行 MCP server。
 - `tools`：提供给模型的工具名（用 server 自己的叫法）。默认全部提供。
 - `required`：为 `true` 时，连不上会让这一轮失败。默认连不上就跳过这个 server 的工具。
@@ -104,19 +117,28 @@ headers:
 - `startup_timeout_seconds`：一次连接最多等多久；默认 30。
 - `tool_timeout_seconds`：一次工具调用最多等多久；默认 300。
 
-值都原样使用，不会展开 `${VAR}`。
+值都原样使用，不会展开 `${VAR}`；只有 `headers` 里的 `${OPENVAALA_...}` 例外。
 
 **在哪里运行。** `stdio` server 在 Executor 所在的机器上、以 Executor 的工作目录启动。`http` 和 `sse` server 从 Executor 所在的机器去连接。所以列上一个 SSH Executor，server 就运行在那台远端主机上。
 
+**请求头。** 发给 `http` 和 `sse` server 的请求，还会带上 `config.yaml` 里 `http.headers` 的请求头：默认有 `User-Agent`，在对话里发起的工具调用还有 `Session-Id` 和 `Conversation-Id`。不想让某个 server 收到其中一条，就在这个 server 的 `headers` 里把它写成 `""`。
+
 **哪些 Agent 能用。** Agent 的 `mcp_servers` 列表按 id 选 server；不写就能用全部 server，写 `[]` 就一个都不用。见 [Agent](agents.md)。
 
-**编辑器里的 server。** 通过 ACP 连接时，编辑器里配置的 MCP server（stdio、http 或 sse）在这个对话里也能用。它们运行在编辑器所在的机器上，消息经过这条连接转发，所以编辑器断开后它们就没了。见[编辑器](../guides/editors.md)。
+**编辑器里的 server。** 通过 ACP 连接时，编辑器里配置的 MCP server（stdio、http 或 sse）在这个对话里也能用。它们运行在编辑器所在的机器上，消息经过这条连接转发，所以编辑器断开后它们就没了。其中的远程 server 也会带上 `config.yaml` 里的 `http.headers`，名字相同时以编辑器给的请求头为准。它们的请求里可以用 `${OPENVAALA_VERSION}`、`${OPENVAALA_OS}` 和 `${OPENVAALA_ARCH}`，但没有 Session 和对话相关的变量，用了这些变量的请求头不会发。见[编辑器](../guides/editors.md)。
 
 在终端界面用 `/mcp`，或者在 Web 界面 **对话设置** 的 **MCP** 标签页里查看连接状态。
 
 ## Hook
 
 hook 在对话的固定时刻运行你的命令。hook 可以拦下工具调用、改写它的参数、给模型补充上下文，或者不让这一轮结束。
+
+<!-- scene: tool-hooks | PreToolUse hook 在工具调用执行前放行、拦下或改写它 -->
+```text
+Agent ─ 工具调用 ─▶ PreToolUse ─┬─ 放行 ──────────────▶ 执行 ─▶ PostToolUse
+                                ├─ 拦下（exit 2）─────▶ 原因交回给模型
+                                └─ 改写（updatedInput）─▶ 用新参数执行
+```
 
 在 `~/.config/openvaala/hooks/` 里放任意多个 `*.yaml` 文件，它们全部生效。目录里的其他文件（比如脚本）不会当作配置读取。
 

@@ -145,7 +145,7 @@ function expectLabelsInOrder(steps: RotatingLabelStep[], expected: string[]) {
 interface ObservedItem {
   text: string
   isGroup: boolean
-  // 从不透明变为透明的次数：渐入一次为 1，减少动画时为 0
+  // 从不透明变为透明的次数：渐入一次为 1
   fades: number
   opacity: number
   moved: boolean
@@ -266,34 +266,34 @@ test("live_visible_items_fade_once_and_existing_members_do_not", async ({
   }
   await observer.evaluate((items) => items.clear())
 
-  // 3. 减少动画时，实时新增的内容直接显示。
+  // 3. 系统偏好减少动画时，实时新增的内容仍只渐入一次。
   await page.emulateMedia({ reducedMotion: "reduce" })
   await fixture.replies(
     {
-      reasoning: "静态思考",
+      reasoning: "系统偏好不改变入场",
       tool: "read_file",
       arguments: JSON.stringify({ path: "readme.txt" }),
     },
-    { text: "减少动画时正文直接显示" }
+    { text: "系统偏好减少动画时正文仍渐入" }
   )
   await startConversation(page, "减少动画时新增消息")
   await expect(
-    messages.getByText("减少动画时正文直接显示", { exact: true })
+    messages.getByText("系统偏好减少动画时正文仍渐入", { exact: true })
   ).toBeVisible()
   for (const item of await expectLiveItems(
     "减少动画时新增消息",
-    "减少动画时正文直接显示"
+    "系统偏好减少动画时正文仍渐入"
   )) {
     expect(item).toBeDefined()
     expect(item!.moved).toBe(false)
-    expect(item!.fades).toBe(0)
+    expect(item!.fades).toBe(1)
   }
 
   // 4. 允许动画时刷新从历史恢复，已有内容没有入场动画。
   await page.emulateMedia({ reducedMotion: "no-preference" })
   await page.reload()
   await expect(
-    messages.getByText("减少动画时正文直接显示", { exact: true })
+    messages.getByText("系统偏好减少动画时正文仍渐入", { exact: true })
   ).toBeVisible()
   expect(
     await messages
@@ -540,6 +540,146 @@ test("json_rows_support_keyboard_selection_and_independent_node_copy", async ({
   await expect(args).toHaveAttribute("aria-expanded", "true")
 })
 
+for (const { width, colorScheme } of [
+  { width: 1280, colorScheme: "light" },
+  { width: 390, colorScheme: "dark" },
+] as const) {
+  test(`json_global_folding_keeps_host_scroll_and_original_copy_${width}`, async ({
+    page,
+    fixture,
+  }) => {
+    await page.setViewportSize({ width, height: 844 })
+    await page.emulateMedia({ colorScheme })
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"])
+    const gate = fixture.createCommandGate(`json-global-${width}`)
+    const argumentsJSON = JSON.stringify({
+      command: `${gate.wait}; printf tree-ready`,
+    })
+    try {
+      await fixture.replies(
+        { tool: "bash", arguments: argumentsJSON },
+        { text: "新增节点正文" }
+      )
+      await fixture.openApp(page)
+      await startConversation(page, "深层输入正文")
+      const turn = getMessages(page).locator("[data-turn-id]").last()
+      await expect(
+        page.getByRole("button", { name: "中断", exact: true })
+      ).toBeVisible()
+      const raw = await openTurnRaw(turn)
+      const textRows = raw.locator('[data-json-path$=\',"text","text"]\']')
+      await expect(textRows).toHaveCount(0)
+      const foldToggle = raw.getByRole("button", { name: /^全部(展开|折叠)$/ })
+      await expect(foldToggle).toHaveCount(1)
+      await expect(foldToggle).toHaveAccessibleName("全部展开")
+      await foldToggle.focus()
+      await foldToggle.press("Enter")
+      await expect(foldToggle).toHaveAccessibleName("全部折叠")
+      await expect(foldToggle).toBeFocused()
+      await expect(textRows.filter({ hasText: "深层输入正文" })).toBeVisible()
+      const args = raw
+        .locator('[data-json-path$=\',"tool_call","arguments"]\']')
+        .first()
+      await expect(args).not.toHaveAttribute("aria-expanded")
+      await args
+        .getByRole("button", { name: "按 JSON 展开", exact: true })
+        .click()
+      const command = raw
+        .locator('[data-json-path$=\',"tool_call","arguments","command"]\']')
+        .first()
+      await expect(command).toBeAttached()
+
+      // 1. 全部展开持续作用于后续保存的节点，原始字符串只有显式选择才按 JSON 显示。
+      await gate.release()
+      await expect(textRows.filter({ hasText: "新增节点正文" })).toBeAttached()
+      await expect(
+        raw.locator('[data-json-path=\'["turn","status"]\']')
+      ).toContainText("completed")
+      await raw.getByRole("button", { name: "复制", exact: true }).click()
+      const original = JSON.parse(
+        await page.evaluate(() => navigator.clipboard.readText())
+      )
+      expect(
+        original.items.find(
+          (item: { tool_call?: { arguments: string } }) => item.tool_call
+        )?.tool_call.arguments
+      ).toBe(argumentsJSON)
+      const scroll = raw.locator("[data-output-scroll]")
+      await expect(scroll).toHaveCSS("max-height", "none")
+      expect((await scroll.boundingBox())!.height).toBeGreaterThan(320)
+      await expect(
+        raw.getByRole("button", { name: "展开输出", exact: true })
+      ).toHaveCount(0)
+      expect(
+        await scroll.evaluate((node) => node.scrollHeight > node.clientHeight)
+      ).toBe(true)
+
+      // 2. 长记录占满右栏剩余高度；窗口变矮时仍在 JSON 内滚动，工具栏不被卷走。
+      for (const height of [500, 844]) {
+        await page.setViewportSize({ width, height })
+        await expect
+          .poll(() =>
+            raw.evaluate((node) => {
+              const panel = node.closest('[role="tabpanel"]')!
+              const output = node.querySelector("[data-output-block]")!
+              return Math.abs(
+                panel.getBoundingClientRect().bottom -
+                  parseFloat(getComputedStyle(panel).paddingBottom) -
+                  output.getBoundingClientRect().bottom
+              )
+            })
+          )
+          .toBeLessThanOrEqual(1)
+        expect(
+          await raw.evaluate((node) => {
+            const panel = node.closest('[role="tabpanel"]')!
+            return panel.scrollHeight - panel.clientHeight
+          })
+        ).toBeLessThanOrEqual(1)
+        expect(
+          (await scroll.boundingBox())!.y + (await scroll.boundingBox())!.height
+        ).toBeLessThanOrEqual(height)
+        await scroll.evaluate((node) => {
+          node.scrollTop = node.scrollHeight
+        })
+        expect(await scroll.evaluate((node) => node.scrollTop)).toBeGreaterThan(
+          0
+        )
+        await expect(foldToggle).toBeInViewport()
+      }
+
+      // 3. 同一个按钮收起根节点；逐节点操作后，按钮按实际展开状态切换。
+      await foldToggle.click()
+      await expect(foldToggle).toHaveAccessibleName("全部展开")
+      await expect(raw.locator("[data-json-path]")).toHaveCount(1)
+      const root = raw.locator('[data-json-path="[]"]').first()
+      await root.press("Enter")
+      await expect(root).toHaveAttribute("aria-expanded", "true")
+      await expect(
+        raw.locator("[data-json-path='[\"items\"]']").first()
+      ).toHaveAttribute("aria-expanded", "false")
+      await foldToggle.click()
+      await expect(foldToggle).toHaveAccessibleName("全部折叠")
+      await expect(command).toBeAttached()
+      await args.press("Enter")
+      await expect(command).toHaveCount(0)
+      await expect(foldToggle).toHaveAccessibleName("全部展开")
+      await args.press("Enter")
+      await expect(command).toBeAttached()
+      await expect(foldToggle).toHaveAccessibleName("全部折叠")
+      await raw.getByRole("button", { name: "复制", exact: true }).click()
+      expect(
+        JSON.parse(await page.evaluate(() => navigator.clipboard.readText()))
+      ).toEqual(original)
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth)
+      ).toBeLessThanOrEqual(width)
+    } finally {
+      await gate.cleanup()
+    }
+  })
+}
+
 test("command_output_follows_only_at_bottom_and_keeps_expansion_after_exit", async ({
   page,
   fixture,
@@ -682,6 +822,171 @@ test("read_file_tool_images_use_the_same_preview", async ({
   await page.keyboard.press("Escape")
 })
 
+for (const { width, colorScheme } of [
+  { width: 390, colorScheme: "light" },
+  { width: 390, colorScheme: "dark" },
+  { width: 1280, colorScheme: "light" },
+] as const) {
+  test(`read_file_images_scroll_below_group_and_expand_in_item_${width}_${colorScheme}`, async ({
+    page,
+    fixture,
+  }) => {
+    await page.setViewportSize({ width, height: 844 })
+    await page.emulateMedia({ colorScheme })
+    // 1. 真实 read_file 读取宽图、横图、长图和文本，图片经过 serve 保存与推送。
+    const pictures = await page.evaluate(() =>
+      [
+        {
+          name: "preview-landscape.png",
+          width: 960,
+          height: 640,
+          color: "#567d65",
+        },
+        {
+          name: "preview-wide.png",
+          width: 1280,
+          height: 320,
+          color: "#49749b",
+        },
+        {
+          name: "preview-tall.png",
+          width: 160,
+          height: 1200,
+          color: "#ab7354",
+        },
+      ].map((picture) => {
+        const canvas = document.createElement("canvas")
+        canvas.width = picture.width
+        canvas.height = picture.height
+        const context = canvas.getContext("2d")!
+        context.fillStyle = picture.color
+        context.fillRect(0, 0, picture.width, picture.height)
+        return { ...picture, dataURL: canvas.toDataURL("image/png") }
+      })
+    )
+    for (const picture of pictures)
+      await writeFile(
+        path.join(fixture.state.workspaceDirectory, picture.name),
+        Buffer.from(picture.dataURL.split(",")[1], "base64")
+      )
+    await writeFile(
+      path.join(fixture.state.workspaceDirectory, "preview-notes.txt"),
+      "图片旁的文本文件"
+    )
+    await fixture.replies(
+      {
+        tools: [
+          ...pictures.map((picture) => picture.name),
+          "preview-notes.txt",
+          "preview-missing.png",
+        ].map((file) => ({
+          name: "read_file",
+          arguments: JSON.stringify({ path: file }),
+        })),
+      },
+      { text: "多图读取完成" }
+    )
+    await fixture.openApp(page)
+    await startConversation(page, "读取图片与文本")
+    const messages = getMessages(page)
+    await expect(
+      messages.getByText("多图读取完成", { exact: true })
+    ).toBeVisible()
+    const turn = messages.locator("[data-turn-id]").last()
+    const group = turn.locator('[data-anchor-key^="group:"]')
+    const strip = group.locator("[data-image-strip]")
+    const thumbnails = strip.locator("img")
+    await expect(thumbnails).toHaveCount(3)
+    for (const thumbnail of await thumbnails.all()) {
+      await expect(thumbnail).toHaveJSProperty("complete", true)
+      expect(
+        await thumbnail.evaluate(
+          (image: HTMLImageElement) => image.naturalWidth
+        )
+      ).toBeGreaterThan(0)
+      await expect(thumbnail).toHaveCSS("max-height", "160px")
+      expect((await thumbnail.boundingBox())!.height).toBeLessThan(160.1)
+    }
+    const tops = await thumbnails.evaluateAll((images) =>
+      images.map((image) => image.getBoundingClientRect().top)
+    )
+    expect(Math.max(...tops) - Math.min(...tops)).toBeLessThanOrEqual(1)
+    await expect(strip).toHaveCSS("overflow-x", "auto")
+    expect(
+      await strip.evaluate((node) => node.scrollWidth - node.clientWidth)
+    ).toBeGreaterThan(0)
+    await strip.evaluate((node) => {
+      node.scrollLeft = node.scrollWidth
+    })
+    expect(await strip.evaluate((node) => node.scrollLeft)).toBeGreaterThan(0)
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth - innerWidth
+      )
+    ).toBeLessThanOrEqual(1)
+
+    // 2. 聚合图可直接预览，关闭预览不展开过程组。
+    await strip
+      .getByRole("button", {
+        name: `预览图片 ${pictures[2].name}`,
+        exact: true,
+      })
+      .click()
+    const dialog = page.getByRole("dialog", { name: "图片预览" })
+    await expect(dialog).toBeVisible()
+    await expect(dialog.locator("img")).toHaveJSProperty(
+      "naturalHeight",
+      pictures[2].height
+    )
+    await dialog
+      .getByRole("button", { name: "关闭图片预览", exact: true })
+      .click()
+    await expect(strip).toBeVisible()
+
+    // 3. 展开聚合后每张图片归到自己的 read_file，标题图标紧挨文件名；文本和失败读取不带图片图标。
+    await expandTurnProcess(turn)
+    await expect(strip).toHaveCount(0)
+    await expect(turn.locator("[data-read-file-image]")).toHaveCount(3)
+    await expect(turn.getByRole("button", { name: /^预览图片/ })).toHaveCount(0)
+    const imageItem = turn
+      .locator("[data-item-key]")
+      .filter({ hasText: pictures[0].name })
+    const icon = imageItem.locator("[data-read-file-image]")
+    const filename = imageItem
+      .locator("[data-item-summary]")
+      .getByText(pictures[0].name, { exact: true })
+    expect(
+      (await icon.boundingBox())!.x + (await icon.boundingBox())!.width
+    ).toBeLessThanOrEqual((await filename.boundingBox())!.x)
+    const centers = await imageItem.evaluate((item) =>
+      ["[data-read-file-image]", "[data-item-icon]"].map((selector) => {
+        const box = item.querySelector(selector)!.getBoundingClientRect()
+        return box.y + box.height / 2
+      })
+    )
+    expect(Math.abs(centers[0] - centers[1])).toBeLessThan(0.1)
+    await filename.click()
+    const expandedImage = imageItem.locator("[data-image-strip] img")
+    await expect(expandedImage).toBeVisible()
+    await expect(expandedImage).toHaveCSS("max-height", "160px")
+    expect((await expandedImage.boundingBox())!.height).toBeLessThan(160.1)
+    await imageItem.getByRole("button", { name: /^预览图片/ }).click()
+    await expect(dialog.locator("img")).toHaveJSProperty(
+      "naturalWidth",
+      pictures[0].width
+    )
+    await dialog
+      .getByRole("button", { name: "关闭图片预览", exact: true })
+      .click()
+
+    // 4. 收起与刷新后仍只显示同一组的三张图。
+    await group.locator(":scope > [data-item-header] button").first().click()
+    await expect(strip.locator("img")).toHaveCount(3)
+    await page.reload()
+    await expect(group.locator("[data-image-strip] img")).toHaveCount(3)
+  })
+}
+
 test("process_summary_counts_tools_and_shimmers_only_while_its_group_runs", async ({
   page,
   fixture,
@@ -759,7 +1064,7 @@ test("process_summary_counts_tools_and_shimmers_only_while_its_group_runs", asyn
     await page.setViewportSize({ width: 390, height: 844 })
     await expectRunningGroup()
     await page.emulateMedia({ reducedMotion: "reduce" })
-    await expect(title).toHaveCSS("animation-name", "none")
+    await expectShimmer(title)
     await expect(title).toBeVisible()
     await expect(action).toBeVisible()
     await page.emulateMedia({ reducedMotion: "no-preference" })
@@ -908,14 +1213,13 @@ test("process_actions_rotate_only_when_real_activity_changes", async ({
     const shimmerStarted = await getShimmerStart(title)
 
     // 动作稳定显示后：布局不变，标题发光没有重新开始，没有残留或自行轮播的动画。
-    const expectActionSettled = async (isShimmerRunning = true) => {
+    const expectActionSettled = async () => {
       await expect(header).toHaveCSS("height", "32px")
       await expect(reveal).toHaveCSS("font-size", "14px")
       await expect(reveal).toHaveCSS("line-height", "20px")
       await expect(header.getByRole("button")).toHaveCount(1)
       expect(await titleNode!.evaluate((node) => node.isConnected)).toBe(true)
-      if (isShimmerRunning)
-        expect(await getShimmerStart(title)).toBe(shimmerStarted)
+      expect(await getShimmerStart(title)).toBe(shimmerStarted)
       await expect.poll(() => isRotatingTextAnimating(reveal)).toBe(false)
       await expect
         .poll(() =>
@@ -939,10 +1243,16 @@ test("process_actions_rotate_only_when_real_activity_changes", async ({
           opacity: "1",
           isMaskSettled: true,
         })
-      const titleBounds = (await title.boundingBox())!
-      const actionBounds = (await reveal.boundingBox())!
-      expect(actionBounds.x - titleBounds.x - titleBounds.width).toBe(8)
-      expect(actionBounds.y).toBe(titleBounds.y)
+      await expect
+        .poll(async () => {
+          const titleBounds = (await title.boundingBox())!
+          const actionBounds = (await reveal.boundingBox())!
+          return {
+            gap: actionBounds.x - titleBounds.x - titleBounds.width,
+            offsetY: actionBounds.y - titleBounds.y,
+          }
+        })
+        .toEqual({ gap: 8, offsetY: 0 })
       await expect(reveal.locator("[data-rotating-text-exit]")).toHaveCount(0)
     }
     await expectActionSettled()
@@ -958,11 +1268,11 @@ test("process_actions_rotate_only_when_real_activity_changes", async ({
       stepCount
     )
 
-    // 3. 减少动画后，后续动作直接切换，不再移动字素。
+    // 3. 系统改为减少动画后，后续动作仍播放逐字切换。
     await page.emulateMedia({ reducedMotion: "reduce" })
     await next.release()
     await expect(label).toHaveText("准备读取 readme.txt")
-    await expectActionSettled(false)
+    await expectActionSettled()
 
     // 4. 动作变空后，视觉上保留最后一个动作，直到最终回复出现。
     await expect(
@@ -996,13 +1306,11 @@ test("process_actions_rotate_only_when_real_activity_changes", async ({
     const stepOf = (text: string) =>
       steps.findLast((step) => step.label === text)!
     expect(stepOf(`执行 ${nextCommand}`).animated).toBe(true)
-    // 减少动画之后的文案切换都是静态的。
-    const reducedSteps = steps.slice(
-      steps.findIndex((step) => step.label.startsWith("准备读取"))
-    )
-    expect(reducedSteps.length).toBeGreaterThan(1)
-    for (const step of reducedSteps)
-      expect(step.animated, `${step.label} 减少动画时应静态`).toBe(false)
+    // 系统偏好改变后，阶段切换播放动画，阶段内追加仍不重播。
+    const readSteps = steps.filter((step) => step.label.startsWith("准备读取"))
+    expect(readSteps[0].animated).toBe(true)
+    for (const step of readSteps.slice(1))
+      expect(step.animated, `${step.label} 是追加，不应重播`).toBe(false)
     expect(stepOf("").visual).toContain("readme.txt")
     expect(stepOf("").visualLater).toContain("readme.txt")
     await expect(current).toHaveCount(0)
@@ -1064,7 +1372,7 @@ test("tool_count_rolls_and_resizes_only_when_real_count_changes", async ({
   const number = header.locator(countsSelector)
   const label = number.locator("[data-rotating-text-label]")
 
-  // 2. 9 变 10 时数字滚动、宽度变宽；10 变 11 前改为减少动画，计数直接更新。
+  // 2. 9 变 10 时数字滚动、宽度变宽；系统改为减少动画后，10 变 11 仍滚动。
   await expect
     .poll(() => label.textContent(), { intervals: [50] })
     .toBe("执行 10 次工具")
@@ -1084,7 +1392,7 @@ test("tool_count_rolls_and_resizes_only_when_real_count_changes", async ({
     stepOf("执行 9 次工具").width
   )
   expect(stepOf("执行 10 次工具").animated).toBe(true)
-  expect(stepOf("执行 11 次工具").animated).toBe(false)
+  expect(stepOf("执行 11 次工具").animated).toBe(true)
   await expect(header).toContainText("执行 11 次工具")
   await expect(header.locator('[data-status-tone="success"]')).toHaveCount(0)
 
@@ -1596,6 +1904,7 @@ test("process_icon_morphs_without_moving_text", async ({
   browser,
   fixture,
 }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" })
   await fixture.replies({
     tool: "bash",
     arguments: JSON.stringify({ command: "printf morph-details" }),
@@ -1777,10 +2086,11 @@ test("running_lattice_releases_summary_space_and_keeps_status_independent", asyn
               )
           ).length
       )
-    // 允许动画时八个格点循环变亮，中间的空位不动；减少动画时全部静态。
-    expect(await countAnimatedCircles()).toBe(8)
-    await page.emulateMedia({ reducedMotion: "reduce" })
-    await expect.poll(countAnimatedCircles).toBe(0)
+    // 两种系统偏好下八个格点都循环变亮，中间的空位不动。
+    for (const reducedMotion of ["no-preference", "reduce"] as const) {
+      await page.emulateMedia({ reducedMotion })
+      await expect.poll(countAnimatedCircles).toBe(8)
+    }
     await expect(status.locator("svg")).toHaveCSS("width", "16px")
     await expect(status.locator("svg")).toHaveCSS("height", "16px")
     await expect(
@@ -1821,7 +2131,6 @@ test("tool_text_colors_follow_collapsed_hover_and_expanded_states", async ({
   fixture,
 }) => {
   // 1. 两个真实工具完成后展开过程组，工具详情保持收起。
-  await page.emulateMedia({ reducedMotion: "reduce" })
   await fixture.replies(
     {
       tool: "bash",

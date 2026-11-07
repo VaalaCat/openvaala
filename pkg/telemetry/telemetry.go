@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -167,17 +169,23 @@ var getFallbackTelemetry = sync.OnceValue(func() *Telemetry {
 	return telemetry
 })
 
-// ContextWithAttrs 把实体身份追加到上下文。
+// ContextWithAttrs 把非身份属性（Executor、工具、连接、Turn 步骤等）追加到上下文；对话、Session、Agent 身份用 defs.ContextWithSessionCtxMeta。
 func ContextWithAttrs(ctx context.Context, attrs ...attribute.KeyValue) context.Context {
 	// 1. 无新增属性时返回原 ctx，否则合并属性，同键以后挂入的值为准。
 	if len(attrs) == 0 {
 		return ctx
 	}
-	return context.WithValue(ctx, attrsContextKey{}, mergeAttrs(getAttrs(ctx), attrs))
+	return context.WithValue(ctx, attrsContextKey{}, mergeAttrs(getContextAttrs(ctx), attrs))
 }
 
-// getAttrs 返回上下文中的实体身份。
+// getAttrs 返回上下文中的实体身份：先是 SessionCtxMeta 转出的对话、Session、Agent 身份，再是 ContextWithAttrs 挂入的属性。
 func getAttrs(ctx context.Context) []attribute.KeyValue {
+	// 1. 拼接 SessionCtxMeta 身份和已挂入的属性，返回新切片。
+	return slices.Concat(newSessionCtxMetaAttrs(defs.GetSessionCtxMeta(ctx)), getContextAttrs(ctx))
+}
+
+// getContextAttrs 返回 ContextWithAttrs 挂入 ctx 的属性，不含 SessionCtxMeta 的身份。
+func getContextAttrs(ctx context.Context) []attribute.KeyValue {
 	// 1. 读取已挂入的属性切片，未提供时返回 nil；调用方不得修改返回的切片。
 	attrs, _ := ctx.Value(attrsContextKey{}).([]attribute.KeyValue)
 	return attrs

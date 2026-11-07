@@ -271,6 +271,52 @@ func TestConnectionThreadReportsSelectedModel(t *testing.T) {
 	}
 }
 
+// TestConnectionThreadResumeSandbox 检查恢复 Thread 时沙箱按对话有没有 Executor 报告，跟 Thread 是不是临时的无关。
+func TestConnectionThreadResumeSandbox(t *testing.T) {
+	// 1. 列出临时和普通 Thread 各自有无 Executor 的组合。
+	tests := []struct {
+		name        string
+		isEphemeral bool
+		executors   []conversation.ExecutorDetails
+		wantSandbox string
+	}{
+		{name: "ephemeral_fork_with_executors", isEphemeral: true, executors: []conversation.ExecutorDetails{{ID: "local"}}, wantSandbox: "dangerFullAccess"},
+		{name: "ephemeral_without_executors", isEphemeral: true, wantSandbox: "readOnly"},
+		{name: "saved_with_executors", executors: []conversation.ExecutorDetails{{ID: "local"}}, wantSandbox: "dangerFullAccess"},
+	}
+	// 2. 恢复 Thread，核对响应里的沙箱。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const conversationID defs.ConversationID = "conversation-1"
+			const sessionID defs.SessionID = "session-1"
+			client := &fakeThreadClient{
+				record: defs.Conversation{ID: conversationID, RootSessionID: sessionID},
+				details: conversation.SessionDetails{
+					ConversationID: conversationID,
+					Session:        defs.Session{ID: sessionID, ConversationID: conversationID, AgentName: "assistant"},
+					Executors:      tt.executors,
+				},
+			}
+			outgoing := make(chan codexMessage, 8)
+			thread := &connectionThread{
+				threadID:        string(conversationID),
+				conversationID:  conversationID,
+				sessionID:       sessionID,
+				client:          client,
+				outgoing:        outgoing,
+				isOpenDelivered: true,
+				isEphemeral:     tt.isEphemeral,
+			}
+			thread.handleThreadResumeRequested(t.Context(), &threadResumeRequested{requestID: json.RawMessage(`1`)})
+			response := <-outgoing
+			result, ok := response.Result.(codexThreadOpenResult)
+			if response.Error != nil || !ok || result.Sandbox.Type != tt.wantSandbox || result.Thread.Ephemeral != tt.isEphemeral {
+				t.Fatalf("thread/resume response = %+v, want sandbox %q and ephemeral %v", response, tt.wantSandbox, tt.isEphemeral)
+			}
+		})
+	}
+}
+
 // TestConnectionThreadHookNotifications 检查 hook 通知的顺序和完整运行内容。
 func TestConnectionThreadHookNotifications(t *testing.T) {
 	// 1. 准备各事件和运行状态，设置时间、范围及输出条目的预期 JSON。

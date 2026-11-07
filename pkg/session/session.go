@@ -54,6 +54,9 @@ type Session interface {
 	CompactContext(ctx context.Context) (defs.TurnID, error)
 	// SelectModel 接收 Conversation 已校验并保存的模型选择，从下个 Turn 起使用，不影响正在执行的 Turn；Session 已停止时返回 nil。
 	SelectModel(ctx context.Context, model defs.ModelSelection) error
+	// AppendContextItems 校验并存下 Item，下一个不是只压缩的 Turn 开始时交给它，写在该轮输入之前；Session 停止时还没交出的 Item 丢弃。
+	// 任一 Item 无效或 Session 已开始停止时返回错误，整批都不收。
+	AppendContextItems(ctx context.Context, items []*defs.Item) (err error)
 }
 
 // sessionImpl 下面的运行状态只由 Run 的事件循环读写，每个 Turn 在自己的执行任务里运行。
@@ -66,7 +69,7 @@ type sessionImpl struct {
 	// turnOpt 是 Run 开始时组装一次的 Turn 配置，带上工具表、执行环境、模型客户端，Inbox 是本 Session。
 	turnOpt turn.TurnOpt
 
-	// requests 收 HandleInput、TakeSteer、WaitSteer、GetStatus、InterruptTurn、CompactContext、SelectModel 交来的请求。
+	// requests 收 HandleInput、TakeSteer、WaitSteer、GetStatus、InterruptTurn、CompactContext、SelectModel、AppendContextItems 交来的请求。
 	requests chan sessionRequest
 	// turnEvents 收 Turn 执行任务结束后交回的结果。
 	turnEvents chan turnFinished
@@ -114,6 +117,9 @@ type sessionImpl struct {
 	lastTurnExecutors []defs.TurnExecutor
 	// pendingHookStartSource 是还没交给 Turn 的 SessionStart 来源：Run 开始时取 opt.HookStartSource，交给第一个非压缩 Turn 后清空；只由事件循环读写。
 	pendingHookStartSource string
+	// pendingContextItems 是 AppendContextItems 收下、还没交给 Turn 的 Item，按收到的顺序排；
+	// 交给下一个不是只压缩的 Turn 后清空；只由事件循环读写。
+	pendingContextItems []*defs.Item
 }
 
 // SessionOpt 是创建 Session 用的配置：Session 记录、DAO、模型客户端、Agent 定义，以及 Conversation 交来的执行环境、工具、Skill 和 hook。
@@ -173,10 +179,10 @@ func NewSession(opt *SessionOpt) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 2. 为每个有工作区的执行环境创建命令工具。
+	// 2. 为每个有工作区、能跑命令的执行环境创建命令工具。
 	sessionTools := make(map[string][]executor.Tool, len(sessionOpt.Environments))
 	for _, environment := range sessionOpt.Environments {
-		if environment.GetWorkspace() == nil {
+		if environment.GetWorkspace() == nil || !environment.IsCommandSupported() {
 			continue
 		}
 		commandTools, err := tools.NewCommandTools(tools.NewCommandToolsOpt(environment.GetID(), environment.GetWorkspace(), terminalManager))
@@ -231,11 +237,13 @@ func (s *sessionImpl) Run(ctx context.Context, events chan<- SessionEvent) error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// 2. 补上 Session 遥测属性，组装 Turn 配置，修复最近的 Turn；修复失败时返回错误。
-	ctx = telemetry.ContextWithAttrs(ctx, telemetry.SessionID(string(s.opt.Session.ID)), telemetry.AgentName(s.opt.Session.AgentName))
-	if s.opt.Session.ParentSessionID != "" {
-		ctx = telemetry.ContextWithAttrs(ctx, telemetry.ParentSessionID(string(s.opt.Session.ParentSessionID)))
-	}
+	// 2. 补上 Session 身份，组装 Turn 配置，修复最近的 Turn；修复失败时返回错误。
+	ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{
+		ConversationID:  s.opt.Session.ConversationID,
+		SessionID:       s.opt.Session.ID,
+		ParentSessionID: s.opt.Session.ParentSessionID,
+		AgentName:       s.opt.Session.AgentName,
+	})
 	logger := telemetry.GetLogger(ctx)
 	logger.Info("session started")
 
@@ -245,6 +253,7 @@ func (s *sessionImpl) Run(ctx context.Context, events chan<- SessionEvent) error
 	turnOpt.Inbox = s
 	turnOpt.Hooks = s.opt.Hooks
 	turnOpt.Session = s.opt.Session
+	turnOpt.MaxSteps = s.opt.Agent.MaxSteps
 	s.turnOpt = *turnOpt
 	s.selectedModel = s.opt.Session.Model
 	s.pendingHookStartSource = s.opt.HookStartSource
@@ -296,6 +305,8 @@ func (s *sessionImpl) runEventLoop(ctx context.Context, events chan<- SessionEve
 				s.handleCompactRequested(ctx, events, request)
 			case modelSelectionRequested:
 				s.selectedModel = request.model
+			case appendContextItemsRequested:
+				s.handleAppendContextItemsRequested(request)
 			default:
 				panic(fmt.Sprintf("unsupported Session request %T", request))
 			}
@@ -440,6 +451,32 @@ func (s *sessionImpl) SelectModel(ctx context.Context, model defs.ModelSelection
 	return err
 }
 
+// AppendContextItems 校验 Item 并提交给事件循环，暂存到下一个非压缩 Turn。
+func (s *sessionImpl) AppendContextItems(ctx context.Context, items []*defs.Item) (err error) {
+	// 1. 校验每个 Item：ID 不为空，还没分配 TurnID 和 ModelCallID，种类和载荷能写入日志并转成模型消息；任一不过整批拒绝。
+	for _, item := range items {
+		if item == nil || item.ID == "" || item.TurnID != "" || item.ModelCallID != "" {
+			return errors.New("context item requires an unassigned item")
+		}
+		if err := item.ValidateContextItem(); err != nil {
+			return err
+		}
+	}
+	// 2. 复制 Item 并提交请求，等待事件循环回复是否收下。
+	reply := make(chan error, 1)
+	request := appendContextItemsRequested{
+		items: make([]*defs.Item, 0, len(items)),
+		reply: reply,
+	}
+	for _, item := range items {
+		request.items = append(request.items, item.Clone())
+	}
+	if err := s.sendRequest(ctx, request); err != nil {
+		return err
+	}
+	return <-reply
+}
+
 // WaitSteer 等活动 Turn 的未读补充输入，返回副本。
 func (s *sessionImpl) WaitSteer(ctx context.Context) ([]*defs.Item, error) {
 	// 1. 提交等待请求；Session 已停止时返回空、不报错。
@@ -488,6 +525,17 @@ func (s *sessionImpl) sendRequest(ctx context.Context, request sessionRequest) e
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// handleAppendContextItemsRequested 把校验过的 Item 追加到待交给 Turn 的队列；已开始停止时拒收。
+func (s *sessionImpl) handleAppendContextItemsRequested(request appendContextItemsRequested) {
+	// 1. 已开始停止时拒收，否则按收到的顺序追加。
+	if s.stopReason != nil {
+		request.reply <- fmt.Errorf("session is stopping: %w", s.stopReason)
+		return
+	}
+	s.pendingContextItems = append(s.pendingContextItems, request.items...)
+	request.reply <- nil
 }
 
 // handleInputRequested 接收一条输入，按模式挂到活动 Turn 上或排队，空闲时开始下一个 Turn。
@@ -743,13 +791,14 @@ func (s *sessionImpl) startTurn(ctx context.Context, events chan<- SessionEvent,
 	turnOpt.PreviousContextUsage = s.lastTurnContextUsage
 	turnOpt.PreviousExecutors = s.lastTurnExecutors
 	turnOpt.IsCompactOnly = isCompactOnly
-	// 2. 普通 Turn 以这批的第一组为输入，更新上个普通 Turn 的模型和 Executor，取走待交出的 SessionStart 来源。
+	// 2. 普通 Turn 以这批的第一组为输入，更新上个普通 Turn 的模型和 Executor，取走待交出的 SessionStart 来源和注入 Item。
 	var turnInput []*defs.Item
 	var parentSpan telemetry.SpanRef
 	if !isCompactOnly {
 		s.lastTurnModel = model.Ref
 		s.lastTurnExecutors = executor.GetTurnExecutors(s.opt.Environments)
 		turnOpt.HookStartSource, s.pendingHookStartSource = s.pendingHookStartSource, ""
+		turnOpt.ContextItems, s.pendingContextItems = s.pendingContextItems, nil
 		turnInput = input.groups[0]
 		parentSpan = input.parentSpan
 	}

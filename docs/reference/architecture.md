@@ -63,7 +63,21 @@ Each conversation, and each session within it, processes its events in order on 
 
 ## Executors and tools
 
-An **executor** is an environment with a file system and a shell: the runtime server's own machine, a machine reached over SSH, or an in-memory sandbox. A conversation opens a *workspace* on each executor it may use, rooted at that executor's working directory.
+An **executor** is an environment with a file system and a shell: the runtime server's own machine, a machine reached over SSH, or an in-memory sandbox. Executors come in three layers:
+
+```text
+ExecutorProvider   which executors this conversation may use
+ └─ Executor       one place that can do work
+     └─ Workspace  reads and writes files, runs commands
+```
+
+- **`ExecutorProvider`** returns the executors available to a conversation. `openvaala serve` uses the one built from your `executors/` files, which gives every conversation the same list. A program that embeds OpenVaala as a Go library can supply its own, for example a different list per conversation.
+- **`Executor`** describes one place (its ID, kind, description and default directory) and opens workspaces on it. Adding a new kind of executor means writing one type; the conversation does not need to know about it.
+- **`Workspace`** is what the tools actually talk to. A conversation opens its own workspace on each executor it may use, rooted at that executor's working directory, and closes them when the conversation stops, so SSH connections and MCP servers do not outlive it.
+
+Reloading configuration swaps the provider along with the rest of the definitions: idle conversations pick up the new list, and new conversations use it from the start.
+
+A saved conversation that nobody is viewing and that has no running turn or background command is stopped after `server.conversation_idle_timeout` (default 30 minutes), which releases its workspaces. Opening it again reconnects them. See [configuration overview](../configuration/overview.md).
 
 Tools come in two kinds. **Environment tools** — `read_file`, `apply_patch`, the command tools and MCP tools — are provided by each workspace; when several executors offer the same tool, the model sees one tool with an `executor` argument, and the call is routed to that workspace. **Collaboration tools** — `spawn_agent` and friends — act on sessions inside the runtime server. Hooks run around tool calls on the executor where the call happens.
 
@@ -91,6 +105,13 @@ pkg/dao   conversations · sessions · turns · items
 ```
 
 The logs are the source of truth. In `metadata.jsonl` each entry carries the full latest state of a conversation, session or turn, so the last entry wins; a deletion is an entry too. Every change is appended and synced before the index is updated, and `openvaala reindex` rebuilds `metadata.db` from the logs at any time. This is what makes conversations portable: a conversation directory is complete on its own and can be copied, backed up or moved. See [Where conversations are stored](../guides/conversations.md#where-conversations-are-stored).
+
+<!-- scene: portable-conversations | The logs are the source of truth; the index can always be rebuilt -->
+```text
+append    metadata.jsonl, <session-id>.jsonl ──▶ metadata.db
+reindex   metadata.jsonl ──▶ metadata.db, rebuilt from the logs
+move      conversations/<conversation-id>/ ──▶ another machine, then reindex
+```
 
 A new conversation is first written to an in-memory SQLite database through `StagedLogStorage` and `StagedRecordStorage`. When it receives its first message, the staged data is copied to the real storage and all reads and writes switch over, which is why an empty conversation leaves nothing on disk.
 

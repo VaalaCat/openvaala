@@ -87,8 +87,10 @@ type directoryEditing struct {
 	ExecutorID string
 	// IsFocused 记录上一帧输入框是否有焦点，用来发现失焦。
 	IsFocused bool
-	// IsSuggesting 为真时才显示建议：内容改过之后、选中建议或失焦之前。
+	// IsSuggesting 为真时才显示建议：点击输入框或打字之后、选中建议或失焦之前。
 	IsSuggesting bool
+	// IsTyped 为真表示用户在这次聚焦里改过目录；改过之后「最近用过」才按输入前缀过滤。
+	IsTyped bool
 	// IsCaretAtEndRequested 让下一帧把光标放到末尾，选中建议后使用。
 	IsCaretAtEndRequested bool
 }
@@ -139,9 +141,14 @@ type providerDraft struct {
 	ID, Protocol, BaseURL, APIKey       string
 	EditingID, DefaultModelKey, IDError string
 	Endpoints                           map[string]string
+	Headers                             []*providerHeaderDraft
 	Models                              []*providerModelDraft
 	RemovedModels                       map[string]*providerModelDraft
 }
+
+// providerHeaderDraft 是服务编辑表单里的一行请求头：名称和值都是输入原文，编辑过程中允许名称为空。
+type providerHeaderDraft struct{ Name, Value string }
+
 type providerModelDraft struct {
 	Key, Alias, UpstreamModel, DisplayName, Protocol, ContextWindow, MaxOutputTokens, Thinking, ReasoningEfforts, DefaultReasoningEffort, Inputs, MergeRoles string
 	InheritReasoning, InheritInputs, InheritMerge                                                                                                            bool
@@ -192,7 +199,9 @@ const (
 	terminalOpening terminalPhase = iota
 	// terminalRunning 表示终端进程在 Executor 上运行，输入和尺寸变化会发给它。
 	terminalRunning
-	// terminalExited 表示进程已结束、打开失败或连接已断开；标签保留，输入被忽略。
+	// terminalReconnecting 表示终端还在 serve 上运行，但这条连接尚未接入：连接断开后等重连，或刚从运行列表加成标签；输入被忽略。
+	terminalReconnecting
+	// terminalExited 表示进程已结束、serve 上已没有这个终端或打开失败；标签保留，输入被忽略。
 	terminalExited
 )
 
@@ -209,6 +218,14 @@ type terminalTab struct {
 	Phase      terminalPhase
 	// OpenRequest 是最近一次 terminal/open 请求的序号；迟到的旧请求结果不套用到新请求上。
 	OpenRequest uint64
+	// ReceivedCursor 是已经写进 State 的输出位置；断线重连从这里续读，新屏幕是 0。
+	ReceivedCursor uint64
+	// IsReplaying 是否正在回放接入时已有的输出？回放期间以及结束后的 100ms 内，终端的输入和尺寸变化不发给 serve。
+	IsReplaying bool
+	// WasTruncated 这次回放是否遇到过 serve 已丢弃的输出？
+	WasTruncated bool
+	// AttachedRows、AttachedCols 是最近一次接入时 serve 上 PTY 的行列数；回放结束时与屏幕尺寸比较。
+	AttachedRows, AttachedCols int
 	// Handle 绑定终端元素，打开成功后用它把键盘焦点交给终端。
 	Handle         ui.Handle
 	FocusRequested bool

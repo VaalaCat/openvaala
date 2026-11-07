@@ -10,7 +10,7 @@ import (
 )
 
 // ProtocolVersion 是 OpenVaala 协议版本，initialize 双方必须一致。
-const ProtocolVersion = "5"
+const ProtocolVersion = "6"
 
 // InitializeMethod 是建立连接后的第一个请求。
 const InitializeMethod = "initialize"
@@ -49,6 +49,7 @@ var Methods = []Method{
 	NewMethod[SteerInputParams, *EmptyResult]("conversation/steerInput"),
 	NewMethod[InterruptTurnWithInputParams, *EmptyResult]("conversation/interruptTurnWithInput"),
 	NewMethod[WithdrawInputParams, *WithdrawInputResult]("conversation/withdrawInput"),
+	NewMethod[AppendContextItemsParams, *EmptyResult]("conversation/appendContextItems"),
 	NewMethod[ConversationParams, *InterruptTurnResult]("conversation/interruptTurn"),
 	NewMethod[ConversationParams, *CompactContextResult]("conversation/compact"),
 	NewMethod[GetSessionParams, *SessionResult]("session/get"),
@@ -83,7 +84,11 @@ var Methods = []Method{
 	NewMethod[SessionParams, *SubscribeSessionResult]("session/subscribe"),
 	NewMethod[SessionParams, *EmptyResult]("session/unsubscribe"),
 	NewMethod[TerminalOpenParams, *TerminalOpenResult]("terminal/open"),
+	NewMethod[TerminalAttachParams, *TerminalAttachResult]("terminal/attach"),
 	NewMethod[TerminalParams, *EmptyResult]("terminal/close"),
+	NewMethod[TerminalParams, *EmptyResult]("terminal/reset"),
+	NewMethod[EmptyParams, *TerminalListResult]("terminal/subscribe"),
+	NewMethod[EmptyParams, *EmptyResult]("terminal/unsubscribe"),
 }
 
 // Notification 是一种通知的名字和参数类型。
@@ -126,6 +131,8 @@ var ServerNotifications = []Notification{
 	NewNotification[ClientMCPDisconnectParams]("clientMCP/disconnect"),
 	NewNotification[TerminalOutputParams]("terminal/output"),
 	NewNotification[TerminalExitedParams]("terminal/exited"),
+	NewNotification[TerminalListResult]("terminal/listChanged"),
+	NewNotification[TerminalsClosedParams]("terminal/listClosed"),
 }
 
 // ClientNotifications 是客户端发给 serve 的通知，共 4 种。

@@ -16,6 +16,9 @@ export type ProviderModelDraft = Omit<
   reasoning_efforts?: string
 }
 
+// ProviderHeaderDraft 是请求头编辑区的一行输入原文。
+export type ProviderHeaderDraft = { name: string; value: string }
+
 // ProviderDraft 保存整页输入；models 中的稳定行 ID 对应 modelAliases 中的别名原文。
 export type ProviderDraft = {
   id: string
@@ -26,6 +29,7 @@ export type ProviderDraft = {
   modelAliases: Record<string, string>
   modelConfigs: Record<string, ProviderModelDraft>
   endpoints: Record<string, string>
+  headers: ProviderHeaderDraft[]
 }
 
 export type ProviderModelIssues = {
@@ -105,7 +109,21 @@ export function fromProviderConfig(config: ProviderConfig): ProviderDraft {
       models.map((id) => [id, fromProviderModelConfig(config.models![id])])
     ),
     endpoints: { ...config.endpoints },
+    headers: Object.entries(config.headers ?? {})
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, value]) => ({ name, value })),
   }
+}
+
+// 将请求头行写成配置；没有条目时返回 undefined。
+export function toProviderHeaders(
+  rows: ProviderHeaderDraft[]
+): Record<string, string> | undefined {
+  // 1. 名称去掉首尾空白，空名称的行忽略，值为空的行照常保留。
+  const entries = rows
+    .map((row) => [row.name.trim(), row.value] as const)
+    .filter(([name]) => name)
+  return entries.length ? Object.fromEntries(entries) : undefined
 }
 
 // 解析逗号分隔的自定义推理强度，保留词的顺序。
@@ -208,11 +226,14 @@ export function toProviderConfig(draft: ProviderDraft): ProviderConfig {
       .map(([protocol, url]) => [protocol, url.trim()])
       .filter(([, url]) => url)
   )
+  // 3. 没有请求头时不写 headers。
+  const headers = toProviderHeaders(draft.headers)
   return {
     id: draft.id.trim(),
     ...(draft.protocol.trim() && { protocol: draft.protocol.trim() }),
     base_url: draft.baseURL.trim(),
     ...(Object.keys(endpoints).length && { endpoints }),
+    ...(headers && { headers }),
     api_key: draft.apiKey.trim(),
     models,
   }

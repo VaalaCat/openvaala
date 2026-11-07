@@ -22,6 +22,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
 	"github.com/VaalaCat/openvaala/pkg/storage"
@@ -840,12 +841,12 @@ func newE2EHarness(t *testing.T, agentName string, startupNotice string, configu
 			},
 		},
 		// local 带 read_file、apply_patch 和命令工具，界面没给目录时在 serve 的工作目录。
-		Executors: []*defs.ExecutorDefinition{{
+		Executors: executor.NewConfigExecutorProvider([]executor.Executor{executor.NewLocalExecutor(&defs.ExecutorDefinition{
 			ID:                 defs.LocalExecutorID,
 			Kind:               defs.ExecutorKindLocal,
 			Description:        "本机",
 			WorkspaceDirectory: serveDirectory,
-		}},
+		})}),
 	})
 	// 3. 配置相同 server_id，并应用本场景的模型与服务设置。
 	serverOpt := &runtimeserver.RuntimeServerOpt{

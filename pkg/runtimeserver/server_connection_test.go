@@ -48,20 +48,20 @@ func TestServerConnectionProtocol(t *testing.T) {
 			name: "duplicate_initialize",
 			run: func(t *testing.T, client *testClient) {
 				client.initialize(t)
-				requireErrorCode(t, client.call(t, "initialize", map[string]any{"protocol_version": "5"}), -32600, "already initialized")
+				requireErrorCode(t, client.call(t, "initialize", map[string]any{"protocol_version": "6"}), -32600, "already initialized")
 			},
 		},
 		{
-			// 协议版本 4 提供 Turn 查询和手动压缩，版本 3 初始化被拒绝后仍可重试。
+			// 协议版本 6 起终端归 Runtime、连接只接入，旧版本 3 初始化被拒绝后仍可重试。
 			name: "unsupported_protocol_version_then_retry",
 			run: func(t *testing.T, client *testClient) {
 				requireErrorCode(t, client.call(t, "initialize", map[string]any{"protocol_version": "3"}), -32600, "unsupported protocol version")
 				var result struct {
 					ProtocolVersion string `json:"protocol_version"`
 				}
-				client.callResult(t, "initialize", map[string]any{"protocol_version": "5"}, &result)
-				if result.ProtocolVersion != "5" {
-					t.Fatalf("protocol_version = %q, want 5", result.ProtocolVersion)
+				client.callResult(t, "initialize", map[string]any{"protocol_version": "6"}, &result)
+				if result.ProtocolVersion != "6" {
+					t.Fatalf("protocol_version = %q, want 6", result.ProtocolVersion)
 				}
 			},
 		},
@@ -110,8 +110,8 @@ func TestServerConnectionProtocol(t *testing.T) {
 			// 无 ID 的 initialize 通知不初始化也不响应，后续初始化请求独立完成并返回对应 ID。
 			name: "notification_gets_no_response",
 			run: func(t *testing.T, client *testClient) {
-				client.sendRaw(t, `{"method":"initialize","params":{"protocol_version":"5"}}`)
-				response := client.call(t, "initialize", map[string]any{"protocol_version": "5"})
+				client.sendRaw(t, `{"method":"initialize","params":{"protocol_version":"6"}}`)
+				response := client.call(t, "initialize", map[string]any{"protocol_version": "6"})
 				if response.Error != nil || string(response.ID) != "1" {
 					t.Fatalf("response = %+v (error %+v), want the initialize request to succeed with id 1", response, response.Error)
 				}
@@ -281,7 +281,7 @@ func TestServerConnectionTelemetry(t *testing.T) {
 		{
 			name: "string_request_id_is_recorded_unquoted",
 			run: func(t *testing.T, h *serverHarness, client *testClient, p *telemetrytest.Pipeline) {
-				client.sendRaw(t, `{"id":"req-1","method":"initialize","params":{"client_info":{"name":"test"},"protocol_version":"5"}}`)
+				client.sendRaw(t, `{"id":"req-1","method":"initialize","params":{"client_info":{"name":"test"},"protocol_version":"6"}}`)
 				if response := client.nextResponse(t); response.Error != nil || string(response.ID) != `"req-1"` {
 					t.Fatalf("response = %+v, want success with id \"req-1\"", response)
 				}

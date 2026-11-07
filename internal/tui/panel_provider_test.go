@@ -53,13 +53,14 @@ func TestProviderPanel(t *testing.T) {
 			"deepseek-v4": {DisplayName: "DeepSeek V4"},
 		}
 	}
-	// gateway 是已配置的 Provider：模型自己写了协议和推理强度，claude 协议走另一个地址；它的 c1 是当前默认模型。
+	// gateway 是已配置的 Provider：模型自己写了协议和推理强度，claude 协议走另一个地址，写了请求头（含一条空值）；它的 c1 是当前默认模型。
 	gateway := defs.ProviderConfig{
 		ID:        "gw",
 		Protocol:  "openai_chat",
 		BaseURL:   "https://gw.example/v1",
 		APIKey:    "gw-secret-key",
 		Endpoints: map[string]string{"claude": "https://claude.example/v1/messages"},
+		Headers:   map[string]string{"X-Team": "infra", "Session-Id": ""},
 		Models: map[string]*defs.ProviderModelConfig{
 			"c1": {
 				Protocol:         "claude",
@@ -458,9 +459,9 @@ func TestProviderPanel(t *testing.T) {
 			},
 		},
 		{
-			// 编辑已有 Provider：已有模型都已勾选，模型自己的协议、推理强度和 Provider 的 endpoints 原样写回；key 留空沿用原 key；
+			// 编辑已有 Provider：已有模型都已勾选，模型自己的协议、推理强度和 Provider 的 endpoints、headers 原样写回；key 留空沿用原 key；
 			// 第 4 步第一项是保持当前默认模型，写入时带上它。
-			name:   "edit_keeps_model_fields_endpoints_and_key",
+			name:   "edit_keeps_model_fields_endpoints_headers_and_key",
 			preset: withGateway,
 			run: func(t *testing.T, h *tuiHarness) {
 				openProviderList(h)

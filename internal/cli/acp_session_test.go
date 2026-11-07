@@ -1263,6 +1263,24 @@ func TestACPConfigOptions(t *testing.T) {
 			wantCurrent: "local",
 		},
 		{
+			// memory 不能当默认 Executor，下拉框里不列出；它在会话详情里排在最后。
+			name: "memory_not_listed",
+			executors: []conversation.ExecutorDetails{{
+				ID:                 "local",
+				WorkspaceDirectory: "/a",
+			}, {
+				ID:                 "extra",
+				Description:        "Extra directory",
+				WorkspaceDirectory: "/b",
+			}, {
+				ID:          defs.MemoryExecutorID,
+				Kind:        defs.ExecutorKindMemory,
+				Description: "Cross-conversation memory",
+			}},
+			wantValues:  []string{"local", "extra"},
+			wantCurrent: "local",
+		},
+		{
 			name: "details_unavailable",
 		},
 	}
@@ -1525,7 +1543,14 @@ const (
 	acpEditorHeaderValue = "editor-secret"
 )
 
-// newACPEditorMCPServer 启动编辑器一侧带 echo 工具的 MCP server，统计请求数和带了配置请求头的请求数。
+// acpGlobalUserAgentPrefix 是全局 http.headers 里 User-Agent 的前缀（内置默认以它开头），本机 server 收到的每个请求都应该带着它；
+// acpGlobalUserAgent 是直接给 getACPClientMCPTransport 传入全局 header 时用的取值。
+const (
+	acpGlobalUserAgentPrefix = "openvaala/"
+	acpGlobalUserAgent       = acpGlobalUserAgentPrefix + "test"
+)
+
+// newACPEditorMCPServer 启动编辑器一侧带 echo 工具的 MCP server，统计请求数和同时带了编辑器配置的请求头与全局 User-Agent 的请求数。
 func newACPEditorMCPServer(t *testing.T, transport string, requests, headed *atomic.Int32) *httptest.Server {
 	t.Helper()
 	// 1. 创建 MCP server 并注册 echo；不声明 tools/list_changed，客户端就不发 subscriptions/listen 长请求。
@@ -1555,7 +1580,7 @@ func newACPEditorMCPServer(t *testing.T, transport string, requests, headed *ato
 	}
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		if r.Header.Get(acpEditorHeaderName) == acpEditorHeaderValue {
+		if r.Header.Get(acpEditorHeaderName) == acpEditorHeaderValue && strings.HasPrefix(r.Header.Get("User-Agent"), acpGlobalUserAgentPrefix) {
 			headed.Add(1)
 		}
 		handler.ServeHTTP(w, r)
@@ -1701,7 +1726,7 @@ func TestACPClientMCPServers(t *testing.T) {
 			}
 			runTurn("first", tt.wantTool, "")
 			if tt.wantTool != "" && (requests.Load() == 0 || requests.Load() != headed.Load()) {
-				t.Fatalf("editor server got %d requests, %d with the configured header, want all of them", requests.Load(), headed.Load())
+				t.Fatalf("editor server got %d requests, %d with the editor header and the global User-Agent, want all of them", requests.Load(), headed.Load())
 			}
 			if tt.getLoadedServers != nil {
 				wire.call(t, "session/load", map[string]any{"sessionId": created.SessionId, "cwd": directory, "mcpServers": tt.getLoadedServers(editorServer.URL)}, nil)

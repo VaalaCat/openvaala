@@ -141,26 +141,26 @@ const (
 
 // ── 身份属性构造 ──
 
-// ConversationID 生成对话身份属性。
-func ConversationID(id string) attribute.KeyValue {
+// conversationIDAttr 生成对话身份属性。
+func conversationIDAttr(id string) attribute.KeyValue {
 	// 1. 将对话 ID 写入身份属性。
 	return conversationIDKey.String(id)
 }
 
-// SessionID 生成 Session 身份属性。
-func SessionID(id string) attribute.KeyValue {
+// sessionIDAttr 生成 Session 身份属性。
+func sessionIDAttr(id string) attribute.KeyValue {
 	// 1. 将 Session ID 写入身份属性。
 	return sessionIDKey.String(id)
 }
 
-// ParentSessionID 生成父 Session 身份属性。
-func ParentSessionID(id string) attribute.KeyValue {
+// parentSessionIDAttr 生成父 Session 身份属性。
+func parentSessionIDAttr(id string) attribute.KeyValue {
 	// 1. 将父 Session ID 写入身份属性。
 	return parentSessionIDKey.String(id)
 }
 
-// AgentName 生成 Agent 名属性。
-func AgentName(name string) attribute.KeyValue {
+// agentNameAttr 生成 Agent 名属性。
+func agentNameAttr(name string) attribute.KeyValue {
 	// 1. 将 Agent 名写入属性，也用作指标维度。
 	return agentNameKey.String(name)
 }

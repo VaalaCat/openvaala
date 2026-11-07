@@ -17,6 +17,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"unicode/utf8"
 
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent"
@@ -25,6 +26,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/executor/tools"
 	"github.com/VaalaCat/openvaala/pkg/hook"
+	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
@@ -2181,7 +2183,7 @@ func TestAgentRecordsModelCallTelemetry(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				p := telemetrytest.NewPipeline(t)
-				ctx := telemetry.ContextWithAttrs(telemetry.ContextWithTelemetry(t.Context(), p.Telemetry), telemetry.AgentName("assistant"))
+				ctx := defs.ContextWithSessionCtxMeta(telemetry.ContextWithTelemetry(t.Context(), p.Telemetry), defs.SessionCtxMeta{AgentName: "assistant"})
 				opt := agent.NewAgentOpt(
 					testTurnID,
 					testSessionID,
@@ -3392,34 +3394,51 @@ func newToolLoopResponses() [][]llmkit.Event {
 	}
 }
 
-// TestAgentWorkspaceInstructions 检查目录规则首次加载、去重及压缩后补回。
+// TestAgentWorkspaceInstructions 检查全局和目录规则首次加载、去重及压缩后补回。
 func TestAgentWorkspaceInstructions(t *testing.T) {
 	// 1. 准备首次读取、历史已有规则和规则被摘要覆盖的样例。
 	for _, tt := range []struct {
 		name             string
 		visible, compact bool
+		global           bool
 	}{
-		{
-			"first_load",
-			false,
-			false,
-		}, {
-			"already_visible",
-			true,
-			false,
-		}, {
-			"reload_after_compaction",
-			true,
-			true,
-		},
+		{name: "first_load"},
+		{name: "already_visible", visible: true},
+		{name: "reload_after_compaction", visible: true, compact: true},
+		{name: "global_first_load", global: true},
+		{name: "global_already_visible", global: true, visible: true},
+		{name: "global_reload_after_compaction", global: true, visible: true, compact: true},
 	} {
 		// 2. 运行带规则的上下文，检查首次追加、已加载去重和压缩后重新追加。
 		t.Run(tt.name, func(t *testing.T) {
 			root := t.TempDir()
+			home := t.TempDir()
+			t.Setenv("HOME", home)
 			path := filepath.Join(root, "AGENTS.md")
 			if err := os.WriteFile(path, []byte("project-rules-marker"), 0600); err != nil {
 				t.Fatal(err)
 			}
+			var wantInstructions []defs.AgentsInstruction
+			if tt.global {
+				globalPath := filepath.Join(home, ".agents", "AGENTS.md")
+				if err := os.MkdirAll(filepath.Dir(globalPath), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(globalPath, []byte("global-rules-marker"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				wantInstructions = append(wantInstructions, defs.AgentsInstruction{
+					Executor: "local",
+					Path:     globalPath,
+					Text:     "global-rules-marker",
+					IsGlobal: true,
+				})
+			}
+			wantInstructions = append(wantInstructions, defs.AgentsInstruction{
+				Executor: "local",
+				Path:     path,
+				Text:     "project-rules-marker",
+			})
 			work, err := workspace.NewLocalWorkspace(workspace.NewLocalWorkspaceOpt(root))
 			if err != nil {
 				t.Fatal(err)
@@ -3436,16 +3455,14 @@ func TestAgentWorkspaceInstructions(t *testing.T) {
 			}
 			var items []*defs.Item
 			if tt.visible {
-				items = append(items, &defs.Item{
-					ID:     "rule",
-					TurnID: testTurnID,
-					Kind:   defs.ItemAgentsInstruction,
-					AgentsInstruction: &defs.AgentsInstruction{
-						Executor: "local",
-						Path:     path,
-						Text:     "project-rules-marker",
-					},
-				})
+				for index, instruction := range wantInstructions {
+					items = append(items, &defs.Item{
+						ID:                defs.ItemID(fmt.Sprintf("rule-%d", index)),
+						TurnID:            testTurnID,
+						Kind:              defs.ItemAgentsInstruction,
+						AgentsInstruction: &instruction,
+					})
+				}
 			}
 			if tt.compact {
 				old := userMessage(strings.Repeat("old work ", 500))
@@ -3469,13 +3486,16 @@ func TestAgentWorkspaceInstructions(t *testing.T) {
 			rules := 0
 			for _, item := range result.Items {
 				if item.Kind == defs.ItemAgentsInstruction {
+					if rules >= len(wantInstructions) || *item.AgentsInstruction != wantInstructions[rules] {
+						t.Fatalf("instruction %d = %+v, want %+v", rules, item.AgentsInstruction, wantInstructions)
+					}
 					rules++
 					if item.TurnID != testTurnID {
 						t.Fatal("rule has wrong Turn")
 					}
 				}
 			}
-			want := 1
+			want := len(wantInstructions)
 			if tt.visible && !tt.compact {
 				want = 0
 			}
@@ -3483,22 +3503,316 @@ func TestAgentWorkspaceInstructions(t *testing.T) {
 				t.Fatalf("new rules = %d, want %d", rules, want)
 			}
 			request := client.requests[len(client.requests)-1]
-			occurrences := 0
+			var instructionTexts []string
 			for _, message := range request.Messages {
 				for _, block := range message.Content {
-					if strings.Contains(block.Text, "project-rules-marker") {
-						occurrences++
+					if strings.Contains(block.Text, "project-rules-marker") || strings.Contains(block.Text, "global-rules-marker") {
+						instructionTexts = append(instructionTexts, block.Text)
 						if message.Role != llmkit.RoleUser {
 							t.Fatal("rules must be user instructions")
 						}
 					}
 				}
 			}
-			if occurrences != 1 {
-				t.Fatalf("rule occurrences = %d", occurrences)
+			if len(instructionTexts) != len(wantInstructions) {
+				t.Fatalf("rule occurrences = %d, want %d", len(instructionTexts), len(wantInstructions))
+			}
+			for index, instruction := range wantInstructions {
+				text := instructionTexts[index]
+				if !strings.Contains(text, instruction.Path) || !strings.Contains(text, instruction.Text) {
+					t.Fatalf("instruction text %d = %q, want %+v", index, text, instruction)
+				}
+				if instruction.IsGlobal && (!strings.Contains(text, "此 Executor 的所有工作区") || !strings.Contains(text, "项目目录规则优先")) {
+					t.Fatalf("global scope missing: %s", text)
+				}
 			}
 			if tt.compact && len(client.requests) != 2 {
 				t.Fatalf("calls = %d, want one compaction and one model call", len(client.requests))
+			}
+		})
+	}
+}
+
+// TestAgentMemoryIndexes 检查 Turn 开始时读 memory 环境的 MEMORY.md：按行截断、空文件不放、读失败只记日志。
+func TestAgentMemoryIndexes(t *testing.T) {
+	// 1. 准备 10 KiB 的多行目录和不含换行的中文，以及刚好 8 KiB、缺文件、空白和读失败的样例。
+	var longIndex strings.Builder
+	for line := 0; longIndex.Len() < 10<<10; line++ {
+		fmt.Fprintf(&longIndex, "- [topic-%04d](topic-%04d.md) — 一句能直接用的结论\n", line, line)
+	}
+	tests := []struct {
+		name string
+		// userIndex、projectIndex 是两份 MEMORY.md 的内容，为空表示不建这个文件。
+		userIndex, projectIndex string
+		// isUserIndexDirectory user/MEMORY.md 是不是一个目录？是的话读它会失败。
+		isUserIndexDirectory bool
+		// hasNoMemoryEnvironment 对话是不是没有 memory 环境？
+		hasNoMemoryEnvironment bool
+		// wantPaths 是本轮新加的记忆目录，按顺序。
+		wantPaths []string
+		// wantTruncated 是 user/MEMORY.md 的预期结果：是否截断，以及检查截断后的正文。
+		wantTruncated bool
+		checkUserText func(t *testing.T, text string)
+		// wantReadWarnings 是读失败的 Warn 日志条数。
+		wantReadWarnings int
+	}{
+		{
+			name:         "both_files_loaded_in_order",
+			userIndex:    "- 回复用中文\n",
+			projectIndex: "- 测试用 table-driven\n",
+			wantPaths:    []string{"user/MEMORY.md", "project/MEMORY.md"},
+			checkUserText: func(t *testing.T, text string) {
+				if text != "- 回复用中文\n" {
+					t.Fatalf("text = %q, want the file content unchanged", text)
+				}
+			},
+		},
+		{
+			name: "missing_files_are_skipped_silently",
+		},
+		{
+			name:         "blank_file_is_skipped",
+			userIndex:    "  \n\t\n",
+			projectIndex: "- 测试用 table-driven\n",
+			wantPaths:    []string{"project/MEMORY.md"},
+		},
+		{
+			name:          "over_limit_cuts_at_last_newline",
+			userIndex:     longIndex.String(),
+			wantPaths:     []string{"user/MEMORY.md"},
+			wantTruncated: true,
+			checkUserText: func(t *testing.T, text string) {
+				lineLength := len(strings.SplitAfter(longIndex.String(), "\n")[0])
+				if len(text) > 8<<10 || len(text)+lineLength <= 8<<10 {
+					t.Fatalf("text length = %d, want the longest whole-line prefix not above 8 KiB (line %d bytes)", len(text), lineLength)
+				}
+				if !strings.HasPrefix(longIndex.String(), text+"\n") {
+					t.Fatalf("text does not end at a line of the file: %q", text[max(0, len(text)-60):])
+				}
+			},
+		},
+		{
+			// 一行 10 KiB 的中文没有换行符，退到上限以内最后一个完整字符：3500 个字符截成 2730 个。
+			name:          "no_newline_within_limit",
+			userIndex:     strings.Repeat("中", 3500),
+			wantPaths:     []string{"user/MEMORY.md"},
+			wantTruncated: true,
+			checkUserText: func(t *testing.T, text string) {
+				if !utf8.ValidString(text) || len(text) > 8<<10 || text != strings.Repeat("中", 2730) {
+					t.Fatalf("text has %d bytes (valid UTF-8: %v), want 2730 whole characters", len(text), utf8.ValidString(text))
+				}
+			},
+		},
+		{
+			name:      "exactly_limit_is_not_truncated",
+			userIndex: strings.Repeat("a", 8<<10),
+			wantPaths: []string{"user/MEMORY.md"},
+			checkUserText: func(t *testing.T, text string) {
+				if len(text) != 8<<10 {
+					t.Fatalf("text length = %d, want the whole 8 KiB", len(text))
+				}
+			},
+		},
+		{
+			// 8 KiB 的完整行后面只有一个换行符：整个文件就是这些内容，不算截断，也不丢最后一行。
+			name:      "exactly_limit_plus_trailing_newline_is_not_truncated",
+			userIndex: strings.Repeat(strings.Repeat("a", 63)+"\n", 127) + strings.Repeat("a", 64) + "\n",
+			wantPaths: []string{"user/MEMORY.md"},
+			checkUserText: func(t *testing.T, text string) {
+				if want := strings.Repeat(strings.Repeat("a", 63)+"\n", 127) + strings.Repeat("a", 64); text != want {
+					t.Fatalf("text has %d bytes, want the 8 KiB without the trailing newline", len(text))
+				}
+			},
+		},
+		{
+			// 上限处正好是行尾、后面还有内容：在上限处截断，不丢最后一整行，并标上截断。
+			name:          "line_boundary_at_limit_with_more_content_is_truncated",
+			userIndex:     strings.Repeat(strings.Repeat("a", 63)+"\n", 127) + strings.Repeat("a", 64) + "\nrest\n",
+			wantPaths:     []string{"user/MEMORY.md"},
+			wantTruncated: true,
+			checkUserText: func(t *testing.T, text string) {
+				if want := strings.Repeat(strings.Repeat("a", 63)+"\n", 127) + strings.Repeat("a", 64); text != want {
+					t.Fatalf("text has %d bytes, want the whole 8 KiB of complete lines", len(text))
+				}
+			},
+		},
+		{
+			name:                 "read_failure_only_logs_a_warning",
+			projectIndex:         "- 测试用 table-driven\n",
+			isUserIndexDirectory: true,
+			wantPaths:            []string{"project/MEMORY.md"},
+			wantReadWarnings:     1,
+		},
+		{
+			name:                   "without_memory_environment",
+			userIndex:              "- 回复用中文\n",
+			hasNoMemoryEnvironment: true,
+		},
+	}
+	// 2. 把目录放进记忆工作区，运行一轮，核对新加的 Item、请求里的消息和 Warn 日志。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDirectory := t.TempDir()
+			const projectName = "projects/local/-repo"
+			userDirectory, projectDirectory := filepath.Join(dataDirectory, "user"), filepath.Join(dataDirectory, projectName)
+			for directory, content := range map[string]string{userDirectory: tt.userIndex, projectDirectory: tt.projectIndex} {
+				if content == "" {
+					continue
+				}
+				if err := os.MkdirAll(directory, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(directory, "MEMORY.md"), []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.isUserIndexDirectory {
+				if err := os.MkdirAll(filepath.Join(userDirectory, "MEMORY.md"), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			memoryWorkspace, err := workspace.NewMemoryWorkspace(workspace.NewMemoryWorkspaceOpt(dataDirectory, projectName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			localWorkspace, err := workspace.NewLocalWorkspace(workspace.NewLocalWorkspaceOpt(t.TempDir()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pipeline := telemetrytest.NewPipeline(t)
+			client := &compactingAgentClient{}
+			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, newTestContext(t, "", []*defs.Item{userMessage("你好")}))
+			opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "local", localWorkspace)}
+			if !tt.hasNoMemoryEnvironment {
+				opt.Environments = append(opt.Environments, newTestEnvironment(t, defs.MemoryExecutorID, memoryWorkspace))
+			}
+			instance, err := agent.NewAgent(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := instance.Run(telemetry.ContextWithTelemetry(t.Context(), pipeline.Telemetry), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var indexes []*defs.MemoryIndex
+			for _, item := range result.Items {
+				if item.Kind == defs.ItemMemoryIndex {
+					if item.TurnID != testTurnID {
+						t.Fatalf("memory index item turn = %q, want %q", item.TurnID, testTurnID)
+					}
+					indexes = append(indexes, item.MemoryIndex)
+				}
+			}
+			var paths []string
+			for _, index := range indexes {
+				paths = append(paths, index.Path)
+			}
+			if !slices.Equal(paths, tt.wantPaths) {
+				t.Fatalf("memory index paths = %v, want %v", paths, tt.wantPaths)
+			}
+			if len(indexes) > 0 && indexes[0].Path == "user/MEMORY.md" {
+				if indexes[0].IsTruncated != tt.wantTruncated {
+					t.Fatalf("IsTruncated = %v, want %v", indexes[0].IsTruncated, tt.wantTruncated)
+				}
+				if tt.checkUserText != nil {
+					tt.checkUserText(t, indexes[0].Text)
+				}
+			}
+			// 3. 每份记忆目录以用户消息发给模型，格式同 FormatMemoryIndex；本轮读失败只记一条 Warn。
+			var requestTexts []string
+			for _, message := range client.requests[0].Messages {
+				for _, block := range message.Content {
+					if strings.Contains(block.Text, "跨对话记忆目录") {
+						requestTexts = append(requestTexts, block.Text)
+						if message.Role != llmkit.RoleUser {
+							t.Fatal("memory index must be a user message")
+						}
+					}
+				}
+			}
+			if len(requestTexts) != len(indexes) {
+				t.Fatalf("memory messages in request = %d, want %d", len(requestTexts), len(indexes))
+			}
+			for position, index := range indexes {
+				if requestTexts[position] != prompt.FormatMemoryIndex(*index) {
+					t.Fatalf("memory message %d = %q, want %q", position, requestTexts[position], prompt.FormatMemoryIndex(*index))
+				}
+			}
+			if warnings := pipeline.GetLogRecords(t, "memory index read failed"); len(warnings) != tt.wantReadWarnings {
+				t.Fatalf("read warnings = %v, want %d", warnings, tt.wantReadWarnings)
+			}
+		})
+	}
+}
+
+// TestAgentMemoryIndexesFollowProject 检查项目记忆按项目判断是否已在上下文里：换了项目就放入新项目的目录，用户级目录不重复放。
+func TestAgentMemoryIndexesFollowProject(t *testing.T) {
+	// 1. 上下文里已有用户级目录和项目 A 的目录，记忆环境指向不同项目。
+	const projectA, projectB = "projects/local/-repo-a", "projects/local/-repo-b"
+	tests := []struct {
+		name string
+		// environmentProject 是记忆环境指向的项目。
+		environmentProject string
+		// wantProjects 是本轮新放进上下文的项目记忆，按顺序；用户级目录已在上下文里，不重复放。
+		wantProjects []string
+	}{
+		{name: "same_project_is_not_appended_again", environmentProject: projectA},
+		{name: "other_project_is_appended", environmentProject: projectB, wantProjects: []string{projectB}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 2. 记忆根目录下放好用户级目录和两个项目的目录。
+			memoryDirectory := t.TempDir()
+			for name, content := range map[string]string{
+				"user":   "- 回复用中文\n",
+				projectA: "- A 项目用 table-driven\n",
+				projectB: "- B 项目用 testify\n",
+			} {
+				if err := os.MkdirAll(filepath.Join(memoryDirectory, name), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(memoryDirectory, name, "MEMORY.md"), []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			memoryWorkspace, err := workspace.NewMemoryWorkspace(workspace.NewMemoryWorkspaceOpt(memoryDirectory, tt.environmentProject))
+			if err != nil {
+				t.Fatal(err)
+			}
+			localWorkspace, err := workspace.NewLocalWorkspace(workspace.NewLocalWorkspaceOpt(t.TempDir()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 3. 运行一轮，核对新放进上下文的记忆目录。
+			history := newTestContext(t, "", []*defs.Item{
+				userMessage("你好"),
+				{ID: "user-memory", TurnID: testTurnID, Kind: defs.ItemMemoryIndex, MemoryIndex: &defs.MemoryIndex{Path: "user/MEMORY.md", Text: "- 回复用中文\n"}},
+				{ID: "project-memory", TurnID: testTurnID, Kind: defs.ItemMemoryIndex, MemoryIndex: &defs.MemoryIndex{Path: "project/MEMORY.md", Project: projectA, Text: "- A 项目用 table-driven\n"}},
+			})
+			opt := agent.NewAgentOpt(testTurnID, testSessionID, &compactingAgentClient{}, testModel, history)
+			opt.Environments = []executor.ExecutionEnvironment{
+				newTestEnvironment(t, "local", localWorkspace),
+				newTestEnvironment(t, defs.MemoryExecutorID, memoryWorkspace),
+			}
+			instance, err := agent.NewAgent(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := instance.Run(t.Context(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotProjects []string
+			for _, item := range result.Items {
+				if item.Kind == defs.ItemMemoryIndex {
+					if item.MemoryIndex.Path != "project/MEMORY.md" {
+						t.Fatalf("appended memory index path = %q, want only project/MEMORY.md", item.MemoryIndex.Path)
+					}
+					gotProjects = append(gotProjects, item.MemoryIndex.Project)
+				}
+			}
+			if !slices.Equal(gotProjects, tt.wantProjects) {
+				t.Fatalf("appended projects = %v, want %v", gotProjects, tt.wantProjects)
 			}
 		})
 	}
@@ -3572,8 +3886,12 @@ func TestAgentWorkspaceInstructionsFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if broken.attempts != 1 || len(client.requests) != 2 {
-				t.Fatalf("failed discovery attempts = %d, model calls = %d; want 1 and 2", broken.attempts, len(client.requests))
+			wantAttempts := 1
+			if tt.operation == "read" {
+				wantAttempts = 2 // 全局规则和项目规则分别尝试读取。
+			}
+			if broken.attempts != wantAttempts || len(client.requests) != 2 {
+				t.Fatalf("failed discovery attempts = %d, model calls = %d; want %d and 2", broken.attempts, len(client.requests), wantAttempts)
 			}
 			for _, request := range client.requests {
 				encoded, err := json.Marshal(request.Messages)
@@ -3597,10 +3915,22 @@ func TestAgentWorkspaceInstructionsFailure(t *testing.T) {
 type testAgentsWorkspace struct {
 	workspace.Workspace
 	operation        string
+	homeDirectory    string
+	homeQueries      int
 	attempts         int
 	metadataCalls    int
 	instructionReads int
 	cancel           context.CancelFunc
+}
+
+// GetHomeDirectory 记录查询次数，返回指定的测试主目录或工作区自己的主目录。
+func (w *testAgentsWorkspace) GetHomeDirectory(ctx context.Context) (string, error) {
+	// 1. 累计查询次数，指定主目录时直接返回，否则查询真实工作区。
+	w.homeQueries++
+	if w.homeDirectory != "" {
+		return w.homeDirectory, nil
+	}
+	return w.Workspace.GetHomeDirectory(ctx)
 }
 
 // GetMetadata 记录工作区查询，并可注入元数据错误或取消。
@@ -3826,13 +4156,14 @@ func TestAgentWorkspaceInstructionsDiscoveryTiming(t *testing.T) {
 		// 2. 运行两步工具调用，检查未使用和工具失败的环境没有读取规则，成功使用后只读取一次。
 		t.Run(tt.name, func(t *testing.T) {
 			remote, err := workspace.NewVirtualWorkspace(workspace.NewVirtualWorkspaceOpt("/project/app", map[string]*workspace.VirtualFile{
-				"/project/.git/config": {Content: []byte("git-marker")},
-				"/project/AGENTS.md":   {Content: []byte("remote-parent-rules")},
+				"/project/.git/config":           {Content: []byte("git-marker")},
+				"/project/AGENTS.md":             {Content: []byte("remote-parent-rules")},
+				"/home/tester/.agents/AGENTS.md": {Content: []byte("remote-global-rules")},
 			}))
 			if err != nil {
 				t.Fatal(err)
 			}
-			observed := &testAgentsWorkspace{Workspace: remote}
+			observed := &testAgentsWorkspace{Workspace: remote, homeDirectory: "/home/tester"}
 			backend := &testToolExecutor{}
 			if tt.toolFails {
 				backend.toolError = &defs.ToolError{
@@ -3880,12 +4211,12 @@ func TestAgentWorkspaceInstructionsDiscoveryTiming(t *testing.T) {
 			}
 			wantLoaded := tt.remoteDefault || (tt.useRemote && !tt.toolFails)
 			if wantLoaded {
-				// 检查根目录和工作目录各读取一次，后续工具步骤复用读取结果。
-				if observed.instructionReads != 2 {
-					t.Fatalf("instruction reads = %d, want 2", observed.instructionReads)
+				// 检查全局、根目录和工作目录各读取一次，后续工具步骤复用读取结果。
+				if observed.homeQueries != 1 || observed.instructionReads != 3 {
+					t.Fatalf("home queries = %d, instruction reads = %d; want 1 and 3", observed.homeQueries, observed.instructionReads)
 				}
-			} else if observed.metadataCalls != 0 || observed.instructionReads != 0 {
-				t.Fatalf("unexpected workspace access: metadata = %d, reads = %d", observed.metadataCalls, observed.instructionReads)
+			} else if observed.homeQueries != 0 || observed.metadataCalls != 0 || observed.instructionReads != 0 {
+				t.Fatalf("unexpected workspace access: home = %d, metadata = %d, reads = %d", observed.homeQueries, observed.metadataCalls, observed.instructionReads)
 			}
 			if len(client.requests) != 3 {
 				t.Fatalf("model requests = %d, want 3", len(client.requests))
@@ -3898,6 +4229,9 @@ func TestAgentWorkspaceInstructionsDiscoveryTiming(t *testing.T) {
 				want := tt.remoteDefault || (step > 0 && wantLoaded)
 				if got := strings.Contains(string(encoded), "remote-parent-rules"); got != want {
 					t.Fatalf("step %d has rules = %v, want %v", step, got, want)
+				}
+				if got := strings.Contains(string(encoded), "remote-global-rules"); got != want {
+					t.Fatalf("step %d has global rules = %v, want %v", step, got, want)
 				}
 			}
 		})
@@ -4860,6 +5194,177 @@ func TestAgentRetriesContextCompaction(t *testing.T) {
 					}
 				}
 			})
+		})
+	}
+}
+
+// TestAgentMaxSteps 检查单轮模型调用上限：最后一步禁用工具并要求总结，仍请求工具时补错误结果，上限为 0 时不受限。
+func TestAgentMaxSteps(t *testing.T) {
+	// 1. 准备工具调用、文本回复和拦下结束的 hook 结果。
+	toolResponse := func(callID string) []llmkit.Event {
+		return []llmkit.Event{
+			{
+				Type: llmkit.EventToolCallEnd,
+				ToolCall: &llmkit.StreamingToolCall{
+					CallID:    callID,
+					Name:      "lookup",
+					Arguments: `{"q":"x"}`,
+				},
+			},
+			{
+				Type:         llmkit.EventDone,
+				FinishReason: "tool_calls",
+			},
+		}
+	}
+	textResponse := []llmkit.Event{
+		{
+			Type:  llmkit.EventContentDelta,
+			Delta: &llmkit.DeltaPayload{Text: "进度总结"},
+		},
+		{
+			Type:         llmkit.EventDone,
+			FinishReason: "stop",
+		},
+	}
+	blocked := &hook.HookOutcome{
+		IsBlocked:   true,
+		BlockReason: "run the tests",
+		SavedRuns:   []*defs.HookRun{newStopHookRun("stop-blocked", defs.HookRunBlocked)},
+	}
+	const wantErr = "agent reached max steps but model still requested tools"
+	tests := []struct {
+		name      string
+		maxSteps  int
+		responses [][]llmkit.Event
+		// outcomes 非空时挂上 Stop hook，按次序返回。
+		outcomes []*hook.HookOutcome
+		// steer 是否有补充输入排在队列里？
+		steer        bool
+		wantErr      string
+		wantExecuted []string
+		wantCalls    int
+		wantHookRuns int
+	}{
+		{
+			name:         "last_step_disables_tools_and_asks_for_summary",
+			maxSteps:     3,
+			responses:    [][]llmkit.Event{toolResponse("call-1"), toolResponse("call-2"), textResponse},
+			wantExecuted: []string{"call-1", "call-2"},
+			wantCalls:    3,
+		},
+		{
+			name:         "model_ignores_tool_choice",
+			maxSteps:     3,
+			responses:    [][]llmkit.Event{toolResponse("call-1"), toolResponse("call-2"), toolResponse("call-3")},
+			wantErr:      wantErr,
+			wantExecuted: []string{"call-1", "call-2"},
+			wantCalls:    3,
+		},
+		{
+			name:         "stop_hook_does_not_continue_at_last_step",
+			maxSteps:     1,
+			responses:    [][]llmkit.Event{textResponse, textResponse},
+			outcomes:     []*hook.HookOutcome{blocked, blocked},
+			wantCalls:    1,
+			wantHookRuns: 1,
+		},
+		{
+			name:      "queued_input_runs_in_next_turn",
+			maxSteps:  1,
+			responses: [][]llmkit.Event{textResponse, textResponse},
+			steer:     true,
+			wantCalls: 1,
+		},
+		{
+			name:     "zero_means_unlimited",
+			maxSteps: 0,
+			responses: [][]llmkit.Event{
+				toolResponse("call-1"), toolResponse("call-2"), toolResponse("call-3"), toolResponse("call-4"), toolResponse("call-5"), textResponse,
+			},
+			wantExecuted: []string{"call-1", "call-2", "call-3", "call-4", "call-5"},
+			wantCalls:    6,
+		},
+	}
+	// 2. 运行 Agent，检查请求、工具执行、结果配对、上下文和 hook 次数。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &sequenceAgentClient{responses: tt.responses}
+			agentContext := newTestContext(t, "", []*defs.Item{userMessage("你好")})
+			toolExecutor := &testToolExecutor{}
+			hooks := &stubHooks{outcomes: tt.outcomes}
+			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, agentContext)
+			opt.ToolExecutor = toolExecutor
+			opt.MaxSteps = tt.maxSteps
+			if len(tt.outcomes) > 0 {
+				opt.Hooks = hooks
+				opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "local", nil)}
+			}
+			if tt.steer {
+				serveAgentInputs(t, opt, agent.AgentInputResult{}, agent.AgentInputResult{Items: []*defs.Item{userMessage("补充说明")}})
+			}
+			instance, err := agent.NewAgent(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			result, err := instance.Run(ctx, nil)
+			if tt.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantErr != "" && (err == nil || err.Error() != tt.wantErr) {
+				t.Fatalf("Run() error = %v, want %q", err, tt.wantErr)
+			}
+			// 3. 只有最后一步的请求禁用工具并以提示结尾，前面的请求不受影响。
+			if len(client.requests) != tt.wantCalls {
+				t.Fatalf("model calls = %d, want %d", len(client.requests), tt.wantCalls)
+			}
+			for index, request := range client.requests {
+				isLast := tt.maxSteps > 0 && index+1 == tt.maxSteps
+				if !isLast {
+					if request.ToolChoice != nil || strings.Contains(fmt.Sprint(request.Messages), prompt.MaxStepsReachedInstructions) {
+						t.Fatalf("request %d = %+v, want no tool choice and no max steps instructions", index, request)
+					}
+					continue
+				}
+				lastMessage := request.Messages[len(request.Messages)-1]
+				if request.ToolChoice == nil || request.ToolChoice.Type != "none" || len(request.Tools) == 0 ||
+					lastMessage.Role != llmkit.RoleUser || len(lastMessage.Content) != 1 || lastMessage.Content[0].Text != prompt.MaxStepsReachedInstructions {
+					t.Fatalf("last request = tool choice %+v, tools %d, last message %+v", request.ToolChoice, len(request.Tools), lastMessage)
+				}
+			}
+			// 4. 提示和排队的输入都不在上下文里。
+			if payload := fmt.Sprint(contextMessages(t, agentContext)); strings.Contains(payload, prompt.MaxStepsReachedInstructions) || strings.Contains(payload, "补充说明") {
+				t.Fatalf("context = %s, want no max steps instructions or queued input", payload)
+			}
+			// 5. 只有上限前的工具调用被执行；每个工具调用都有配对的结果，最后一步的结果是固定错误。
+			if !slices.Equal(toolExecutor.calls, tt.wantExecuted) {
+				t.Fatalf("executed calls = %v, want %v", toolExecutor.calls, tt.wantExecuted)
+			}
+			results := make(map[string]*defs.ToolResult)
+			var callIDs []string
+			for _, item := range result.Items {
+				switch item.Kind {
+				case defs.ItemToolCall:
+					callIDs = append(callIDs, item.ToolCall.CallID)
+				case defs.ItemToolResult:
+					results[item.ToolResult.CallID] = item.ToolResult
+				}
+			}
+			for _, callID := range callIDs {
+				if results[callID] == nil {
+					t.Fatalf("tool call %q has no result in %+v", callID, result.Items)
+				}
+			}
+			if tt.wantErr != "" {
+				if rejected := results["call-3"]; rejected.Error == nil || rejected.Error.Message != tt.wantErr {
+					t.Fatalf("rejected result = %+v, want error %q", rejected, tt.wantErr)
+				}
+			}
+			if len(hooks.requests) != tt.wantHookRuns {
+				t.Fatalf("stop hook requests = %d, want %d", len(hooks.requests), tt.wantHookRuns)
+			}
 		})
 	}
 }

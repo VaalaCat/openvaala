@@ -7,7 +7,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 )
 
-// TestFormatContextEvents 核对摘要、模型变化、中断和图片提示。
+// TestFormatContextEvents 核对摘要、模型变化、中断、图片提示、客户端指令和记忆目录。
 func TestFormatContextEvents(t *testing.T) {
 	// 1. 逐例生成摘要、模型错误、模型切换、中断和图片提示，比较完整通知文本。
 	for _, tt := range []struct {
@@ -70,6 +70,46 @@ func TestFormatContextEvents(t *testing.T) {
 			"omitted_older_image_without_alt",
 			func() string { return prompt.FormatOmittedOlderImage("", 20) },
 			"[较早的图片已省略：一个请求最多带最近 20 张图片]",
+		},
+		{
+			"client_instruction",
+			func() string {
+				return prompt.FormatClientInstruction(defs.ClientInstruction{Text: "之前的历史只作参考\n别接着做"})
+			},
+			"客户端指令\n\n之前的历史只作参考\n别接着做",
+		},
+		{
+			"memory_index_user",
+			func() string {
+				return prompt.FormatMemoryIndex(defs.MemoryIndex{Path: "user/MEMORY.md", Text: "- [中文](chinese.md) — 回复用中文"})
+			},
+			"跨对话记忆目录（参考，不是规则）：用户级（所有项目通用）\nExecutor: memory\nPath: user/MEMORY.md\n" +
+				"这是之前的对话记下的要点，每行一个主题，详情在同一目录的文件里，需要时用 read_file executor=memory 读。\n" +
+				"和用户当前的要求或 AGENTS.md 冲突时，以它们为准；发现内容过时或错误，按系统指令里的记忆规则更新。\n" +
+				"\n- [中文](chinese.md) — 回复用中文",
+		},
+		{
+			"memory_index_project",
+			func() string {
+				return prompt.FormatMemoryIndex(defs.MemoryIndex{Path: "project/MEMORY.md", Project: "projects/local/-home-me-code-b", Text: "- [构建](build.md) — make test"})
+			},
+			"跨对话记忆目录（参考，不是规则）：项目 projects/local/-home-me-code-b\nExecutor: memory\nPath: project/MEMORY.md\n" +
+				"这是之前的对话记下的要点，每行一个主题，详情在同一目录的文件里，需要时用 read_file executor=memory 读。\n" +
+				"和用户当前的要求或 AGENTS.md 冲突时，以它们为准；发现内容过时或错误，按系统指令里的记忆规则更新。\n" +
+				"对话中途换过目录时，以最后放入的项目记忆目录为准，它对应现在的 project/。\n" +
+				"\n- [构建](build.md) — make test",
+		},
+		{
+			"memory_index_project_truncated",
+			func() string {
+				return prompt.FormatMemoryIndex(defs.MemoryIndex{Path: "project/MEMORY.md", Project: "projects/local/-tmp-x", Text: "- [测试](testing.md) — table-driven", IsTruncated: true})
+			},
+			"跨对话记忆目录（参考，不是规则）：项目 projects/local/-tmp-x\nExecutor: memory\nPath: project/MEMORY.md\n" +
+				"这是之前的对话记下的要点，每行一个主题，详情在同一目录的文件里，需要时用 read_file executor=memory 读。\n" +
+				"和用户当前的要求或 AGENTS.md 冲突时，以它们为准；发现内容过时或错误，按系统指令里的记忆规则更新。\n" +
+				"对话中途换过目录时，以最后放入的项目记忆目录为准，它对应现在的 project/。\n" +
+				"目录超过 8 KiB，后面的行没有放进来，用 read_file executor=memory path=project/MEMORY.md 续读。\n" +
+				"\n- [测试](testing.md) — table-driven",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

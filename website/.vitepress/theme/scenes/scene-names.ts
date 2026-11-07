@@ -28,9 +28,25 @@ export const sceneNames = [
   "conversation-fork",
   "context-compaction",
   "runtime-layers",
+  "input-queue",
+  "subagents",
+  "tool-hooks",
+  "executor-routing",
 ] as const
 
 export type SceneName = (typeof sceneNames)[number]
+
+// narrowLayoutSceneNames 是另画了一版窄屏布局的场景：组件接收 layout 属性，Scene 同时渲染宽、窄两版，按屏幕宽度只显示一版。
+export const narrowLayoutSceneNames: readonly SceneName[] = [
+  "unified-runtime",
+  "shared-progress",
+  "ecosystem",
+  "portable-conversations",
+  "input-queue",
+  "subagents",
+  "tool-hooks",
+  "executor-routing",
+]
 
 // isSceneName 判断字符串是否是已登记的场景名？
 export function isSceneName(name: string): name is SceneName {

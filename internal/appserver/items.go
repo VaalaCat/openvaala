@@ -538,11 +538,11 @@ func newCodexHistoryThread(thread historyThread, sessions []defs.Session, pathMa
 	return newCodexRootThread(thread.conversation, model, pathMappings, isWindowsClient, status, version)
 }
 
-// newCodexThreadOpenResult 创建 Thread 打开结果和历史起点游标。
-func newCodexThreadOpenResult(thread codexThread) codexThreadOpenResult {
-	// 1. 普通 Thread 使用全访问沙箱，临时 Thread 使用只读沙箱，复制模型和目录并填写 newest 游标。
+// newCodexThreadOpenResult 创建 Thread 打开结果和历史起点游标；hasExecutors 为 false（对话没有装配 Executor）时沙箱报告只读。
+func newCodexThreadOpenResult(thread codexThread, hasExecutors bool) codexThreadOpenResult {
+	// 1. 有 Executor 的 Thread 使用全访问沙箱，没有 Executor 的使用只读沙箱，复制模型和目录并填写 newest 游标。
 	sandbox := codexSandboxPolicy{Type: "dangerFullAccess"}
-	if thread.Ephemeral {
+	if !hasExecutors {
 		sandbox.Type = "readOnly"
 	}
 	return codexThreadOpenResult{

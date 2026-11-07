@@ -528,7 +528,7 @@ func TestListHooks(t *testing.T) {
 	}
 }
 
-// fakeForkClient 是 thread/fork、thread/archive、thread/unarchive、thread/delete 用的 runtimeclient.Client：对话和 Session 的查询用
+// fakeForkClient 是 thread/fork、thread/inject_items、thread/archive、thread/unarchive、thread/delete 用的 runtimeclient.Client：对话和 Session 的查询用
 // fakeHistoryClient，ForkConversation 返回 forkErr。
 type fakeForkClient struct {
 	*fakeHistoryClient
@@ -571,7 +571,7 @@ func TestRootThreadOnlyMethods(t *testing.T) {
 	}
 	// 2. 遍历根 Thread 专用方法，核对 -32600 和错误文本。
 	for _, tt := range tests {
-		for _, method := range []string{"thread/fork", "thread/archive", "thread/unarchive", "thread/delete"} {
+		for _, method := range []string{"thread/fork", "thread/inject_items", "thread/archive", "thread/unarchive", "thread/delete"} {
 			t.Run(tt.name+"/"+method, func(t *testing.T) {
 				client := newHistoryConversationClient(nil)
 				client.sessions = append(client.sessions, defs.Session{
@@ -629,14 +629,6 @@ func TestForkThreadErrors(t *testing.T) {
 			},
 		},
 		{
-			name:   "ephemeral",
-			params: `{"threadId":"` + string(historyConversationID) + `","ephemeral":true}`,
-			want: codexError{
-				errorCodeInvalidParams,
-				"ephemeral thread/fork is not supported",
-			},
-		},
-		{
 			name:    "both_boundaries",
 			params:  `{"threadId":"` + string(historyConversationID) + `","beforeTurnId":"t2","lastTurnId":"t1"}`,
 			forkErr: fmt.Errorf("conversation/fork: %w", conversation.ErrForkBoundaryConflict),
@@ -663,15 +655,6 @@ func TestForkThreadErrors(t *testing.T) {
 				"lastTurnId 't9' was not found in the source thread",
 			},
 		},
-		{
-			name:    "last_turn_running",
-			params:  `{"threadId":"` + string(historyConversationID) + `","lastTurnId":"t2"}`,
-			forkErr: fmt.Errorf("conversation/fork: %w", conversation.ErrForkTurnRunning),
-			want: codexError{
-				errorCodeInvalidRequest,
-				"lastTurnId 't2' identifies an in-progress turn",
-			},
-		},
 	}
 	// 2. 发送分叉请求，核对 Codex 错误码和文本。
 	for _, tt := range tests {
@@ -692,6 +675,228 @@ func TestForkThreadErrors(t *testing.T) {
 			})
 			if got := getCodexError(err, ""); err == nil || *got != tt.want {
 				t.Fatalf("thread/fork %s error = %v, want %+v", tt.params, err, tt.want)
+			}
+		})
+	}
+}
+
+// fakeSideConversationClient 是记录 thread/start、thread/fork、thread/inject_items 交给 serve 的请求的 runtimeclient.Client：
+// 对话和 Session 的查询用 fakeHistoryClient。
+type fakeSideConversationClient struct {
+	*fakeHistoryClient
+	createRequests []runtimeclient.CreateConversationRequest
+	forkRequests   []runtimeclient.ForkConversationRequest
+	appendRequests []runtimeclient.AppendContextItemsRequest
+}
+
+// CreateConversation 记录创建请求，返回新对话记录。
+func (f *fakeSideConversationClient) CreateConversation(_ context.Context, request *runtimeclient.CreateConversationRequest) (defs.Conversation, error) {
+	// 1. 记录请求，返回测试对话。
+	f.createRequests = append(f.createRequests, *request)
+	return defs.Conversation{ID: "created", RootSessionID: "created-root"}, nil
+}
+
+// ForkConversation 记录分叉请求，返回分叉出的对话记录。
+func (f *fakeSideConversationClient) ForkConversation(_ context.Context, request *runtimeclient.ForkConversationRequest) (defs.Conversation, error) {
+	// 1. 记录请求，返回测试对话。
+	f.forkRequests = append(f.forkRequests, *request)
+	return defs.Conversation{ID: "forked", RootSessionID: "forked-root"}, nil
+}
+
+// AppendContextItems 记录注入请求。
+func (f *fakeSideConversationClient) AppendContextItems(_ context.Context, request *runtimeclient.AppendContextItemsRequest) error {
+	// 1. 记录请求。
+	f.appendRequests = append(f.appendRequests, *request)
+	return nil
+}
+
+// TestSideConversationRequests 检查 thread/start 的 environments、thread/fork 的 ephemeral 和 developerInstructions，以及 thread/inject_items 转给 serve 的请求。
+func TestSideConversationRequests(t *testing.T) {
+	// 1. 准备各请求的参数和期望交给 serve 的请求；注入条目期望转成的客户端指令正文按调用分组。
+	const noRuntimeURL = "runtime client requires a URL"
+	rootID := string(historyConversationID)
+	injectParams := func(items string) string {
+		return `{"threadId":"` + rootID + `","items":` + items + `}`
+	}
+	sourceSettings := defs.ExecutorSettings{WorkspaceDirectories: map[string]string{defs.LocalExecutorID: "/new"}}
+	const wantInjectError = "thread/inject_items only supports user and developer message items"
+	tests := []struct {
+		name   string
+		method string
+		params string
+		// wantErr 是请求返回的错误文本。thread/start 和 thread/fork 在测试里没有真实 serve 可跟随，请求交给 serve 后在跟随 Thread 时失败，
+		// 失败说明请求已走到跟随这一步；跟随和回复由 internal/e2e 的 TestCodexSideConversation 覆盖。
+		wantErr        string
+		wantCreate     []runtimeclient.CreateConversationRequest
+		wantFork       []runtimeclient.ForkConversationRequest
+		wantAppendText [][]string
+	}{
+		{
+			name:    "ephemeral fork with developer instructions",
+			method:  "thread/fork",
+			params:  `{"threadId":"` + rootID + `","ephemeral":true,"developerInstructions":"side rules"}`,
+			wantErr: noRuntimeURL,
+			wantFork: []runtimeclient.ForkConversationRequest{{
+				ConversationID:   historyConversationID,
+				ExecutorSettings: sourceSettings,
+				Ephemeral:        true,
+			}},
+			wantAppendText: [][]string{{"side rules"}},
+		},
+		{
+			name:    "fork without developer instructions",
+			method:  "thread/fork",
+			params:  `{"threadId":"` + rootID + `","ephemeral":true}`,
+			wantErr: noRuntimeURL,
+			wantFork: []runtimeclient.ForkConversationRequest{{
+				ConversationID:   historyConversationID,
+				ExecutorSettings: sourceSettings,
+				Ephemeral:        true,
+			}},
+		},
+		{
+			name:    "saved fork",
+			method:  "thread/fork",
+			params:  `{"threadId":"` + rootID + `"}`,
+			wantErr: noRuntimeURL,
+			wantFork: []runtimeclient.ForkConversationRequest{{
+				ConversationID:   historyConversationID,
+				ExecutorSettings: sourceSettings,
+			}},
+		},
+		{
+			name:           "inject user message",
+			method:         "thread/inject_items",
+			params:         injectParams(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"boundary"}]}]`),
+			wantAppendText: [][]string{{"boundary"}},
+		},
+		{
+			name:           "inject developer message",
+			method:         "thread/inject_items",
+			params:         injectParams(`[{"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]}]`),
+			wantAppendText: [][]string{{"rules"}},
+		},
+		{
+			name:   "inject text parts joined in order",
+			method: "thread/inject_items",
+			params: injectParams(`[{"type":"message","role":"user","content":[` +
+				`{"type":"input_text","text":"a"},{"type":"input_image","image_url":"data:,"},{"type":"input_text","text":"b"}]}]`),
+			wantAppendText: [][]string{{"ab"}},
+		},
+		{
+			name:   "inject several messages in one call",
+			method: "thread/inject_items",
+			params: injectParams(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]},` +
+				`{"type":"message","role":"developer","content":[{"type":"input_text","text":"two"}]}]`),
+			wantAppendText: [][]string{{"one", "two"}},
+		},
+		{
+			name:    "inject assistant message",
+			method:  "thread/inject_items",
+			params:  injectParams(`[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x"}]}]`),
+			wantErr: wantInjectError,
+		},
+		{
+			name:    "inject function call",
+			method:  "thread/inject_items",
+			params:  injectParams(`[{"type":"function_call","name":"x","arguments":"{}","call_id":"c1"}]`),
+			wantErr: wantInjectError,
+		},
+		{
+			name:    "inject image only message",
+			method:  "thread/inject_items",
+			params:  injectParams(`[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:,"}]}]`),
+			wantErr: wantInjectError,
+		},
+		{
+			name:    "inject message without content",
+			method:  "thread/inject_items",
+			params:  injectParams(`[{"type":"message","role":"developer","content":[]}]`),
+			wantErr: wantInjectError,
+		},
+		{
+			name:   "inject rejects the whole batch",
+			method: "thread/inject_items",
+			params: injectParams(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"ok"}]},` +
+				`{"type":"reasoning","summary":[]}]`),
+			wantErr: wantInjectError,
+		},
+		{
+			name:       "start without environments",
+			method:     "thread/start",
+			params:     `{"ephemeral":true,"environments":[]}`,
+			wantErr:    noRuntimeURL,
+			wantCreate: []runtimeclient.CreateConversationRequest{{AgentName: "assistant", Ephemeral: true, WithoutExecutors: true}},
+		},
+		{
+			name:       "start ephemeral keeps executors",
+			method:     "thread/start",
+			params:     `{"ephemeral":true}`,
+			wantErr:    noRuntimeURL,
+			wantCreate: []runtimeclient.CreateConversationRequest{{AgentName: "assistant", Ephemeral: true}},
+		},
+		{
+			name:       "start saved without environments",
+			method:     "thread/start",
+			params:     `{"environments":[]}`,
+			wantErr:    noRuntimeURL,
+			wantCreate: []runtimeclient.CreateConversationRequest{{AgentName: "assistant", WithoutExecutors: true}},
+		},
+		{
+			name:       "start with environments keeps executors",
+			method:     "thread/start",
+			params:     `{"ephemeral":true,"environments":[{"id":"local"}]}`,
+			wantErr:    noRuntimeURL,
+			wantCreate: []runtimeclient.CreateConversationRequest{{AgentName: "assistant", Ephemeral: true}},
+		},
+	}
+	// 2. 发送请求，核对返回、交给 serve 的创建、分叉请求和注入的客户端指令。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeSideConversationClient{fakeHistoryClient: newHistoryConversationClient(nil)}
+			c := newHistoryConnection(client)
+			c.isInitialized = true
+			result, err := c.handleRequest(t.Context(), codexMessage{
+				ID:     json.RawMessage(`1`),
+				Method: tt.method,
+				Params: json.RawMessage(tt.params),
+			})
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("%s error = %v, want %q", tt.method, err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			} else if result != (codexEmptyObjectResult{}) {
+				t.Fatalf("%s result = %#v, want an empty object", tt.method, result)
+			}
+			if !reflect.DeepEqual(client.createRequests, tt.wantCreate) {
+				t.Fatalf("create requests = %+v, want %+v", client.createRequests, tt.wantCreate)
+			}
+			if !reflect.DeepEqual(client.forkRequests, tt.wantFork) {
+				t.Fatalf("fork requests = %+v, want %+v", client.forkRequests, tt.wantFork)
+			}
+			// 注入写进请求指定的 Thread 对话，开发者指令写进刚分叉出的对话。
+			wantAppendConversationID := historyConversationID
+			if tt.method == "thread/fork" {
+				wantAppendConversationID = "forked"
+			}
+			var gotAppendText [][]string
+			for _, request := range client.appendRequests {
+				if request.ConversationID != wantAppendConversationID {
+					t.Fatalf("append conversation = %q, want %q", request.ConversationID, wantAppendConversationID)
+				}
+				var texts []string
+				for _, item := range request.Items {
+					if item.ID == "" || item.Kind != defs.ItemClientInstruction || item.ClientInstruction == nil {
+						t.Fatalf("appended item = %+v, want a client instruction with an ID", item)
+					}
+					texts = append(texts, item.ClientInstruction.Text)
+				}
+				gotAppendText = append(gotAppendText, texts)
+			}
+			if !reflect.DeepEqual(gotAppendText, tt.wantAppendText) {
+				t.Fatalf("appended texts = %q, want %q", gotAppendText, tt.wantAppendText)
 			}
 		})
 	}

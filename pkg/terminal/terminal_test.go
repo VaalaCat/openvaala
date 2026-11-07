@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -212,7 +213,7 @@ func TestTerminal(t *testing.T) {
 				stopCtx, cancelStop := context.WithTimeout(t.Context(), 5*time.Second)
 				defer cancelStop()
 				info, err := command.Stop(stopCtx)
-				if err != nil || info.Status != terminal.TerminalStatusExited || info.StopReason != terminal.TerminalStoppedByTool {
+				if err != nil || info.Status != terminal.TerminalStatusExited || info.StopReason != terminal.TerminalStoppedByRequest {
 					t.Fatalf("Stop() = %+v, %v, want exited with stopped", info, err)
 				}
 			},
@@ -226,7 +227,7 @@ func TestTerminal(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if info.Status != terminal.TerminalStatusExited || info.StopReason != terminal.TerminalStoppedByTool || info.ExitCode == nil || *info.ExitCode != -1 {
+				if info.Status != terminal.TerminalStatusExited || info.StopReason != terminal.TerminalStoppedByRequest || info.ExitCode == nil || *info.ExitCode != -1 {
 					t.Fatalf("Stop() = %+v, want exited by signal with stopped", info)
 				}
 				waitCondition(t, 2*time.Second, func() bool { return isProcessGone(childPID) })
@@ -264,7 +265,7 @@ func TestTerminal(t *testing.T) {
 				process := newFakeProcess(nil)
 				_ = process.Close()
 				request := f.newRequest("ignored")
-				request.Workspace = &fakeProcessWorkspace{process: process}
+				request.Workspace = newFakeProcessWorkspace(process)
 				info := waitFinished(t, f.startTerminal(t, request))
 				if info.Status != terminal.TerminalStatusFailed || info.ExitCode != nil || info.Err == nil ||
 					!strings.Contains(info.Err.Error(), "termination was not confirmed") {
@@ -273,12 +274,12 @@ func TestTerminal(t *testing.T) {
 			},
 		},
 		{
-			name: "stop_failure_keeps_command_until_session_close",
+			name: "stop_failure_keeps_command_until_manager_stops",
 			run: func(t *testing.T, f *terminalManagerFixture) {
 				pipeline := telemetrytest.NewPipeline(t)
 				process := newFakeProcess(errors.New("kill session refused"))
 				request := f.newRequest("ignored")
-				request.Workspace = &fakeProcessWorkspace{process: process}
+				request.Workspace = newFakeProcessWorkspace(process)
 				command, err := f.manager.StartTerminal(telemetry.ContextWithTelemetry(t.Context(), pipeline.Telemetry), request)
 				if err != nil {
 					t.Fatal(err)
@@ -289,15 +290,15 @@ func TestTerminal(t *testing.T) {
 				if _, err := f.manager.GetTerminal("local", command.GetInfo().ID); err != nil || !f.manager.IsBusy() {
 					t.Fatalf("after a failed Stop GetTerminal error = %v, IsBusy %v, want the command still managed", err, f.manager.IsBusy())
 				}
-				// 1. 关闭 Session，核对 Terminate 失败后释放进程，Run 返回 failed 且没有已确认的停止原因。
+				// 1. 停止管理器，核对 Terminate 失败后释放进程，Run 返回 failed 且没有已确认的停止原因。
 				f.stopManager(t)
 				info := command.GetInfo()
 				if info.Status != terminal.TerminalStatusFailed || info.StopReason != "" || !strings.Contains(info.Err.Error(), "termination was not confirmed") {
 					t.Fatalf("Info after Run = %+v, want failed without a confirmed stop", info)
 				}
-				// 2. 核对工具停止失败不记日志，Session 关闭的终止失败只写一条 Warn。
+				// 2. 核对工具停止失败不记日志，管理器停止的终止失败只写一条 Warn。
 				records := pipeline.GetLogRecords(t, "terminate command failed")
-				if len(records) != 1 || records[0]["stop_reason"] != string(terminal.TerminalStoppedBySession) {
+				if len(records) != 1 || records[0]["stop_reason"] != string(terminal.TerminalStoppedByManager) {
 					t.Fatalf("terminate warnings = %v, want one for session_closed", records)
 				}
 			},
@@ -309,6 +310,233 @@ func TestTerminal(t *testing.T) {
 				request.Directory = filepath.Join(f.root, "missing")
 				if command, err := f.manager.StartTerminal(t.Context(), request); err == nil || command != nil {
 					t.Fatalf("StartTerminal(missing directory) = %v, %v, want an error", command, err)
+				}
+			},
+		},
+		{
+			name: "resize_same_size_skips_process",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				tests := []struct {
+					name                 string
+					rows, cols           uint16
+					wantRows, wantCols   uint16
+					wantRequestedPTYSize string
+				}{
+					{name: "explicit_size", rows: 30, cols: 100, wantRows: 30, wantCols: 100, wantRequestedPTYSize: "30x100"},
+					{name: "default_size", rows: 0, cols: 0, wantRows: 24, wantCols: 80, wantRequestedPTYSize: "0x0"},
+				}
+				for _, tt := range tests {
+					t.Run(tt.name, func(t *testing.T) {
+						process := newFakeInteractiveProcess(false)
+						fakeWorkspace := newFakeProcessWorkspace(process)
+						command := f.startFakeTerminal(t, fakeWorkspace, tt.rows, tt.cols)
+						requests := fakeWorkspace.getRequests()
+						if len(requests) != 1 || !requests[0].TTY || strconv.Itoa(int(requests[0].Rows))+"x"+strconv.Itoa(int(requests[0].Cols)) != tt.wantRequestedPTYSize {
+							t.Fatalf("StartProcess requests = %+v, want one TTY request sized %s", requests, tt.wantRequestedPTYSize)
+						}
+						if info := command.GetInfo(); info.Rows != tt.wantRows || info.Cols != tt.wantCols {
+							t.Fatalf("GetInfo() size = %dx%d, want %dx%d", info.Rows, info.Cols, tt.wantRows, tt.wantCols)
+						}
+						if err := command.Resize(t.Context(), tt.wantRows, tt.wantCols); err != nil || len(process.getCalls()) != 0 {
+							t.Fatalf("Resize(same size) = %v with calls %v, want nil without calling the process", err, process.getCalls())
+						}
+						for range 2 {
+							if err := command.Resize(t.Context(), 40, 120); err != nil {
+								t.Fatal(err)
+							}
+						}
+						if calls := process.getCalls(); !slices.Equal(calls, []string{"resize 40x120"}) {
+							t.Fatalf("process calls = %v, want one resize to 40x120", calls)
+						}
+					})
+				}
+			},
+		},
+		{
+			name: "resize_updates_output_info",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				command := f.startFakeTerminal(t, newFakeProcessWorkspace(newFakeInteractiveProcess(false)), 0, 0)
+				before, err := command.ReadOutput(t.Context(), 0, 0)
+				if err != nil || before.Info.Rows != 24 || before.Info.Cols != 80 {
+					t.Fatalf("ReadOutput() = %+v, %v, want size 24x80", before.Info, err)
+				}
+				if err := command.Resize(t.Context(), 40, 120); err != nil {
+					t.Fatal(err)
+				}
+				after, err := command.ReadOutput(t.Context(), 0, 0)
+				if err != nil || after.Info.Rows != 40 || after.Info.Cols != 120 {
+					t.Fatalf("ReadOutput() after Resize = %+v, %v, want size 40x120", after.Info, err)
+				}
+			},
+		},
+		{
+			// 改尺寸卡在写入上：输出照常可读，Stop 终止进程后卡住的改尺寸返回错误。
+			name: "stuck_resize_keeps_output_and_stop",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				process := newFakeInteractiveProcess(true)
+				fakeWorkspace := newFakeProcessWorkspace(process)
+				fakeWorkspace.output = "ready"
+				command := f.startFakeTerminal(t, fakeWorkspace, 0, 0)
+				resizeResult := make(chan error, 1)
+				go func() { resizeResult <- command.Resize(t.Context(), 40, 120) }()
+				waitCondition(t, 2*time.Second, func() bool { return slices.Equal(process.getCalls(), []string{"resize 40x120"}) })
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				output, err := command.ReadOutput(ctx, 0, 2*time.Second)
+				if err != nil || output.Text != "ready" || output.Info.Rows != 24 || output.Info.Cols != 80 {
+					t.Fatalf("ReadOutput() = %+v, %v, want ready at the old size 24x80", output, err)
+				}
+				info, err := command.Stop(ctx)
+				if err != nil || info.Status != terminal.TerminalStatusExited || info.StopReason != terminal.TerminalStoppedByRequest {
+					t.Fatalf("Stop() = %+v, %v, want exited with stopped", info, err)
+				}
+				select {
+				case err := <-resizeResult:
+					if err == nil {
+						t.Fatal("stuck Resize() = nil, want the write error after the process was terminated")
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("stuck Resize() did not return after Stop")
+				}
+			},
+		},
+		{
+			name: "writes_keep_call_order",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				process := newFakeInteractiveProcess(false)
+				command := f.startFakeTerminal(t, newFakeProcessWorkspace(process), 0, 0)
+				if err := command.Resize(t.Context(), 30, 100); err != nil {
+					t.Fatal(err)
+				}
+				if written, err := command.WriteInput(t.Context(), "a"); written != 1 || err != nil {
+					t.Fatalf("WriteInput(a) = %d, %v, want 1", written, err)
+				}
+				if err := command.Resize(t.Context(), 40, 120); err != nil {
+					t.Fatal(err)
+				}
+				if written, err := command.WriteInput(t.Context(), "b"); written != 1 || err != nil {
+					t.Fatalf("WriteInput(b) = %d, %v, want 1", written, err)
+				}
+				want := []string{"resize 30x100", "input a", "resize 40x120", "input b"}
+				if calls := process.getCalls(); !slices.Equal(calls, want) {
+					t.Fatalf("process calls = %v, want %v", calls, want)
+				}
+			},
+		},
+		{
+			name: "resize_and_clear_reject_unavailable_terminals",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				plain := f.startTerminal(t, f.newRequest("sleep 30"))
+				if err := plain.Resize(t.Context(), 30, 100); !errors.Is(err, terminal.ErrInputUnavailable) {
+					t.Fatalf("Resize() on a plain command error = %v, want ErrInputUnavailable", err)
+				}
+				request := f.newRequest("true")
+				request.Interactive = true
+				finished := f.startTerminal(t, request)
+				waitFinished(t, finished)
+				if err := finished.Resize(t.Context(), 30, 100); !errors.Is(err, terminal.ErrTerminalFinished) {
+					t.Fatalf("Resize() after finish error = %v, want ErrTerminalFinished", err)
+				}
+				if err := finished.ClearOutput(t.Context()); !errors.Is(err, terminal.ErrTerminalFinished) {
+					t.Fatalf("ClearOutput() after finish error = %v, want ErrTerminalFinished", err)
+				}
+			},
+		},
+		{
+			name: "clear_output_is_not_truncation",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				command := f.startTerminal(t, f.newRequest("printf hello; sleep 30"))
+				first, err := command.ReadOutput(t.Context(), 0, 2*time.Second)
+				if err != nil || first.Text != "hello" {
+					t.Fatalf("ReadOutput() = %+v, %v, want hello", first, err)
+				}
+				if err := command.ClearOutput(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				wantEnd := first.NextCursor + uint64(len(terminalClearSequence))
+				tests := []struct {
+					name   string
+					cursor uint64
+				}{
+					{name: "caught_up", cursor: first.NextCursor},
+					{name: "behind", cursor: 2},
+					{name: "from_start", cursor: 0},
+				}
+				for _, tt := range tests {
+					t.Run(tt.name, func(t *testing.T) {
+						output, err := command.ReadOutput(t.Context(), tt.cursor, 0)
+						if err != nil || output.Text != terminalClearSequence || output.Truncated || output.NextCursor != wantEnd || output.EndCursor != wantEnd {
+							t.Fatalf("ReadOutput(%d) = %+v, %v, want the clear sequence untruncated ending at %d", tt.cursor, output, err, wantEnd)
+						}
+					})
+				}
+			},
+		},
+		{
+			name: "overflow_then_clear",
+			opt: &terminal.TerminalManagerOpt{
+				MaxTerminals:   64,
+				MaxOutputBytes: 4096,
+			},
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				// 6667 个三字节的「中」共 20001 字节，再接 TAIL，之后命令继续运行。
+				command := f.startTerminal(t, f.newRequest("printf '中%.0s' $(seq 6667); printf TAIL; sleep 30"))
+				var before terminal.TerminalOutput
+				waitCondition(t, 5*time.Second, func() bool {
+					var err error
+					before, err = command.ReadOutput(t.Context(), 0, 0)
+					return err == nil && strings.HasSuffix(before.Text, "TAIL")
+				})
+				const producedBytes = 20005
+				if !before.Truncated || before.EndCursor != producedBytes || before.HasMore {
+					t.Fatalf("ReadOutput() before clear = truncated %v, end %d, more %v, want truncated at end %d", before.Truncated, before.EndCursor, before.HasMore, producedBytes)
+				}
+				retainedStart := before.NextCursor - uint64(len(before.Text))
+				if err := command.ClearOutput(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				wantEnd := uint64(producedBytes + len(terminalClearSequence))
+				tests := []struct {
+					name          string
+					cursor        uint64
+					wantTruncated bool
+				}{
+					{name: "inside_overflowed_range", cursor: 0, wantTruncated: true},
+					{name: "at_overflow_end", cursor: retainedStart, wantTruncated: false},
+					{name: "inside_cleared_range", cursor: retainedStart + 100, wantTruncated: false},
+				}
+				for _, tt := range tests {
+					t.Run(tt.name, func(t *testing.T) {
+						output, err := command.ReadOutput(t.Context(), tt.cursor, 0)
+						if err != nil || output.Text != terminalClearSequence || output.Truncated != tt.wantTruncated || output.EndCursor != wantEnd {
+							t.Fatalf("ReadOutput(%d) = %+v, %v, want the clear sequence with truncated %v ending at %d", tt.cursor, output, err, tt.wantTruncated, wantEnd)
+						}
+					})
+				}
+			},
+		},
+		{
+			name: "end_cursor_counts_all_output",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				tests := []struct {
+					name        string
+					command     string
+					wantEnd     uint64
+					wantNext    uint64
+					wantHasMore bool
+				}{
+					{name: "single_page", command: "printf abc中文", wantEnd: 9, wantNext: 9, wantHasMore: false},
+					{name: "paged", command: "head -c 100000 /dev/zero | tr '\\0' a", wantEnd: 100000, wantNext: 64 << 10, wantHasMore: true},
+				}
+				for _, tt := range tests {
+					t.Run(tt.name, func(t *testing.T) {
+						command := f.startTerminal(t, f.newRequest(tt.command))
+						waitFinished(t, command)
+						output, err := command.ReadOutput(t.Context(), 0, 0)
+						if err != nil || output.EndCursor != tt.wantEnd || output.NextCursor != tt.wantNext || output.HasMore != tt.wantHasMore {
+							t.Fatalf("ReadOutput() = end %d, next %d, more %v, %v, want end %d, next %d, more %v", output.EndCursor, output.NextCursor, output.HasMore, err, tt.wantEnd, tt.wantNext, tt.wantHasMore)
+						}
+					})
 				}
 			},
 		},
@@ -363,16 +591,157 @@ func (p *fakeProcess) Close() error {
 	return nil
 }
 
-// fakeProcessWorkspace 的 StartProcess 总是返回同一个假进程，其他方法不可用。
+// terminalClearSequence 是 ClearOutput 之后输出里只剩的清屏序列，和包内常量同值。
+const terminalClearSequence = "\x1b[0m\x1b(B\x1b[H\x1b[2J\x1b[3J"
+
+// fakeProcessWorkspace 的 StartProcess 总是返回同一个假进程，其他方法不可用；Close 只记录次数。
 type fakeProcessWorkspace struct {
 	workspace.Workspace
-	process *fakeProcess
+	process workspace.Process
+	// startErr 非 nil 时 StartProcess 返回它。
+	startErr error
+	// output 非空时，StartProcess 成功后把它异步写进进程的 Stdout。
+	output string
+	// closed 在第一次 Close 时关闭。
+	closed     chan struct{}
+	mu         sync.Mutex
+	requests   []*workspace.ProcessRequest
+	closeCount int
 }
 
-// StartProcess 返回预设测试进程。
-func (w *fakeProcessWorkspace) StartProcess(context.Context, *workspace.ProcessRequest) (workspace.Process, error) {
-	// 1. 返回已配置的进程和 nil 错误。
+// newFakeProcessWorkspace 创建返回 process 的假工作区。
+func newFakeProcessWorkspace(process workspace.Process) *fakeProcessWorkspace {
+	// 1. 保存进程并创建关闭信号。
+	return &fakeProcessWorkspace{
+		process: process,
+		closed:  make(chan struct{}),
+	}
+}
+
+// StartProcess 记录请求，返回预设测试进程或启动错误。
+func (w *fakeProcessWorkspace) StartProcess(_ context.Context, request *workspace.ProcessRequest) (workspace.Process, error) {
+	// 1. 记录请求；配置了启动错误时返回它。
+	w.mu.Lock()
+	w.requests = append(w.requests, request)
+	w.mu.Unlock()
+	if w.startErr != nil {
+		return nil, w.startErr
+	}
+	// 2. 配置了输出时在后台写进 Stdout：读输出任务在 StartProcess 返回后才启动，同步写会卡住。
+	if w.output != "" {
+		go func() { _, _ = request.Stdout.Write([]byte(w.output)) }()
+	}
 	return w.process, nil
+}
+
+// Close 记录关闭次数，第一次关闭时发出关闭信号。
+func (w *fakeProcessWorkspace) Close() error {
+	// 1. 累加次数，第一次时关闭信号通道。
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closeCount++
+	if w.closeCount == 1 {
+		close(w.closed)
+	}
+	return nil
+}
+
+// getCloseCount 返回 Close 被调用的次数。
+func (w *fakeProcessWorkspace) getCloseCount() int {
+	// 1. 加锁读取次数。
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closeCount
+}
+
+// getRequests 返回收到的 StartProcess 请求。
+func (w *fakeProcessWorkspace) getRequests() []*workspace.ProcessRequest {
+	// 1. 加锁复制请求列表。
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.requests)
+}
+
+// fakeInteractiveProcess 是测试用的交互进程：按调用顺序记录改尺寸和输入，Terminate 或 Close 后 Wait 返回。
+type fakeInteractiveProcess struct {
+	// isResizeBlocked 为 true 时 ResizeTerminal 一直等到进程被 Terminate 或 Close，再返回写入已关闭的错误，和 SSH 会话关闭后的写入一致。
+	isResizeBlocked bool
+	// terminateUnblock 非 nil 时 Terminate 一直等到它关闭，再返回连接已关闭的错误，模拟卡住的 SSH 连接。
+	terminateUnblock <-chan struct{}
+	// terminateErr 非 nil 时 Terminate 立刻返回它，进程不结束，模拟 SSH 上 kill 脚本快速失败。
+	terminateErr error
+	released     chan struct{}
+	releaseOnce  sync.Once
+	mu           sync.Mutex
+	calls        []string
+}
+
+// newFakeInteractiveProcess 创建可控制结束的交互测试进程。
+func newFakeInteractiveProcess(isResizeBlocked bool) *fakeInteractiveProcess {
+	// 1. 初始化改尺寸是否卡住和结束通道。
+	return &fakeInteractiveProcess{
+		isResizeBlocked: isResizeBlocked,
+		released:        make(chan struct{}),
+	}
+}
+
+// Wait 等到进程被终止或放手后返回被信号终止的退出码。
+func (p *fakeInteractiveProcess) Wait() (int, error) {
+	// 1. 等待结束信号。
+	<-p.released
+	return -1, nil
+}
+
+// Terminate 结束进程；配置了 terminateUnblock 时先卡住。
+func (p *fakeInteractiveProcess) Terminate() error {
+	// 1. 卡住时等到解除信号并返回错误；配置了终止错误时直接返回它；否则结束进程。
+	if p.terminateUnblock != nil {
+		<-p.terminateUnblock
+		return errors.New("connection closed")
+	}
+	if p.terminateErr != nil {
+		return p.terminateErr
+	}
+	_ = p.Close()
+	return nil
+}
+
+// WriteTerminalInput 记录输入。
+func (p *fakeInteractiveProcess) WriteTerminalInput(data []byte) (int, error) {
+	// 1. 按调用顺序记录输入。
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, "input "+string(data))
+	return len(data), nil
+}
+
+// ResizeTerminal 记录改尺寸；配置了卡住时等到进程结束。
+func (p *fakeInteractiveProcess) ResizeTerminal(rows, cols uint16) error {
+	// 1. 按调用顺序记录改尺寸。
+	p.mu.Lock()
+	p.calls = append(p.calls, "resize "+strconv.Itoa(int(rows))+"x"+strconv.Itoa(int(cols)))
+	p.mu.Unlock()
+	// 2. 配置了卡住时等到进程结束，再返回写入已关闭的错误。
+	if p.isResizeBlocked {
+		<-p.released
+		return errors.New("session closed")
+	}
+	return nil
+}
+
+// Close 放手进程，让 Wait 返回。
+func (p *fakeInteractiveProcess) Close() error {
+	// 1. 关闭结束信号，重复关闭时不再操作。
+	p.releaseOnce.Do(func() { close(p.released) })
+	return nil
+}
+
+// getCalls 返回按调用顺序记录的改尺寸和输入。
+func (p *fakeInteractiveProcess) getCalls() []string {
+	// 1. 加锁复制记录。
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.calls)
 }
 
 // readUntilFinished 持续读取终端输出直到结束。

@@ -23,6 +23,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
 	"github.com/VaalaCat/openvaala/pkg/storage"
@@ -881,20 +882,20 @@ func newTestRuntimeOpt(store *serverStore, model *serverModel, defaultDirectory 
 				DefaultReasoningEffort: "low",
 			},
 		},
-		Executors: []*defs.ExecutorDefinition{
-			{
+		Executors: executor.NewConfigExecutorProvider([]executor.Executor{
+			executor.NewLocalExecutor(&defs.ExecutorDefinition{
 				ID:                 defs.LocalExecutorID,
 				Kind:               defs.ExecutorKindLocal,
 				Description:        "本机",
 				WorkspaceDirectory: defaultDirectory,
-			},
-			{
+			}),
+			executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
 				ID:                 "a",
 				Kind:               defs.ExecutorKindVirtual,
 				Description:        "虚拟",
 				WorkspaceDirectory: "/workspace",
-			},
-		},
+			}, nil)),
+		}),
 	})
 
 	return opt
@@ -1452,10 +1453,10 @@ func (c *testClient) callResult(t *testing.T, method string, params any, result 
 // initialize 使用测试客户端身份完成协议初始化。
 func (c *testClient) initialize(t *testing.T) {
 	t.Helper()
-	// 1. 发送客户端名称和协议版本 5。
+	// 1. 发送客户端名称和协议版本 6。
 	c.callResult(t, "initialize", map[string]any{
 		"client_info":      map[string]any{"name": "test"},
-		"protocol_version": "5",
+		"protocol_version": "6",
 	}, nil)
 }
 

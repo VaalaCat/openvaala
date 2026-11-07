@@ -341,6 +341,34 @@ func getWorkLocationLabel(executorID, directory string, maxDirectory int) string
 	return executorID + " · " + string(name)
 }
 
+// getWorkLocation 返回对话的工作位置：默认 Executor（为空时是 local）和它在这个对话里的目录；没有记录目录时目录为空串。
+func getWorkLocation(conv defs.Conversation) (executorID, directory string) {
+	// 1. 默认 Executor 为空时按 local 取目录。
+	executorID = conv.ExecutorSettings.DefaultExecutorID
+	if executorID == "" {
+		executorID = defs.LocalExecutorID
+	}
+	return executorID, conv.ExecutorSettings.WorkspaceDirectories[executorID]
+}
+
+// getRecentDirectories 返回 executorID 最近用过的目录：默认 Executor 是它的对话的工作目录；
+// conversations 按更新时间从新到旧排列，去重后最多 limit 个，没有记录目录的对话跳过。
+func getRecentDirectories(conversations []defs.Conversation, executorID string, limit int) []string {
+	// 1. 依次取每个对话的工作位置，只留这个 Executor 的，重复的保留最新的那次。
+	directories := []string{}
+	for _, conv := range conversations {
+		convExecutorID, directory := getWorkLocation(conv)
+		if convExecutorID != executorID || directory == "" || slices.Contains(directories, directory) {
+			continue
+		}
+		directories = append(directories, directory)
+		if len(directories) == limit {
+			break
+		}
+	}
+	return directories
+}
+
 // getDefaultDirectory 返回 Executor 在配置里的默认根目录；找不到 Executor 时为空。
 func getDefaultDirectory(executors []conversation.ExecutorDetails, executorID string) string {
 	// 1. 目录列表不大，直接按 ID 查找。
@@ -585,4 +613,21 @@ func previousConversationHint() string {
 		return "⌃Tab"
 	}
 	return "Ctrl+Tab"
+}
+
+// toProviderHeaders 把请求头编辑行转成 Provider 的 headers：名称去掉首尾空白，名称为空的行忽略，值为空的行照常保留；没有可保存的行时返回 nil。
+func toProviderHeaders(rows []*providerHeaderDraft) map[string]string {
+	// 1. 逐行收集有名称的条目。
+	var headers map[string]string
+	for _, row := range rows {
+		name := strings.TrimSpace(row.Name)
+		if name == "" {
+			continue
+		}
+		if headers == nil {
+			headers = map[string]string{}
+		}
+		headers[name] = row.Value
+	}
+	return headers
 }

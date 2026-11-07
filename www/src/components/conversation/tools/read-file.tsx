@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next"
+import { ImageIcon } from "lucide-react"
 import { CodeView } from "@/components/base/code-view"
 import { ToolCard, ToolMeta } from "@/components/conversation/tool-call-view"
 import type { ToolRendererProps } from "@/lib/item-renderers"
@@ -24,7 +25,21 @@ export function ReadFileTool(props: ToolRendererProps) {
   return (
     <ToolCard
       {...props}
-      argumentSummary={path && <span className="text-code">{path}</span>}
+      argumentSummary={
+        path &&
+        (images.length > 0 ? (
+          <span className="flex max-w-full items-center gap-1">
+            <ImageIcon
+              data-read-file-image
+              aria-hidden
+              className="size-4 shrink-0"
+            />
+            <span className="truncate text-code">{path}</span>
+          </span>
+        ) : (
+          <span className="text-code">{path}</span>
+        ))
+      }
     >
       {text !== undefined && (
         <>

@@ -316,6 +316,70 @@ test("provider connection conversion trims values and omits empty endpoint overr
   })
 })
 
+test("headers round trip, skip empty names and keep empty values", () => {
+  const saved: ProviderConfig = {
+    ...config({ m: {} }),
+    headers: { "X-Title": "MyTool", "Session-Id": "" },
+  }
+  const sortedRows = [
+    { name: "Session-Id", value: "" },
+    { name: "X-Title", value: "MyTool" },
+  ]
+  const cases: {
+    name: string
+    saved: ProviderConfig
+    wantRows: { name: string; value: string }[]
+    added: { name: string; value: string }[]
+    want: Record<string, string> | undefined
+  }[] = [
+    {
+      name: "saved_headers_sorted_by_name",
+      saved,
+      wantRows: sortedRows,
+      added: [],
+      want: saved.headers,
+    },
+    {
+      name: "blank_names_skipped_and_names_trimmed",
+      saved,
+      wantRows: sortedRows,
+      added: [
+        { name: "  ", value: "x" },
+        { name: " X-Team ", value: "infra" },
+      ],
+      want: { "Session-Id": "", "X-Title": "MyTool", "X-Team": "infra" },
+    },
+    {
+      name: "no_rows_omits_headers",
+      saved: config({ m: {} }),
+      wantRows: [],
+      added: [],
+      want: undefined,
+    },
+    {
+      name: "only_blank_rows_omit_headers",
+      saved: config({ m: {} }),
+      wantRows: [],
+      added: [{ name: " ", value: "" }],
+      want: undefined,
+    },
+  ]
+  for (const each of cases) {
+    const draft = fromProviderConfig(each.saved)
+    assert.deepEqual(draft.headers, each.wantRows, each.name)
+    const baseline = structuredClone(draft)
+    draft.headers.push(...each.added)
+    const provider = toProviderConfig(draft)
+    assert.deepEqual(provider.headers, each.want, each.name)
+    assert.equal("headers" in provider, each.want !== undefined, each.name)
+    assert.equal(
+      isSameProviderDraft(draft, baseline),
+      each.added.length === 0,
+      each.name
+    )
+  }
+})
+
 test("provider IDs and model groups use existing public rules", () => {
   for (const each of [
     { id: "", want: undefined },

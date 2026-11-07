@@ -13,7 +13,9 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"golang.org/x/image/draw"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
@@ -102,6 +104,22 @@ func newReadFailedResult(callID string, err error) *executor.ToolExecutionResult
 	})
 }
 
+// newSearchFailedResult 返回 glob、grep 失败的工具结果：调用取消或超时、path 参数不对、搜索命令或读取失败分别用不同的错误码。
+func newSearchFailedResult(ctx context.Context, callID string, err error) *executor.ToolExecutionResult {
+	// 1. 取消优先；path 参数不对写成 invalid_arguments；其他写成 search_failed。
+	var invalidPath *invalidSearchPathError
+	switch {
+	case ctx.Err() != nil:
+		return encodeContextError(callID, ctx.Err())
+	case errors.As(err, &invalidPath):
+		return newInvalidArgumentsResult(callID, err)
+	}
+	return encodeToolResult(callID, nil, &defs.ToolError{
+		Code:    "search_failed",
+		Message: err.Error(),
+	})
+}
+
 // encodeContextError 把取消或超时编码为工具错误。
 func encodeContextError(callID string, err error) *executor.ToolExecutionResult {
 	// 1. 按 DeadlineExceeded 选择 timeout，其他错误使用 canceled。
@@ -158,7 +176,7 @@ func (r CommandResult) IsFailed() bool {
 	if r.Status == string(terminal.TerminalStatusFailed) {
 		return true
 	}
-	isStoppedByTool := r.StopReason == string(terminal.TerminalStoppedByTool)
+	isStoppedByTool := r.StopReason == string(terminal.TerminalStoppedByRequest)
 	return r.ExitCode != nil && *r.ExitCode != 0 && !isStoppedByTool
 }
 
@@ -514,4 +532,147 @@ func validatePatchPaths(changes []*patchChange) error {
 		change.path = logical
 	}
 	return nil
+}
+
+// quoteShellArgument 把参数用单引号包起来，交给 bash 时按字面值处理。
+func quoteShellArgument(value string) string {
+	// 1. 单引号里不能再有单引号：先结束引号，补一个转义的单引号，再重新开始引号。
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+// limitScriptLineBytes 让脚本在远端把每行输出截到 maxScriptLineBytes 字节，并保留管道里搜索命令的退出码。
+func limitScriptLineBytes(command string) string {
+	// 1. pipefail 让没有匹配（1）和出错（2）照常传回来，cut 只截长度。
+	return fmt.Sprintf("set -o pipefail; %s | cut -b 1-%d", command, maxScriptLineBytes)
+}
+
+// portableClassReplacements 是 \d \D \w \W \s \S 在 POSIX 扩展正则里的等价写法。
+var portableClassReplacements = map[byte]string{
+	'd': "[0-9]",
+	'D': "[^0-9]",
+	'w': "[[:alnum:]_]",
+	'W': "[^[:alnum:]_]",
+	's': "[[:space:]]",
+	'S': "[^[:space:]]",
+}
+
+// translatePortablePattern 把方括号外的 \d \D \w \W \s \S 换成 POSIX 扩展正则也认识的字符类，其余内容保持不变。
+func translatePortablePattern(pattern string) string {
+	// 1. 逐字节扫描：方括号内原样复制；方括号外的反斜杠转义，属于六个简写时替换，否则连同下一个字符原样复制。
+	var translated strings.Builder
+	isInBracket := false
+	for index := 0; index < len(pattern); index++ {
+		char := pattern[index]
+		switch {
+		case isInBracket:
+			if char == '[' && index+1 < len(pattern) && pattern[index+1] == ':' {
+				if end := strings.Index(pattern[index+2:], ":]"); end >= 0 {
+					translated.WriteString(pattern[index : index+end+4])
+					index += end + 3
+					continue
+				}
+			}
+			isInBracket = char != ']'
+			translated.WriteByte(char)
+		case char == '\\' && index+1 < len(pattern):
+			index++
+			if replacement, ok := portableClassReplacements[pattern[index]]; ok {
+				translated.WriteString(replacement)
+				continue
+			}
+			translated.WriteByte(char)
+			translated.WriteByte(pattern[index])
+		case char == '[':
+			isInBracket = true
+			translated.WriteByte(char)
+			// 方括号开头的 ^ 和紧跟着的 ] 都属于字符集本身，不结束方括号。
+			if index+1 < len(pattern) && pattern[index+1] == '^' {
+				index++
+				translated.WriteByte('^')
+			}
+			if index+1 < len(pattern) && pattern[index+1] == ']' {
+				index++
+				translated.WriteByte(']')
+			}
+		default:
+			translated.WriteByte(char)
+		}
+	}
+	return translated.String()
+}
+
+// isExtensionGroupPattern 正则里是否有 (? 开头的分组或内联标记？转义的 \( 和方括号里的 ( 不算。
+func isExtensionGroupPattern(pattern string) bool {
+	// 1. 跳过转义字符和方括号字符集，其余位置遇到 (? 就返回 true。
+	isInBracket := false
+	for index := 0; index < len(pattern); index++ {
+		switch char := pattern[index]; {
+		case char == '\\':
+			index++
+		case isInBracket:
+			isInBracket = char != ']'
+		case char == '[':
+			isInBracket = true
+		case char == '(' && index+1 < len(pattern) && pattern[index+1] == '?':
+			return true
+		}
+	}
+	return false
+}
+
+// isHiddenPath 相对路径里是否有以 . 开头的目录或文件名？路径中的 . 本身不算。
+func isHiddenPath(relativePath string) bool {
+	// 1. 逐段检查，只要有一段以 . 开头且不是 . 就是隐藏路径。
+	for segment := range strings.SplitSeq(relativePath, "/") {
+		if segment != "." && strings.HasPrefix(segment, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// isSearchGlobMatch 相对路径是否匹配搜索通配符？不含 / 的通配符按文件名匹配任意深度（*.go 匹配 sub/b.go），含 / 的按整个相对路径匹配。
+func isSearchGlobMatch(pattern, relativePath string) bool {
+	// 1. 不含 / 时只取文件名，再用 doublestar 匹配；通配符已在调用前校验过。
+	if !strings.Contains(pattern, "/") {
+		relativePath = path.Base(relativePath)
+	}
+	return doublestar.MatchUnvalidated(pattern, relativePath)
+}
+
+// resolveSearchPath 把 glob、grep 的 path 参数转成绝对路径；省略时是工作区根目录。
+func resolveSearchPath(rootDirectory, value string) string {
+	// 1. 空值取根目录，绝对路径清理后直接用，相对路径按根目录展开。
+	switch {
+	case value == "":
+		return rootDirectory
+	case filepath.IsAbs(value):
+		return filepath.Clean(value)
+	}
+	return filepath.Join(rootDirectory, value)
+}
+
+// getDisplayPath 把绝对路径写成相对工作区根目录的路径；在根目录之外时保留绝对路径。
+func getDisplayPath(rootDirectory, absolutePath string) string {
+	// 1. 能写成不越出根目录的相对路径就用相对路径。
+	relative, err := filepath.Rel(rootDirectory, absolutePath)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, "../") {
+		return absolutePath
+	}
+	return relative
+}
+
+// truncateMatchText 把匹配行截成最多 maxMatchTextChars 个字符，被截断时末尾加 …。
+func truncateMatchText(line []byte) string {
+	// 1. 去掉行尾换行；按字符数找到截断位置，不把超长行整行转成 rune 切片。
+	line = bytes.TrimRight(line, "\r\n")
+	offset := 0
+	for count := 0; count < maxMatchTextChars && offset < len(line); count++ {
+		_, size := utf8.DecodeRune(line[offset:])
+		offset += size
+	}
+	if offset >= len(line) {
+		return string(line)
+	}
+	return string(line[:offset]) + "…"
 }

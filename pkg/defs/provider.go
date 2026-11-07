@@ -28,6 +28,8 @@ type ProviderConfig struct {
 	// Endpoints 按协议写完整请求地址，写了的协议不再用 BaseURL 拼，可以是别的 host。
 	Endpoints map[string]string `yaml:"endpoints,omitempty" json:"endpoints,omitempty"`
 	APIKey    string            `yaml:"api_key" json:"api_key"`
+	// Headers 是只发给这个 Provider 的 header 模板，同名覆盖 http.headers；值为 "" 表示不发。
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	// Models 是模型 id 到模型配置的映射；值为 nil 时全部用默认。
 	Models map[string]*ProviderModelConfig `yaml:"models" json:"models"`
 }

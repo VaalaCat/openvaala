@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -252,6 +253,51 @@ func TestConversationManagement(t *testing.T) {
 				f.requireListed(t, []defs.ConversationID{keptID}, nil)
 			},
 		},
+		{
+			name: "idle_stop",
+			run: func(t *testing.T, f *conversationManagementFixture) {
+				f.startServeWithIdleStop(t)
+				observer := f.openNewConversation(t)
+				conversationID := observer.conversation.ID
+				firstPID := f.getMCPServerPID(t, observer, "第一轮")
+
+				// 2. 退订后对话空闲，到时停止实例，MCP 进程随之退出。
+				observer.stop()
+				waitProcessGone(t, firstPID)
+
+				// 3. 重新打开后能继续对话，MCP 重新连接成新进程。
+				reopened := openRuntimeObserver(t, f.config, conversationID)
+				if secondPID := f.getMCPServerPID(t, reopened, "第二轮"); secondPID == firstPID {
+					t.Fatalf("MCP server pid after reopening = %d, want a new process", secondPID)
+				}
+			},
+		},
+		{
+			name: "idle_stop_waits_for_background_command",
+			run: func(t *testing.T, f *conversationManagementFixture) {
+				// 1. 对话里启动一条 5 秒的后台命令，然后退订。
+				f.startServeWithIdleStop(t)
+				observer := f.openNewConversation(t)
+				observer.startTurn(t, "启动后台命令")
+				f.model.next(t).reply <- e2eModelReply{tool: "mcp__fake__pid", arguments: `{}`}
+				request := f.model.next(t)
+				pid, err := strconv.Atoi(getMCPToolResultText(t, request.body))
+				if err != nil {
+					t.Fatalf("pid tool result: %v", err)
+				}
+				request.reply <- e2eModelReply{tool: "bash", arguments: `{"command":"sleep 5","wait_seconds":0}`}
+				f.model.next(t).reply <- e2eModelReply{text: "done"}
+				readTurnFinished(t, observer, defs.TurnStatusCompleted)
+				observer.stop()
+
+				// 2. 空闲时长过去两倍后命令仍在跑，对话没有停止；命令结束后才停止。
+				time.Sleep(2500 * time.Millisecond)
+				if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err != nil {
+					t.Fatalf("MCP server %d is gone while a background command is running: %v", pid, err)
+				}
+				waitProcessGone(t, pid)
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) { test.run(t, newConversationManagementFixture(t, binary)) })
 	}
@@ -280,6 +326,46 @@ func newConversationManagementFixture(t *testing.T, binary string) *conversation
 	stopServeOnCleanup(t, binary, f.config)
 	f.connectControl(t)
 	return f
+}
+
+// startServeWithIdleStop 配置 1 秒的 server.conversation_idle_timeout 和一个 stdio MCP server，并重启服务。
+func (f *conversationManagementFixture) startServeWithIdleStop(t *testing.T) {
+	t.Helper()
+	// 1. 在配置里写入空闲时长，写入假 MCP server 的定义。
+	directory := filepath.Dir(f.config)
+	config, err := os.ReadFile(f.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.config, []byte(strings.Replace(string(config), "server:\n", "server:\n  conversation_idle_timeout: 1s\n", 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(directory, "mcp_servers"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	fakeServer := "id: fake\ntype: stdio\ncommand: " + buildFakeMCPServer(t) + "\n"
+	if err := os.WriteFile(filepath.Join(directory, "mcp_servers", "fake.yaml"), []byte(fakeServer), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// 2. 重启服务让配置生效。
+	f.stopServe(t)
+	f.startServe(t)
+}
+
+// getMCPServerPID 跑一轮让模型调用假 MCP server 的 pid 工具，返回它的进程号。
+func (f *conversationManagementFixture) getMCPServerPID(t *testing.T, observer *runtimeObserver, text string) int {
+	t.Helper()
+	// 1. 提交输入，模型调用 pid 工具后回复结束。
+	observer.startTurn(t, text)
+	f.model.next(t).reply <- e2eModelReply{tool: "mcp__fake__pid", arguments: `{}`}
+	request := f.model.next(t)
+	pid, err := strconv.Atoi(getMCPToolResultText(t, request.body))
+	if err != nil {
+		t.Fatalf("pid tool result: %v", err)
+	}
+	request.reply <- e2eModelReply{text: "done"}
+	readTurnFinished(t, observer, defs.TurnStatusCompleted)
+	return pid
 }
 
 // connectControl 连接控制 Client，并在后台持续读掉它的事件。

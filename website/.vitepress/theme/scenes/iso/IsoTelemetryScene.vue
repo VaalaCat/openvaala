@@ -48,7 +48,7 @@ function getRowPath(cardAt: Vec3, [a, b, length]: number[]): string {
 </script>
 
 <template>
-  <SceneCanvas view-box="-170 -112 340 216" :period="10000">
+  <SceneCanvas view-box="-170 -120 340 216" :period="10000">
     <!-- 底座、立柱和指标屏 -->
     <IsoSlab :at="[-28, -18, 0]" :size="[56, 26, 3]" :radius="7" />
     <IsoSlab :at="[-5, -5, 3]" :size="[10, 4, 9]" :radius="2" />

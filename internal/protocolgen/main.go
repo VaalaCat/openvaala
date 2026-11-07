@@ -95,8 +95,11 @@ func generateProtocolTypes() (string, error) {
 	golang.IncludeCustomDeclaration(map[string]guts.TypeOverride{
 		"encoding/json.RawMessage": config.OverrideLiteral(bindings.KeywordUnknown),
 	})
-	if err := golang.IncludeCustom(map[string]string{"github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.Role": "string"}); err != nil {
-		return "", fmt.Errorf("map ir.Role: %w", err)
+	if err := golang.IncludeCustom(map[string]string{
+		"github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.Role": "string",
+		"time.Time": "string",
+	}); err != nil {
+		return "", fmt.Errorf("map custom types: %w", err)
 	}
 	if err := golang.ExcludeCustom(tableOnlyTypes...); err != nil {
 		return "", fmt.Errorf("exclude table only types: %w", err)
@@ -218,7 +221,7 @@ func isNegativeConstant(node bindings.Node) bool {
 	return false
 }
 
-// writeTables 把方法表和服务端通知表写成 MethodParams、MethodResult、NotificationParams 三个接口。
+// writeTables 把方法表和两个方向的通知表写成 MethodParams、MethodResult、NotificationParams、ClientNotificationParams 四个接口。
 func writeTables(source *strings.Builder, ts *guts.Typescript) error {
 	// 1. 方法名到参数类型、结果类型。
 	methodParams := make([]tableEntry, 0, len(runtimeprotocol.Methods))
@@ -236,21 +239,35 @@ func writeTables(source *strings.Builder, ts *guts.Typescript) error {
 		methodResults = append(methodResults, tableEntry{name: method.Name, typeName: result})
 	}
 
-	// 2. 通知名到参数类型。
-	notificationParams := make([]tableEntry, 0, len(runtimeprotocol.ServerNotifications))
-	for _, notification := range runtimeprotocol.ServerNotifications {
-		params, err := getTypeScriptTypeName(ts, notification.Params)
-		if err != nil {
-			return fmt.Errorf("notification %s params: %w", notification.Name, err)
-		}
-		notificationParams = append(notificationParams, tableEntry{name: notification.Name, typeName: params})
+	// 2. 服务端通知、客户端通知名到参数类型。
+	notificationParams, err := getNotificationEntries(ts, runtimeprotocol.ServerNotifications)
+	if err != nil {
+		return err
+	}
+	clientNotificationParams, err := getNotificationEntries(ts, runtimeprotocol.ClientNotifications)
+	if err != nil {
+		return err
 	}
 
-	// 3. 三张表依次写出。
+	// 3. 四张表依次写出。
 	writeTable(source, "MethodParams", "每个请求方法的参数类型。", methodParams)
 	writeTable(source, "MethodResult", "每个请求方法的结果类型。", methodResults)
 	writeTable(source, "NotificationParams", "每种服务端通知的参数类型。", notificationParams)
+	writeTable(source, "ClientNotificationParams", "每种客户端通知的参数类型。", clientNotificationParams)
 	return nil
+}
+
+// getNotificationEntries 把一组通知转成名字到 TypeScript 参数类型的表行。
+func getNotificationEntries(ts *guts.Typescript, notifications []runtimeprotocol.Notification) ([]tableEntry, error) {
+	entries := make([]tableEntry, 0, len(notifications))
+	for _, notification := range notifications {
+		params, err := getTypeScriptTypeName(ts, notification.Params)
+		if err != nil {
+			return nil, fmt.Errorf("notification %s params: %w", notification.Name, err)
+		}
+		entries = append(entries, tableEntry{name: notification.Name, typeName: params})
+	}
+	return entries, nil
 }
 
 // writeErrorCodes 把 JSON-RPC 错误码写成 TypeScript 常量，值取自 runtimeprotocol.ErrorCode*。
@@ -268,6 +285,7 @@ func writeErrorCodes(source *strings.Builder) {
 		{"ErrorCodeSessionBusy", runtimeprotocol.ErrorCodeSessionBusy},
 		{"ErrorCodeConversationNotFound", runtimeprotocol.ErrorCodeConversationNotFound},
 		{"ErrorCodeSessionNotFound", runtimeprotocol.ErrorCodeSessionNotFound},
+		{"ErrorCodeTerminalNotFound", runtimeprotocol.ErrorCodeTerminalNotFound},
 	}
 
 	// 2. 逐个写出。

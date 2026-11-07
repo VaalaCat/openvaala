@@ -1,6 +1,7 @@
 import { map } from "nanostores"
 import type { Content, ConversationID } from "./api/protocol.gen"
 
+// 新对话页的草稿身份，每个服务器一份；空 ID 不会和真实对话相同。
 export const newConversationDraftID: ConversationID = ""
 export type ConversationDraft = { content: Content[] }
 const emptyDraft: ConversationDraft = { content: [] }

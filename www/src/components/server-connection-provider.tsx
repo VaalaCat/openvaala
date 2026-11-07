@@ -14,6 +14,7 @@ import { StandalonePage } from "@/components/base/standalone-page"
 import { LatticeLoader } from "@/components/base/lattice-loader"
 import { ServerConnection } from "@/lib/api/server-connection"
 import { RunningConversationsSync } from "@/lib/api/running-conversations-sync"
+import { RunningTerminalsSync } from "@/lib/api/running-terminals-sync"
 import {
   $servers,
   getPageServerURL,
@@ -39,6 +40,22 @@ export function useRunningConversationsSync(): RunningConversationsSync {
   if (!sync)
     throw new Error(
       "useRunningConversationsSync needs a connected ServerConnectionProvider"
+    )
+  return sync
+}
+
+const RunningTerminalsSyncContext = createContext<
+  RunningTerminalsSync | undefined
+>(undefined)
+
+// 读取当前服务器的运行中终端列表同步对象。
+// eslint-disable-next-line react-refresh/only-export-components
+export function useRunningTerminalsSync(): RunningTerminalsSync {
+  // 1. 读取服务器作用域创建的同步对象。
+  const sync = useContext(RunningTerminalsSyncContext)
+  if (!sync)
+    throw new Error(
+      "useRunningTerminalsSync needs a connected ServerConnectionProvider"
     )
   return sync
 }
@@ -114,6 +131,10 @@ function ConnectionGate({
     () => new RunningConversationsSync(connection),
     [connection]
   )
+  const runningTerminalsSync = useMemo(
+    () => new RunningTerminalsSync(connection),
+    [connection]
+  )
   const url = connection.entry.url
   useEffect(() => {
     // 1. 登记连上后的处理：首次连上时还没有查询，跳过；之后每次重连让全部查询过期。
@@ -123,8 +144,9 @@ function ConnectionGate({
         invalidateAfterReconnect(queryClient, connection.getServerID())
       hasConnected = true
     })
-    // 2. 登记运行集合订阅，运行连接并保存 server_id。
+    // 2. 登记运行集合和终端列表订阅，运行连接并保存 server_id。
     const stopRunningConversationsSync = runningConversationsSync.run()
+    const stopRunningTerminalsSync = runningTerminalsSync.run()
     const stop = connection.run()
     const stopSavingServerID = connection.$serverID.listen((serverID) => {
       if (serverID) saveServerID(url, serverID)
@@ -132,10 +154,17 @@ function ConnectionGate({
     return () => {
       stopSavingServerID()
       stopRefreshingAfterReconnect()
+      stopRunningTerminalsSync()
       stopRunningConversationsSync()
       stop()
     }
-  }, [connection, queryClient, runningConversationsSync, url])
+  }, [
+    connection,
+    queryClient,
+    runningConversationsSync,
+    runningTerminalsSync,
+    url,
+  ])
   if (state === "unauthorized")
     return (
       <TokenEntryPage
@@ -170,7 +199,9 @@ function ConnectionGate({
       <RunningConversationsSyncContext.Provider
         value={runningConversationsSync}
       >
-        {children}
+        <RunningTerminalsSyncContext.Provider value={runningTerminalsSync}>
+          {children}
+        </RunningTerminalsSyncContext.Provider>
       </RunningConversationsSyncContext.Provider>
     </ServerConnectionContext.Provider>
   )

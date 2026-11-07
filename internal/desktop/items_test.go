@@ -4,14 +4,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
 	"image/png"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/VaalaCat/openvaala/internal/cli"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/dao"
@@ -58,6 +63,51 @@ func TestMarkdownNativeRendering(t *testing.T) {
 				if err := png.Encode(file, tester.Image()); err != nil {
 					t.Fatal(err)
 				}
+			}
+		})
+	}
+}
+
+// TestLoadImageHeaders 检查网络图片下载带上 http.headers，并允许跳到别的域名。
+func TestLoadImageHeaders(t *testing.T) {
+	// 1. 图片服务记录收到的 header；跳转用例让第一个服务重定向到另一个端口的服务。
+	var picture bytes.Buffer
+	if err := png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name     string
+		redirect bool
+	}{{"direct", false}, {"cross_origin_redirect", true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			received := make(chan http.Header, 1)
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Header.Clone()
+				w.Write(picture.Bytes())
+			}))
+			defer target.Close()
+			url := target.URL
+			if tt.redirect {
+				front := httptest.NewServer(http.RedirectHandler(target.URL, http.StatusFound))
+				defer front.Close()
+				url = front.URL
+			}
+			// 2. 经 NewDesktop 建立下载客户端，再加载图片。
+			d, err := NewDesktop(&DesktopOpt{RuntimeServerStart: cli.RuntimeServerStartOpt{Executable: "openvaala"}, HTTPHeaders: map[string]string{"X-Team": "infra"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.ctx = t.Context()
+			d.images = map[string]*imageResource{url: {}}
+			d.loadImage(url)
+			d.tasks.Wait()
+			select {
+			case header := <-received:
+				if header.Get("X-Team") != "infra" {
+					t.Fatalf("headers = %v", header)
+				}
+			default:
+				t.Fatal("image server was not reached")
 			}
 		})
 	}
@@ -239,18 +289,24 @@ func TestHistoryPrependReading(t *testing.T) {
 	}
 }
 
-// TestRealtimeItemFade 检查真实保存事件只在首次出现淡入，历史与减少动画不播放。
+// TestRealtimeItemFade 检查真实保存事件只在首次出现淡入，历史不播放。
 func TestRealtimeItemFade(t *testing.T) {
 	// 1. 对比原生实际像素，不仅检查是否存有计时字段。
 	for _, tt := range []struct {
-		name          string
-		live, reduced bool
-	}{{"live", true, false}, {"history", false, false}, {"reduced", true, true}} {
+		name           string
+		live           bool
+		osReduceMotion bool
+	}{
+		{"live", true, false},
+		{"history", false, false},
+		{"live with OS motion preference", true, true},
+		{"history with OS motion preference", false, true},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
 			d := testDesktop()
-			d.preferences.ReduceMotion = tt.reduced
 			d.readingTarget = readingTarget{ConversationID: "c", SessionID: "s"}
 			tester := ui.NewTester(func(c *ui.Context) { d.applyAppearance(c); ui.Column(c).Fill().Children(func() { d.itemsView(c) }) }, 640, 400)
+			tester.SetPreferences(ui.Preferences{ReduceMotion: tt.osReduceMotion})
 			item := runtimeprotocol.LoggedItem{Ordinal: 1, Item: &defs.Item{ID: "live", Kind: defs.ItemMessage, Message: &defs.Message{Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: "new native message"}}}}}}
 			if tt.live {
 				d.handleClientEvent(&runtimeclient.ItemsSaved{ConversationID: "c", SessionID: "s", Items: []runtimeprotocol.LoggedItem{item}})
@@ -261,8 +317,8 @@ func TestRealtimeItemFade(t *testing.T) {
 			before := append([]byte(nil), tester.Image().Pix...)
 			tester.Advance(200 * time.Millisecond)
 			after := tester.Image().Pix
-			if bytes.Equal(before, after) == (tt.live && !tt.reduced) {
-				t.Fatalf("unexpected animation live=%v reduced=%v", tt.live, tt.reduced)
+			if bytes.Equal(before, after) == tt.live {
+				t.Fatalf("unexpected animation live=%v", tt.live)
 			}
 			stable := append([]byte(nil), after...)
 			tester.Advance(time.Second)
@@ -273,25 +329,21 @@ func TestRealtimeItemFade(t *testing.T) {
 	}
 }
 
-// TestJumpToLatest 检查回底动作在结束后恢复追随，减少动画立即到位。
+// TestJumpToLatest 检查回底动作到达最新消息并恢复追随。
 func TestJumpToLatest(t *testing.T) {
 	// 1. 原生滚动离开底部，再点击产品入口。
-	for _, reduced := range []bool{false, true} {
-		t.Run(fmt.Sprint(reduced), func(t *testing.T) {
+	for _, row := range []int{20, 40} {
+		t.Run(fmt.Sprint(row), func(t *testing.T) {
 			d := testDesktop()
-			d.preferences.ReduceMotion = reduced
 			for index := range 80 {
 				d.items = append(d.items, viewItem{Ordinal: storage.Ordinal(index + 1), Item: &defs.Item{ID: defs.ItemID(fmt.Sprint(index)), Kind: defs.ItemMessage, Message: &defs.Message{Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: fmt.Sprintf("reading row %d", index)}}}}}})
 			}
 			tester := ui.NewTester(func(c *ui.Context) { d.applyAppearance(c); ui.Column(c).Fill().Children(func() { d.itemsView(c) }) }, 640, 480)
 			tester.SetLocale("zh-Hans")
-			d.messageList.ScrollTo(20, ui.Start)
+			d.messageList.ScrollTo(row, ui.Start)
 			tester.Frame()
 			if err := tester.Click("回到底部"); err != nil {
 				t.Fatal(err)
-			}
-			if reduced && !d.messageList.AtEnd() {
-				t.Fatal("reduced motion did not jump immediately")
 			}
 			tester.Advance(200 * time.Millisecond)
 			if !d.messageList.AtEnd() || !tester.HasText("reading row 79") {
@@ -453,6 +505,7 @@ func TestItemActivityTitles(t *testing.T) {
 		{"summary", viewItem{Item: &defs.Item{ID: "s", Kind: defs.ItemContextSummary, ContextSummary: &defs.ContextSummary{Text: "summary"}}}, "root", []string{"上下文已压缩"}, false},
 		{"skill", viewItem{Item: &defs.Item{ID: "k", Kind: defs.ItemSkillInstruction, SkillInstruction: &defs.SkillInstruction{Name: "review"}}}, "root", []string{"加载 Skill"}, false},
 		{"agents", viewItem{Item: &defs.Item{ID: "a", Kind: defs.ItemAgentsInstruction, AgentsInstruction: &defs.AgentsInstruction{Path: "AGENTS.md"}}}, "root", []string{"加载目录规则"}, false},
+		{"client instruction", viewItem{Item: &defs.Item{ID: "c", Kind: defs.ItemClientInstruction, ClientInstruction: &defs.ClientInstruction{Text: "boundary"}}}, "root", []string{"客户端指令"}, false},
 		{"hook", viewItem{Item: &defs.Item{ID: "h", Kind: defs.ItemHookRun, HookRun: &defs.HookRun{ID: "run", Status: defs.HookRunBlocked, Event: "pre_tool_use", Handler: "guard.sh"}}}, "root", []string{"Hook 事件", "Blocked"}, false},
 		{"model change", viewItem{Item: &defs.Item{ID: "m", Kind: defs.ItemModelChange, ModelChange: &defs.ModelChange{PreviousModel: defs.ModelRef{ProviderID: "p", ModelID: "a"}, Model: defs.ModelRef{ProviderID: "p", ModelID: "b"}}}}, "root", []string{"模型从"}, false},
 		{"unknown", viewItem{Item: &defs.Item{ID: "u", Kind: "mystery"}}, "root", []string{"未知类型的记录：mystery"}, false},
@@ -473,6 +526,49 @@ func TestItemActivityTitles(t *testing.T) {
 			}
 			if _, found := tester.Find("从这里分叉"); found != tt.fork {
 				t.Fatalf("fork action=%v texts=%q", found, tester.Texts())
+			}
+		})
+	}
+}
+
+// TestMemoryIndexItem 检查记忆目录条目：标题行带路径，展开后有「路径@memory」和正文，截断过的多一行提示，不显示成未知类型的记录。
+func TestMemoryIndexItem(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		index defs.MemoryIndex
+		// wantText 是正文按 Markdown 渲染之后的列表项文字。
+		wantText string
+	}{
+		{"complete", defs.MemoryIndex{Path: "user/MEMORY.md", Text: "- 回复用中文"}, "回复用中文"},
+		{"truncated", defs.MemoryIndex{Path: "project/MEMORY.md", Text: "- 测试用 table-driven", IsTruncated: true}, "测试用 table-driven"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.items = []viewItem{{Ordinal: 1, Item: &defs.Item{ID: "memory", TurnID: "turn", Kind: defs.ItemMemoryIndex, MemoryIndex: &tt.index}}}
+			tester := ui.NewTester(func(c *ui.Context) { d.applyAppearance(c); ui.Column(c).Fill().Children(func() { d.itemsView(c) }) }, 640, 480)
+			// 折叠时只有标题和路径，正文要点开才有。
+			for _, want := range []string{"带上了记忆目录", tt.index.Path} {
+				if !tester.HasText(want) {
+					t.Fatalf("missing %q: %q", want, tester.Texts())
+				}
+			}
+			if tester.HasText(tt.wantText) {
+				t.Fatalf("body visible while collapsed: %q", tester.Texts())
+			}
+			if err := tester.Click("带上了记忆目录"); err != nil {
+				t.Fatal(err)
+			}
+			tester.Advance(300 * time.Millisecond)
+			for _, want := range []string{tt.index.Path + "@memory", tt.wantText} {
+				if !tester.HasText(want) {
+					t.Fatalf("missing %q after expanding: %q", want, tester.Texts())
+				}
+			}
+			if got := tester.HasText("超过 8 KiB，已截断"); got != tt.index.IsTruncated {
+				t.Fatalf("truncated note shown = %v, want %v: %q", got, tt.index.IsTruncated, tester.Texts())
+			}
+			if slices.ContainsFunc(tester.Texts(), func(text string) bool { return strings.Contains(text, "未知类型") }) {
+				t.Fatalf("memory index shown as an unknown record: %q", tester.Texts())
 			}
 		})
 	}

@@ -134,8 +134,10 @@ type codexThreadStartParams struct {
 	Config codexThreadStartConfig `json:"config"`
 	// DynamicTools 非空时拒绝。
 	DynamicTools []json.RawMessage `json:"dynamicTools"`
-	// Ephemeral 是否新建临时对话？临时对话没有 Executor。
+	// Ephemeral 是否新建临时对话？只决定对话存在内存里，跟工具无关。
 	Ephemeral bool `json:"ephemeral"`
+	// Environments 给了空数组时不装配 Executor；省略或非空时照常装配。
+	Environments *[]json.RawMessage `json:"environments"`
 	// ThreadSource 只在临时对话时原样写进回给客户端的 Thread。
 	ThreadSource *string `json:"threadSource"`
 }
@@ -158,7 +160,7 @@ type codexThreadResumeParams struct {
 type codexThreadForkParams struct {
 	// ThreadID 必须是根 Thread。
 	ThreadID string `json:"threadId"`
-	// LastTurnID 复制到这一轮为止；它和 BeforeTurnID 最多给一个，都不给时复制全部已结束的轮次。
+	// LastTurnID 复制到这一轮为止；它和 BeforeTurnID 最多给一个，都不给时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
 	LastTurnID string `json:"lastTurnId"`
 	// BeforeTurnID 复制到这一轮之前。
 	BeforeTurnID string `json:"beforeTurnId"`
@@ -168,8 +170,30 @@ type codexThreadForkParams struct {
 	Config codexThreadStartConfig `json:"config"`
 	// ExcludeTurns 客户端是不是自己翻页读历史？是时响应的 thread.turns 为空。
 	ExcludeTurns bool `json:"excludeTurns"`
-	// Ephemeral 是不是要分叉成临时对话？不支持，为 true 时拒绝。
+	// Ephemeral 是不是要分叉成临时对话？是时分叉只存在内存里，回复的 Thread 带 ephemeral。
 	Ephemeral bool `json:"ephemeral"`
+	// DeveloperInstructions 非空时，分叉成功后作为一条客户端指令写进分叉的上下文。
+	DeveloperInstructions string `json:"developerInstructions"`
+}
+
+// codexThreadInjectItemsParams 是 thread/inject_items 的参数：Items 是 Responses API 格式的原始条目。
+type codexThreadInjectItemsParams struct {
+	// ThreadID 必须是根 Thread。
+	ThreadID string            `json:"threadId"`
+	Items    []json.RawMessage `json:"items"`
+}
+
+// codexInjectedItem 是 thread/inject_items 里一条 Responses API 格式的条目，只认 user 和 developer 的 message。
+type codexInjectedItem struct {
+	Type    string                 `json:"type"`
+	Role    string                 `json:"role"`
+	Content []codexInjectedContent `json:"content"`
+}
+
+// codexInjectedContent 是注入条目 content 里的一段，type 为 input_text 的才有文字。
+type codexInjectedContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // codexThreadParams 是只带 Thread id 的请求参数：thread/unsubscribe、thread/compact/start、thread/archive、thread/unarchive、thread/delete。
@@ -539,14 +563,14 @@ type codexThreadOpenResult struct {
 	// ApprovalPolicy 总是 never。
 	ApprovalPolicy    string `json:"approvalPolicy"`
 	ApprovalsReviewer string `json:"approvalsReviewer"`
-	// Sandbox 按普通或临时 Thread 区分。
+	// Sandbox 按对话有没有装配 Executor 区分。
 	Sandbox codexSandboxPolicy `json:"sandbox"`
 	// TurnsBackwardsCursor 和 ItemsBackwardsCursor 都是 codexNewestHistoryCursor，新 Thread 也带游标、读到空历史。
 	TurnsBackwardsCursor string `json:"turnsBackwardsCursor"`
 	ItemsBackwardsCursor string `json:"itemsBackwardsCursor"`
 }
 
-// codexSandboxPolicy 是 Thread 的沙箱：普通 Thread 是 dangerFullAccess；临时 Thread 的对话没有 Executor，不能读写文件、执行命令，是 readOnly。
+// codexSandboxPolicy 是 Thread 的沙箱：对话装配了 Executor 的 Thread 是 dangerFullAccess，没有装配的（例如 thread/start 带空 environments）是 readOnly；是否临时不影响。
 type codexSandboxPolicy struct {
 	Type string `json:"type"`
 }
@@ -1256,6 +1280,8 @@ func (*threadHistoryEndRequested) isConnectionThreadRequest() {}
 type connectionThreadOpened struct {
 	// thread 是回复打开请求用的 Thread 对象。
 	thread codexThread
+	// hasExecutors 是对话装配了 Executor 吗？回复打开请求的沙箱据此报告。
+	hasExecutors bool
 	// followStart 是跟随起点：新开始跟随时 thread/resume、thread/fork 的 thread.turns 读到它为止。
 	followStart historyReadEnd
 	// subAgentSessionIDs 是首次同步时对话里的全部子 Session，连接据此记下这些子 Thread 属于哪个对话（不论是否跟随）。

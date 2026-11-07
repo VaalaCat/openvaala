@@ -163,6 +163,23 @@
 
 /* ---------- 场景容器 ---------- */
 
+/* 另画了窄屏布局的场景：宽屏只显示 wide 版，719px 以下只显示 narrow 版；窄屏版最宽 400px、居中。 */
+.scene-layout--narrow {
+  display: none;
+  max-width: 400px;
+  margin-inline: auto;
+}
+
+@media (max-width: 719px) {
+  .scene-layout--wide {
+    display: none;
+  }
+
+  .scene-layout--narrow {
+    display: block;
+  }
+}
+
 .scene-figure {
   margin: 0;
 }
@@ -234,18 +251,19 @@
     height: 168px;
   }
 
+  /* 正文场景和首页卖点向两侧伸进页边距，画布放大约一成。 */
+  .scene-figure--inline,
+  .scene-figure--pillar {
+    margin-inline: calc(12px - var(--site-gutter));
+  }
+
   .scene-figure--inline .scene-canvas,
   .scene-figure--pillar .scene-canvas {
-    padding: 14px;
+    padding: 10px;
     border-radius: 12px;
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .scene-canvas * {
-    animation: none !important;
-  }
-}
 
 /* 工作灯：Executor、按键等物体正在处理时亮起的信号蓝小椭圆，静态画面里熄灭。 */
 .scene-light {
@@ -292,13 +310,14 @@
 }
 
 @media (max-width: 719px) {
+  /* 字号按节点框宽度取上限：最长的标签（如 this machine）仍留在框内。 */
   .scene-canvas--flow .scene-label {
-    font-size: 12.5px;
+    font-size: 11.5px;
   }
 
   .scene-canvas--flow .scene-label--small,
   .scene-group-label {
-    font-size: 10px;
+    font-size: 9.5px;
   }
 
   .scene-detail {

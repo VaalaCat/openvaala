@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
@@ -27,7 +28,7 @@ func TestProtocolNotificationNames(t *testing.T) {
 				"item/started", "item/delta", "item/completed", "item/interrupted", "item/toolProgress",
 				"hook/started", "hook/completed",
 				"clientMCP/connect", "clientMCP/message", "clientMCP/disconnect",
-				"terminal/output", "terminal/exited",
+				"terminal/output", "terminal/exited", "terminal/listChanged", "terminal/listClosed",
 			},
 		},
 		{
@@ -63,6 +64,30 @@ func TestRunningConversationsWire(t *testing.T) {
 		{"empty", runtime.RunningConversations{ConversationIDs: []defs.ConversationID{}}, `{"conversation_ids":[]}`},
 		{"running", runtime.RunningConversations{ConversationIDs: []defs.ConversationID{"one"}}, `{"conversation_ids":["one"]}`},
 		{"closed", RunningConversationsClosedParams{Reason: "runtime has stopped"}, `{"reason":"runtime has stopped"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(tt.value)
+			if err != nil || string(got) != tt.want {
+				t.Fatalf("JSON = %s, %v; want %s", got, err, tt.want)
+			}
+		})
+	}
+}
+
+// TestTerminalWire 检查终端消息在线上的字段：输出数据是 base64，空数据也编码成空串，列表项省略空的对话。
+func TestTerminalWire(t *testing.T) {
+	// 1. 分别编码带数据的输出、第一页为空的输出、有对话和没有对话的列表项、列表和关闭通知。
+	for _, tt := range []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{"output", TerminalOutputParams{TerminalID: "t1", Data: []byte("hi"), NextCursor: 2, Truncated: true, HasMore: true}, `{"terminal_id":"t1","data":"aGk=","next_cursor":2,"truncated":true,"has_more":true}`},
+		{"empty_first_output", TerminalOutputParams{TerminalID: "t1", Data: []byte{}, NextCursor: 7}, `{"terminal_id":"t1","data":"","next_cursor":7,"truncated":false,"has_more":false}`},
+		{"item_with_conversation", TerminalItem{TerminalID: "t1", ExecutorID: "local", Directory: "/work", StartedAt: time.Date(2026, 11, 6, 1, 2, 3, 0, time.UTC), ConversationID: "c1"}, `{"terminal_id":"t1","executor_id":"local","directory":"/work","started_at":"2026-11-06T01:02:03Z","conversation_id":"c1"}`},
+		{"item_without_conversation", TerminalItem{TerminalID: "t1", ExecutorID: "local", Directory: "/work", StartedAt: time.Date(2026, 11, 6, 1, 2, 3, 0, time.UTC)}, `{"terminal_id":"t1","executor_id":"local","directory":"/work","started_at":"2026-11-06T01:02:03Z"}`},
+		{"empty_list", TerminalListResult{Terminals: []TerminalItem{}}, `{"terminals":[]}`},
+		{"closed", TerminalsClosedParams{Reason: "runtime has stopped"}, `{"reason":"runtime has stopped"}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := json.Marshal(tt.value)

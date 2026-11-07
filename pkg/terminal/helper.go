@@ -3,6 +3,7 @@ package terminal
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"time"
 	"unicode/utf8"
 )
 
@@ -44,16 +45,28 @@ func newTerminalID() string {
 }
 
 // newTerminalInfo 生成命令启动时的信息。
-func newTerminalInfo(id string, request *TerminalRequest) TerminalInfo {
+func newTerminalInfo(id string, request *TerminalRequest, startedAt time.Time) TerminalInfo {
 	// 1. 复制编号和请求字段，状态设为 running。
-	return TerminalInfo{
+	info := TerminalInfo{
 		ID:            id,
 		EnvironmentID: request.EnvironmentID,
 		Command:       request.Command,
 		Directory:     request.Directory,
 		Interactive:   request.Interactive,
+		StartedAt:     startedAt,
 		Status:        TerminalStatusRunning,
 	}
+	// 2. 交互命令记录 PTY 初始行列数，为零时按 24×80。
+	if request.Interactive {
+		info.Rows, info.Cols = request.Rows, request.Cols
+		if info.Rows == 0 {
+			info.Rows = defaultTerminalRows
+		}
+		if info.Cols == 0 {
+			info.Cols = defaultTerminalCols
+		}
+	}
+	return info
 }
 
 // isChannelClosed 信号通道是否已关闭？

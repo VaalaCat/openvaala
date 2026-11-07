@@ -51,7 +51,6 @@ func (d *Desktop) applyAppearance(c *ui.Context) {
 	if d.preferences.BodyFont != "" {
 		t.Typography.Font = d.preferences.BodyFont
 	}
-	t.Motion.Reduced = d.preferences.ReduceMotion
 	// 2. stone 覆盖中性色及强调色，blue 保留 One 主题的蓝色强调。
 	if d.preferences.Palette == "stone" {
 		if dark {

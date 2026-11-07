@@ -26,10 +26,11 @@ OpenVaala keeps the agent loop, tool execution and the interfaces apart — a ce
 OpenVaala runs on Linux and macOS (amd64 and arm64).
 
 - **GitHub Releases** — download the `openvaala` binary for your platform, which includes the web UI, or a desktop package for macOS or Linux, from [Releases](https://github.com/VaalaCat/openvaala/releases).
-- **go install** — the command-line tool with the web UI from the latest release:
+- **go install** — the command-line tool, or the desktop program (not an app package), from the latest release:
 
   ```bash
   go install github.com/VaalaCat/openvaala/cmd/openvaala@latest
+  go install github.com/VaalaCat/openvaala/cmd/openvaala-desktop@latest
   ```
 
 - **From source** — `script/build.sh` builds the CLI with the web UI (Go 1.27.3+, Node.js 24+, pnpm); `script/build-desktop.sh` builds the desktop app.

@@ -2,7 +2,7 @@ import { useState, type Ref } from "react"
 import { useStore } from "@nanostores/react"
 import { RefreshCw, Server } from "lucide"
 import { MorphIcon } from "morphicons/react"
-import { motion, useIsPresent, useReducedMotion } from "motion/react"
+import { motion, useIsPresent } from "motion/react"
 import type { ParseKeys } from "i18next"
 import { useTranslation } from "react-i18next"
 import { StatusDot } from "@/components/base/status-dot"
@@ -47,7 +47,6 @@ export function ServerConnectionControl({
   const connection = useServerConnection()
   const state = useStore(connection.$state)
   const pending = useStore(connection.$isManualReconnectPending)
-  const reduceMotion = useReducedMotion()
   const isPresent = useIsPresent()
   const [hovered, setHovered] = useState(false)
   const [focused, setFocused] = useState(false)
@@ -62,9 +61,9 @@ export function ServerConnectionControl({
   return (
     <motion.div
       ref={ref}
-      layoutId={reduceMotion ? undefined : layoutId}
-      layout={reduceMotion ? false : "position"}
-      transition={{ duration: reduceMotion ? 0 : 0.2, ease: "easeInOut" }}
+      layoutId={layoutId}
+      layout="position"
+      transition={{ duration: 0.2, ease: "easeInOut" }}
       className="size-8 shrink-0"
       inert={!isPresent}
       aria-hidden={!isPresent || undefined}
@@ -98,12 +97,11 @@ export function ServerConnectionControl({
             <span
               className={cn(
                 "server-reconnect-icon flex",
-                pending && "animate-spin motion-reduce:animate-none"
+                pending && "animate-spin"
               )}
             >
               <MorphIcon
                 icon={showRefresh ? RefreshCw : Server}
-                reducedMotion="user"
                 size={16}
                 aria-hidden
               />

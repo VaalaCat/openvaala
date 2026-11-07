@@ -165,6 +165,11 @@ test("getToolArgumentPreview uses only meaningful built-in arguments", () => {
       value: { command_id: "cmd1", chars: "y\n" },
       want: 'cmd1 ← "y\\n"',
     },
+    ...["glob", "grep"].map((name) => ({
+      name,
+      value: { pattern: "**/*.go\nignored", path: "src" },
+      want: "**/*.go",
+    })),
     ...["read_command_output", "stop_command"].map((name) => ({
       name,
       value: { command_id: "cmd1" },

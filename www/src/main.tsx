@@ -11,6 +11,17 @@ import { createQueryClient } from "./lib/query/client"
 import { initializeI18n } from "./i18n"
 import "./index.css"
 
+// iOS 在渲染输入控件前设置聚焦缩放上限，其他平台保留默认 viewport。
+if (
+  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+) {
+  const viewport = document.querySelector<HTMLMetaElement>(
+    'meta[name="viewport"]'
+  )!
+  viewport.content += ", maximum-scale=1.0"
+}
+
 initializeAppearance()
 await initializeI18n()
 const queryClient = createQueryClient()

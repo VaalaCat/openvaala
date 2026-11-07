@@ -3,19 +3,21 @@ package runtime
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/agent/agent_context"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
-	"github.com/VaalaCat/openvaala/pkg/workspace"
+	"github.com/VaalaCat/openvaala/pkg/terminal"
 )
 
 // ── Runtime 错误 ──
@@ -49,6 +51,8 @@ var ErrConversationReconfigured = errors.New("conversation reconfigured")
 
 // CreateConversationRequest 是新建对话的参数：用哪个 Agent、什么模型、哪些 Executor 和环境变量；对话建好后立即启动。
 type CreateConversationRequest struct {
+	// ConversationID 是调用方指定的新对话 ID；为空时由 Runtime 生成。不检查是否重复。
+	ConversationID defs.ConversationID
 	// AgentName 是根 Session 使用的 Agent 名。
 	AgentName string
 	// Model 是根 Session 的模型选择；零值时使用根 Agent 的默认模型。
@@ -59,8 +63,9 @@ type CreateConversationRequest struct {
 	Environment []string
 	// Ephemeral 为 true 时建临时对话：存储在一个只属于它的 sqlite 内存库里，永远不进对话列表；
 	// 没有订阅者、也没有 Session 在跑，满 UnsavedConversationIdleTimeout 后结束并丢弃，之后按 ID 读回「对话不存在」。
-	// 临时对话没有 Executor 和 Skill，ExecutorSettings 原样存进记录。
 	Ephemeral bool
+	// WithoutExecutors 为 true 时不装配 Executor 和 Skill，ExecutorSettings 原样存进记录、不生效，Environment 忽略。
+	WithoutExecutors bool
 }
 
 // OpenConversationRequest 是打开已保存对话的参数：对话没在运行时按记录里的 Executor 设置和 Environment 装配；已打开时忽略 Environment。
@@ -92,8 +97,8 @@ type Definitions struct {
 	MCPServers []*mcpclient.ServerDefinition
 	// Hooks 是全部 hook 定义（含插件带来的），已按配置顺序排列；为空时对话也有一个不含任何 hook 的 hook.Hooks。
 	Hooks []*hook.HookDefinition
-	// Executors 是全部 Executor：local、builtin，再加 executors/ 里配置的，按这个顺序。
-	Executors []*defs.ExecutorDefinition
+	// Executors 决定每个对话能用哪些 Executor，reload 时和其他定义一起替换；nil 时没有 Executor。
+	Executors executor.ExecutorProvider
 	// Skills 是所有对话共用的 skill：skills.directory、builtin、各插件，按这个顺序去重。
 	Skills []*skill.Skill
 }
@@ -121,23 +126,18 @@ type ResolveWorkspaceDirectoryRequest struct {
 	BaseDirectory string
 }
 
-// OpenTerminalWorkspaceRequest 指定终端要用哪个 Executor、起始目录和客户端环境变量。
-type OpenTerminalWorkspaceRequest struct {
+// OpenTerminalRequest 指定终端的 Executor、起始目录、客户端环境变量、初始尺寸和所属对话。
+type OpenTerminalRequest struct {
 	// ExecutorID 为空时用 local Executor。
 	ExecutorID string
 	// Directory 为空时用该 Executor 的默认工作目录；否则按 ResolveWorkspaceDirectory 的规则解析并检查它是目录。
 	Directory string
 	// Environment 的含义同 CreateConversationRequest；只给 local 种类的 Executor 用。
 	Environment []string
-}
-
-// TerminalWorkspace 是为一个终端新建的独立工作区，由调用方持有：用完后，SSH 工作区（workspace.SSHWorkspace）须由调用方关闭。
-type TerminalWorkspace struct {
-	Workspace workspace.Workspace
-	// ExecutorID 是实际使用的 Executor。
-	ExecutorID string
-	// Directory 是解析后的绝对起始目录。
-	Directory string
+	// Rows、Cols 是 PTY 初始行列数，为零时按 24×80。
+	Rows, Cols uint16
+	// ConversationID 为空时只有原生客户端的 Dock 显示这个终端。
+	ConversationID defs.ConversationID
 }
 
 // GetWorkspaceDirectoriesRequest 指定 Executor、待列出的目录和相对路径基准。
@@ -170,11 +170,13 @@ type SetConversationTitleRequest struct {
 	Title          string
 }
 
-// ForkConversationRequest 把已保存的对话根 Session 复制到某一轮为止，成为一个新对话并打开。
+// ForkConversationRequest 把已保存的对话根 Session 复制到某一轮为止，成为一个新对话并打开；还在运行的轮次只复制已保存的部分。
 type ForkConversationRequest struct {
 	ConversationID defs.ConversationID
+	// ForkedConversationID 是调用方指定的分叉出的新对话 ID；为空时由 Runtime 生成。不检查是否重复。
+	ForkedConversationID defs.ConversationID
 	// BeforeTurnID 复制到这一轮之前（不含），回退重来用；LastTurnID 复制到这一轮（含）。
-	// 两个最多填一个；都不填时复制所有已结束的轮次。
+	// 两个最多填一个；都不填时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
 	BeforeTurnID defs.TurnID
 	LastTurnID   defs.TurnID
 	// Model 是新根 Session 的模型；零值时照抄来源根 Session 的模型。
@@ -183,6 +185,9 @@ type ForkConversationRequest struct {
 	// 配置中已不存在的 Executor 只记 Warn。
 	ExecutorSettings defs.ExecutorSettings
 	Environment      []string
+	// Ephemeral 为 true 时，分叉存进只属于它的 sqlite 内存库，不进对话列表；
+	// 没有订阅者、也没有 Session 在跑，满 UnsavedConversationIdleTimeout 后结束并丢弃。
+	Ephemeral bool
 }
 
 // SetConversationArchivedRequest 归档（Archived 为 true）或取消归档一个已保存的对话。
@@ -230,6 +235,13 @@ type InterruptTurnWithInputRequest struct {
 type WithdrawInputRequest struct {
 	ConversationID defs.ConversationID
 	ItemID         defs.ItemID
+}
+
+// AppendContextItemsRequest 指定要注入根 Session 下一轮上下文的 Item。
+type AppendContextItemsRequest struct {
+	ConversationID defs.ConversationID
+	// Items 可以是任何不需要模型调用、也不由运行时自己写入的种类，载荷必须有效；ID 由调用方生成，还没分配 TurnID 和 ModelCallID。
+	Items []*defs.Item
 }
 
 // CompactContextRequest 选择要手动压缩根 Session 上下文的对话。
@@ -391,6 +403,40 @@ type runningUnsubscribeRequested struct {
 
 func (*runningUnsubscribeRequested) isRuntimeRequest() {}
 
+// terminalOpenRequested 由 OpenTerminal 在工作区建好后发出：事件循环在 r.tasks 里启动 shell，登记所属对话并唤醒订阅，再回复启动结果。
+type terminalOpenRequested struct {
+	// ctx 是 OpenTerminal 调用方的 ctx，启动 shell 时去掉取消。
+	ctx context.Context
+	// request 带着已建好的独占工作区，StartTerminal 之后工作区归 pkg/terminal 关闭。
+	request        *terminal.TerminalRequest
+	conversationID defs.ConversationID
+	reply          chan terminalOpenReply
+}
+
+func (*terminalOpenRequested) isRuntimeRequest() {}
+
+// terminalOpenReply 是事件循环对 terminalOpenRequested 的回复：已启动登记的终端，或启动错误。
+type terminalOpenReply struct {
+	opened *OpenedTerminal
+	err    error
+}
+
+// terminalsSubscribeRequested 由 SubscribeTerminals 触发，Runtime 登记订阅并回复同一时刻的运行中终端。
+type terminalsSubscribeRequested struct {
+	ctx   context.Context
+	reply chan *TerminalsSubscription
+}
+
+func (*terminalsSubscribeRequested) isRuntimeRequest() {}
+
+// terminalsUnsubscribeRequested 在终端订阅上下文结束时触发，Runtime 移除并关闭对应流。
+type terminalsUnsubscribeRequested struct {
+	stream *subscriptionStream[[]RunningTerminal]
+	reason error
+}
+
+func (*terminalsUnsubscribeRequested) isRuntimeRequest() {}
+
 // ── Runtime 运行状态 ──
 
 // runtimeDefinitions 是 Runtime 当前的定义和两个索引，构造后只读，reload 时整份替换。
@@ -427,6 +473,20 @@ type RunningConversationsSubscription struct {
 
 // GetCloseReason 返回全局运行订阅关闭的原因。
 func (s *RunningConversationsSubscription) GetCloseReason() error {
+	// 1. 返回事件循环关闭通道前写入的原因。
+	return s.stream.closeReason
+}
+
+// TerminalsSubscription 返回登记时的运行中终端及之后的完整列表更新。
+type TerminalsSubscription struct {
+	// Initial 和 Events 里的列表按启动先后排序，由全部订阅者共享，只读。
+	Initial []RunningTerminal
+	Events  <-chan []RunningTerminal
+	stream  *subscriptionStream[[]RunningTerminal]
+}
+
+// GetCloseReason 返回终端订阅关闭的原因：订阅方 ctx 结束、ErrSubscriberTooSlow 或 ErrRuntimeStopped。
+func (s *TerminalsSubscription) GetCloseReason() error {
 	// 1. 返回事件循环关闭通道前写入的原因。
 	return s.stream.closeReason
 }
@@ -501,6 +561,22 @@ type RunningConversations struct {
 	ConversationIDs []defs.ConversationID `json:"conversation_ids"`
 }
 
+// OpenedTerminal 是 OpenTerminal 的结果。
+type OpenedTerminal struct {
+	Terminal terminal.Terminal
+	// ExecutorID 是实际使用的 Executor。
+	ExecutorID string
+	// Directory 是解析后的绝对起始目录。
+	Directory string
+}
+
+// RunningTerminal 是一个运行中的终端和打开它的对话。
+type RunningTerminal struct {
+	Info terminal.TerminalInfo
+	// ConversationID 为空表示打开终端时没有指定对话。
+	ConversationID defs.ConversationID
+}
+
 // SessionRuntimeInfo 是一个 Session 的运行信息，可直接用 == 比较；runtimeConversation 在它有变化时发给对话订阅者，
 // 例如 Session 启停、Turn 开始或结束、用量和上下文占用变化、换模型。
 type SessionRuntimeInfo struct {
@@ -566,6 +642,21 @@ type SessionContextUsage struct {
 	// Items 是本轮最近一次统一测量的 Item 分类估算；还没有测量时为空。
 	Items []agent_context.ItemTokens `json:"items"`
 }
+
+// ── Runtime 终端常量 ──
+
+const (
+	// terminalShellCommand 是终端里运行的命令（经 bash -c，本机和 SSH 相同）：先保证 HOME 有值（没有时取当前用户的主目录，再退到 /tmp），
+	// 再按 $SHELL、fish、zsh、bash、sh、mksh 的顺序选第一个能找到的 shell，以登录 shell 的方式替换当前进程；都找不到时退出码为 127。
+	terminalShellCommand = `if [ -z "$HOME" ]; then HOME=$(cd ~ 2>/dev/null && pwd); fi; [ -n "$HOME" ] || HOME=/tmp; export HOME
+for shell in "$SHELL" fish zsh bash sh mksh; do
+  shell_path=$(command -v "$shell" 2>/dev/null) && [ -x "$shell_path" ] && exec "$shell_path" -l
+done
+echo "no usable shell found" >&2
+exit 127`
+	// terminalStopTimeout 是删除对话时结束一个终端的等待上限。
+	terminalStopTimeout = 5 * time.Second
+)
 
 // ── Runtime 模型目录 ──
 

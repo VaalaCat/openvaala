@@ -257,6 +257,15 @@ type modelSelectionRequested struct{ model defs.ModelSelection }
 
 func (modelSelectionRequested) isSessionRequest() {}
 
+// appendContextItemsRequested 由 AppendContextItems 在 Item 通过校验后交给事件循环，暂存到下一个非压缩 Turn。
+type appendContextItemsRequested struct {
+	// items 是已复制的 Item，ID 由调用方生成，还没分配 TurnID 和 ModelCallID。
+	items []*defs.Item
+	reply chan error
+}
+
+func (appendContextItemsRequested) isSessionRequest() {}
+
 // ── Session Turn 执行结果 ──
 
 // turnFinished 由 Turn 执行任务在发出 SessionTurnFinished 后交回事件循环。

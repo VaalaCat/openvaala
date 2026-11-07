@@ -2,6 +2,7 @@ import { OverflowTooltip } from "@/components/base/overflow-tooltip"
 import { useStore } from "@nanostores/react"
 import { useTranslation } from "react-i18next"
 import { Link } from "react-router"
+import { useIsSessionLinked } from "@/components/conversation/session-link-context"
 import { useServerConnection } from "@/components/server-connection-provider"
 import type { ConversationSync } from "@/lib/api/conversation-sync"
 import type { SessionID } from "@/lib/api/protocol.gen"
@@ -10,7 +11,7 @@ import { getSessionName } from "@/lib/session-tree"
 import { cn } from "@/lib/utils"
 
 // 对话里一个 Session 的链接，点击进入它的页面：子 Agent 显示任务名（没有时用 Agent 名），根 Session 叫「主 Agent」；
-// 还不在 $sessions 里的 Session 显示 ID
+// 还不在 $sessions 里的 Session 显示 ID；没有页面可去时只显示名字
 export function SessionLink({
   sync,
   sessionID,
@@ -23,11 +24,20 @@ export function SessionLink({
   const { t } = useTranslation()
   const connection = useServerConnection()
   const info = useStore(sync.$sessions, { keys: [sessionID] })[sessionID]
+  const isLinked = useIsSessionLinked(sync)
   const serverID = connection.getServerID()
   const isRoot = !!info && !info.session.parent_session_id
   const name = info
     ? getSessionName(info, t("conversation.session.root"))
     : sessionID
+  if (!isLinked)
+    return (
+      <OverflowTooltip
+        render={<span className={cn("max-w-48 min-w-0 truncate", className)} />}
+      >
+        {name}
+      </OverflowTooltip>
+    )
   return (
     <OverflowTooltip
       render={

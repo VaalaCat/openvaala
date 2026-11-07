@@ -16,12 +16,14 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
+	"github.com/VaalaCat/openvaala/pkg/terminal"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"golang.org/x/sync/singleflight"
@@ -30,9 +32,9 @@ import (
 // Runtime 保存共享定义和运行中的对话，按 ConversationID 处理对话操作与订阅。
 // 对话的装配、设置更新和客户端 MCP 登记在调用方 goroutine 里执行，运行表与定义只由 Runtime 事件循环修改。
 type Runtime interface {
-	// Run 运行到上下文结束，停止并等待全部对话后返回；只能调用一次。需要运行实例的方法在 Run 启动前等待，Run 返回后返回 ErrRuntimeStopped。
+	// Run 运行到上下文结束，停止并等待全部对话和交互终端后返回；只能调用一次。需要运行实例的方法在 Run 启动前等待，Run 返回后返回 ErrRuntimeStopped。
 	Run(ctx context.Context) error
-	// IsIdle 全部已打开对话是否都没有运行中的 Turn 或后台命令？包括子 Agent；Runtime 已停止时返回 ErrRuntimeStopped。
+	// IsIdle 全部已打开对话是否都没有运行中的 Turn 或后台命令，也没有没结束的交互终端？包括子 Agent；Runtime 已停止时返回 ErrRuntimeStopped。
 	IsIdle(ctx context.Context) (bool, error)
 
 	// CreateConversation 按 Agent、模型、Executor 设置和环境创建并启动对话；模型目录为空返回 ErrNoModelConfigured，设置无效返回 conversation.ErrInvalidExecutorSettings。
@@ -49,11 +51,11 @@ type Runtime interface {
 	ListConversations(ctx context.Context, request *dao.ListConversationsRequest) (storage.Page[dao.ConversationListEntry, dao.RecordCursor[defs.ConversationID]], error)
 	// SetConversationTitle 保存标题的前 256 个字符，已打开对话的订阅者会收到标题变化。
 	SetConversationTitle(ctx context.Context, request *SetConversationTitleRequest) error
-	// ForkConversation 复制已保存对话到指定轮次并打开分叉；没有可复制轮次时新建未保存对话，临时和未保存来源返回 ErrConversationNotFound。
+	// ForkConversation 复制已保存对话到指定轮次并打开分叉；没有可复制轮次时新建未保存对话，临时和未保存来源返回 ErrConversationNotFound；Ephemeral 时分叉写进内存库、不进对话列表。
 	ForkConversation(ctx context.Context, request *ForkConversationRequest) (defs.Conversation, error)
 	// SetConversationArchived 更新归档时间并返回记录，状态相同时不写入；临时和未保存对话返回 ErrConversationNotFound。
 	SetConversationArchived(ctx context.Context, request *SetConversationArchivedRequest) (defs.Conversation, error)
-	// DeleteConversation 停止对话并删除全部记录和历史；有 Session 在执行 Turn 时返回 session.ErrSessionBusy，临时和未保存对话返回 ErrConversationNotFound。
+	// DeleteConversation 停止对话并删除全部记录和历史，删除成功后结束这个对话打开的终端；有 Session 在执行 Turn 时返回 session.ErrSessionBusy，临时和未保存对话返回 ErrConversationNotFound。
 	DeleteConversation(ctx context.Context, request *DeleteConversationRequest) error
 
 	// SubmitInput 将输入交给已打开对话的根 Session，返回 ItemID；普通新对话先保存，用户输入接收后用正文给空标题命名。
@@ -66,6 +68,9 @@ type Runtime interface {
 	InterruptTurnWithInput(ctx context.Context, request *InterruptTurnWithInputRequest) error
 	// WithdrawInput 原子取走根 Session 的完整待处理用户输入组。
 	WithdrawInput(ctx context.Context, request *WithdrawInputRequest) ([]*defs.Item, error)
+	// AppendContextItems 把 Item 交给已打开对话的根 Session，下一轮 Turn 开始时写在本轮输入之前，不启动 Turn；
+	// Item 无效时返回错误，都不收；对话没打开时返回 ErrConversationNotOpen。
+	AppendContextItems(ctx context.Context, request *AppendContextItemsRequest) (err error)
 	// CompactContext 请求根 Session 启动压缩 Turn 并返回 TurnID；有活动 Turn 或排队输入时返回 session.ErrSessionBusy，普通新对话先保存。
 	CompactContext(ctx context.Context, request *CompactContextRequest) (defs.TurnID, error)
 	// SubscribeConversation 订阅已打开对话的标题与全部 Session 运行信息，先返回初始信息再有序推送变化，订阅上下文结束后退订。
@@ -89,12 +94,17 @@ type Runtime interface {
 	GetHooks(ctx context.Context) ([]*hook.HookInfo, error)
 	// ListAgents 按配置顺序返回当前定义中的 Agent 名、说明和默认模型，不含系统指令。
 	ListAgents(ctx context.Context) ([]AgentInfo, error)
-	// ListExecutors 按 local、builtin、配置顺序返回 Executor 说明和默认目录。
+	// ListExecutors 按 ExecutorProvider 给的顺序返回 Executor 说明和默认目录。
 	ListExecutors(ctx context.Context) ([]conversation.ExecutorDetails, error)
-	// ResolveWorkspaceDirectory 按当前 Executor 定义解析工作目录；SSH Executor 每次调用建立连接，结束后断开。
+	// ResolveWorkspaceDirectory 按当前 ExecutorProvider 解析工作目录；SSH Executor 每次调用建立连接，结束后断开。
 	ResolveWorkspaceDirectory(ctx context.Context, request *ResolveWorkspaceDirectoryRequest) (string, error)
-	// OpenTerminalWorkspace 按当前 Executor 定义为一个终端新建独立工作区，不借用任何对话的工作区；virtual Executor 返回 workspace.ErrTTYUnsupported。
-	OpenTerminalWorkspace(ctx context.Context, request *OpenTerminalWorkspaceRequest) (*TerminalWorkspace, error)
+	// OpenTerminal 用所属对话能用的 Executor 新建独立工作区并启动 shell；工作区建好后 ctx 结束只取消等待，终端照常启动和登记。未知 Executor 返回 conversation.ErrInvalidExecutorSettings，
+	// virtual Executor 返回 workspace.ErrTTYUnsupported，没结束的终端达到上限时返回 terminal.ErrTerminalLimitReached。
+	OpenTerminal(ctx context.Context, request *OpenTerminalRequest) (opened *OpenedTerminal, err error)
+	// GetTerminal 查找已打开的终端，已结束但记录还在的也返回；找不到时返回 terminal.ErrTerminalNotFound，不新建。
+	GetTerminal(ctx context.Context, terminalID string) (result terminal.Terminal, err error)
+	// SubscribeTerminals 返回运行中的终端并订阅变化，ctx 结束后退订。
+	SubscribeTerminals(ctx context.Context) (subscription *TerminalsSubscription, err error)
 	// GetWorkspaceDirectories 列出指定 Executor 上一个目录的普通直接子目录，请求结束后关闭临时工作区。
 	GetWorkspaceDirectories(ctx context.Context, request *GetWorkspaceDirectoriesRequest) (directories *conversation.WorkspaceDirectories, err error)
 	// SetDefinitions 替换整份定义，并行更新空闲对话；等待全部更新结束，结果列出未更新的忙碌对话，单个更新失败只记日志并保留原配置。
@@ -144,7 +154,15 @@ type runtimeImpl struct {
 	// unsavedConversationStores 是活着的临时对话和还没保存的新对话各自的存储：建对话时存入；
 	// 新对话 Persist 成功，或对话结束、被移出运行表时删除并关闭内存库。
 	unsavedConversationStores syncmap.SyncMap[defs.ConversationID, *unsavedConversationStore]
-	// tasks 是各对话的运行任务，只在 Run 的事件循环内启动，Run 返回前等待。
+	// interactiveTerminals 是用户打开的 shell，Run 返回前停止并等待全部。
+	interactiveTerminals terminal.TerminalManager
+	// terminalConversations 是 Runtime 已登记的终端：编号到打开它的对话，没有对话时值为空。
+	terminalConversations syncmap.SyncMap[string, defs.ConversationID]
+	// terminalsChanged 合并终端打开和结束的唤醒，容量 1。
+	terminalsChanged chan struct{}
+	// terminalSubscribers 是运行中终端的订阅，只由 Runtime 事件循环读写。
+	terminalSubscribers map[*subscriptionStream[[]RunningTerminal]]*runtimeSubscriber
+	// tasks 是各对话的运行任务、交互终端管理器、启动终端和结束对话终端的任务，只在 Run 的事件循环内启动，Run 返回前等待。
 	tasks sync.WaitGroup
 }
 
@@ -159,8 +177,11 @@ type RuntimeOpt struct {
 	// Telemetry 是遥测管道，由 Run 挂到 ctx 供全部对话使用；nil 时使用全局兜底。
 	Telemetry *telemetry.Telemetry
 	// UnsavedConversationIdleTimeout 是没保存的对话（临时对话、还没收到第一条输入的新对话）没有订阅者、也没有 Session 在跑后，
-	// 等多久结束并丢弃；NewRuntimeOpt 默认 60 秒。
+	// 等多久结束并丢弃，不受后台命令影响；NewRuntimeOpt 默认 60 秒。
 	UnsavedConversationIdleTimeout time.Duration
+	// SavedConversationIdleTimeout 是已保存的对话没有订阅者、也没有 Session 或后台命令在跑后，等多久停止运行实例；
+	// 记录不动，下次 OpenConversation 重新装配。NewRuntimeOpt 默认 0，表示不停止。
+	SavedConversationIdleTimeout time.Duration
 	// MaxImageBytes 是 read_file 交给模型的单张图片上限，来自 tools.max_image_kb；serve 启动时定，reload 不变。
 	// NewRuntimeOpt 默认 500 KiB。
 	MaxImageBytes int
@@ -185,21 +206,37 @@ func (opt *RuntimeOpt) WithUnsavedConversationIdleTimeout(timeout time.Duration)
 	return opt
 }
 
+// WithSavedConversationIdleTimeout 修改已保存对话的空闲停止时长。
+func (opt *RuntimeOpt) WithSavedConversationIdleTimeout(timeout time.Duration) *RuntimeOpt {
+	// 1. 保存空闲时长并返回同一份配置。
+	opt.SavedConversationIdleTimeout = timeout
+	return opt
+}
+
 // NewRuntime 校验依赖，创建共享 DAO 并保存初始定义。
 func NewRuntime(opt *RuntimeOpt) (Runtime, error) {
-	// 1. 检查存储和至少一个 Agent 定义，空闲丢弃时长必须为正数。
+	// 1. 检查存储和至少一个 Agent 定义，未保存对话的空闲时长必须为正数，已保存对话的不能为负。
 	if opt == nil || opt.Records == nil || opt.Logs == nil || opt.Definitions == nil || len(opt.Definitions.Agents) == 0 {
 		return nil, errors.New("runtime requires record storage, log storage and at least one agent")
 	}
 	if opt.UnsavedConversationIdleTimeout <= 0 {
 		return nil, errors.New("runtime requires a positive unsaved conversation idle timeout")
 	}
+	if opt.SavedConversationIdleTimeout < 0 {
+		return nil, errors.New("runtime requires a non-negative saved conversation idle timeout")
+	}
 	// 2. 创建共享 DAO。
 	query, mutation, err := dao.NewDAO(dao.NewDAOOpt(opt.Records, opt.Logs))
 	if err != nil {
 		return nil, fmt.Errorf("create runtime DAO: %w", err)
 	}
-	// 3. 初始化请求通道和运行表，保存初始定义后清掉 opt 里的定义；模型目录可以为空。
+	// 3. 创建交互终端管理器，终端结束时唤醒 Runtime 重新发布终端列表。
+	terminalsChanged := make(chan struct{}, 1)
+	interactiveTerminals, err := terminal.NewTerminalManager(terminal.NewTerminalManagerOpt().WithTerminalFinished(terminalsChanged))
+	if err != nil {
+		return nil, fmt.Errorf("create interactive terminal manager: %w", err)
+	}
+	// 4. 初始化请求通道和运行表，保存初始定义后清掉 opt 里的定义；模型目录可以为空。
 	r := &runtimeImpl{
 		opt:                  *opt,
 		query:                query,
@@ -210,13 +247,16 @@ func NewRuntime(opt *RuntimeOpt) (Runtime, error) {
 		runningConversations: make(map[defs.ConversationID]*runtimeConversation),
 		runningChanged:       make(chan struct{}, 1),
 		runningSubscribers:   make(map[*subscriptionStream[RunningConversations]]*runtimeSubscriber),
+		interactiveTerminals: interactiveTerminals,
+		terminalsChanged:     terminalsChanged,
+		terminalSubscribers:  make(map[*subscriptionStream[[]RunningTerminal]]*runtimeSubscriber),
 	}
 	r.definitions.Store(newRuntimeDefinitions(opt.Definitions))
 	r.opt.Definitions = nil
 	return r, nil
 }
 
-// Run 运行 Runtime 事件循环：串行处理运行表和定义的变更，ctx 结束后等全部对话退出再返回。
+// Run 运行 Runtime 事件循环：串行处理运行表、定义和终端登记的变更，ctx 结束后等全部对话和终端退出再返回。
 func (r *runtimeImpl) Run(ctx context.Context) error {
 	// 1. 拒绝重复运行，登记退出通知和遥测。
 	select {
@@ -226,7 +266,9 @@ func (r *runtimeImpl) Run(ctx context.Context) error {
 	}
 	defer close(r.stopped)
 	ctx = telemetry.ContextWithTelemetry(ctx, r.opt.Telemetry)
-	// 2. 分发查找、启动、停止、记录修改和定义替换请求。
+	// 2. 启动交互终端管理器，ctx 结束时它停止并等待全部终端。
+	r.tasks.Go(func() { _ = r.interactiveTerminals.Run(ctx) })
+	// 3. 分发查找、启动、停止、记录修改、定义替换、终端打开和订阅请求。
 	for {
 		select {
 		case request := <-r.requests:
@@ -251,15 +293,26 @@ func (r *runtimeImpl) Run(ctx context.Context) error {
 				r.handleRunningSubscribeRequested(ctx, request)
 			case *runningUnsubscribeRequested:
 				removeSubscriber(r.runningSubscribers, request.stream, request.reason)
+			case *terminalOpenRequested:
+				r.handleTerminalOpenRequested(request)
+			case *terminalsSubscribeRequested:
+				r.handleTerminalsSubscribeRequested(request)
+			case *terminalsUnsubscribeRequested:
+				removeSubscriber(r.terminalSubscribers, request.stream, request.reason)
 			default:
 				panic(fmt.Sprintf("unsupported Runtime request %T", request))
 			}
 		case <-r.runningChanged:
 			r.publishRunningConversations(ctx)
+		case <-r.terminalsChanged:
+			r.publishRunningTerminals()
 		case <-ctx.Done():
-			// 3. 上下文结束后等待全部对话退出，关闭仍登记的内存库，再返回上下文错误。
+			// 4. 上下文结束后等待全部对话、终端和后台任务退出，关闭仍登记的内存库，再返回上下文错误。
 			for stream := range r.runningSubscribers {
 				removeSubscriber(r.runningSubscribers, stream, ErrRuntimeStopped)
+			}
+			for stream := range r.terminalSubscribers {
+				removeSubscriber(r.terminalSubscribers, stream, ErrRuntimeStopped)
 			}
 			r.tasks.Wait()
 			for _, conversationID := range r.unsavedConversationStores.Keys() {
@@ -290,14 +343,14 @@ func (r *runtimeImpl) createConversation(ctx context.Context, request *CreateCon
 	}
 	// 3. 按环境变量、Executor 设置和原设置装配对话；设置无效时返回 conversation.ErrInvalidExecutorSettings，装配失败时关闭内存库。
 	opt := &conversation.ConversationOpt{
-		Query:         store.query,
-		Mutation:      store.mutation,
-		Definitions:   definitions.conversationDefinitions,
-		Environment:   request.Environment,
-		MaxImageBytes: r.opt.MaxImageBytes,
-		Ephemeral:     request.Ephemeral,
+		Query:            store.query,
+		Mutation:         store.mutation,
+		Definitions:      definitions.conversationDefinitions,
+		Environment:      request.Environment,
+		MaxImageBytes:    r.opt.MaxImageBytes,
+		WithoutExecutors: request.WithoutExecutors,
 	}
-	instance, err := conversation.CreateConversation(ctx, request.AgentName, request.Model, request.ExecutorSettings, storedSettings, opt)
+	instance, err := conversation.CreateConversation(ctx, cmp.Or(request.ConversationID, defs.NewConversationID()), request.AgentName, request.Model, request.ExecutorSettings, storedSettings, opt)
 	if err != nil {
 		return defs.Conversation{}, errors.Join(err, store.database.Close())
 	}
@@ -594,9 +647,9 @@ func (r *runtimeImpl) publishRunningConversations(ctx context.Context) {
 	}
 }
 
-// signalRunningConversationsChanged 非阻塞唤醒 Runtime 重新读取运行集合。
-func signalRunningConversationsChanged(changed chan<- struct{}) {
-	// 1. 容量已满时合并本次唤醒。
+// signalChanged 非阻塞唤醒 Runtime 重新读取并发布运行集合或终端列表。
+func signalChanged(changed chan<- struct{}) {
+	// 1. 通道已有未处理的唤醒时合并本次唤醒。
 	select {
 	case changed <- struct{}{}:
 	default:
@@ -642,7 +695,7 @@ func (r *runtimeImpl) handleConversationTitleChangeRequested(change *conversatio
 	change.reply <- err
 }
 
-// ForkConversation 按指定轮次复制已保存对话并打开分叉。
+// ForkConversation 按指定轮次复制已保存对话并打开分叉；临时分叉写进它自己的内存库。
 func (r *runtimeImpl) ForkConversation(ctx context.Context, request *ForkConversationRequest) (defs.Conversation, error) {
 	// 1. 从共享库读取来源，读取当前定义并检查模型目录。
 	source, err := r.getSavedConversation(ctx, request.ConversationID)
@@ -653,20 +706,33 @@ func (r *runtimeImpl) ForkConversation(ctx context.Context, request *ForkConvers
 	if len(definitions.conversationDefinitions.Models) == 0 {
 		return defs.Conversation{}, ErrNoModelConfigured
 	}
-	opt := &conversation.ConversationOpt{
+	// 2. 选择分叉写到哪里：临时分叉打开独立内存库，普通分叉写共享库。
+	target := &conversation.ConversationOpt{
 		Query:       r.query,
 		Mutation:    r.mutation,
 		Definitions: definitions.conversationDefinitions,
 	}
-	// 2. 按请求截取点复制来源根 Session。
+	var store *unsavedConversationStore
+	if request.Ephemeral {
+		if store, err = r.openUnsavedConversationStore(true); err != nil {
+			return defs.Conversation{}, err
+		}
+		target.Query, target.Mutation = store.query, store.mutation
+	}
+	// 3. 按请求截取点复制来源根 Session，来源固定从共享库读；失败时关闭临时分叉的内存库。
 	forked, err := conversation.ForkConversation(ctx, &conversation.ForkConversationRequest{
-		Source:           source,
-		BeforeTurnID:     request.BeforeTurnID,
-		LastTurnID:       request.LastTurnID,
-		Model:            request.Model,
-		ExecutorSettings: request.ExecutorSettings,
-	}, opt)
-	// 3. 截取点之前没有轮次时，沿用来源根 Agent 和模型创建未保存对话。
+		Source:               source,
+		SourceQuery:          r.query,
+		ForkedConversationID: request.ForkedConversationID,
+		BeforeTurnID:         request.BeforeTurnID,
+		LastTurnID:           request.LastTurnID,
+		Model:                request.Model,
+		ExecutorSettings:     request.ExecutorSettings,
+	}, target)
+	if err != nil && store != nil {
+		err = errors.Join(err, store.database.Close())
+	}
+	// 4. 截取点之前没有轮次时，沿用来源根 Agent 和模型创建未保存对话；新对话是否临时跟着请求走。
 	if errors.Is(err, conversation.ErrNothingToFork) {
 		root, err := r.getSession(ctx, source.ID, source.RootSessionID)
 		if err != nil {
@@ -677,21 +743,43 @@ func (r *runtimeImpl) ForkConversation(ctx context.Context, request *ForkConvers
 			model = root.Model
 		}
 		return r.createConversation(ctx, &CreateConversationRequest{
+			ConversationID:   request.ForkedConversationID,
 			AgentName:        root.AgentName,
 			Model:            model,
 			ExecutorSettings: request.ExecutorSettings,
 			Environment:      request.Environment,
+			Ephemeral:        request.Ephemeral,
 		}, source.ExecutorSettings)
 	}
 	if err != nil {
 		return defs.Conversation{}, err
 	}
-	// 4. 按请求设置打开分叉，登记时写入补齐的设置；已被别人打开时返回运行实例的记录，不删除分叉。
+	// 5. 临时分叉用自己的内存库装配并登记，写入补齐的设置；任一步失败都关闭内存库。
+	if request.Ephemeral {
+		opt := &conversation.ConversationOpt{
+			Query:         store.query,
+			Mutation:      store.mutation,
+			Definitions:   definitions.conversationDefinitions,
+			Environment:   request.Environment,
+			MaxImageBytes: r.opt.MaxImageBytes,
+		}
+		instance, err := conversation.GetConversation(ctx, forked, source.ExecutorSettings, opt)
+		if err != nil {
+			return defs.Conversation{}, errors.Join(err, store.database.Close())
+		}
+		settings := instance.GetExecutorSettings()
+		result := r.startConversation(ctx, instance, store, &settings)
+		if result.err != nil {
+			return defs.Conversation{}, errors.Join(result.err, store.database.Close())
+		}
+		return result.record, nil
+	}
+	// 6. 按请求设置打开分叉，登记时写入补齐的设置；已被别人打开时返回运行实例的记录，不删除分叉。
 	result := r.openConversation(ctx, forked, source.ExecutorSettings, request.Environment, true)
 	if errors.Is(result.err, errConversationAlreadyOpen) {
 		return result.runningConversation.getRecord(ctx)
 	}
-	// 5. 其余打开错误时删除复制出的记录与历史，删除失败只记日志。
+	// 7. 其余打开错误时删除复制出的记录与历史，删除失败只记日志。
 	if result.err != nil {
 		if err := r.mutation.DeleteConversation(context.WithoutCancel(ctx), forked.ID); err != nil {
 			telemetry.GetLogger(ctx).Warn("delete forked conversation failed", "error", err)
@@ -801,8 +889,12 @@ func (r *runtimeImpl) handleConversationDeleteRequested(ctx context.Context, req
 		running.cancel()
 		<-running.stopped
 	}
-	// 3. 删除记录和日志，回复删除结果。
-	request.reply <- r.mutation.DeleteConversation(ctx, conversationID)
+	// 3. 删除记录和日志；删除成功后在 r.tasks 里结束这个对话打开的终端，再回复删除结果。
+	err := r.mutation.DeleteConversation(ctx, conversationID)
+	if err == nil {
+		r.tasks.Go(func() { r.stopConversationTerminals(ctx, conversationID) })
+	}
+	request.reply <- err
 }
 
 // SubscribeSession 登记已打开对话中一个 Session 的内容订阅。
@@ -936,31 +1028,76 @@ func (r *runtimeImpl) ListAgents(context.Context) ([]AgentInfo, error) {
 	return newAgentInfos(r.definitions.Load().conversationDefinitions.Agents), nil
 }
 
-// ListExecutors 按定义顺序返回 Executor 说明和默认工作目录。
-func (r *runtimeImpl) ListExecutors(context.Context) ([]conversation.ExecutorDetails, error) {
-	// 1. 从当前定义提取 Executor 展示字段。
-	return newExecutorDetails(r.definitions.Load().conversationDefinitions.Executors), nil
+// ListExecutors 按 ExecutorProvider 给的顺序返回 Executor 说明和默认工作目录。
+func (r *runtimeImpl) ListExecutors(ctx context.Context) ([]conversation.ExecutorDetails, error) {
+	// 1. 向 ExecutorProvider 要没有对话时的列表，提取展示字段。
+	executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	return newExecutorDetails(executors), nil
 }
 
-// ResolveWorkspaceDirectory 使用当前 Executor 定义解析用户输入的工作目录。
+// ResolveWorkspaceDirectory 使用当前 ExecutorProvider 解析用户输入的工作目录。
 func (r *runtimeImpl) ResolveWorkspaceDirectory(ctx context.Context, request *ResolveWorkspaceDirectoryRequest) (string, error) {
-	// 1. 读取当前 Executor 定义，交给对话目录解析方法。
-	executors := r.definitions.Load().conversationDefinitions.Executors
+	// 1. 向 ExecutorProvider 要没有对话时的列表，交给对话目录解析方法。
+	executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, "")
+	if err != nil {
+		return "", err
+	}
 	return conversation.ResolveWorkspaceDirectory(ctx, executors, request.ExecutorID, request.Directory, request.BaseDirectory)
 }
 
-// OpenTerminalWorkspace 使用当前 Executor 定义为终端建立独立工作区。
-func (r *runtimeImpl) OpenTerminalWorkspace(ctx context.Context, request *OpenTerminalWorkspaceRequest) (*TerminalWorkspace, error) {
-	// 1. 读取当前 Executor 定义，ExecutorID 为空时用 local；未知 ID 返回 ErrInvalidExecutorSettings，virtual 返回 ErrTTYUnsupported。
-	executors := r.definitions.Load().conversationDefinitions.Executors
+// OpenTerminal 为终端建立独立工作区，经事件循环启动 shell 并登记所属对话，返回已启动的终端。
+func (r *runtimeImpl) OpenTerminal(ctx context.Context, request *OpenTerminalRequest) (*OpenedTerminal, error) {
+	// 1. 校验 Executor 并建立工作区，这一步随 ctx 取消。
+	terminalRequest, err := r.newTerminalRequest(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	// 2. 提交启动请求；事件循环收下前 ctx 结束或 Runtime 停止时，关闭工作区后返回，收下之后工作区归 pkg/terminal 关闭。
+	open := &terminalOpenRequested{
+		ctx:            ctx,
+		request:        terminalRequest,
+		conversationID: request.ConversationID,
+		reply:          make(chan terminalOpenReply, 1),
+	}
+	select {
+	case r.requests <- open:
+	case <-r.stopped:
+		terminalRequest.CloseWorkspace(ctx)
+		return nil, ErrRuntimeStopped
+	case <-ctx.Done():
+		terminalRequest.CloseWorkspace(ctx)
+		return nil, ctx.Err()
+	}
+	// 3. 等待启动和登记结果；ctx 先结束时只返回 ctx 错误，启动和登记照常完成。
+	select {
+	case reply := <-open.reply:
+		return reply.opened, reply.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// newTerminalRequest 向 ExecutorProvider 要终端所属对话的列表，为一个终端打开独占的工作区，返回启动 shell 要的完整请求。
+func (r *runtimeImpl) newTerminalRequest(ctx context.Context, request *OpenTerminalRequest) (*terminal.TerminalRequest, error) {
+	// 1. 向 ExecutorProvider 要所属对话的列表，ExecutorID 为空时用 local；未知 ID 和 memory 返回 ErrInvalidExecutorSettings，virtual 返回 ErrTTYUnsupported。
+	executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, request.ConversationID)
+	if err != nil {
+		return nil, err
+	}
 	executorID := cmp.Or(request.ExecutorID, defs.LocalExecutorID)
-	index := slices.IndexFunc(executors, func(definition *defs.ExecutorDefinition) bool { return definition.ID == executorID })
+	index := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == executorID })
 	if index < 0 {
 		return nil, fmt.Errorf("%w: unknown executor %q", conversation.ErrInvalidExecutorSettings, executorID)
 	}
-	definition := executors[index]
+	definition := executors[index].GetDefinition()
 	if definition.Kind == defs.ExecutorKindVirtual {
 		return nil, workspace.ErrTTYUnsupported
+	}
+	if definition.Kind == defs.ExecutorKindMemory {
+		return nil, fmt.Errorf("%w: memory executor has no workspace directory", conversation.ErrInvalidExecutorSettings)
 	}
 	// 2. 目录为空时用默认工作目录，否则在临时工作区上解析并检查它是目录。
 	directory := definition.WorkspaceDirectory
@@ -971,22 +1108,155 @@ func (r *runtimeImpl) OpenTerminalWorkspace(ctx context.Context, request *OpenTe
 		}
 		directory = resolved
 	}
-	// 3. 以起始目录为根创建这个终端独占的工作区。
-	terminalWorkspace, err := conversation.NewExecutorWorkspace(ctx, definition, directory, request.Environment)
+	// 3. 以起始目录为根打开这个终端独占的工作区。
+	terminalWorkspace, err := executors[index].NewWorkspace(ctx, &executor.NewWorkspaceRequest{RootDirectory: directory, Environment: request.Environment})
 	if err != nil {
 		return nil, err
 	}
-	return &TerminalWorkspace{
-		Workspace:  terminalWorkspace,
-		ExecutorID: executorID,
-		Directory:  directory,
+	return &terminal.TerminalRequest{
+		EnvironmentID: executorID,
+		Workspace:     terminalWorkspace,
+		Command:       terminalShellCommand,
+		Directory:     directory,
+		Interactive:   true,
+		Rows:          request.Rows,
+		Cols:          request.Cols,
+		OwnsWorkspace: true,
 	}, nil
 }
 
-// GetWorkspaceDirectories 使用当前 Executor 定义查询工作区目录候选。
+// handleTerminalOpenRequested 在 r.tasks 里启动 shell，登记所属对话并唤醒订阅，再回复结果。
+func (r *runtimeImpl) handleTerminalOpenRequested(request *terminalOpenRequested) {
+	r.tasks.Go(func() {
+		// 1. 启动 shell，终端不随调用方的 ctx 取消；启动失败时工作区已由 pkg/terminal 关闭。
+		started, err := r.interactiveTerminals.StartTerminal(context.WithoutCancel(request.ctx), request.request)
+		if err != nil {
+			request.reply <- terminalOpenReply{err: err}
+			return
+		}
+		// 2. 登记所属对话，清掉已淘汰终端的记录，再唤醒订阅发布新列表。
+		r.terminalConversations.Store(started.GetInfo().ID, request.conversationID)
+		for _, terminalID := range r.terminalConversations.Keys() {
+			if _, err := r.interactiveTerminals.GetTerminalByID(terminalID); err != nil {
+				r.terminalConversations.Delete(terminalID)
+			}
+		}
+		signalChanged(r.terminalsChanged)
+		// 3. 回复已启动的终端、实际使用的 Executor 和起始目录。
+		request.reply <- terminalOpenReply{opened: &OpenedTerminal{
+			Terminal:   started,
+			ExecutorID: request.request.EnvironmentID,
+			Directory:  request.request.Directory,
+		}}
+	})
+}
+
+// GetTerminal 按编号查找已打开的终端。
+func (r *runtimeImpl) GetTerminal(_ context.Context, terminalID string) (terminal.Terminal, error) {
+	// 1. 在交互终端里查，找不到时返回 terminal.ErrTerminalNotFound。
+	return r.interactiveTerminals.GetTerminalByID(terminalID)
+}
+
+// SubscribeTerminals 经 Runtime 事件循环登记运行中终端的订阅。
+func (r *runtimeImpl) SubscribeTerminals(ctx context.Context) (*TerminalsSubscription, error) {
+	// 1. 提交订阅上下文，Runtime 停止或请求取消时返回错误。
+	request := &terminalsSubscribeRequested{ctx: ctx, reply: make(chan *TerminalsSubscription, 1)}
+	select {
+	case r.requests <- request:
+	case <-r.stopped:
+		return nil, ErrRuntimeStopped
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	// 2. 返回初始列表及之后的事件流。
+	return <-request.reply, nil
+}
+
+// handleTerminalsSubscribeRequested 登记运行中终端的订阅并读取初始列表。
+func (r *runtimeImpl) handleTerminalsSubscribeRequested(request *terminalsSubscribeRequested) {
+	// 1. 登记订阅和取消监听；取消请求交回 Runtime 事件循环处理。
+	stream := &subscriptionStream[[]RunningTerminal]{events: make(chan []RunningTerminal, subscriptionBufferSize)}
+	r.terminalSubscribers[stream] = &runtimeSubscriber{
+		stopWatching: context.AfterFunc(request.ctx, func() {
+			select {
+			case r.requests <- &terminalsUnsubscribeRequested{stream: stream, reason: context.Cause(request.ctx)}:
+			case <-r.stopped:
+			}
+		}),
+	}
+	// 2. 返回当前完整列表，留在唤醒通道中的变化由后续循环重新发布。
+	request.reply <- &TerminalsSubscription{
+		Initial: r.getRunningTerminals(),
+		Events:  stream.events,
+		stream:  stream,
+	}
+}
+
+// getRunningTerminals 按启动先后读取已登记且仍在运行的终端。
+func (r *runtimeImpl) getRunningTerminals() []RunningTerminal {
+	// 1. 只取 terminalConversations 里已登记、状态为 running 的终端，带上打开它的对话。
+	startedTerminals := r.interactiveTerminals.ListAllTerminals()
+	running := make([]RunningTerminal, 0, len(startedTerminals))
+	for _, startedTerminal := range startedTerminals {
+		info := startedTerminal.GetInfo()
+		conversationID, registered := r.terminalConversations.Load(info.ID)
+		if registered && info.Status == terminal.TerminalStatusRunning {
+			running = append(running, RunningTerminal{Info: info, ConversationID: conversationID})
+		}
+	}
+	return running
+}
+
+// publishRunningTerminals 重新读取完整列表并发送给已登记的订阅者。
+func (r *runtimeImpl) publishRunningTerminals() {
+	// 1. 没有订阅者时不读取。
+	if len(r.terminalSubscribers) == 0 {
+		return
+	}
+	// 2. 入队完整列表，缓冲已满的订阅以 ErrSubscriberTooSlow 关闭。
+	running := r.getRunningTerminals()
+	for stream := range r.terminalSubscribers {
+		select {
+		case stream.events <- running:
+		default:
+			removeSubscriber(r.terminalSubscribers, stream, ErrSubscriberTooSlow)
+		}
+	}
+}
+
+// stopConversationTerminals 结束一个对话打开的全部终端，每个最多等 terminalStopTimeout；失败只记 Warn。
+func (r *runtimeImpl) stopConversationTerminals(ctx context.Context, conversationID defs.ConversationID) {
+	// 1. 取出这个对话登记的终端编号。
+	var terminalIDs []string
+	r.terminalConversations.Range(func(terminalID string, terminalConversationID defs.ConversationID) bool {
+		if terminalConversationID == conversationID {
+			terminalIDs = append(terminalIDs, terminalID)
+		}
+		return true
+	})
+	// 2. 逐个限时结束；已被淘汰的终端跳过。
+	for _, terminalID := range terminalIDs {
+		conversationTerminal, err := r.interactiveTerminals.GetTerminalByID(terminalID)
+		if err != nil {
+			continue
+		}
+		stopCtx, cancel := context.WithTimeout(ctx, terminalStopTimeout)
+		_, err = conversationTerminal.Stop(stopCtx)
+		cancel()
+		if err != nil {
+			logCtx := defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: conversationID})
+			telemetry.GetLogger(logCtx).Warn("stop conversation terminal failed", "terminal.id", terminalID, "error", err)
+		}
+	}
+}
+
+// GetWorkspaceDirectories 使用当前 ExecutorProvider 查询工作区目录候选。
 func (r *runtimeImpl) GetWorkspaceDirectories(ctx context.Context, request *GetWorkspaceDirectoriesRequest) (*conversation.WorkspaceDirectories, error) {
-	// 1. 读取当前 Executor 定义，在本次临时工作区上列出目录。
-	executors := r.definitions.Load().conversationDefinitions.Executors
+	// 1. 向 ExecutorProvider 要没有对话时的列表，在本次临时工作区上列出目录。
+	executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, "")
+	if err != nil {
+		return nil, err
+	}
 	return conversation.GetWorkspaceDirectories(ctx, executors, request.ExecutorID, request.Directory, request.BaseDirectory)
 }
 
@@ -1027,7 +1297,7 @@ func (r *runtimeImpl) SetDefinitions(ctx context.Context, request *Definitions) 
 		}
 		tasks.Go(func() {
 			if err := running.conversation.SetDefinitions(ctx, definitions.conversationDefinitions); err != nil {
-				logCtx := telemetry.ContextWithAttrs(ctx, telemetry.ConversationID(string(conversationID)))
+				logCtx := defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: conversationID})
 				telemetry.GetLogger(logCtx).Warn("set conversation definitions failed", "error", err)
 			}
 		})
@@ -1123,7 +1393,7 @@ func (r *runtimeImpl) ListItems(ctx context.Context, request *ListItemsRequest) 
 	})
 }
 
-// IsIdle 所有已打开对话是否都没有运行中的 Turn 和后台命令？
+// IsIdle 所有已打开对话是否都没有运行中的 Turn 和后台命令，也没有没结束的交互终端？
 func (r *runtimeImpl) IsIdle(ctx context.Context) (bool, error) {
 	// 1. 经事件循环取得运行对话列表。
 	request := &runningConversationsRequested{reply: make(chan []*runtimeConversation, 1)}
@@ -1140,7 +1410,11 @@ func (r *runtimeImpl) IsIdle(ctx context.Context) (bool, error) {
 			return false, nil
 		}
 	}
-	// 3. 检查查询期间上下文是否结束，再返回空闲。
+	// 3. 对话都空闲后，还有没结束的交互终端时返回 false。
+	if r.interactiveTerminals.IsBusy() {
+		return false, nil
+	}
+	// 4. 检查查询期间上下文是否结束，再返回空闲。
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -1260,7 +1534,7 @@ func (r *runtimeImpl) handleConversationStartRequested(ctx context.Context, requ
 	// 3. 创建对话运行记录，有待更新的 Executor 设置时先保存。
 	runCtx, cancel := context.WithCancel(ctx)
 	running := newRuntimeConversation(
-		request.instance, cancel, record, query, mutation, r.definitions.Load(), request.unsavedStore, r.opt.UnsavedConversationIdleTimeout, r.runningChanged,
+		request.instance, cancel, record, query, mutation, r.definitions.Load(), request.unsavedStore, r.opt.UnsavedConversationIdleTimeout, r.opt.SavedConversationIdleTimeout, r.runningChanged,
 	)
 	if request.executorSettings != nil {
 		record.ExecutorSettings = *request.executorSettings
@@ -1275,7 +1549,7 @@ func (r *runtimeImpl) handleConversationStartRequested(ctx context.Context, requ
 		r.unsavedConversationStores.Store(conversationID, request.unsavedStore)
 	}
 	r.runningConversations[conversationID] = running
-	signalRunningConversationsChanged(r.runningChanged)
+	signalChanged(r.runningChanged)
 	telemetry.AddActiveConversations(ctx, 1)
 	r.tasks.Go(func() {
 		defer telemetry.AddActiveConversations(ctx, -1)
@@ -1335,7 +1609,7 @@ func (r *runtimeImpl) handleConversationStopped(ctx context.Context, request *co
 	}
 	// 2. 移除旧实例并关闭仍登记的内存库。
 	delete(r.runningConversations, id)
-	signalRunningConversationsChanged(r.runningChanged)
+	signalChanged(r.runningChanged)
 	r.discardUnsavedConversationStore(ctx, id)
 }
 
@@ -1368,7 +1642,7 @@ func (r *runtimeImpl) discardUnsavedConversationStore(ctx context.Context, conve
 	}
 	// 2. 关闭内存库，失败只记 Warn。
 	if err := store.database.Close(); err != nil {
-		logCtx := telemetry.ContextWithAttrs(ctx, telemetry.ConversationID(string(conversationID)))
+		logCtx := defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: conversationID})
 		telemetry.GetLogger(logCtx).Warn("close unsaved conversation database failed", "error", err)
 	}
 }
@@ -1446,4 +1720,15 @@ func (r *runtimeImpl) WithdrawInput(ctx context.Context, request *WithdrawInputR
 	}
 	// 2. 将操作交给对话根 Session。
 	return running.conversation.WithdrawInput(ctx, request.ItemID)
+}
+
+// AppendContextItems 把注入的 Item 交给对话根 Session。
+func (r *runtimeImpl) AppendContextItems(ctx context.Context, request *AppendContextItemsRequest) (err error) {
+	// 1. 取得运行对话。
+	running, err := r.getRunningConversation(ctx, request.ConversationID)
+	if err != nil {
+		return err
+	}
+	// 2. 将 Item 交给对话根 Session。
+	return running.conversation.AppendContextItems(ctx, request.Items)
 }

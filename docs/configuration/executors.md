@@ -8,10 +8,12 @@ Executors are a separate layer so that new kinds of environment can be added wit
 
 ## Built-in executors
 
-Two executors exist without any configuration:
+Three executors exist without any configuration:
 
 - **`local`** — the machine the runtime server runs on. Its working directory is chosen per conversation; see [Work location](#work-location).
 - **`openvaala`** — a built-in in-memory sandbox rooted at `/workspace`. Nothing it writes touches your disk, and its contents are reset whenever the conversation is reopened or reconfigured. It also holds the built-in documentation skill under `/skills/openvaala/`. Its shell is an embedded Bash interpreter with common file and text utilities (`cat`, `grep`, `sed`, `awk`, `jq`, `find`, `tar` and so on). It cannot run external programs, has no network access, and runs scripts with `bash <file>` rather than `./script`.
+
+- **`memory`** — the cross-conversation [memory](extensions.md#memory) stored on the runtime server's machine. It only reads and writes files, so it has no `bash`, and it runs no hooks. It has no working directory and cannot be the default executor. To turn memory off for one conversation, uncheck `memory` in that conversation's available executors.
 
 ## Add executors
 
@@ -67,12 +69,12 @@ The model chooses executors by their `description`, so say what each one is for.
 
 ### Fields
 
-- `id` — required, matching the file name. `local`, `client` and `openvaala` are reserved.
+- `id` — required, matching the file name. `local`, `client`, `openvaala` and `memory` are reserved.
 - `kind` — `local` (a directory on the runtime server's machine), `virtual` (an in-memory sandbox like `openvaala`) or `ssh` (a remote machine).
 - `description` — required. Shown to the model.
 - `workspace_directory` — the executor's default root directory:
   - `local`: an existing absolute path, or one starting with `~`.
-  - `virtual`: an absolute path inside the sandbox; default `/workspace`.
+  - `virtual`: an absolute path inside the sandbox; default `/workspace`. Files live only in memory: restarting serve, reloading the configuration and the idle stop of a conversation (see `server.conversation_idle_timeout`) all clear them.
   - `ssh`: an absolute path on the remote machine.
 - `ssh` — connection settings, only for `kind: ssh`:
   - `address` — `[user@]host[:port]`. The user defaults to your local user name and the port to 22.
@@ -126,17 +128,18 @@ File and command tools exist once per available executor. When a tool is offered
 
 So within one turn, the agent can read a file on `local`, run the tests on `buildbox` and check a log on `staging`:
 
-<!-- scene: unified-runtime | One conversation, tool calls on three machines -->
+<!-- scene: executor-routing | Same-name tools merge into one; the executor argument picks the machine -->
 ```text
-          one conversation
-   (agent loop in the runtime server)
-                  │
-     ┌────────────┼─────────────┐
-     ▼            ▼             ▼
-   local       buildbox       staging
- (this host)    (ssh)          (ssh)
- read_file    bash:          bash:
- src/app.go   make test      tail app.log
+  local (default)     buildbox (ssh)      staging (ssh)
+  read_file  bash     read_file  bash     read_file  bash
+        └───────────────────┼───────────────────┘
+                            ▼
+  the model sees one read_file and one bash, each with
+  executor: local | buildbox | staging
+                            │
+  read_file src/app.go                  ──▶ local      (no executor: the default)
+  bash make test,    executor=buildbox  ──▶ buildbox
+  bash tail app.log, executor=staging   ──▶ staging
 ```
 
 Subagents share the conversation's executors. To keep a conversation on one machine, make only that executor available.

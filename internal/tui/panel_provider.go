@@ -619,7 +619,7 @@ func (p *providerPanel) submitForm(m *tuiModel) tea.Cmd {
 
 // getFormProvider 用连接表单的内容生成 Provider 配置。
 func (p *providerPanel) getFormProvider() defs.ProviderConfig {
-	// 1. 读取表单字段，不含模型；key 留空时使用原 key，编辑时保留原 endpoints。
+	// 1. 读取表单字段，不含模型；key 留空时使用原 key，编辑时保留原 endpoints 和 headers。
 	provider := defs.ProviderConfig{
 		ID:       p.form.id,
 		Protocol: p.form.protocol,
@@ -628,6 +628,7 @@ func (p *providerPanel) getFormProvider() defs.ProviderConfig {
 	}
 	if p.editedProvider != nil {
 		provider.Endpoints = p.editedProvider.Endpoints
+		provider.Headers = p.editedProvider.Headers
 	}
 	return provider
 }

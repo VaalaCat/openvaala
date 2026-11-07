@@ -27,8 +27,9 @@
 - 从 frp-panel `arch-refactor` 拷来的基础组件和 lib（`components/base`、`lib/clipboard.ts`、`lib/draft-baseline.ts` 等）已归本项目维护，按本项目需要直接改。
 - 同一种展示只做一个组件，第二处要用时先提取，不复制。
 - 消息显示由 `itemRenderers`、`toolRenderers` 两张表决定：新增 Item 类型或工具只在 `items/`、`tools/` 加一个文件，并在表里登记一行。
-- 加载转圈统一改用 `base/lattice-loader.tsx`；思考／过程聚合仅保留已有文字 shimmer，不叠加格点。减少动画时用静态图形，不引入计时器或成功标记。
-- 服务器与对话共用 `base/status-dot.tsx`；运行波纹用 `motion/react`，服务器手动重连期间原位旋转 Refresh，减少动画时静态。图标变形仍用 Morphicons。
+- 加载转圈统一改用 `base/lattice-loader.tsx`；思考／过程聚合仅保留已有文字 shimmer，不叠加格点，不引入计时器或成功标记。
+- 服务器与对话共用 `base/status-dot.tsx`；运行波纹用 `motion/react`，服务器手动重连期间原位旋转 Refresh。图标变形仍用 Morphicons。
+- 不提供「减少动画」功能，也不按系统偏好关闭动画；保留流式追加、历史恢复等业务场景原有的即时更新。
 
 ## 边距和换行
 
@@ -38,12 +39,16 @@
 - 要对齐的区域放进同一个容器共享宽度，例如输入区和消息共用消息列，不按滚动条宽度单独补偿。
 - 文字只用文字角色类（见下节）。
 - Markdown 正文 `overflow-wrap: anywhere`；代码、工具输出、JSON 不折行，横向滚动。
+- 横向滚动只留在代码、JSON、图片条等内容块内，不带动页面和消息列；复制提示等绝对定位的隐藏内容由控件自身承接定位。
 - ID、路径、模型名单行省略，真被截断时才用 `OverflowTooltip` 显示完整文本；工具标题后的参数摘要是例外：始终单行省略、不加 Tooltip／原生 title，完整参数在展开详情阅读。
 - 过程标题的类型／展开图标共用 16px 位置，用 Morphicons 原位变形；异常状态独立，不显示时不占位，摘要直接接上。触屏不做特化：收起默认业务图标，hover／键盘聚焦时右箭头，展开后下箭头；调试／链接／状态说明不嵌进展开按钮。
+- 工具结果图片在收起的过程聚合下方横向排列；展开后归入各自条目。复用 `ImagePreviewStrip`，缩略图最高 160px，不换行堆高；实际读到图片时在 read_file 文件名前显示图片图标。
+- 模型回复复制按 Turn 选择最后一条有文字且已保存的回复；运行中的轮次隐藏本轮入口，不移除旧轮复制。用户消息的复制独立保留。
 
 ## 文字角色
 
 字号、行高、字体和字重集中在 `src/index.css` 维护。页面和组件按用途选文字角色，不写 `text-xs`、`text-sm`、`text-[…]`、`fontSize`、`font-family`，也不用零散的 `leading-*` 调排版。
+可调阅读和终端数值的默认值、范围由 `lib/appearance/preferences.ts` 维护；CSS 角色读取变量，xterm 使用同一份终端偏好。
 
 - `text-title`：页面主标题，16px / 24px，标题字体、中等字重。
 - `text-section`：内部章节、卡片、弹窗、空状态标题，14px / 24px，标题字体、中等字重。
@@ -52,8 +57,13 @@
 - `text-table`：列表和详情字段的值、名称、地址，14px / 20px，正文字体。
 - `text-caption`：时间、辅助说明、校验说明、浮层提示、一般辅助状态，12px / 16px，正文字体。
 - `text-token`：紧凑 token 用量，12px / 20px，正文字体、等宽数字。
-- `text-code`：代码、工具输出、JSON，12px / 20px，等宽字体。
+- `text-code`：文件名、路径摘要、快捷键等固定界面文字，12px / 20px，等宽字体。
+- `text-reading`：用户消息、模型回复和展开的正文内容，默认 14px / 24px，跟随「外观 → 正文」。
+- `text-code-reading`：代码、工具原始输出和 JSON 阅读内容，默认 12px / 20px，跟随「外观 → 代码」；代码块内边距用 `code-padding`。文件名摘要、快捷键等固定界面文字仍用 `text-code`。
 
+- 移动端保持小字：输入框、文本域、按钮和选项与桌面统一 14px，不按屏宽单独放大；辅助文字、token 和代码仍用各自角色。
+- iOS 在入口设置 `maximum-scale=1` 抑制输入聚焦时的自动缩放；不全局设置 `user-scalable=no`，不限制 Android 和桌面的手动缩放。
+- 外观调整即时生效并在当前浏览器保存；正文、代码与终端分别调整，不改变普通控件字号。终端默认 13px / 1.1 倍行高，修改后更新 xterm 并重新计算行列，不重启 shell。
 - 官方组件也要显式接入文字角色：`CardTitle`、`DialogTitle`、`AlertDialogTitle`、`AlertTitle`、`EmptyTitle` 用 `text-section`；`DialogContent` 和段落正文容器用 `text-body`；`FieldLabel` 用 `text-ui`；各类 `Description`、`FieldError` 和 `TooltipContent` 用 `text-caption`。工具动作与主要状态用 `text-ui`，不缩成辅助字号。
 - token 展示只用 `components/base/token-number-value.tsx` 的 `TokenNumberValue`；非 token 数量、数字输入框、正文、输出和原始数据不因此格式化。按钮及选项内用 `interactive={false}`，完整值在对应详情提供。
 
@@ -90,6 +100,8 @@
 - 多字段表单统一字段起点和控件边缘，横向排列时顶部对齐。
 - 焦点描边、错误边框和输入附属按钮的焦点状态完整可见，不被相邻边框或 `overflow` 裁切。
 - 禁用的图标按钮需要说明原因时用 Base UI `focusableWhenDisabled` 保留悬停和键盘提示，不改官方组件。
+- 模型选择的弹层形态按视口决定：手机用 Drawer，桌面用锚定浮层；容器宽度只决定入口合并、文字省略和排布，桌面窄 Tab 不切手机抽屉。
+- JSON 用一个按钮切换「全部展开／全部折叠」，按实际节点状态显示下一步动作；字符串的解析与全文展开仍各自独立，不改变复制的原始值。调试记录使用右栏剩余高度、内部滚动；消息里的代码和工具输出保留默认限高。
 
 ## 操作反馈
 

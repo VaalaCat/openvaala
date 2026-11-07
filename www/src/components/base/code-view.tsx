@@ -22,7 +22,7 @@ export function CodeView({
   const lines = useMemo(() => text.split("\n"), [text])
   return (
     <OutputBlock copyValue={code} maxHeight={maxHeight} heightMode={heightMode}>
-      <pre className="w-max min-w-full px-3 py-2 text-code">
+      <pre className="w-max min-w-full code-padding text-code-reading">
         {lines.map((line, index) => (
           <Fragment key={index}>
             {index > 0 && "\n"}

@@ -1,3 +1,4 @@
+import { chromium } from "@playwright/test"
 import {
   expect,
   getComposer,
@@ -134,8 +135,8 @@ test("composer_compact_pending_and_stop", async ({ page, fixture }) => {
   await expect(rows).toHaveCount(2)
   await expect(toolbar.locator('button[aria-label="排队"]')).toHaveCount(0)
 
-  // 4. 宽屏和最窄屏各检查一遍：每行 32px、文字与输入文字同一起点；收起后标题行预览下一条，消息视口不变且仍贴底；
-  //    操作栏单行且没有待处理入口；输入框上方可见的每个文字行都不被托盘或按钮覆盖（输入框下面被遮住是设计）。
+  // 4. 宽屏和最窄屏各检查一遍：每行 32px、文字与输入文字同一起点；收起后标题行预览下一条，消息视口多出输入框少掉的高度且仍贴底；
+  //    操作栏单行且没有待处理入口；消息区可见的每个文字行都不被托盘或按钮覆盖。
   for (const { width, colorScheme } of [
     { width: 1280, colorScheme: "light" },
     { width: 390, colorScheme: "dark" },
@@ -143,7 +144,7 @@ test("composer_compact_pending_and_stop", async ({ page, fixture }) => {
   ] as const) {
     await page.setViewportSize({ width, height: 844 })
     await page.emulateMedia({ colorScheme })
-    await expect(composer).toHaveCSS("font-size", width < 768 ? "16px" : "14px")
+    await expect(composer).toHaveCSS("font-size", "14px")
     // 左组与右组各自紧凑排列；输入出现排队按钮后也保持方形、4px间距和同一行。
     const model = toolbar.locator('[aria-label="模型"]')
     const context = toolbar.getByRole("button", { name: /^上下文占用：/ })
@@ -227,7 +228,7 @@ test("composer_compact_pending_and_stop", async ({ page, fixture }) => {
     await expect(toolbar.locator('[aria-label="模型"]')).toContainText(
       longModelName
     )
-    // 先量展开时的输入框和消息视口，收起后输入框少 64px、视口不变。
+    // 先量展开时的输入框和消息视口，收起后输入框少 64px、消息视口多 64px。
     const inputHeight = (await inputGroup.boundingBox())!.height
     const viewportHeight = await getViewportHeight()
     await expect.poll(getBottomGap).toBeLessThanOrEqual(1)
@@ -240,7 +241,7 @@ test("composer_compact_pending_and_stop", async ({ page, fixture }) => {
         Math.round(inputHeight - (await inputGroup.boundingBox())!.height)
       )
       .toBe(64)
-    expect(await getViewportHeight()).toBe(viewportHeight)
+    await expect.poll(getViewportHeight).toBe(viewportHeight + 64)
     await expect(composer).toHaveCSS("height", "40px")
     await expect.poll(getBottomGap).toBeLessThanOrEqual(1)
 
@@ -253,7 +254,7 @@ test("composer_compact_pending_and_stop", async ({ page, fixture }) => {
             Math.round((await inputGroup.boundingBox())!.height)
           )
           .toBe(Math.round(inputHeight))
-        expect(await getViewportHeight()).toBe(viewportHeight)
+        await expect.poll(getViewportHeight).toBe(viewportHeight)
       }
       // 输入框贴在消息区底部；回到底部后，托盘标题在输入框内部、消息正文的下方。
       await scroller.evaluate((node) => {
@@ -296,11 +297,11 @@ test("composer_compact_pending_and_stop", async ({ page, fixture }) => {
         )
       ).toBe(true)
       const samples = await messages.evaluate((region) => {
-        // 只看消息区可视区顶部到输入框所在 form 顶部之间的行。
+        // 输入区在滚动容器外面，消息区可视区里的每一行都不应被它的按钮或托盘盖住。
         const viewport = region.closest('[data-slot="message-scroller"]')!
         const clip = {
           top: viewport.getBoundingClientRect().top,
-          bottom: viewport.querySelector("form")!.getBoundingClientRect().top,
+          bottom: viewport.getBoundingClientRect().bottom,
         }
         return [...region.querySelectorAll("p")].flatMap((paragraph) => {
           const range = document.createRange()
@@ -402,4 +403,74 @@ test("composer_compact_pending_and_stop", async ({ page, fixture }) => {
   await page.mouse.move(0, 0)
   await expect(send).toHaveCSS("background-color", sendBackground)
   await expect(composer).toHaveCSS("height", "40px")
+})
+
+test("composer_is_outside_the_scroller_and_shares_the_message_column_edges", async ({
+  fixture,
+}) => {
+  // 1. 无头浏览器默认隐藏滚动条，这里自己起一个显示经典滚动条的浏览器：消息区和输入区各保留一条滚动条槽，对齐才真正经过检验。
+  const browser = await chromium.launch({
+    ignoreDefaultArgs: ["--hide-scrollbars"],
+  })
+  try {
+    const page = await browser.newPage({ locale: "zh-CN" })
+    await fixture.replies({
+      text: Array.from(
+        { length: 32 },
+        (_, index) => `可继续阅读的正文 ${index}。`
+      ).join("\n\n"),
+    })
+    await fixture.openApp(page)
+    await startConversation(page, "输入区在滚动容器外")
+    await expect(
+      getMessages(page).getByText("可继续阅读的正文 31。", { exact: true })
+    ).toBeVisible()
+
+    // 2. 输入框不在消息滚动容器里：消息区回弹（浏览器的弹性过卷）只动消息，不带着输入框动。
+    //    触控板的真实回弹无法在自动化里模拟，这里检查 DOM 结构和布局。
+    const scroller = getMessageScroller(page)
+    const composer = getComposer(page)
+    await expect(scroller.getByRole("textbox", { name: "消息" })).toHaveCount(0)
+    expect(
+      await composer.evaluate((node) =>
+        node.closest('[data-slot="message-scroller"]')
+      )
+    ).toBeNull()
+    await expect(scroller).toHaveCSS("overscroll-behavior-y", "contain")
+
+    // 3. 1920 时消息列居中且受最大宽度限制，1280 时填满，390 是手机：输入框左右边缘和消息列内容边缘相差不超过 1px。
+    const inputGroup = composer.locator(
+      'xpath=ancestor::*[@data-slot="input-group"][1]'
+    )
+    for (const width of [1920, 1280, 390]) {
+      await page.setViewportSize({ width, height: 844 })
+      // 消息区确实保留了滚动条槽，否则下面的对齐没有检验意义。
+      await expect
+        .poll(() =>
+          scroller.evaluate(
+            (node) => node.getBoundingClientRect().width - node.clientWidth
+          )
+        )
+        .toBeGreaterThan(0)
+      await scroller.evaluate((node) => {
+        node.scrollTop = node.scrollHeight
+      })
+      const message = (await getMessages(page).boundingBox())!
+      const input = (await inputGroup.boundingBox())!
+      expect(Math.abs(input.x - message.x)).toBeLessThanOrEqual(1)
+      expect(
+        Math.abs(input.x + input.width - (message.x + message.width))
+      ).toBeLessThanOrEqual(1)
+      // 输入框在消息区下沿的下方，不重叠。
+      const scrollerBounds = (await scroller.boundingBox())!
+      expect(input.y).toBeGreaterThanOrEqual(
+        scrollerBounds.y + scrollerBounds.height
+      )
+      await page.screenshot({
+        path: test.info().outputPath(`${width}-outside-scroller.png`),
+      })
+    }
+  } finally {
+    await browser.close()
+  }
 })

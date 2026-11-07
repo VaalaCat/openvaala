@@ -129,7 +129,6 @@ export function ArchivedConversationsPage() {
                 <ConversationActions
                   conversation={conversation}
                   name={name}
-                  isOpened={false}
                   trigger={
                     <Button variant="ghost" size="icon" className="text-ui" />
                   }

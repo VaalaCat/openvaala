@@ -1,5 +1,5 @@
 import { Skeleton } from "@/components/ui/skeleton"
-import { motion, useReducedMotion } from "motion/react"
+import { motion } from "motion/react"
 import { useIsMobile } from "@/hooks/use-mobile"
 import {
   Tooltip,
@@ -10,13 +10,13 @@ import type { ParseKeys } from "i18next"
 import { XIcon } from "lucide-react"
 import { useStore } from "@nanostores/react"
 import { useTranslation } from "react-i18next"
-import { ScrollableTabsList } from "@/components/base/scrollable-tabs-list"
+import { TabBar } from "@/components/base/tab-bar"
 import { AgentsTree } from "@/components/conversation/agents-tree"
 import { ContextTab } from "@/components/conversation/context-tab"
 import { ItemDebugTab } from "@/components/conversation/item-debug-tab"
 import { TurnsTab } from "@/components/conversation/turns-tab"
 import { RpcLogPanel } from "@/components/debug/rpc-log-panel"
-import { Tabs, TabsContent, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import type { ConversationSync } from "@/lib/api/conversation-sync"
 import type { ItemDebugTarget, MessageRow } from "@/lib/item-renderers"
@@ -49,7 +49,6 @@ export function RightPanel({
   messageRows: MessageRow[]
 }) {
   const { t } = useTranslation()
-  const reduceMotion = useReducedMotion()
   const isMobile = useIsMobile()
   const tab = useStore($rightPanelTab)
   const targetKey = isReady
@@ -61,41 +60,44 @@ export function RightPanel({
       onValueChange={(next: RightPanelTab) => $rightPanelTab.set(next)}
       className="h-full min-h-0 min-w-0 gap-0"
     >
-      <div className="flex shrink-0 items-start gap-2 border-b p-3 [&>div]:pb-0">
-        <ScrollableTabsList>
+      <TabBar
+        actions={
+          <Tooltip disabled={isMobile}>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="shrink-0"
+                  aria-label={t("conversation.panel.close")}
+                  onClick={onClose}
+                />
+              }
+            >
+              <XIcon />
+            </TooltipTrigger>
+            <TooltipContent className="text-caption">
+              {t("conversation.panel.close")}
+            </TooltipContent>
+          </Tooltip>
+        }
+      >
+        <TabsList>
           {Object.entries(tabLabelKeys).map(([value, labelKey]) => (
             <TabsTrigger key={value} value={value} className="text-ui">
               {t(labelKey)}
             </TabsTrigger>
           ))}
-        </ScrollableTabsList>
-        <Tooltip disabled={isMobile}>
-          <TooltipTrigger
-            render={
-              <Button
-                variant="ghost"
-                size="icon"
-                className="ml-auto shrink-0"
-                aria-label={t("conversation.panel.close")}
-                onClick={onClose}
-              />
-            }
-          >
-            <XIcon />
-          </TooltipTrigger>
-          <TooltipContent className="text-caption">
-            {t("conversation.panel.close")}
-          </TooltipContent>
-        </Tooltip>
-      </div>
+        </TabsList>
+      </TabBar>
       {!isReady && tab !== "rpc" && <Skeleton className="m-3 h-28" />}
       {(isReady || tab === "rpc") && (
         <motion.div
           key={`${tab}:${targetKey}`}
           className="flex min-h-0 min-w-0 flex-1 flex-col"
-          initial={reduceMotion ? false : { opacity: 0 }}
+          initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          transition={{ duration: reduceMotion ? 0 : 0.12 }}
+          transition={{ duration: 0.12 }}
         >
           <TabsContent
             value="agents"

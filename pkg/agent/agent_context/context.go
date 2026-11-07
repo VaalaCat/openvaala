@@ -41,6 +41,8 @@ type AgentContext interface {
 	IsCompacted() bool
 	// IsAgentsInstructionLoaded 当前历史里是否已有这个 Executor 下这个路径的目录规则？
 	IsAgentsInstructionLoaded(executorID, path string) bool
+	// IsMemoryIndexLoaded 当前历史里是否已有这个路径、这个项目的记忆目录？
+	IsMemoryIndexLoaded(path, project string) bool
 }
 
 // agentContextImpl 保存模型配置、指令和本轮有序历史。
@@ -394,6 +396,17 @@ func (c *agentContextImpl) IsAgentsInstructionLoaded(executorID, path string) bo
 	for _, item := range c.items {
 		if item.Kind == defs.ItemAgentsInstruction && item.AgentsInstruction != nil &&
 			item.AgentsInstruction.Executor == executorID && item.AgentsInstruction.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// IsMemoryIndexLoaded 当前历史里是否已有这个路径、这个项目的记忆目录？
+func (c *agentContextImpl) IsMemoryIndexLoaded(path, project string) bool {
+	// 1. 查找路径和项目都匹配的记忆目录 Item。
+	for _, item := range c.items {
+		if item.Kind == defs.ItemMemoryIndex && item.MemoryIndex != nil && item.MemoryIndex.Path == path && item.MemoryIndex.Project == project {
 			return true
 		}
 	}

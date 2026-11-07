@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/VaalaCat/openvaala/pkg/defs"
 )
 
 // TestAppServerStartupConfig 检查桌面启动查询只输出配置 JSON。
@@ -44,9 +46,8 @@ func TestAppServerStartupConfig(t *testing.T) {
 			t.Setenv("OPENVAALA_CLIENT_URL", "ws://127.0.0.1:1/api/v1/openvaala")
 			var output, stderr bytes.Buffer
 			root := NewCLI(&CLIOpt{
-				Stdout:  &output,
-				Stderr:  &stderr,
-				Version: "dev-startup-test",
+				Stdout: &output,
+				Stderr: &stderr,
 			})
 			root.SetArgs(tt.arguments)
 			if err := root.ExecuteContext(t.Context()); err != nil {
@@ -56,7 +57,7 @@ func TestAppServerStartupConfig(t *testing.T) {
 			if err := json.Unmarshal(output.Bytes(), &got); err != nil {
 				t.Fatalf("startup output is not one JSON object: %v; output=%q", err, output.String())
 			}
-			if got["appServerVersion"] != "dev-startup-test" {
+			if got["appServerVersion"] != defs.GetBuildVersion() {
 				t.Fatalf("appServerVersion = %v", got["appServerVersion"])
 			}
 			requirements, ok := got["configRequirements"].(map[string]any)

@@ -23,8 +23,6 @@ var (
 	ErrForkBoundaryConflict = errors.New("fork accepts at most one of before turn and last turn")
 	// ErrForkTurnNotFound 是指定的轮次不在来源根 Session 里时 ForkConversation 返回的错误。
 	ErrForkTurnNotFound = errors.New("fork turn was not found in the root session")
-	// ErrForkTurnRunning 是 LastTurnID 指向的轮次还没结束时 ForkConversation 返回的错误。
-	ErrForkTurnRunning = errors.New("fork turn is still running")
 	// ErrNothingToFork 是截取点之前没有可复制的轮次时 ForkConversation 返回的错误。
 	ErrNothingToFork = errors.New("nothing to fork before the requested turn")
 )
@@ -56,8 +54,8 @@ type ConversationDefinitions struct {
 	MCPServers []*mcpclient.ServerDefinition
 	// Hooks 是本对话使用的 hook，nil 表示没有 hook。
 	Hooks hook.Hooks
-	// Executors 是全部 Executor 定义，按 local、builtin、配置的顺序；对话按自己的 Executor 设置从中选出可用的建执行环境。
-	Executors []*defs.ExecutorDefinition
+	// Executors 决定本对话能用哪些 Executor，不能为 nil，由 Runtime 保证；对话按自己的 Executor 设置从中选出可用的建执行环境。
+	Executors executor.ExecutorProvider
 	// Skills 是所有对话共用的 skill；和项目目录、主目录里的 skill 同名时，项目目录的优先，其次是这里的，主目录的最后。
 	Skills []*skill.Skill
 }
@@ -144,8 +142,10 @@ type conversationConfig struct {
 	// environments 是按 settings 建出的执行环境，第一个为默认，这套配置下的全部 Session 共用；
 	// 它们的 MCP 连接由 Run 在换上这套配置时启动，换走或 Run 返回前停止。
 	environments []executor.ExecutionEnvironment
-	// sshWorkspaces 是这套配置建的 SSH 工作区，只属于本对话；停掉这套执行环境后关闭，没换上就被丢弃的配置由丢弃方关闭。
-	sshWorkspaces []workspace.SSHWorkspace
+	// executors 是装配时 GetExecutors 返回的列表，Session 详情从这里取种类。
+	executors []executor.Executor
+	// workspaces 是这套配置建的全部工作区，只属于本对话；停掉这套执行环境后关闭，没换上就被丢弃的配置由丢弃方关闭。
+	workspaces []workspace.Workspace
 	// skills 是项目目录、definitions.Skills、主目录三段按顺序去重后的 skill，按名字排序；各 Agent 按 SkillNames 选择。
 	skills []*skill.Skill
 	// sessionsCtx 是这套配置下全部 Session 共用的 ctx，派生自 Run 的 ctx。
@@ -158,7 +158,7 @@ type conversationConfig struct {
 
 // configChange 由 SetExecutorSettings 或 SetDefinitions 在新配置装配完成后交给 Run。
 type configChange struct {
-	// base 是装配新配置时读到的当前配置；Run 收到时当前配置已经不是它，就回复 errConfigChanged 并关闭 next 的 SSH 工作区。
+	// base 是装配新配置时读到的当前配置；Run 收到时当前配置已经不是它，就回复 errConfigChanged 并关闭 next 的工作区。
 	base *conversationConfig
 	// next 是装配好的新配置。
 	next *conversationConfig
@@ -310,11 +310,13 @@ type SessionDetails struct {
 	Tools []string `json:"tools"`
 }
 
-// ExecutorDetails 是一个 Executor 的展示字段：ID、说明和工作区根目录。
+// ExecutorDetails 是一个 Executor 的展示字段：ID、种类、说明和工作区根目录。
 type ExecutorDetails struct {
-	ID                 string `json:"id"`
-	Description        string `json:"description,omitempty"`
-	WorkspaceDirectory string `json:"workspace_directory,omitempty"`
+	ID string `json:"id"`
+	// Kind 是 Executor 的种类；界面选默认 Executor 时用它去掉 memory。
+	Kind               defs.ExecutorKind `json:"kind"`
+	Description        string            `json:"description,omitempty"`
+	WorkspaceDirectory string            `json:"workspace_directory,omitempty"`
 }
 
 // MCPServerInfo 是对话里一个执行环境上的一个 MCP 连接；客户端登记的 ExecutorID 为 defs.ClientExecutorID。

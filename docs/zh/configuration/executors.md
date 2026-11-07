@@ -8,10 +8,12 @@ Executor 是单独的一层，以后加入新的执行环境时，Agent 的工�
 
 ## 内置 Executor
 
-不做任何配置就有两个 Executor：
+不做任何配置就有三个 Executor：
 
 - **`local`**：Runtime 服务运行的那台机器。它的工作目录按对话选择，见[工作位置](#工作位置)。
 - **`openvaala`**：内置的内存沙箱，根目录是 `/workspace`。它写的任何东西都不会落到你的磁盘上，对话重新打开或重新配置时内容会被重置。内置的文档 skill 也放在它的 `/skills/openvaala/` 下。它的 shell 是一个内嵌的 Bash 解释器，带常用的文件和文本工具（`cat`、`grep`、`sed`、`awk`、`jq`、`find`、`tar` 等）。它不能运行外部程序，不能联网，运行脚本要用 `bash <file>`，不能用 `./script`。
+
+- **`memory`**：存在 Runtime 服务所在机器上的跨对话[记忆](extensions.md#记忆)。它只能读写文件，所以没有 `bash`，也不跑 hook。它没有工作目录，不能当默认 Executor。想在某个对话里关掉记忆，到这个对话的可用 Executor 里取消勾选 `memory`。
 
 ## 添加 Executor
 
@@ -67,12 +69,12 @@ workspace_directory: ~/notes
 
 ### 字段
 
-- `id`：必填，和文件名一致。`local`、`client` 和 `openvaala` 是保留的。
+- `id`：必填，和文件名一致。`local`、`client`、`openvaala` 和 `memory` 是保留的。
 - `kind`：`local`（Runtime 服务所在机器上的一个目录）、`virtual`（和 `openvaala` 一样的内存沙箱）或 `ssh`（远端机器）。
 - `description`：必填，会显示给模型。
 - `workspace_directory`：Executor 默认的根目录：
   - `local`：已存在的绝对路径，或者以 `~` 开头。
-  - `virtual`：沙箱里的绝对路径；默认 `/workspace`。
+  - `virtual`：沙箱里的绝对路径；默认 `/workspace`。文件只在内存里：重启 serve、重新加载配置和对话空闲关闭（见 `server.conversation_idle_timeout`）都会清空它们。
   - `ssh`：远端机器上的绝对路径。
 - `ssh`：连接设置，只用于 `kind: ssh`：
   - `address`：`[user@]host[:port]`。用户名默认是你本机的用户名，端口默认 22。
@@ -126,17 +128,18 @@ workspace_directory: ~/notes
 
 所以在同一轮里，Agent 可以在 `local` 上读文件、在 `buildbox` 上跑测试、在 `staging` 上查日志：
 
-<!-- scene: unified-runtime | 一个对话，工具调用落在三台机器上 -->
+<!-- scene: executor-routing | 同名工具合并成一个，executor 参数决定在哪台机器执行 -->
 ```text
-          一个对话
-   （Agent 主循环在 Runtime 服务里）
-                  │
-     ┌────────────┼─────────────┐
-     ▼            ▼             ▼
-   local       buildbox       staging
- (this host)    (ssh)          (ssh)
- read_file    bash:          bash:
- src/app.go   make test      tail app.log
+  local（默认）       buildbox（ssh）     staging（ssh）
+  read_file  bash     read_file  bash     read_file  bash
+        └───────────────────┼───────────────────┘
+                            ▼
+  模型看到的是一个 read_file 和一个 bash，都多一个参数
+  executor: local | buildbox | staging
+                            │
+  read_file src/app.go                  ──▶ local      （不写 executor，用默认的）
+  bash make test，executor=buildbox     ──▶ buildbox
+  bash tail app.log，executor=staging   ──▶ staging
 ```
 
 子 Agent 和对话共用同一批 Executor。想让一个对话只在一台机器上工作，就只让那个 Executor 可用。

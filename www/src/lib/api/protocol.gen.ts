@@ -88,12 +88,28 @@ export interface AgentToolProgress {
 
 // From defs/item.go
 /**
- * AgentsInstruction 是某个 Executor 上一份 AGENTS.md 的路径和正文。
+ * AgentsInstruction 是某个 Executor 上一份 AGENTS.md 的路径、正文和适用范围。
  */
 export interface AgentsInstruction {
     executor: string;
     path: string;
     text: string;
+    /**
+     * IsGlobal 是否为适用于本 Executor 全部工作区的用户级规则？
+     */
+    is_global?: boolean;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * AppendContextItemsParams 是 conversation/appendContextItems 的参数。
+ */
+export interface AppendContextItemsParams {
+    conversation_id: ConversationID;
+    /**
+     * Items 可以是任何不需要模型调用、也不由运行时自己写入的种类，载荷必须有效；ID 由调用方生成，还没分配 turn_id 和 model_call_id。
+     */
+    items: (Item | null)[];
 }
 
 // From defs/provider.go
@@ -115,6 +131,14 @@ export interface CatalogProvider {
 export interface ClientInfo {
     name: string;
     version?: string;
+}
+
+// From defs/item.go
+/**
+ * ClientInstruction 是客户端写进上下文的一段指令，例如旁支的「之前的历史只作参考，别接着做」。
+ */
+export interface ClientInstruction {
+    text: string;
 }
 
 // From runtimeprotocol/types.go
@@ -348,9 +372,13 @@ export interface CreateConversationParams {
      */
     environment?: string[];
     /**
-     * Ephemeral 是否建临时对话？临时对话不装配，没有 Executor 和 Skill，executor_settings 原样记下但不生效，environment 忽略。
+     * Ephemeral 是否建临时对话？临时对话只在内存里，不进对话列表，没人用时丢弃。
      */
     ephemeral?: boolean;
+    /**
+     * WithoutExecutors 是否不装配 Executor 和 Skill？为 true 时 executor_settings 原样记下但不生效，environment 忽略。
+     */
+    without_executors?: boolean;
 }
 
 // From storage/page.go
@@ -381,13 +409,23 @@ export type ExecutionStreamType = "terminal";
 
 // From conversation/types.go
 /**
- * ExecutorDetails 是一个 Executor 的展示字段：ID、说明和工作区根目录。
+ * ExecutorDetails 是一个 Executor 的展示字段：ID、种类、说明和工作区根目录。
  */
 export interface ExecutorDetails {
     id: string;
+    /**
+     * Kind 是 Executor 的种类；界面选默认 Executor 时用它去掉 memory。
+     */
+    kind: ExecutorKind;
     description?: string;
     workspace_directory?: string;
 }
+
+// From defs/executor.go
+/**
+ * ExecutorKind 是 Executor 的种类；自定义 Executor 可以用自己的种类。
+ */
+export type ExecutorKind = "local" | "memory" | "ssh" | "virtual";
 
 // From defs/conversation.go
 /**
@@ -427,7 +465,7 @@ export interface ExecutorsChange {
 export interface ForkConversationParams {
     conversation_id: ConversationID;
     /**
-     * BeforeTurnID 复制到这一轮之前（不含），LastTurnID 复制到这一轮（含）；最多给一个，都不给时复制全部已结束的轮次。
+     * BeforeTurnID 复制到这一轮之前（不含），LastTurnID 复制到这一轮（含）；最多给一个，都不给时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
      */
     before_turn_id?: TurnID;
     last_turn_id?: TurnID;
@@ -440,6 +478,10 @@ export interface ForkConversationParams {
      */
     executor_settings: ExecutorSettings;
     environment?: string[];
+    /**
+     * Ephemeral 是否分叉成临时对话？临时对话只在内存里，不进对话列表，没人用时丢弃。
+     */
+    ephemeral?: boolean;
 }
 
 // From runtimeprotocol/types.go
@@ -659,6 +701,8 @@ export interface Item {
     executors_change?: ExecutorsChange;
     skill_instruction?: SkillInstruction;
     agents_instruction?: AgentsInstruction;
+    memory_index?: MemoryIndex;
+    client_instruction?: ClientInstruction;
     hook_run?: HookRun;
 }
 
@@ -684,7 +728,7 @@ export type ItemID = string;
 /**
  * ItemKind 区分消息、模型输出和历史记录的种类。
  */
-export type ItemKind = "agents_instruction" | "context_summary" | "executors_change" | "hook_run" | "message" | "model_change" | "model_error" | "reasoning" | "session_fork" | "skill_instruction" | "tool_call" | "tool_result" | "turn_interrupted";
+export type ItemKind = "agents_instruction" | "client_instruction" | "context_summary" | "executors_change" | "hook_run" | "memory_index" | "message" | "model_change" | "model_error" | "reasoning" | "session_fork" | "skill_instruction" | "tool_call" | "tool_result" | "turn_interrupted";
 
 // From runtimeprotocol/types.go
 /**
@@ -929,6 +973,29 @@ export interface MCPServerInfo extends ConnectionInfo {
     executor_id: string;
 }
 
+// From defs/item.go
+/**
+ * MemoryIndex 是 Turn 开始时从 memory Executor 读进上下文的一份 MEMORY.md。
+ */
+export interface MemoryIndex {
+    /**
+     * Path 是 memory Executor 里的路径：user/MEMORY.md 或 project/MEMORY.md。
+     */
+    path: string;
+    /**
+     * Project 是项目记忆所属的项目：项目记忆目录相对记忆根目录的路径，例如 projects/local/-tmp-x；用户级记忆为空。
+     */
+    project?: string;
+    /**
+     * Text 最多 8 KiB，超出时在最后一个完整行处截断。
+     */
+    text: string;
+    /**
+     * IsTruncated 是否截断过？
+     */
+    is_truncated?: boolean;
+}
+
 // From defs/message.go
 /**
  * Message 是一条消息：发送方、接收方地址和内容。
@@ -1131,7 +1198,7 @@ export interface PendingInput {
 /**
  * ProtocolVersion 是 OpenVaala 协议版本，initialize 双方必须一致。
  */
-export const ProtocolVersion = "5";
+export const ProtocolVersion = "6";
 
 // From defs/provider.go
 /**
@@ -1152,6 +1219,10 @@ export interface ProviderConfig {
      */
     endpoints?: Record<string, string>;
     api_key: string;
+    /**
+     * Headers 是只发给这个 Provider 的 header 模板，同名覆盖 http.headers；值为 "" 表示不发。
+     */
+    headers?: Record<string, string>;
     /**
      * Models 是模型 id 到模型配置的映射；值为 nil 时全部用默认。
      */
@@ -1718,7 +1789,33 @@ export type SubscriptionKind = "conversation" | "session";
 
 // From runtimeprotocol/types.go
 /**
- * TerminalExitedParams 是 serve 发给打开该终端的连接的 terminal/exited 的参数：终端进程结束后发出一次，此后这个 terminal_id 不再有通知。
+ * TerminalAttachParams 是 terminal/attach 的参数：把这条连接接入已有终端。
+ */
+export interface TerminalAttachParams {
+    terminal_id: string;
+    /**
+     * Cursor 是开始发送输出的字节位置，刷新后传 0。
+     */
+    cursor: number;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * TerminalAttachResult 是 terminal/attach 的结果：终端的 Executor、起始目录和 PTY 当前尺寸。
+ */
+export interface TerminalAttachResult {
+    executor_id: string;
+    directory: string;
+    /**
+     * Rows、Cols 是 PTY 当前尺寸，客户端先按它回放。
+     */
+    rows: number;
+    cols: number;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * TerminalExitedParams 是 serve 发给接入该终端的连接的 terminal/exited 的参数：终端进程结束后发出一次，此后这个 terminal_id 不再有通知。
  */
 export interface TerminalExitedParams {
     terminal_id: string;
@@ -1740,7 +1837,30 @@ export interface TerminalInputParams {
 
 // From runtimeprotocol/types.go
 /**
- * TerminalOpenParams 是 terminal/open 的参数：在 executor_id 对应的 Executor 上为这条连接新开一个终端，shell 的起始目录是 directory。
+ * TerminalItem 是一个运行中的终端。
+ */
+export interface TerminalItem {
+    terminal_id: string;
+    executor_id: string;
+    directory: string;
+    started_at: string;
+    /**
+     * ConversationID 是打开终端的对话，打开时没有指定对话则省略。
+     */
+    conversation_id?: ConversationID;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * TerminalListResult 是 terminal/subscribe 的结果，也是 terminal/listChanged 的参数：全部运行中的终端。
+ */
+export interface TerminalListResult {
+    terminals: TerminalItem[];
+}
+
+// From runtimeprotocol/types.go
+/**
+ * TerminalOpenParams 是 terminal/open 的参数：在 executor_id 对应的 Executor 上新开一个终端，shell 的起始目录是 directory；打开后这条连接自动接入。
  */
 export interface TerminalOpenParams {
     /**
@@ -1760,6 +1880,10 @@ export interface TerminalOpenParams {
      * Environment 是客户端的环境变量（格式同 os.Environ），只给 local Executor 的 shell 用；为空时继承 serve 进程的环境。
      */
     environment?: string[];
+    /**
+     * ConversationID 是打开终端的对话，只决定标签页显示在哪。
+     */
+    conversation_id?: ConversationID;
 }
 
 // From runtimeprotocol/types.go
@@ -1774,16 +1898,28 @@ export interface TerminalOpenResult {
 
 // From runtimeprotocol/types.go
 /**
- * TerminalOutputParams 是 serve 发给打开该终端的连接的 terminal/output 的参数：终端新产生的一批输出，JSON 里是 base64，按产生顺序送达。
+ * TerminalOutputParams 是 serve 发给接入该终端的连接的 terminal/output 的参数：一段输出，JSON 里是 base64，按产生顺序送达。
  */
 export interface TerminalOutputParams {
     terminal_id: string;
     data: string;
+    /**
+     * NextCursor 是这段输出之后的位置，断网重连从这里续读。
+     */
+    next_cursor: number;
+    /**
+     * Truncated 请求的位置已被丢弃，Data 从最早保留处开始？
+     */
+    truncated: boolean;
+    /**
+     * HasMore 接入时已有的输出还没发完？为 false 时客户端结束回放；之后的新输出都是 false。
+     */
+    has_more: boolean;
 }
 
 // From runtimeprotocol/types.go
 /**
- * TerminalParams 是 terminal/close 的参数：结束这条连接打开的一个终端。
+ * TerminalParams 是 terminal/close、terminal/reset 的参数：指定一个终端。
  */
 export interface TerminalParams {
     terminal_id: string;
@@ -1797,6 +1933,14 @@ export interface TerminalResizeParams {
     terminal_id: string;
     rows: number;
     cols: number;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * TerminalsClosedParams 是 serve 发给订阅了终端列表的连接的 terminal/listClosed 的参数：订阅被 serve 关闭的原因，主动退订和断线不发。
+ */
+export interface TerminalsClosedParams {
+    reason: string;
 }
 
 // From defs/message.go
@@ -1836,6 +1980,11 @@ export interface ToolCall {
      * Status 为空时参数还在生成。
      */
     status?: ToolCallStatus;
+    /**
+     * ProviderData 是模型厂商附在这次调用上的签名等数据；下一次请求原样还给 llmkit，否则 Gemini 等会拒绝或丢失签名。
+     */
+    // external type "github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.ToolCallProviderData", to include this type the package must be explicitly included in the parsing
+    provider_data?: unknown;
 }
 
 // From defs/toolcall.go
@@ -2031,6 +2180,7 @@ export interface MethodParams {
     "conversation/steerInput": SteerInputParams;
     "conversation/interruptTurnWithInput": InterruptTurnWithInputParams;
     "conversation/withdrawInput": WithdrawInputParams;
+    "conversation/appendContextItems": AppendContextItemsParams;
     "conversation/interruptTurn": ConversationParams;
     "conversation/compact": ConversationParams;
     "session/get": GetSessionParams;
@@ -2065,7 +2215,11 @@ export interface MethodParams {
     "session/subscribe": SessionParams;
     "session/unsubscribe": SessionParams;
     "terminal/open": TerminalOpenParams;
+    "terminal/attach": TerminalAttachParams;
     "terminal/close": TerminalParams;
+    "terminal/reset": TerminalParams;
+    "terminal/subscribe": EmptyParams;
+    "terminal/unsubscribe": EmptyParams;
 }
 
 /**
@@ -2086,6 +2240,7 @@ export interface MethodResult {
     "conversation/steerInput": EmptyResult;
     "conversation/interruptTurnWithInput": EmptyResult;
     "conversation/withdrawInput": WithdrawInputResult;
+    "conversation/appendContextItems": EmptyResult;
     "conversation/interruptTurn": InterruptTurnResult;
     "conversation/compact": CompactContextResult;
     "session/get": SessionResult;
@@ -2120,7 +2275,11 @@ export interface MethodResult {
     "session/subscribe": SubscribeSessionResult;
     "session/unsubscribe": EmptyResult;
     "terminal/open": TerminalOpenResult;
+    "terminal/attach": TerminalAttachResult;
     "terminal/close": EmptyResult;
+    "terminal/reset": EmptyResult;
+    "terminal/subscribe": TerminalListResult;
+    "terminal/unsubscribe": EmptyResult;
 }
 
 /**
@@ -2150,6 +2309,18 @@ export interface NotificationParams {
     "clientMCP/disconnect": ClientMCPDisconnectParams;
     "terminal/output": TerminalOutputParams;
     "terminal/exited": TerminalExitedParams;
+    "terminal/listChanged": TerminalListResult;
+    "terminal/listClosed": TerminalsClosedParams;
+}
+
+/**
+ * 每种客户端通知的参数类型。
+ */
+export interface ClientNotificationParams {
+    "clientMCP/message": ClientMCPMessageParams;
+    "clientMCP/closed": ClientMCPClosedParams;
+    "terminal/input": TerminalInputParams;
+    "terminal/resize": TerminalResizeParams;
 }
 
 export const ErrorCodeParse = -32700;
@@ -2160,3 +2331,4 @@ export const ErrorCodeRuntime = -32000;
 export const ErrorCodeSessionBusy = -32001;
 export const ErrorCodeConversationNotFound = -32002;
 export const ErrorCodeSessionNotFound = -32003;
+export const ErrorCodeTerminalNotFound = -32004;

@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -31,6 +32,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/session"
@@ -39,6 +41,7 @@ import (
 	storagefile "github.com/VaalaCat/openvaala/pkg/storage/file"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
+	"github.com/VaalaCat/openvaala/pkg/terminal"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -965,17 +968,17 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 		h.waitLog(t, conv.ID, conv.RootSessionID, wantLogCount)
 	}
 	// newReloadedDefinitions 返回测试 Agent 和模型目录，加上 executors 和共用的 skills，和 reload 重新读出的整份定义一样。
-	newReloadedDefinitions := func(h *runtimeHarness, executors []*defs.ExecutorDefinition, skills ...*skill.Skill) *runtime.Definitions {
+	newReloadedDefinitions := func(h *runtimeHarness, executors []executor.Executor, skills ...*skill.Skill) *runtime.Definitions {
 		definitions := newTestRuntimeOpt(h.store, h.model).Definitions
-		definitions.Executors, definitions.Skills = executors, skills
+		definitions.Executors, definitions.Skills = executor.NewConfigExecutorProvider(executors), skills
 		return definitions
 	}
 	tests := []struct {
 		name string
 		// withoutModels Runtime 启动时是否没有模型？没有时 assistant 的默认模型是零值，和没配模型时的内置 default Agent 一样。
 		withoutModels bool
-		// executors 不为 nil 时返回 Runtime 启动时的 Executor 定义。
-		executors func(t *testing.T) []*defs.ExecutorDefinition
+		// executors 不为 nil 时返回 Runtime 启动时的 Executor。
+		executors func(t *testing.T) []executor.Executor
 		run       func(t *testing.T, h *runtimeHarness)
 	}{
 		{
@@ -1164,12 +1167,7 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 			run: func(t *testing.T, h *runtimeHarness) {
 				conv := h.create(t)
 				statuses := h.subscribeConversation(t, conv.ID)
-				extra := &defs.ExecutorDefinition{
-					ID:                 "extra",
-					Kind:               defs.ExecutorKindVirtual,
-					Description:        "新加的",
-					WorkspaceDirectory: "/workspace",
-				}
+				extra := newVirtualExecutor("extra", "新加的", "/workspace")
 				added := &skill.Skill{
 					Name:        "added",
 					Description: "新加的技能",
@@ -1197,7 +1195,7 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 			// 对话 A 的默认 Executor 在 reload 后变成不回 SSH 握手的远端：A 在自己的 goroutine 里卡到 ctx 截止，换定义失败、保留原配置；
 			// 卡住期间对话 B 换完定义、照常收输入，新建对话也不受影响。
 			name: "reload_does_not_block_other_conversations",
-			executors: func(t *testing.T) []*defs.ExecutorDefinition {
+			executors: func(t *testing.T) []executor.Executor {
 				return append(newLocalExecutors(t), newLocalExecutor(t, "remote"))
 			},
 			run: func(t *testing.T, h *runtimeHarness) {
@@ -1247,23 +1245,18 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 			},
 		},
 		{
-			name:      "ephemeral_stays_without_executors_after_reload",
+			name:      "without_executors_stays_without_executors_after_reload",
 			executors: newLocalExecutors,
 			run: func(t *testing.T, h *runtimeHarness) {
 				conv, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{
-					AgentName: "assistant",
-					Ephemeral: true,
+					AgentName:        "assistant",
+					WithoutExecutors: true,
 				})
 				if err != nil {
 					t.Fatal(err)
 				}
 				statuses := h.subscribeConversation(t, conv.ID)
-				extra := &defs.ExecutorDefinition{
-					ID:                 "extra",
-					Kind:               defs.ExecutorKindVirtual,
-					Description:        "新加的",
-					WorkspaceDirectory: "/workspace",
-				}
+				extra := newVirtualExecutor("extra", "新加的", "/workspace")
 				h.setDefinitionsRequest(t, newReloadedDefinitions(h, append(newLocalExecutors(t), extra)))
 				waitEventsClosed(t, statuses.Events)
 				details, err := h.rt.GetSessionDetails(t.Context(), &runtime.GetSessionDetailsRequest{
@@ -1271,7 +1264,7 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 					SessionID:      conv.RootSessionID,
 				})
 				if err != nil || len(details.Executors) != 0 {
-					t.Fatalf("ephemeral executors = %+v, %v; want none", details.Executors, err)
+					t.Fatalf("without-executors executors = %+v, %v; want none", details.Executors, err)
 				}
 			},
 		},
@@ -1285,7 +1278,7 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 				opt.Definitions.Agents[0].Model, opt.Definitions.Models = defs.ModelRef{}, nil
 			}
 			if tt.executors != nil {
-				opt.Definitions.Executors = tt.executors(t)
+				opt.Definitions.Executors = executor.NewConfigExecutorProvider(tt.executors(t))
 			}
 			tt.run(t, startTestRuntimeWithOpt(t, store, model, opt))
 		})
@@ -1594,8 +1587,8 @@ type mcpRuntimeFixture struct {
 	binary string
 	// pidDirectory 是各 MCP server 启动时写进程号文件的目录。
 	pidDirectory string
-	// executors 是定义里的本机 Executor local 和 extra，各用自己的临时目录。
-	executors []*defs.ExecutorDefinition
+	// executors 是本机 Executor local 和 extra，各用自己的临时目录。
+	executors []executor.Executor
 }
 
 // mcpServerState 是 GetMCPServers 一项里测试关心的部分。
@@ -1609,7 +1602,7 @@ type mcpServerState struct {
 func (f *mcpRuntimeFixture) newDefinitions(fakePIDName string, extraModels ...*defs.ModelDefinition) *runtime.Definitions {
 	// 1. 使用 local 和 extra，追加模型，Agent 只用 fake 和 remote；fake 绑定 local，unused 绑定两环境，remote 绑定 ssh-dev。
 	definitions := newTestRuntimeOpt(f.store, f.model).Definitions
-	definitions.Executors = f.executors
+	definitions.Executors = executor.NewConfigExecutorProvider(f.executors)
 	definitions.Agents[0].MCPServerIDs = defs.OptionalStringList{"fake", "remote"}
 	definitions.Models = append(definitions.Models, extraModels...)
 	definitions.MCPServers = []*mcpclient.ServerDefinition{
@@ -1635,10 +1628,10 @@ func (f *mcpRuntimeFixture) newServerDefinition(id string, executorIDs []string,
 }
 
 // newMCPTestExecutors 创建各有独立目录的 local 和 extra Executor。
-func newMCPTestExecutors(t *testing.T) []*defs.ExecutorDefinition {
+func newMCPTestExecutors(t *testing.T) []executor.Executor {
 	t.Helper()
-	// 1. 返回两个本机 Executor 定义。
-	return []*defs.ExecutorDefinition{newLocalExecutor(t, defs.LocalExecutorID), newLocalExecutor(t, "extra")}
+	// 1. 返回两个本机 Executor。
+	return []executor.Executor{newLocalExecutor(t, defs.LocalExecutorID), newLocalExecutor(t, "extra")}
 }
 
 // getPIDPath 返回假 MCP server 的进程号文件路径。
@@ -2082,7 +2075,7 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 			}
 			opt := newTestRuntimeOpt(store, model)
 			opt.Definitions.Agents[0].MCPServerIDs = tt.agentMCPServerIDs
-			opt.Definitions.Executors = f.executors
+			opt.Definitions.Executors = executor.NewConfigExecutorProvider(f.executors)
 			if tt.unsavedIdleTimeout != 0 {
 				opt.WithUnsavedConversationIdleTimeout(tt.unsavedIdleTimeout)
 			}
@@ -2836,49 +2829,42 @@ func TestRuntimeListExecutors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			store, model := openRuntimeStore(t), newRuntimeModel(t)
 			local := newLocalExecutor(t, defs.LocalExecutorID)
-			builtin := &defs.ExecutorDefinition{
-				ID:                 "openvaala",
-				Kind:               defs.ExecutorKindVirtual,
-				Description:        "内置",
-				WorkspaceDirectory: "/workspace",
-			}
-			remote := &defs.ExecutorDefinition{
+			builtin := newVirtualExecutor("openvaala", "内置", "/workspace")
+			remote := executor.NewSSHExecutor(executor.NewSSHExecutorOpt(&defs.ExecutorDefinition{
 				ID:                 "remote",
 				Kind:               defs.ExecutorKindSSH,
 				Description:        "离线",
 				WorkspaceDirectory: "/project",
-				SSH:                &defs.SSHExecutorDefinition{Address: "test@127.0.0.1:1"},
-			}
+			}, "test@127.0.0.1:1", ""))
 			h := startTestRuntimeWithOpt(t, store, model, newExecutorRuntimeOpt(store, model, local, builtin, remote))
 			want := []conversation.ExecutorDetails{
 				{
 					ID:                 defs.LocalExecutorID,
-					Description:        local.Description,
-					WorkspaceDirectory: local.WorkspaceDirectory,
+					Kind:               defs.ExecutorKindLocal,
+					Description:        local.GetDefinition().Description,
+					WorkspaceDirectory: local.GetDefinition().WorkspaceDirectory,
 				},
 				{
 					ID:                 "openvaala",
+					Kind:               defs.ExecutorKindVirtual,
 					Description:        "内置",
 					WorkspaceDirectory: "/workspace",
 				},
 				{
 					ID:                 "remote",
+					Kind:               defs.ExecutorKindSSH,
 					Description:        "离线",
 					WorkspaceDirectory: "/project",
 				},
 			}
 			if tt.reload {
-				extra := &defs.ExecutorDefinition{
-					ID:                 "extra",
-					Kind:               defs.ExecutorKindVirtual,
-					Description:        "新加的",
-					WorkspaceDirectory: "/scratch",
-				}
+				extra := newVirtualExecutor("extra", "新加的", "/scratch")
 				definitions := newTestRuntimeOpt(store, model).Definitions
-				definitions.Executors = []*defs.ExecutorDefinition{local, builtin, extra}
+				definitions.Executors = executor.NewConfigExecutorProvider([]executor.Executor{local, builtin, extra})
 				h.setDefinitionsRequest(t, definitions)
 				want[2] = conversation.ExecutorDetails{
 					ID:                 "extra",
+					Kind:               defs.ExecutorKindVirtual,
 					Description:        "新加的",
 					WorkspaceDirectory: "/scratch",
 				}
@@ -2887,6 +2873,147 @@ func TestRuntimeListExecutors(t *testing.T) {
 			if err != nil || !reflect.DeepEqual(got, want) {
 				t.Fatalf("ListExecutors() = %+v, %v; want %+v", got, err, want)
 			}
+		})
+	}
+}
+
+// TestRuntimeExecutorProvider 检查 Runtime 经 ExecutorProvider 取 Executor：按对话取列表、nil 时没有 Executor、出错时请求失败、终端带上所属对话、memory 不能开终端和选目录。
+func TestRuntimeExecutorProvider(t *testing.T) {
+	// 1. 列出各场景。
+	tests := []struct {
+		name string
+		run  func(t *testing.T, store *runtimeStore, model *runtimeModel)
+	}{
+		{
+			name: "conversations_get_their_own_executors",
+			run: func(t *testing.T, store *runtimeStore, model *runtimeModel) {
+				opt := newTestRuntimeOpt(store, model)
+				opt.Definitions.Executors = &recordingExecutorProvider{newExecutors: func(conversationID defs.ConversationID) []executor.Executor {
+					return []executor.Executor{newVirtualExecutor("own", string(conversationID), "/workspace")}
+				}}
+				h := startTestRuntimeWithOpt(t, store, model, opt)
+				for _, conv := range []defs.Conversation{h.create(t), h.create(t)} {
+					details, err := h.rt.GetSessionDetails(t.Context(), &runtime.GetSessionDetailsRequest{ConversationID: conv.ID, SessionID: conv.RootSessionID})
+					if err != nil || len(details.Executors) != 1 || details.Executors[0].Description != string(conv.ID) {
+						t.Fatalf("session executors = %+v, %v; want the executor built for %s", details.Executors, err, conv.ID)
+					}
+				}
+			},
+		},
+		{
+			name: "nil_provider_has_no_executors",
+			run: func(t *testing.T, store *runtimeStore, model *runtimeModel) {
+				h := startTestRuntime(t, store, model)
+				h.completeRound(t, h.create(t), "你好", 2)
+				if executors, err := h.rt.ListExecutors(t.Context()); err != nil || len(executors) != 0 {
+					t.Fatalf("ListExecutors() = %+v, %v; want none", executors, err)
+				}
+				if _, err := h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{}); !errors.Is(err, conversation.ErrInvalidExecutorSettings) {
+					t.Fatalf("OpenTerminal() error = %v, want %v", err, conversation.ErrInvalidExecutorSettings)
+				}
+			},
+		},
+		{
+			name: "provider_error_fails_create_and_open",
+			run: func(t *testing.T, store *runtimeStore, model *runtimeModel) {
+				saved := startTestRuntimeWithOpt(t, store, model, newExecutorRuntimeOpt(store, model, newLocalExecutors(t)...))
+				conv := saved.create(t)
+				saved.completeRound(t, conv, "保存", 2)
+				saved.stop(t)
+				wantErr := errors.New("executors unavailable")
+				provider := &recordingExecutorProvider{getErr: wantErr}
+				opt := newTestRuntimeOpt(store, model)
+				opt.Definitions.Executors = provider
+				h := startTestRuntimeWithOpt(t, store, model, opt)
+				if _, err := h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID}); !errors.Is(err, wantErr) {
+					t.Fatalf("OpenConversation() error = %v, want %v", err, wantErr)
+				}
+				if _, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{AgentName: "assistant"}); !errors.Is(err, wantErr) {
+					t.Fatalf("CreateConversation() error = %v, want %v", err, wantErr)
+				}
+				conversationIDs := provider.conversationIDs.Keys()
+				if len(conversationIDs) != 2 || !slices.Contains(conversationIDs, conv.ID) {
+					t.Fatalf("provider conversation IDs = %v, want %s and the new conversation", conversationIDs, conv.ID)
+				}
+				for _, conversationID := range conversationIDs {
+					isOpen, err := h.rt.IsConversationOpen(t.Context(), &runtime.GetConversationRequest{ConversationID: conversationID})
+					if err != nil || isOpen {
+						t.Fatalf("IsConversationOpen(%s) = %v, %v; want false", conversationID, isOpen, err)
+					}
+				}
+			},
+		},
+		{
+			name: "reload_error_keeps_old_config",
+			run: func(t *testing.T, store *runtimeStore, model *runtimeModel) {
+				opt := newExecutorRuntimeOpt(store, model, newLocalExecutors(t)...)
+				h := startTestRuntimeWithOpt(t, store, model, opt)
+				conv := h.create(t)
+				reloaded := *opt.Definitions
+				reloaded.Executors = &recordingExecutorProvider{getErr: errors.New("executors unavailable")}
+				if _, err := h.rt.SetDefinitions(t.Context(), &reloaded); err != nil {
+					t.Fatalf("SetDefinitions() = %v, want success", err)
+				}
+				details, err := h.rt.GetSessionDetails(t.Context(), &runtime.GetSessionDetailsRequest{ConversationID: conv.ID, SessionID: conv.RootSessionID})
+				if err != nil || len(details.Executors) != 1 || details.Executors[0].ID != defs.LocalExecutorID {
+					t.Fatalf("session executors = %+v, %v; want the previous local kept", details.Executors, err)
+				}
+				h.completeRound(t, conv, "还能用", 2)
+			},
+		},
+		{
+			name: "terminal_passes_conversation_id",
+			run: func(t *testing.T, store *runtimeStore, model *runtimeModel) {
+				t.Setenv("SHELL", "/bin/bash")
+				local := newLocalExecutor(t, defs.LocalExecutorID)
+				provider := &recordingExecutorProvider{newExecutors: func(defs.ConversationID) []executor.Executor { return []executor.Executor{local} }}
+				opt := newTestRuntimeOpt(store, model)
+				opt.Definitions.Executors = provider
+				h := startTestRuntimeWithOpt(t, store, model, opt)
+				const conversationID = defs.ConversationID("conversation-of-terminal")
+				if _, err := h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{ConversationID: conversationID, Rows: 24, Cols: 80}); err != nil {
+					t.Fatal(err)
+				}
+				if got := provider.conversationIDs.Keys(); !slices.Equal(got, []defs.ConversationID{conversationID}) {
+					t.Fatalf("provider conversation IDs = %v, want %s", got, conversationID)
+				}
+			},
+		},
+		{
+			name: "memory_rejected_for_terminal_and_directory",
+			run: func(t *testing.T, store *runtimeStore, model *runtimeModel) {
+				memory := executor.NewMemoryExecutor(executor.NewMemoryExecutorOpt(&defs.ExecutorDefinition{ID: defs.MemoryExecutorID, Kind: defs.ExecutorKindMemory}, t.TempDir()))
+				h := startTestRuntimeWithOpt(t, store, model, newExecutorRuntimeOpt(store, model, newLocalExecutor(t, defs.LocalExecutorID), memory))
+				for name, call := range map[string]func() error{
+					"open_terminal": func() error {
+						_, err := h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{ExecutorID: defs.MemoryExecutorID})
+						return err
+					},
+					"open_terminal_in_directory": func() error {
+						_, err := h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{ExecutorID: defs.MemoryExecutorID, Directory: "/"})
+						return err
+					},
+					"resolve_directory": func() error {
+						_, err := h.rt.ResolveWorkspaceDirectory(t.Context(), &runtime.ResolveWorkspaceDirectoryRequest{ExecutorID: defs.MemoryExecutorID, Directory: "/"})
+						return err
+					},
+					"list_directories": func() error {
+						_, err := h.rt.GetWorkspaceDirectories(t.Context(), &runtime.GetWorkspaceDirectoriesRequest{ExecutorID: defs.MemoryExecutorID, Directory: "/"})
+						return err
+					},
+				} {
+					const want = "invalid executor settings: memory executor has no workspace directory"
+					if err := call(); !errors.Is(err, conversation.ErrInvalidExecutorSettings) || err.Error() != want {
+						t.Fatalf("%s error = %v, want %q", name, err, want)
+					}
+				}
+			},
+		},
+	}
+	// 2. 每个场景用独立的存储和模型。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.run(t, openRuntimeStore(t), newRuntimeModel(t))
 		})
 	}
 }
@@ -2908,7 +3035,8 @@ func TestRuntimeOpenLegacyConversation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store, model := openRuntimeStore(t), newRuntimeModel(t)
-			opt := newExecutorRuntimeOpt(store, model, newLocalExecutors(t)...)
+			local := newLocalExecutor(t, defs.LocalExecutorID)
+			opt := newExecutorRuntimeOpt(store, model, local)
 			h := startTestRuntimeWithOpt(t, store, model, opt)
 			legacy := h.create(t)
 			// 第一条输入才把新对话写进共用库，重启后才能打开。
@@ -2930,7 +3058,7 @@ func TestRuntimeOpenLegacyConversation(t *testing.T) {
 				ConversationID: legacy.ID,
 				SessionID:      legacy.RootSessionID,
 			})
-			if localDirectory := opt.Definitions.Executors[0].WorkspaceDirectory; err != nil || len(details.Executors) != 1 || details.Executors[0].WorkspaceDirectory != localDirectory {
+			if localDirectory := local.GetDefinition().WorkspaceDirectory; err != nil || len(details.Executors) != 1 || details.Executors[0].WorkspaceDirectory != localDirectory {
 				t.Fatalf("session executors = %+v, %v; want local at %s", details.Executors, err, localDirectory)
 			}
 			saved, err := restarted.rt.GetConversation(t.Context(), &runtime.GetConversationRequest{ConversationID: legacy.ID})
@@ -3162,7 +3290,7 @@ func TestRuntimeSetConversationExecutorSettings(t *testing.T) {
 				Executor:    defs.LocalExecutorID,
 			}}
 			h := startTestRuntimeWithOpt(t, store, model, opt)
-			previous := defs.ExecutorSettings{WorkspaceDirectories: map[string]string{defs.LocalExecutorID: local.WorkspaceDirectory}}
+			previous := defs.ExecutorSettings{WorkspaceDirectories: map[string]string{defs.LocalExecutorID: local.GetDefinition().WorkspaceDirectory}}
 			conv, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{
 				AgentName:        "default",
 				ExecutorSettings: previous,
@@ -3178,7 +3306,7 @@ func TestRuntimeSetConversationExecutorSettings(t *testing.T) {
 					ConversationID: conv.ID,
 					ExecutorSettings: defs.ExecutorSettings{
 						DefaultExecutorID:    "second",
-						WorkspaceDirectories: map[string]string{defs.LocalExecutorID: local.WorkspaceDirectory, "second": second.WorkspaceDirectory},
+						WorkspaceDirectories: map[string]string{defs.LocalExecutorID: local.GetDefinition().WorkspaceDirectory, "second": second.GetDefinition().WorkspaceDirectory},
 					},
 				},
 			})
@@ -3552,37 +3680,65 @@ func TestRuntimeIsIdle(t *testing.T) {
 }
 
 // newLocalExecutor 创建以临时目录为工作目录的本机 Executor。
-func newLocalExecutor(t *testing.T, id string) *defs.ExecutorDefinition {
+func newLocalExecutor(t *testing.T, id string) executor.Executor {
 	t.Helper()
 	// 1. 将 HOME 设为临时目录，并填入指定 ID、说明和独立工作目录。
 	t.Setenv("HOME", t.TempDir())
-	return &defs.ExecutorDefinition{
+	return executor.NewLocalExecutor(&defs.ExecutorDefinition{
 		ID:                 id,
 		Kind:               defs.ExecutorKindLocal,
 		Description:        id + " 测试环境",
 		WorkspaceDirectory: t.TempDir(),
-	}
+	})
 }
 
 // newLocalExecutors 创建只包含 local 的测试 Executor 列表。
-func newLocalExecutors(t *testing.T) []*defs.ExecutorDefinition {
+func newLocalExecutors(t *testing.T) []executor.Executor {
 	t.Helper()
 	// 1. 创建 local 并放入列表。
-	return []*defs.ExecutorDefinition{newLocalExecutor(t, defs.LocalExecutorID)}
+	return []executor.Executor{newLocalExecutor(t, defs.LocalExecutorID)}
 }
 
-// newExecutorRuntimeOpt 创建带指定 Executor 定义的测试配置。
-func newExecutorRuntimeOpt(store *runtimeStore, model *runtimeModel, executors ...*defs.ExecutorDefinition) *runtime.RuntimeOpt {
-	// 1. 创建默认配置并替换 Executor 列表。
+// newVirtualExecutor 创建指定 ID、说明和根目录的 virtual Executor。
+func newVirtualExecutor(id, description, directory string) executor.Executor {
+	// 1. 用没有预置文件的定义创建 Executor。
+	return executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
+		ID:                 id,
+		Kind:               defs.ExecutorKindVirtual,
+		Description:        description,
+		WorkspaceDirectory: directory,
+	}, nil))
+}
+
+// newExecutorRuntimeOpt 创建带指定 Executor 的测试配置。
+func newExecutorRuntimeOpt(store *runtimeStore, model *runtimeModel, executors ...executor.Executor) *runtime.RuntimeOpt {
+	// 1. 创建默认配置，把 Executor 列表包成 ExecutorProvider。
 	opt := newTestRuntimeOpt(store, model)
-	opt.Definitions.Executors = executors
+	opt.Definitions.Executors = executor.NewConfigExecutorProvider(executors)
 	return opt
+}
+
+// recordingExecutorProvider 是测试用 ExecutorProvider：记下收到的对话 ID；getErr 不为空时返回它，否则用 newExecutors 建列表。
+type recordingExecutorProvider struct {
+	newExecutors    func(conversationID defs.ConversationID) []executor.Executor
+	getErr          error
+	conversationIDs syncmap.SyncMap[defs.ConversationID, struct{}]
+}
+
+// GetExecutors 记下对话 ID，返回 getErr 或这个对话的列表。
+func (p *recordingExecutorProvider) GetExecutors(_ context.Context, conversationID defs.ConversationID) ([]executor.Executor, error) {
+	// 1. 保存对话 ID，按设置返回错误或列表。
+	p.conversationIDs.Store(conversationID, struct{}{})
+	if p.getErr != nil {
+		return nil, p.getErr
+	}
+	return p.newExecutors(conversationID), nil
 }
 
 // unresponsiveSSHListener 是只接受 TCP 连接、从不回 SSH 握手的监听。
 type unresponsiveSSHListener struct {
-	// executor 是指向它的 SSH Executor 定义，带一把临时私钥。
-	executor *defs.ExecutorDefinition
+	// executor 是指向它的 SSH Executor，带一把临时私钥。
+	executor executor.Executor
 	// accepted 在第一次接受连接时关闭。
 	accepted chan struct{}
 }
@@ -3610,16 +3766,12 @@ func newUnresponsiveSSHExecutor(t *testing.T, id string) *unresponsiveSSHListene
 		t.Fatal(err)
 	}
 	l := &unresponsiveSSHListener{
-		executor: &defs.ExecutorDefinition{
+		executor: executor.NewSSHExecutor(executor.NewSSHExecutorOpt(&defs.ExecutorDefinition{
 			ID:                 id,
 			Kind:               defs.ExecutorKindSSH,
 			Description:        id + " 测试环境",
 			WorkspaceDirectory: "/project",
-			SSH: &defs.SSHExecutorDefinition{
-				Address:      "test@" + listener.Addr().String(),
-				IdentityFile: identityFile,
-			},
-		},
+		}, "test@"+listener.Addr().String(), identityFile)),
 		accepted: make(chan struct{}),
 	}
 	// 3. 启动接收任务，登记连接，首次接受时关闭 accepted。
@@ -3859,6 +4011,281 @@ func TestRuntimeCompactContext(t *testing.T) {
 			tt.run(t, startTestRuntime(t, openRuntimeStore(t), newRuntimeModel(t)))
 		})
 	}
+}
+
+// TestRuntimeAppendContextItems 检查注入的 Item 暂存到下一个非压缩 Turn，写在本轮输入之前。
+func TestRuntimeAppendContextItems(t *testing.T) {
+	// 1. 列出写入顺序、活动 Turn 期间注入、有效消息、无效 Item、压缩 Turn、Session 停止和对话没打开七种场景。
+	tests := []struct {
+		name string
+		run  func(t *testing.T, h *runtimeHarness)
+	}{
+		{
+			name: "written before next input",
+			run: func(t *testing.T, h *runtimeHarness) {
+				conv := h.create(t)
+				instruction := newClientInstructionItem("请用英文回答")
+				h.appendContextItems(t, conv.ID, instruction)
+				h.submit(t, conv.ID, "你好", "")
+				request := h.model.receive(t)
+				if texts := getRequestUserTexts(request.body); len(texts) != 2 || !strings.HasPrefix(texts[0], "客户端指令") || !strings.Contains(texts[0], "请用英文回答") || texts[1] != "你好" {
+					t.Fatalf("model user messages = %q, want the client instruction before the input", texts)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"好"}}
+				logged := h.waitLog(t, conv.ID, conv.RootSessionID, 3)
+				if logged[0].Item.ID != instruction.ID || logged[0].Item.Kind != defs.ItemClientInstruction || logged[1].Item.Kind != defs.ItemMessage {
+					t.Fatalf("log = %+v, want the client instruction then the input", logged)
+				}
+				if logged[0].Item.TurnID == "" || logged[0].Item.TurnID != logged[1].Item.TurnID {
+					t.Fatalf("Turn IDs = %q and %q, want the same non-empty Turn", logged[0].Item.TurnID, logged[1].Item.TurnID)
+				}
+			},
+		},
+		{
+			name: "while turn active goes to next turn",
+			run: func(t *testing.T, h *runtimeHarness) {
+				conv := h.create(t)
+				h.submit(t, conv.ID, "第一轮", "")
+				release := make(chan struct{})
+				h.model.receive(t).reply <- runtimeModelResponse{chunks: []string{"处理", "中"}, release: release}
+				instruction := newClientInstructionItem("下一轮才看到")
+				h.appendContextItems(t, conv.ID, instruction)
+				close(release)
+				h.waitLog(t, conv.ID, conv.RootSessionID, 2)
+
+				h.submit(t, conv.ID, "第二轮", "")
+				request := h.model.receive(t)
+				if texts := getRequestUserTexts(request.body); len(texts) != 3 || !strings.HasPrefix(texts[1], "客户端指令") || texts[2] != "第二轮" {
+					t.Fatalf("second Turn user messages = %q, want the client instruction before the second input", texts)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"好"}}
+				logged := h.waitLog(t, conv.ID, conv.RootSessionID, 5)
+				if logged[2].Item.ID != instruction.ID || logged[3].Item.Kind != defs.ItemMessage {
+					t.Fatalf("log = %+v, want the client instruction as the first item of the second Turn", logged)
+				}
+				if logged[1].Item.TurnID == logged[2].Item.TurnID || logged[2].Item.TurnID != logged[3].Item.TurnID {
+					t.Fatalf("Turn IDs = %q, %q, %q; want the client instruction in the second Turn only", logged[1].Item.TurnID, logged[2].Item.TurnID, logged[3].Item.TurnID)
+				}
+			},
+		},
+		{
+			name: "valid message accepted",
+			run: func(t *testing.T, h *runtimeHarness) {
+				conv := h.create(t)
+				note := &defs.Item{
+					ID:   defs.NewItemID(),
+					Kind: defs.ItemMessage,
+					Message: &defs.Message{
+						From:    &defs.Address{Kind: defs.IdentityUser},
+						Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: "补充说明"}}},
+					},
+				}
+				h.appendContextItems(t, conv.ID, note)
+				h.submit(t, conv.ID, "你好", "")
+				request := h.model.receive(t)
+				if texts := getRequestUserTexts(request.body); len(texts) != 2 || texts[0] != "补充说明" || texts[1] != "你好" {
+					t.Fatalf("model user messages = %q, want the injected message before the input", texts)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"好"}}
+				logged := h.waitLog(t, conv.ID, conv.RootSessionID, 3)
+				if logged[0].Item.ID != note.ID || logged[0].Item.TurnID == "" || logged[0].Item.TurnID != logged[1].Item.TurnID {
+					t.Fatalf("log = %+v, want the injected message first in the same Turn as the input", logged)
+				}
+			},
+		},
+		{
+			name: "invalid item rejected",
+			run: func(t *testing.T, h *runtimeHarness) {
+				invalid := []struct {
+					name  string
+					items []*defs.Item
+				}{
+					{
+						name:  "missing payload",
+						items: []*defs.Item{{ID: defs.NewItemID(), Kind: defs.ItemClientInstruction}},
+					},
+					{
+						name: "turn already assigned",
+						items: []*defs.Item{{
+							ID:                defs.NewItemID(),
+							TurnID:            defs.NewTurnID(),
+							Kind:              defs.ItemClientInstruction,
+							ClientInstruction: &defs.ClientInstruction{Text: "已有 Turn"},
+						}},
+					},
+					{
+						name:  "message without payload",
+						items: []*defs.Item{{ID: defs.NewItemID(), Kind: defs.ItemMessage}},
+					},
+					{
+						name: "message without sender",
+						items: []*defs.Item{{
+							ID:      defs.NewItemID(),
+							Kind:    defs.ItemMessage,
+							Message: &defs.Message{Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: "没有发送方"}}}},
+						}},
+					},
+					{
+						name: "tool call needs a model call",
+						items: []*defs.Item{{
+							ID:       defs.NewItemID(),
+							Kind:     defs.ItemToolCall,
+							ToolCall: &defs.ToolCall{CallID: "call-1", Name: "bash", Arguments: "{}"},
+						}},
+					},
+					{
+						name:  "unknown kind",
+						items: []*defs.Item{{ID: defs.NewItemID(), Kind: "mystery"}},
+					},
+					{
+						name:  "whole batch rejected",
+						items: []*defs.Item{newClientInstructionItem("有效"), {ID: defs.NewItemID(), Kind: defs.ItemClientInstruction}},
+					},
+				}
+				for _, tt := range invalid {
+					t.Run(tt.name, func(t *testing.T) {
+						conv := h.create(t)
+						if err := h.rt.AppendContextItems(t.Context(), &runtime.AppendContextItemsRequest{ConversationID: conv.ID, Items: tt.items}); err == nil {
+							t.Fatal("AppendContextItems() error = nil, want the invalid item rejected")
+						}
+						h.submit(t, conv.ID, "你好", "")
+						request := h.model.receive(t)
+						if texts := getRequestUserTexts(request.body); len(texts) != 1 || texts[0] != "你好" {
+							t.Fatalf("model user messages = %q, want only the input", texts)
+						}
+						request.reply <- runtimeModelResponse{chunks: []string{"好"}}
+						for _, entry := range h.waitLog(t, conv.ID, conv.RootSessionID, 2) {
+							if slices.ContainsFunc(tt.items, func(item *defs.Item) bool { return item.ID == entry.Item.ID }) {
+								t.Fatalf("log has the rejected item %+v, want none", entry.Item)
+							}
+						}
+					})
+				}
+			},
+		},
+		{
+			name: "compact turn skips pending items",
+			run: func(t *testing.T, h *runtimeHarness) {
+				conv := h.create(t)
+				h.completeRound(t, conv, "第一轮", 2)
+				h.completeRound(t, conv, "第二轮", 4)
+				instruction := newClientInstructionItem("压缩之后才写入")
+				h.appendContextItems(t, conv.ID, instruction)
+				compactTurnID := h.compactContextWhenIdle(t, conv.ID)
+				summaryRequest := h.model.receive(t)
+				if payload, _ := json.Marshal(summaryRequest.body["messages"]); strings.Contains(string(payload), "客户端指令") {
+					t.Fatalf("compaction messages = %s, want no client instruction", payload)
+				}
+				summaryRequest.reply <- runtimeModelResponse{chunks: []string{"摘要内容"}}
+				h.waitTurnStatus(t, conv.RootSessionID, compactTurnID, defs.TurnStatusCompleted)
+
+				h.submit(t, conv.ID, "第三轮", "")
+				request := h.model.receive(t)
+				if texts := getRequestUserTexts(request.body); len(texts) < 2 || !strings.HasPrefix(texts[len(texts)-2], "客户端指令") || texts[len(texts)-1] != "第三轮" {
+					t.Fatalf("third Turn user messages = %q, want the client instruction before the input", texts)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"好"}}
+				var instructionTurnIDs []defs.TurnID
+				for _, entry := range h.waitLog(t, conv.ID, conv.RootSessionID, 8) {
+					if entry.Item.Kind == defs.ItemClientInstruction {
+						instructionTurnIDs = append(instructionTurnIDs, entry.Item.TurnID)
+					}
+				}
+				if len(instructionTurnIDs) != 1 || instructionTurnIDs[0] == compactTurnID {
+					t.Fatalf("client instruction Turns = %v, want one outside the compaction Turn %s", instructionTurnIDs, compactTurnID)
+				}
+			},
+		},
+		{
+			name: "dropped when session stops",
+			run: func(t *testing.T, h *runtimeHarness) {
+				conv := h.create(t)
+				h.completeRound(t, conv, "开始", 2)
+				h.appendContextItems(t, conv.ID, newClientInstructionItem("不会保存"))
+				h.stop(t)
+
+				restarted := startTestRuntime(t, h.store, h.model)
+				if _, err := restarted.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID}); err != nil {
+					t.Fatal(err)
+				}
+				restarted.submit(t, conv.ID, "继续", "")
+				request := restarted.model.receive(t)
+				for _, text := range getRequestUserTexts(request.body) {
+					if strings.HasPrefix(text, "客户端指令") {
+						t.Fatalf("restarted Turn messages include the dropped client instruction %q", text)
+					}
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"继续好"}}
+				for _, entry := range restarted.waitLog(t, conv.ID, conv.RootSessionID, 4) {
+					if entry.Item.Kind == defs.ItemClientInstruction {
+						t.Fatalf("log has a client instruction %+v, want it dropped", entry.Item)
+					}
+				}
+			},
+		},
+		{
+			name: "conversation not open",
+			run: func(t *testing.T, h *runtimeHarness) {
+				err := h.rt.AppendContextItems(t.Context(), &runtime.AppendContextItemsRequest{
+					ConversationID: defs.NewConversationID(),
+					Items:          []*defs.Item{newClientInstructionItem("没人收")},
+				})
+				if !errors.Is(err, runtime.ErrConversationNotOpen) {
+					t.Fatalf("AppendContextItems() = %v, want ErrConversationNotOpen", err)
+				}
+			},
+		},
+	}
+	// 2. 每个场景用独立的 Runtime，检查注入后的模型请求、Item 日志和错误。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.run(t, startTestRuntime(t, openRuntimeStore(t), newRuntimeModel(t)))
+		})
+	}
+}
+
+// newClientInstructionItem 创建一条还没分配 TurnID 的客户端指令 Item。
+func newClientInstructionItem(text string) *defs.Item {
+	// 1. 生成 Item ID，种类和载荷都是客户端指令。
+	return &defs.Item{
+		ID:                defs.NewItemID(),
+		Kind:              defs.ItemClientInstruction,
+		ClientInstruction: &defs.ClientInstruction{Text: text},
+	}
+}
+
+// appendContextItems 向指定对话注入 Item 并检查成功。
+func (h *runtimeHarness) appendContextItems(t *testing.T, conversationID defs.ConversationID, items ...*defs.Item) {
+	t.Helper()
+	// 1. 请求注入，失败则结束测试。
+	if err := h.rt.AppendContextItems(t.Context(), &runtime.AppendContextItemsRequest{ConversationID: conversationID, Items: items}); err != nil {
+		t.Fatalf("AppendContextItems() = %v", err)
+	}
+}
+
+// getRequestUserTexts 按请求顺序提取模型请求里每条 user 消息的文本。
+func getRequestUserTexts(body map[string]any) []string {
+	// 1. 只读 user 消息，content 是字符串时直接取，是分段时拼接各段文本。
+	var texts []string
+	messages, _ := body["messages"].([]any)
+	for _, value := range messages {
+		message := value.(map[string]any)
+		if message["role"] != "user" {
+			continue
+		}
+		switch content := message["content"].(type) {
+		case string:
+			texts = append(texts, content)
+		case []any:
+			var text strings.Builder
+			for _, part := range content {
+				segment, _ := part.(map[string]any)["text"].(string)
+				text.WriteString(segment)
+			}
+			texts = append(texts, text.String())
+		}
+	}
+	return texts
 }
 
 // TestRuntimeListTurns 检查 Turn 分页、批量查询和必需参数。
@@ -4248,6 +4675,271 @@ func waitConversationDiscarded(t *testing.T, h *runtimeHarness, id defs.Conversa
 			t.Fatalf("GetConversation() error = %v, want ErrConversationNotFound", err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestRuntimeCreateConversationFlags 检查 Ephemeral 只决定存在哪里，WithoutExecutors 只决定有没有 Executor 工具。
+func TestRuntimeCreateConversationFlags(t *testing.T) {
+	// 1. 列出两个开关的四种组合：是否进对话列表看 ListConversations，有没有 Executor 工具看模型收到的请求里有没有 bash。
+	tests := []struct {
+		name             string
+		ephemeral        bool
+		withoutExecutors bool
+		// wantListed 发出第一条输入后，对话是否在对话列表里？
+		wantListed bool
+		// wantExecutorTools 模型收到的请求里是否带 Executor 的 bash 工具？
+		wantExecutorTools bool
+	}{
+		{
+			name:              "neither",
+			wantListed:        true,
+			wantExecutorTools: true,
+		},
+		{
+			name:              "ephemeral only",
+			ephemeral:         true,
+			wantExecutorTools: true,
+		},
+		{
+			name:             "without executors only",
+			withoutExecutors: true,
+			wantListed:       true,
+		},
+		{
+			name:             "both",
+			ephemeral:        true,
+			withoutExecutors: true,
+		},
+	}
+	// 2. 按各组合创建对话并发出第一条输入，检查对话列表和模型请求里的工具。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			h := startTestRuntimeWithOpt(t, store, model, newExecutorRuntimeOpt(store, model, newLocalExecutors(t)...))
+			conv, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{
+				AgentName:        "assistant",
+				Ephemeral:        tt.ephemeral,
+				WithoutExecutors: tt.withoutExecutors,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.submit(t, conv.ID, "你好", "")
+			request := h.model.receive(t)
+			toolNames := getRequestToolNames(request.body)
+			if got := slices.Contains(toolNames, "bash"); got != tt.wantExecutorTools {
+				t.Fatalf("model tools = %v, want bash = %v", toolNames, tt.wantExecutorTools)
+			}
+			request.reply <- runtimeModelResponse{chunks: []string{"好"}}
+			if got := h.isConversationListed(t, conv.ID, false); got != tt.wantListed {
+				t.Fatalf("conversation listed = %v, want %v", got, tt.wantListed)
+			}
+		})
+	}
+}
+
+// waitConversationTurnStatus 等待指定对话的 Turn 到达目标状态，已保存和临时对话都能读。
+func (h *runtimeHarness) waitConversationTurnStatus(t *testing.T, conv defs.Conversation, turnID defs.TurnID, status defs.TurnStatus) {
+	t.Helper()
+	// 1. 在 5 秒内经 Runtime 轮询 Turn 记录，未到目标状态则继续等待。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		turns, err := h.rt.GetTurns(t.Context(), &runtime.GetTurnsRequest{
+			ConversationID: conv.ID,
+			SessionID:      conv.RootSessionID,
+			TurnIDs:        []defs.TurnID{turnID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(turns) == 1 && turns[0].Status == status {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Turn %s = %+v, want status %q", turnID, turns, status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestRuntimeEphemeralFork 检查临时分叉只存在内存里、照常装配 Executor、复制已保存的内容并在没人用时被丢弃。
+func TestRuntimeEphemeralFork(t *testing.T) {
+	// 1. 列出来源停在工具调用上、没人用时丢弃、截取点之前没有轮次、来源已压缩四种场景。
+	tests := []struct {
+		name string
+		// idleTimeout 非 0 时作为没保存的对话的丢弃等待时长。
+		idleTimeout time.Duration
+		run         func(t *testing.T, h *runtimeHarness)
+	}{
+		{
+			name: "ephemeral fork",
+			run: func(t *testing.T, h *runtimeHarness) {
+				// 来源第 1 轮跑完，第 2 轮停在一个会阻塞的命令工具调用上。
+				source := h.create(t)
+				watcher := h.subscribeSession(t, source.ID, source.RootSessionID)
+				firstTurn := h.runRootTurn(t, source, watcher, "第一轮", runtimeModelResponse{chunks: []string{"回复一"}})
+				h.submit(t, source.ID, "第二轮", "")
+				h.model.receive(t).reply <- runtimeModelResponse{calls: []llmkit.ToolCall{{
+					ID:        "call-block",
+					Name:      "bash",
+					Arguments: `{"command":"sleep 30","wait_seconds":30}`,
+				}}}
+				logged := h.waitLog(t, source.ID, source.RootSessionID, 4)
+				if logged[3].Item.Kind != defs.ItemToolCall {
+					t.Fatalf("source item 4 = %+v, want the pending tool call", logged[3].Item)
+				}
+				turnIDs := h.listRootTurnIDs(t, source)
+				if len(turnIDs) != 2 || turnIDs[0] != firstTurn {
+					t.Fatalf("source Turns = %v, want 2 starting with %s", turnIDs, firstTurn)
+				}
+				secondTurn := turnIDs[1]
+
+				// 临时分叉不进对话列表，也不写共享库，但有 Executor 工具。
+				forked, err := h.rt.ForkConversation(t.Context(), &runtime.ForkConversationRequest{
+					ConversationID: source.ID,
+					Ephemeral:      true,
+				})
+				if err != nil || forked.ID == source.ID || forked.ForkedFromID != source.ID {
+					t.Fatalf("ForkConversation() = %+v, %v; want a new conversation forked from %s", forked, err, source.ID)
+				}
+				if h.isConversationListed(t, forked.ID, false) || h.isConversationListed(t, forked.ID, true) {
+					t.Fatal("ephemeral fork is listed")
+				}
+				if _, found, err := h.store.query.GetConversation(t.Context(), forked.ID); err != nil || found {
+					t.Fatalf("shared GetConversation(fork) found = %v, %v; want not found", found, err)
+				}
+				details, err := h.rt.GetSessionDetails(t.Context(), &runtime.GetSessionDetailsRequest{
+					ConversationID: forked.ID,
+					SessionID:      forked.RootSessionID,
+				})
+				if err != nil || len(details.Executors) == 0 || !slices.Contains(details.Tools, "bash") {
+					t.Fatalf("fork details executors = %+v, tools = %v, %v; want the Executor tools", details.Executors, details.Tools, err)
+				}
+
+				// 分叉里没结束的第 2 轮由分叉的 Session 改成 interrupted，来源的第 2 轮不动。
+				h.waitConversationTurnStatus(t, forked, secondTurn, defs.TurnStatusInterrupted)
+				h.waitTurnStatus(t, source.RootSessionID, secondTurn, defs.TurnStatusRunning)
+
+				// 给分叉输入后这一轮正常完成，没有结果的工具调用带 missing_output。
+				forkWatcher := h.subscribeSession(t, forked.ID, forked.RootSessionID)
+				h.submit(t, forked.ID, "继续", "")
+				request := h.model.receive(t)
+				if payload, _ := json.Marshal(request.body["messages"]); !strings.Contains(string(payload), "call-block") || !strings.Contains(string(payload), "missing_output") {
+					t.Fatalf("fork request messages = %s, want the pending call-block with missing_output", payload)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"好"}}
+				events := collectUntil(t, forkWatcher.Events, isTurnFinished)
+				if finished := getSessionEvent(events[len(events)-1]).(*session.SessionTurnFinished); finished.Status != defs.TurnStatusCompleted {
+					t.Fatalf("fork Turn = %+v, want completed", finished)
+				}
+				h.waitTurnStatus(t, source.RootSessionID, secondTurn, defs.TurnStatusRunning)
+			},
+		},
+		{
+			name:        "ephemeral fork discarded after idle",
+			idleTimeout: 50 * time.Millisecond,
+			run: func(t *testing.T, h *runtimeHarness) {
+				source := h.create(t)
+				h.subscribeSession(t, source.ID, source.RootSessionID)
+				h.completeRound(t, source, "第一轮", 2)
+				forked, err := h.rt.ForkConversation(t.Context(), &runtime.ForkConversationRequest{
+					ConversationID: source.ID,
+					Ephemeral:      true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				subscriptionCtx, unsubscribe := context.WithCancel(t.Context())
+				defer unsubscribe()
+				if _, err := h.rt.SubscribeConversation(subscriptionCtx, &runtime.SubscribeConversationRequest{ConversationID: forked.ID}); err != nil {
+					t.Fatal(err)
+				}
+				unsubscribe()
+				waitConversationDiscarded(t, h, forked.ID)
+				if _, err := h.rt.GetConversation(t.Context(), &runtime.GetConversationRequest{ConversationID: source.ID}); err != nil {
+					t.Fatalf("GetConversation(source) = %v; want the source kept", err)
+				}
+			},
+		},
+		{
+			// 截取点之前没有轮次：沿用来源的 Agent 新建对话，仍是临时的，照常装配 Executor。
+			name: "ephemeral fork before the first turn",
+			run: func(t *testing.T, h *runtimeHarness) {
+				source := h.create(t)
+				watcher := h.subscribeSession(t, source.ID, source.RootSessionID)
+				first := h.runRootTurn(t, source, watcher, "第一轮", runtimeModelResponse{chunks: []string{"回复一"}})
+				forked, err := h.rt.ForkConversation(t.Context(), &runtime.ForkConversationRequest{
+					ConversationID: source.ID,
+					BeforeTurnID:   first,
+					Ephemeral:      true,
+				})
+				if err != nil || forked.ID == source.ID || forked.ForkedFromID != "" {
+					t.Fatalf("ForkConversation() = %+v, %v; want a new conversation", forked, err)
+				}
+				details, err := h.rt.GetSessionDetails(t.Context(), &runtime.GetSessionDetailsRequest{
+					ConversationID: forked.ID,
+					SessionID:      forked.RootSessionID,
+				})
+				if err != nil || !slices.Contains(details.Tools, "bash") {
+					t.Fatalf("fork tools = %v, %v; want the Executor tools", details.Tools, err)
+				}
+				h.submit(t, forked.ID, "新问题", "")
+				h.model.receive(t).reply <- runtimeModelResponse{chunks: []string{"好"}}
+				h.waitLog(t, forked.ID, forked.RootSessionID, 2)
+				if h.isConversationListed(t, forked.ID, false) {
+					t.Fatal("ephemeral fork is listed after its first input")
+				}
+			},
+		},
+		{
+			// 来源压缩过：分叉只复制摘要覆盖的最后一条 Item 起的内容，更早的历史留在共享库的来源里，模型上下文用不到它。
+			name: "ephemeral fork of a compacted source",
+			run: func(t *testing.T, h *runtimeHarness) {
+				source := h.create(t)
+				h.completeRound(t, source, "第一轮", 2)
+				h.completeRound(t, source, "第二轮", 4)
+				compactTurn := h.compactContextWhenIdle(t, source.ID)
+				h.model.receive(t).reply <- runtimeModelResponse{chunks: []string{"摘要内容"}}
+				h.waitTurnStatus(t, source.RootSessionID, compactTurn, defs.TurnStatusCompleted)
+				h.waitLog(t, source.ID, source.RootSessionID, 5)
+				h.completeRound(t, source, "第三轮", 7)
+
+				forked, err := h.rt.ForkConversation(t.Context(), &runtime.ForkConversationRequest{
+					ConversationID: source.ID,
+					Ephemeral:      true,
+				})
+				if err != nil || h.isConversationListed(t, forked.ID, false) {
+					t.Fatalf("ForkConversation() = %+v, %v; want an unlisted conversation", forked, err)
+				}
+				// 分叉的 Item 从摘要覆盖的最后一条（序号 3）起，它前面的 2 条留在来源里。
+				if items := h.listRootItems(t, forked); len(items) == 0 || items[0].Ordinal != 3 {
+					t.Fatalf("fork items = %+v, want starting at ordinal 3", items)
+				}
+				forkWatcher := h.subscribeSession(t, forked.ID, forked.RootSessionID)
+				h.submit(t, forked.ID, "第四轮", "")
+				request := h.model.receive(t)
+				payload, _ := json.Marshal(request.body["messages"])
+				if !strings.Contains(string(payload), "摘要内容") || !strings.Contains(string(payload), "第四轮") || strings.Contains(string(payload), "第一轮") {
+					t.Fatalf("fork request messages = %s, want the summary and the new input without the summarized history", payload)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"好"}}
+				events := collectUntil(t, forkWatcher.Events, isTurnFinished)
+				if finished := getSessionEvent(events[len(events)-1]).(*session.SessionTurnFinished); finished.Status != defs.TurnStatusCompleted {
+					t.Fatalf("fork Turn = %+v, want completed", finished)
+				}
+			},
+		},
+	}
+	// 2. 创建带 local Executor 的 Runtime，逐个场景执行分叉并检查。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			opt := newExecutorRuntimeOpt(store, model, newLocalExecutors(t)...)
+			if tt.idleTimeout != 0 {
+				opt.WithUnsavedConversationIdleTimeout(tt.idleTimeout)
+			}
+			tt.run(t, startTestRuntimeWithOpt(t, store, model, opt))
+		})
 	}
 }
 
@@ -4744,4 +5436,722 @@ func (h *runtimeHarness) readFirstLogItem(t *testing.T, conv defs.Conversation) 
 		t.Fatal(err)
 	}
 	return &item
+}
+
+// terminalFixture 是 TestRuntimeTerminals 每个场景的运行环境：带 local Executor 的测试 Runtime 和一个终端订阅。
+type terminalFixture struct {
+	h            *runtimeHarness
+	executor     executor.Executor
+	subscription *runtime.TerminalsSubscription
+}
+
+// TestRuntimeTerminals 检查 Runtime 持有的交互终端：登记所属对话、发布完整列表、影响空闲判断、随对话删除和 Run 结束。
+func TestRuntimeTerminals(t *testing.T) {
+	// 1. 列出打开、退出、空闲、删除对话、取消打开、查询、订阅关闭和 Run 结束场景。
+	tests := []struct {
+		name string
+		run  func(t *testing.T, f *terminalFixture)
+	}{
+		{
+			name: "open_is_listed_with_conversation",
+			run: func(t *testing.T, f *terminalFixture) {
+				if f.subscription.Initial == nil || len(f.subscription.Initial) != 0 {
+					t.Fatalf("initial terminals = %#v, want an empty list", f.subscription.Initial)
+				}
+				conv := f.h.create(t)
+				withConversation := f.open(t, conv.ID)
+				withoutConversation := f.open(t, "")
+				info := withConversation.Terminal.GetInfo()
+				if withConversation.ExecutorID != defs.LocalExecutorID || withConversation.Directory != f.executor.GetDefinition().WorkspaceDirectory ||
+					info.EnvironmentID != defs.LocalExecutorID || info.Directory != f.executor.GetDefinition().WorkspaceDirectory || info.Rows != 30 || info.Cols != 100 {
+					t.Fatalf("opened = %+v, info = %+v; want the local executor, its directory and a 30x100 terminal", withConversation, info)
+				}
+				ids := []string{info.ID, withoutConversation.Terminal.GetInfo().ID}
+				listed := waitRunningTerminals(t, f.subscription.Events, ids)
+				if listed[0].ConversationID != conv.ID || listed[1].ConversationID != "" ||
+					listed[0].Info.Status != terminal.TerminalStatusRunning || listed[1].Info.Status != terminal.TerminalStatusRunning {
+					t.Fatalf("listed terminals = %+v, want running terminals of %q and of no conversation", listed, conv.ID)
+				}
+				late, err := f.h.rt.SubscribeTerminals(t.Context())
+				if err != nil || !slices.Equal(getRunningTerminalIDs(late.Initial), ids) || late.Initial[0].ConversationID != conv.ID {
+					t.Fatalf("late subscription = %+v, %v; want the same two terminals", late, err)
+				}
+			},
+		},
+		{
+			name: "open_and_exit_publish_full_list",
+			run: func(t *testing.T, f *terminalFixture) {
+				first := f.open(t, "")
+				firstID := first.Terminal.GetInfo().ID
+				waitRunningTerminals(t, f.subscription.Events, []string{firstID})
+				second := f.open(t, "")
+				secondID := second.Terminal.GetInfo().ID
+				waitRunningTerminals(t, f.subscription.Events, []string{firstID, secondID})
+				if _, err := first.Terminal.WriteInput(t.Context(), "exit\n"); err != nil {
+					t.Fatal(err)
+				}
+				waitRunningTerminals(t, f.subscription.Events, []string{secondID})
+			},
+		},
+		{
+			name: "is_idle_counts_terminals",
+			run: func(t *testing.T, f *terminalFixture) {
+				requireIdle := func(want bool) {
+					t.Helper()
+					if got, err := f.h.rt.IsIdle(t.Context()); err != nil || got != want {
+						t.Fatalf("IsIdle() = %v, %v, want %v", got, err, want)
+					}
+				}
+				requireIdle(true)
+				opened := f.open(t, "")
+				requireIdle(false)
+				if _, err := opened.Terminal.Stop(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				requireIdle(true)
+			},
+		},
+		{
+			name: "delete_conversation_stops_terminals",
+			run: func(t *testing.T, f *terminalFixture) {
+				deleted, kept := f.createSavedConversation(t), f.createSavedConversation(t)
+				deletedTerminal, keptTerminal := f.open(t, deleted.ID), f.open(t, kept.ID)
+				keptID := keptTerminal.Terminal.GetInfo().ID
+				waitRunningTerminals(t, f.subscription.Events, []string{deletedTerminal.Terminal.GetInfo().ID, keptID})
+				if err := f.h.rt.DeleteConversation(t.Context(), &runtime.DeleteConversationRequest{ConversationID: deleted.ID}); err != nil {
+					t.Fatal(err)
+				}
+				listed := waitRunningTerminals(t, f.subscription.Events, []string{keptID})
+				if listed[0].ConversationID != kept.ID {
+					t.Fatalf("listed terminals = %+v, want only the terminal of %q", listed, kept.ID)
+				}
+				if info := deletedTerminal.Terminal.GetInfo(); info.Status == terminal.TerminalStatusRunning || info.StopReason != terminal.TerminalStoppedByRequest {
+					t.Fatalf("deleted conversation terminal = %+v, want stopped", info)
+				}
+				if info := keptTerminal.Terminal.GetInfo(); info.Status != terminal.TerminalStatusRunning {
+					t.Fatalf("other conversation terminal = %+v, want still running", info)
+				}
+			},
+		},
+		{
+			// OpenTerminal 的 ctx 和打开并发取消：返回 ctx 错误的打开也照常登记，终端带着所属对话出现在列表里，删除对话后全部结束。
+			name: "cancelled_open_stays_registered",
+			run: func(t *testing.T, f *terminalFixture) {
+				conv := f.createSavedConversation(t)
+				for range 20 {
+					ctx, cancel := context.WithCancel(t.Context())
+					var opened *runtime.OpenedTerminal
+					var openErr error
+					var tasks sync.WaitGroup
+					tasks.Go(func() {
+						opened, openErr = f.h.rt.OpenTerminal(ctx, &runtime.OpenTerminalRequest{ConversationID: conv.ID})
+					})
+					tasks.Go(cancel)
+					tasks.Wait()
+					cancel()
+					if openErr != nil && !errors.Is(openErr, context.Canceled) {
+						t.Fatalf("OpenTerminal() = %v, %v; want success or %v", opened, openErr, context.Canceled)
+					}
+				}
+				// 等登记全部完成：每次发布的列表里的终端都带着所属对话，一段时间没有新列表后取最后一份。
+				var lastListed []runtime.RunningTerminal
+				for quiet := false; !quiet; {
+					select {
+					case listed := <-f.subscription.Events:
+						for _, running := range listed {
+							if running.ConversationID != conv.ID {
+								t.Fatalf("listed terminal = %+v, want conversation %q", running, conv.ID)
+							}
+						}
+						lastListed = listed
+					case <-time.After(300 * time.Millisecond):
+						quiet = true
+					}
+				}
+				if err := f.h.rt.DeleteConversation(t.Context(), &runtime.DeleteConversationRequest{ConversationID: conv.ID}); err != nil {
+					t.Fatal(err)
+				}
+				if len(lastListed) > 0 {
+					waitRunningTerminals(t, f.subscription.Events, []string{})
+				}
+				if idle, err := f.h.rt.IsIdle(t.Context()); err != nil || !idle {
+					t.Fatalf("IsIdle() = %v, %v, want true after the conversation is deleted", idle, err)
+				}
+			},
+		},
+		{
+			name: "get_unknown_terminal",
+			run: func(t *testing.T, f *terminalFixture) {
+				if _, err := f.h.rt.GetTerminal(t.Context(), "cmd_missing"); !errors.Is(err, terminal.ErrTerminalNotFound) {
+					t.Fatalf("GetTerminal(unknown) error = %v, want %v", err, terminal.ErrTerminalNotFound)
+				}
+			},
+		},
+		{
+			name: "get_finished_terminal",
+			run: func(t *testing.T, f *terminalFixture) {
+				opened := f.open(t, "")
+				id := opened.Terminal.GetInfo().ID
+				if got, err := f.h.rt.GetTerminal(t.Context(), id); err != nil || got.GetInfo().ID != id {
+					t.Fatalf("GetTerminal(running) = %v, %v, want terminal %s", got, err, id)
+				}
+				if _, err := opened.Terminal.Stop(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if got, err := f.h.rt.GetTerminal(t.Context(), id); err != nil || got.GetInfo().Status == terminal.TerminalStatusRunning {
+					t.Fatalf("GetTerminal(finished) = %v, %v, want the finished terminal", got, err)
+				}
+			},
+		},
+		{
+			name: "open_rejects_unknown_executor",
+			run: func(t *testing.T, f *terminalFixture) {
+				_, err := f.h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{ExecutorID: "gone"})
+				if !errors.Is(err, conversation.ErrInvalidExecutorSettings) {
+					t.Fatalf("OpenTerminal(unknown executor) error = %v, want %v", err, conversation.ErrInvalidExecutorSettings)
+				}
+			},
+		},
+		{
+			name: "subscription_close_reasons",
+			run: func(t *testing.T, f *terminalFixture) {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancelled, err := f.h.rt.SubscribeTerminals(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cancel()
+				waitEventsClosed(t, cancelled.Events)
+				if reason := cancelled.GetCloseReason(); !errors.Is(reason, context.Canceled) {
+					t.Fatalf("close reason after cancel = %v, want %v", reason, context.Canceled)
+				}
+				f.h.stop(t)
+				waitEventsClosed(t, f.subscription.Events)
+				if reason := f.subscription.GetCloseReason(); !errors.Is(reason, runtime.ErrRuntimeStopped) {
+					t.Fatalf("close reason after stop = %v, want %v", reason, runtime.ErrRuntimeStopped)
+				}
+				if _, err := f.h.rt.SubscribeTerminals(t.Context()); !errors.Is(err, runtime.ErrRuntimeStopped) {
+					t.Fatalf("SubscribeTerminals() after stop error = %v, want %v", err, runtime.ErrRuntimeStopped)
+				}
+				if _, err := f.h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{}); !errors.Is(err, runtime.ErrRuntimeStopped) {
+					t.Fatalf("OpenTerminal() after stop error = %v, want %v", err, runtime.ErrRuntimeStopped)
+				}
+			},
+		},
+		{
+			name: "run_waits_for_terminals",
+			run: func(t *testing.T, f *terminalFixture) {
+				opened := f.open(t, "")
+				shellPID := readShellPID(t, opened.Terminal)
+				if err := f.h.stop(t); !errors.Is(err, context.Canceled) {
+					t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+				}
+				if info := opened.Terminal.GetInfo(); info.Status == terminal.TerminalStatusRunning || info.StopReason != terminal.TerminalStoppedByManager {
+					t.Fatalf("terminal after Run = %+v, want stopped by the manager", info)
+				}
+				if isProcessAlive(shellPID) {
+					t.Fatalf("shell process %d is still alive after Run returned", shellPID)
+				}
+			},
+		},
+	}
+	// 2. 每个场景用独立的 Runtime 和 local Executor，订阅终端后运行。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SHELL", "/bin/bash")
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			local := newLocalExecutor(t, defs.LocalExecutorID)
+			h := startTestRuntimeWithOpt(t, store, model, newExecutorRuntimeOpt(store, model, local))
+			subscription, err := h.rt.SubscribeTerminals(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.run(t, &terminalFixture{h: h, executor: local, subscription: subscription})
+		})
+	}
+}
+
+// open 在 local Executor 上打开一个 30x100 的终端，所属对话为空时不指定对话。
+func (f *terminalFixture) open(t *testing.T, conversationID defs.ConversationID) *runtime.OpenedTerminal {
+	t.Helper()
+	// 1. 请求打开终端，失败则结束测试。
+	opened, err := f.h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{ConversationID: conversationID, Rows: 30, Cols: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return opened
+}
+
+// createSavedConversation 创建对话并跑完第一轮，让它保存进共用库、可以被删除。
+func (f *terminalFixture) createSavedConversation(t *testing.T) defs.Conversation {
+	t.Helper()
+	// 1. 创建对话，提交一条输入并等回复结束。
+	conv := f.h.create(t)
+	watcher := f.h.subscribeSession(t, conv.ID, conv.RootSessionID)
+	f.h.runRootTurn(t, conv, watcher, "保存对话", runtimeModelResponse{chunks: []string{"好的"}})
+	return conv
+}
+
+// getRunningTerminalIDs 按列表顺序取出终端编号。
+func getRunningTerminalIDs(running []runtime.RunningTerminal) []string {
+	// 1. 逐个取出 Info 里的编号，空列表得到空切片。
+	ids := make([]string, 0, len(running))
+	for _, item := range running {
+		ids = append(ids, item.Info.ID)
+	}
+	return ids
+}
+
+// waitRunningTerminals 等待完整的运行中终端列表与预期编号一致，返回这份列表。
+func waitRunningTerminals(t *testing.T, events <-chan []runtime.RunningTerminal, want []string) []runtime.RunningTerminal {
+	t.Helper()
+	// 1. 读取到预期列表或超时。
+	listed := collectUntil(t, events, func(running []runtime.RunningTerminal) bool {
+		return slices.Equal(getRunningTerminalIDs(running), want)
+	})
+	return listed[len(listed)-1]
+}
+
+// readShellPID 让终端里的 shell 打印自己的进程号并读出来。
+func readShellPID(t *testing.T, command terminal.Terminal) int {
+	t.Helper()
+	// 1. 写入打印命令，轮询输出直到出现进程号；命令行回显里的 $$ 不匹配。
+	if _, err := command.WriteInput(t.Context(), "echo shell_pid=$$\n"); err != nil {
+		t.Fatal(err)
+	}
+	pattern := regexp.MustCompile(`shell_pid=(\d+)`)
+	var text string
+	var cursor uint64
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		output, err := command.ReadOutput(t.Context(), cursor, 200*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text += output.Text
+		cursor = output.NextCursor
+		if match := pattern.FindStringSubmatch(text); match != nil {
+			shellPID, err := strconv.Atoi(match[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			return shellPID
+		}
+	}
+	t.Fatalf("shell did not print its pid, output = %q", text)
+	return 0
+}
+
+// TestRuntimeCallerConversationID 检查调用方指定的对话 ID 用于新建和分叉的对话，并最先交给 ExecutorProvider。
+func TestRuntimeCallerConversationID(t *testing.T) {
+	// 1. 列出新建、分叉、没有轮次可复制的分叉和 Provider 收到的 ID 场景。
+	tests := []struct {
+		name string
+		run  func(t *testing.T, h *runtimeHarness, provider *recordingExecutorProvider)
+	}{
+		{
+			name: "create_uses_given_id",
+			run: func(t *testing.T, h *runtimeHarness, _ *recordingExecutorProvider) {
+				const id = defs.ConversationID("caller-create")
+				conv, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{ConversationID: id, AgentName: "assistant"})
+				if err != nil || conv.ID != id {
+					t.Fatalf("CreateConversation() = %+v, %v; want ID %s", conv, err, id)
+				}
+			},
+		},
+		{
+			name: "create_generates_id_when_empty",
+			run: func(t *testing.T, h *runtimeHarness, _ *recordingExecutorProvider) {
+				first, second := h.create(t), h.create(t)
+				if first.ID == "" || second.ID == "" || first.ID == second.ID {
+					t.Fatalf("generated IDs = %q, %q; want two distinct non-empty IDs", first.ID, second.ID)
+				}
+			},
+		},
+		{
+			name: "fork_uses_given_id",
+			run: func(t *testing.T, h *runtimeHarness, _ *recordingExecutorProvider) {
+				const id = defs.ConversationID("caller-fork")
+				source := h.create(t)
+				h.completeRound(t, source, "你好", 2)
+				forked, err := h.rt.ForkConversation(t.Context(), &runtime.ForkConversationRequest{ConversationID: source.ID, ForkedConversationID: id})
+				if err != nil || forked.ID != id || forked.ForkedFromID != source.ID {
+					t.Fatalf("ForkConversation() = %+v, %v; want ID %s forked from %s", forked, err, id, source.ID)
+				}
+			},
+		},
+		{
+			name: "fork_without_turns_uses_given_id",
+			run: func(t *testing.T, h *runtimeHarness, _ *recordingExecutorProvider) {
+				const id = defs.ConversationID("caller-fork-empty")
+				source := h.create(t)
+				watcher := h.subscribeSession(t, source.ID, source.RootSessionID)
+				first := h.runRootTurn(t, source, watcher, "第一轮", runtimeModelResponse{chunks: []string{"回复一"}})
+				forked, err := h.rt.ForkConversation(t.Context(), &runtime.ForkConversationRequest{ConversationID: source.ID, BeforeTurnID: first, ForkedConversationID: id})
+				if err != nil || forked.ID != id {
+					t.Fatalf("ForkConversation() = %+v, %v; want ID %s", forked, err, id)
+				}
+			},
+		},
+		{
+			name: "provider_sees_given_id",
+			run: func(t *testing.T, h *runtimeHarness, provider *recordingExecutorProvider) {
+				const id = defs.ConversationID("caller-provider")
+				if _, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{ConversationID: id, AgentName: "assistant"}); err != nil {
+					t.Fatal(err)
+				}
+				if got := provider.conversationIDs.Keys(); !slices.Equal(got, []defs.ConversationID{id}) {
+					t.Fatalf("provider conversation IDs = %v, want %s", got, id)
+				}
+			},
+		},
+	}
+	// 2. 每个场景用带记录型 Provider 的 Runtime 执行。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			provider := &recordingExecutorProvider{newExecutors: func(defs.ConversationID) []executor.Executor { return nil }}
+			opt := newTestRuntimeOpt(store, model)
+			opt.Definitions.Executors = provider
+			tt.run(t, startTestRuntimeWithOpt(t, store, model, opt), provider)
+		})
+	}
+}
+
+// savedIdleFixture 是一个已保存、没有订阅者的对话，以及它的订阅和 Runtime。
+type savedIdleFixture struct {
+	h    *runtimeHarness
+	conv defs.Conversation
+	// unsubscribe 一次取消对话和根 Session 的订阅。
+	unsubscribe context.CancelFunc
+	infos       *runtime.ConversationSubscription
+	watcher     *runtime.SessionSubscription
+}
+
+// subscribe 重新登记对话和根 Session 订阅，之后用 unsubscribe 取消。
+func (f *savedIdleFixture) subscribe(t *testing.T) {
+	t.Helper()
+	// 1. 用同一个可取消的 ctx 登记两个订阅。
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	infos, err := f.h.rt.SubscribeConversation(ctx, &runtime.SubscribeConversationRequest{ConversationID: f.conv.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher, err := f.h.rt.SubscribeSession(ctx, &runtime.SubscribeSessionRequest{ConversationID: f.conv.ID, SessionID: f.conv.RootSessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.unsubscribe, f.infos, f.watcher = cancel, infos, watcher
+}
+
+// isOpen 对话是否有运行实例？
+func (f *savedIdleFixture) isOpen(t *testing.T) bool {
+	t.Helper()
+	// 1. 查询运行表。
+	isOpen, err := f.h.rt.IsConversationOpen(t.Context(), &runtime.GetConversationRequest{ConversationID: f.conv.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return isOpen
+}
+
+// waitClosed 等待对话的运行实例退出。
+func (f *savedIdleFixture) waitClosed(t *testing.T) {
+	t.Helper()
+	// 1. 在 5 秒内轮询运行表，超时则结束测试。
+	deadline := time.Now().Add(5 * time.Second)
+	for f.isOpen(t) {
+		if time.Now().After(deadline) {
+			t.Fatal("conversation is still open after the saved idle timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// requireStaysOpen 等过几倍空闲时长后检查对话仍然打开。
+func (f *savedIdleFixture) requireStaysOpen(t *testing.T, idleTimeout time.Duration) {
+	t.Helper()
+	// 1. 没有可等待的事件，只能等过几个空闲时长再看。
+	time.Sleep(5 * idleTimeout)
+	if !f.isOpen(t) {
+		t.Fatal("conversation was stopped, want it to stay open")
+	}
+}
+
+// TestRuntimeSavedConversationIdleStop 检查已保存对话空闲到时只停止运行实例，有人使用时保持打开。
+func TestRuntimeSavedConversationIdleStop(t *testing.T) {
+	// 1. 列出各种使用状态下到期后的表现。
+	const idleTimeout = 50 * time.Millisecond
+	tests := []struct {
+		name string
+		// ephemeral 为 true 时建临时对话，它的丢弃时长也用 idleTimeout。
+		ephemeral bool
+		// executors 非 nil 时替换默认的 local 列表。
+		executors func(t *testing.T) []executor.Executor
+		// request 是创建对话时附带的 Executor 选择。
+		request     runtime.CreateConversationRequest
+		idleTimeout time.Duration
+		run         func(t *testing.T, f *savedIdleFixture)
+	}{
+		{
+			name:        "without_executors_stays_open",
+			idleTimeout: idleTimeout,
+			request:     runtime.CreateConversationRequest{WithoutExecutors: true},
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.unsubscribe()
+				f.requireStaysOpen(t, idleTimeout)
+			},
+		},
+		{
+			name:        "virtual_default_executor_stays_open",
+			idleTimeout: idleTimeout,
+			executors: func(t *testing.T) []executor.Executor {
+				return append(newLocalExecutors(t), newVirtualExecutor("sandbox", "沙箱", "/workspace"))
+			},
+			request: runtime.CreateConversationRequest{ExecutorSettings: defs.ExecutorSettings{DefaultExecutorID: "sandbox"}},
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.unsubscribe()
+				f.requireStaysOpen(t, idleTimeout)
+			},
+		},
+		{
+			name:        "local_default_with_builtin_virtual_still_stops",
+			idleTimeout: idleTimeout,
+			executors: func(t *testing.T) []executor.Executor {
+				return append(newLocalExecutors(t), newVirtualExecutor("openvaala", "内置沙箱", "/workspace"))
+			},
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.unsubscribe()
+				f.waitClosed(t)
+			},
+		},
+		{
+			name:        "stops_after_idle_timeout",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.unsubscribe()
+				f.waitClosed(t)
+				got, err := f.h.rt.GetConversation(t.Context(), &runtime.GetConversationRequest{ConversationID: f.conv.ID})
+				if err != nil || got.ID != f.conv.ID {
+					t.Fatalf("GetConversation() = %+v, %v; want the saved record", got, err)
+				}
+				page, err := f.h.rt.ListItems(t.Context(), &runtime.ListItemsRequest{ConversationID: f.conv.ID, SessionID: f.conv.RootSessionID, Limit: 10})
+				if err != nil || len(page.Items) != 2 {
+					t.Fatalf("ListItems() = %d items, %v; want the two items of the first turn", len(page.Items), err)
+				}
+			},
+		},
+		{
+			name:        "reopen_continues_conversation",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.unsubscribe()
+				f.waitClosed(t)
+				if _, err := f.h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: f.conv.ID}); err != nil {
+					t.Fatal(err)
+				}
+				f.subscribe(t)
+				f.h.runRootTurn(t, f.conv, f.watcher, "继续", runtimeModelResponse{chunks: []string{"接着"}})
+			},
+		},
+		{
+			name:        "subscriber_keeps_conversation_open",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.requireStaysOpen(t, idleTimeout)
+			},
+		},
+		{
+			name:        "running_turn_keeps_conversation_open",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.h.submit(t, f.conv.ID, "慢慢想", "")
+				request := f.h.model.receive(t)
+				collectUntil(t, f.infos.Events, func(info runtime.SessionRuntimeInfo) bool { return info.State == session.SessionStateRunning })
+				f.unsubscribe()
+				f.requireStaysOpen(t, idleTimeout)
+				request.reply <- runtimeModelResponse{chunks: []string{"想好了"}}
+				f.waitClosed(t)
+			},
+		},
+		{
+			name:        "running_subagent_keeps_conversation_open",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.h.submit(t, f.conv.ID, "委派", "")
+				f.h.model.receive(t).reply <- runtimeModelResponse{calls: []llmkit.ToolCall{{
+					ID:        "spawn",
+					Name:      "spawn_agent",
+					Arguments: `{"task_name":"review","message":"check"}`,
+				}}}
+				root, child := f.h.model.receiveRootAndTask(t, "review")
+				root.reply <- runtimeModelResponse{chunks: []string{"已委派"}}
+				collectUntil(t, f.watcher.Events, isTurnFinished)
+				collectUntil(t, f.infos.Events, func(info runtime.SessionRuntimeInfo) bool {
+					return info.Session.ParentSessionID == f.conv.RootSessionID && info.State == session.SessionStateRunning
+				})
+				f.unsubscribe()
+				f.requireStaysOpen(t, idleTimeout)
+				child.reply <- runtimeModelResponse{chunks: []string{"子任务完成"}}
+				f.h.model.receive(t).reply <- runtimeModelResponse{chunks: []string{"已汇总"}}
+				f.waitClosed(t)
+			},
+		},
+		{
+			name:        "background_command_keeps_conversation_open",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				started := f.h.runCommandToolRound(t, f.conv, f.watcher, "call-bash", "bash", `{"command":"sleep 1","wait_seconds":0}`)
+				if started.ToolError != nil || started.Status != "running" || started.CommandID == "" {
+					t.Fatalf("bash result = %+v, want a running command", started)
+				}
+				// 全程不重新订阅：命令还在跑时到期不停，命令结束后到期自己停。
+				f.unsubscribe()
+				f.requireStaysOpen(t, idleTimeout)
+				f.waitClosed(t)
+			},
+		},
+		{
+			name:        "unsaved_conversation_discards_despite_background_command",
+			ephemeral:   true,
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				started := f.h.runCommandToolRound(t, f.conv, f.watcher, "call-bash", "bash", `{"command":"sleep 30","wait_seconds":0}`)
+				if started.ToolError != nil || started.Status != "running" {
+					t.Fatalf("bash result = %+v, want a running command", started)
+				}
+				f.unsubscribe()
+				waitConversationDiscarded(t, f.h, f.conv.ID)
+			},
+		},
+		{
+			name: "zero_timeout_never_stops",
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.unsubscribe()
+				f.requireStaysOpen(t, idleTimeout)
+			},
+		},
+		{
+			name:        "reopen_right_after_idle_stop",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				f.unsubscribe()
+				f.waitClosed(t)
+				if _, err := f.h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: f.conv.ID}); err != nil {
+					t.Fatal(err)
+				}
+				f.subscribe(t)
+				f.requireStaysOpen(t, idleTimeout)
+			},
+		},
+		{
+			name:        "running_terminal_keeps_running",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				opened, err := f.h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{ConversationID: f.conv.ID, Rows: 30, Cols: 100})
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.unsubscribe()
+				f.waitClosed(t)
+				if info := opened.Terminal.GetInfo(); info.Status != terminal.TerminalStatusRunning {
+					t.Fatalf("terminal after the conversation stopped = %+v, want running", info)
+				}
+			},
+		},
+	}
+	// 2. 每个场景用独立的 Runtime，先跑完第一轮让对话保存，再交给场景。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SHELL", "/bin/bash")
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			executors := newLocalExecutors(t)
+			if tt.executors != nil {
+				executors = tt.executors(t)
+			}
+			opt := newExecutorRuntimeOpt(store, model, executors...).WithSavedConversationIdleTimeout(tt.idleTimeout)
+			if tt.ephemeral {
+				opt.WithUnsavedConversationIdleTimeout(tt.idleTimeout)
+			}
+			f := &savedIdleFixture{h: startTestRuntimeWithOpt(t, store, model, opt)}
+			request := tt.request
+			request.AgentName, request.Ephemeral = "assistant", tt.ephemeral
+			conv, err := f.h.rt.CreateConversation(t.Context(), &request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.conv = conv
+			f.subscribe(t)
+			f.h.runRootTurn(t, f.conv, f.watcher, "保存对话", runtimeModelResponse{chunks: []string{"好的"}})
+			tt.run(t, f)
+		})
+	}
+}
+
+// TestRuntimeMaxSteps 检查 Agent 定义的 max_steps 经 Session 和 Turn 生效：最后一步禁用工具，模型总结则 Turn 完成，仍请求工具则 Turn 失败且历史完整。
+func TestRuntimeMaxSteps(t *testing.T) {
+	// 1. 列出第 2 步模型是否遵守禁用工具。
+	tests := []struct {
+		name string
+		// isToolChoiceIgnored 为 true 时第 2 步模型仍返回工具调用。
+		isToolChoiceIgnored bool
+		wantStatus          defs.TurnStatus
+	}{
+		{name: "summary_turn_completes", wantStatus: defs.TurnStatusCompleted},
+		{name: "ignored_tool_choice_fails_turn", isToolChoiceIgnored: true, wantStatus: defs.TurnStatusFailed},
+	}
+	// 2. 每个场景用独立的 Runtime，Agent 最多调用 2 次模型。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SHELL", "/bin/bash")
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			opt := newExecutorRuntimeOpt(store, model, newLocalExecutors(t)...)
+			opt.Definitions.Agents[0].MaxSteps = 2
+			h := startTestRuntimeWithOpt(t, store, model, opt)
+			conv := h.create(t)
+			watcher, err := h.rt.SubscribeSession(t.Context(), &runtime.SubscribeSessionRequest{ConversationID: conv.ID, SessionID: conv.RootSessionID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			toolCall := func(callID string) runtimeModelResponse {
+				return runtimeModelResponse{calls: []llmkit.ToolCall{{ID: callID, Name: "bash", Arguments: `{"command":"echo hi"}`}}}
+			}
+			// 3. 第 1 步正常请求工具，第 2 步禁用工具。
+			h.submit(t, conv.ID, "干活", "")
+			first := h.model.receive(t)
+			if first.body["tool_choice"] == "none" {
+				t.Fatalf("first request = %v, want tools enabled", first.body)
+			}
+			first.reply <- toolCall("c1")
+			second := h.model.receive(t)
+			if second.body["tool_choice"] != "none" {
+				t.Fatalf("second request = %v, want tools disabled", second.body)
+			}
+			if tt.isToolChoiceIgnored {
+				second.reply <- toolCall("c2")
+			} else {
+				second.reply <- runtimeModelResponse{chunks: []string{"做了一部分"}}
+			}
+			events := collectUntil(t, watcher.Events, isTurnFinished)
+			finished := getSessionEvent(events[len(events)-1]).(*session.SessionTurnFinished)
+			if finished.Status != tt.wantStatus {
+				t.Fatalf("turn status = %q, want %q", finished.Status, tt.wantStatus)
+			}
+			// 4. 保存的历史里每个 ToolCall 都有 ToolResult。
+			results := map[string]bool{}
+			for _, logged := range h.listRootItems(t, conv) {
+				if logged.Item.Kind == defs.ItemToolResult {
+					results[logged.Item.ToolResult.CallID] = true
+				}
+			}
+			for _, logged := range h.listRootItems(t, conv) {
+				if logged.Item.Kind == defs.ItemToolCall && !results[logged.Item.ToolCall.CallID] {
+					t.Fatalf("tool call %s has no tool result", logged.Item.ToolCall.CallID)
+				}
+			}
+			// 5. 下一轮能正常完成。
+			next := h.runRootTurn(t, conv, watcher, "继续", runtimeModelResponse{chunks: []string{"接着做"}})
+			h.waitTurnStatus(t, conv.RootSessionID, next, defs.TurnStatusCompleted)
+		})
+	}
 }

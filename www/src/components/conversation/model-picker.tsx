@@ -6,7 +6,7 @@ import {
 } from "@/components/ui/tooltip"
 import { OverflowTooltip } from "@/components/base/overflow-tooltip"
 import { useMemo, useRef, useState } from "react"
-import { motion, useReducedMotion } from "motion/react"
+import { motion } from "motion/react"
 import { useQuery } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
 import { CheckIcon, ChevronDownIcon, XIcon } from "lucide-react"
@@ -15,8 +15,13 @@ import {
   DrawerTrigger,
   DrawerContent,
   DrawerTitle,
-  DrawerClose,
 } from "@/components/ui/drawer"
+import {
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+  PopoverTitle,
+} from "@/components/ui/popover"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { RequestError } from "@/components/base/request-error"
@@ -84,13 +89,13 @@ export function ModelPicker({
 }) {
   const { t } = useTranslation()
   const isMobile = useIsMobile()
-  const reducedMotion = useReducedMotion()
-  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [compactOpen, setCompactOpen] = useState(false)
   const [modelOpen, setModelOpen] = useState(false)
   const [effortOpen, setEffortOpen] = useState(false)
   const [search, setSearch] = useState("")
   const connection = useServerConnection()
   const triggerRef = useRef<HTMLButtonElement>(null)
+  const searchRef = useRef<HTMLInputElement>(null)
   const models = useQuery({
     ...modelListOptions(connection, agentName ?? ""),
     enabled: agentName !== undefined,
@@ -99,8 +104,8 @@ export function ModelPicker({
   const isSelectionPending = agentName === undefined || models.isPending
   const selectionDisabled = disabled || isSelectionPending
   // 1. 目标尚未就绪或控件禁用时，关闭浮层并清空搜索。
-  if (selectionDisabled && (drawerOpen || modelOpen || effortOpen || search)) {
-    setDrawerOpen(false)
+  if (selectionDisabled && (compactOpen || modelOpen || effortOpen || search)) {
+    setCompactOpen(false)
     setModelOpen(false)
     setEffortOpen(false)
     setSearch("")
@@ -133,7 +138,8 @@ export function ModelPicker({
       : isSelectionPending
         ? t("common.loading")
         : t("modelPicker.placeholder")
-  if (compact) {
+  // 2. 容器窄时合并入口；手机用抽屉，桌面用锚定浮层。
+  if (compact || isMobile) {
     const filtered = groups
       .map((group) => ({
         ...group,
@@ -144,178 +150,200 @@ export function ModelPicker({
         ),
       }))
       .filter((group) => group.items.length > 0)
-    return (
-      <Drawer
-        open={drawerOpen && !selectionDisabled}
-        onOpenChange={(next) => {
-          setDrawerOpen(next)
-          if (!next) setSearch("")
-        }}
+    const trigger = (
+      <Button
+        type="button"
+        variant={variant}
+        className={cn(
+          "model-selection-value max-w-full min-w-0 shrink gap-2 text-ui transition-colors",
+          variant === "ghost" && "px-1"
+        )}
+        aria-label={t("modelPicker.model")}
+        disabled={selectionDisabled}
       >
-        <DrawerTrigger
-          render={
-            <Button
-              type="button"
-              variant={variant}
-              className={cn(
-                "model-selection-value max-w-full min-w-0 shrink gap-2 text-ui transition-colors",
-                variant === "ghost" && "px-1"
-              )}
-              aria-label={t("modelPicker.model")}
-              disabled={selectionDisabled}
-            />
-          }
-        >
-          <OverflowTooltip render={<span className="min-w-0 truncate" />}>
-            {label}
-          </OverflowTooltip>
-          {showReasoningEffort && effort && (
-            <span className="shrink-0 color-muted">{effort}</span>
-          )}
-          <ChevronDownIcon className="shrink-0" />
-        </DrawerTrigger>
-        <DrawerContent className="text-body">
-          <div className="flex shrink-0 items-center justify-between gap-2 p-3">
+        <OverflowTooltip render={<span className="min-w-0 truncate" />}>
+          {label}
+        </OverflowTooltip>
+        {showReasoningEffort && effort && (
+          <span className="shrink-0 color-muted">{effort}</span>
+        )}
+        <ChevronDownIcon className="shrink-0" />
+      </Button>
+    )
+    const onCompactOpenChange = (next: boolean) => {
+      setCompactOpen(next)
+      if (!next) setSearch("")
+    }
+    const content = (
+      <>
+        <div className="flex shrink-0 items-center justify-between gap-2 p-3">
+          {isMobile ? (
             <DrawerTitle className="text-section">
               {t("modelPicker.model")}
             </DrawerTitle>
-            <Tooltip disabled={isMobile}>
-              <TooltipTrigger
-                render={
-                  <DrawerClose
-                    render={
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        aria-label={t("modelPicker.close")}
-                      />
-                    }
-                  />
-                }
+          ) : (
+            <PopoverTitle className="text-section">
+              {t("modelPicker.model")}
+            </PopoverTitle>
+          )}
+          <Tooltip disabled={isMobile}>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={t("modelPicker.close")}
+                  onClick={() => onCompactOpenChange(false)}
+                />
+              }
+            >
+              <XIcon />
+            </TooltipTrigger>
+            <TooltipContent className="text-caption">
+              {t("modelPicker.close")}
+            </TooltipContent>
+          </Tooltip>
+        </div>
+        <div className="flex min-h-0 flex-col gap-2 px-3 pb-3">
+          <Input
+            ref={searchRef}
+            type="search"
+            className="shrink-0 text-ui"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            aria-label={t("modelPicker.search")}
+            placeholder={t("modelPicker.search")}
+          />
+          {showReasoningEffort &&
+            selected &&
+            selected.reasoning_efforts.length > 0 && (
+              <ToggleGroup
+                disabled={selectionDisabled}
+                className="max-w-full shrink-0 overflow-x-auto"
+                aria-label={t("modelPicker.reasoningEffort", {
+                  effort: effort || t("modelPicker.defaultEffort"),
+                })}
+                value={effort ? [effort] : []}
+                onValueChange={(next) => {
+                  if (next[0])
+                    onChange({ ref: selected.ref, reasoning_effort: next[0] })
+                }}
               >
-                <XIcon />
-              </TooltipTrigger>
-              <TooltipContent className="text-caption">
-                {t("modelPicker.close")}
-              </TooltipContent>
-            </Tooltip>
-          </div>
-          <div className="flex min-h-0 flex-col gap-2 px-3 pb-3">
-            <Input
-              type="search"
-              className="shrink-0 text-ui"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              aria-label={t("modelPicker.search")}
-              placeholder={t("modelPicker.search")}
+                {selected.reasoning_efforts.map((each) => (
+                  <ToggleGroupItem
+                    key={each}
+                    value={each}
+                    className="model-selection-option text-ui"
+                  >
+                    {each}
+                  </ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            )}
+          {models.isError && shouldShowLoadError(models.error) && (
+            <RequestError
+              error={models.error}
+              onRetry={() => void models.refetch()}
             />
-            {showReasoningEffort &&
-              selected &&
-              selected.reasoning_efforts.length > 0 && (
-                <ToggleGroup
-                  disabled={selectionDisabled}
-                  className="max-w-full shrink-0 overflow-x-auto"
-                  aria-label={t("modelPicker.reasoningEffort", {
-                    effort: effort || t("modelPicker.defaultEffort"),
-                  })}
-                  value={effort ? [effort] : []}
-                  onValueChange={(next) => {
-                    if (next[0])
-                      onChange({ ref: selected.ref, reasoning_effort: next[0] })
-                  }}
+          )}
+          {models.isPending && (
+            <LatticeLoader aria-label={t("common.loading")} />
+          )}
+          {!models.data &&
+            models.isError &&
+            !shouldShowLoadError(models.error) && (
+              <Skeleton className="h-28 w-full" />
+            )}
+          <div className="max-h-[50svh] min-h-0 overflow-y-auto">
+            {filtered.map((group) => (
+              <div key={group.value} className="flex flex-col gap-1 pb-2">
+                <OverflowTooltip
+                  render={
+                    <p className="truncate px-2 py-1 text-caption color-muted" />
+                  }
                 >
-                  {selected.reasoning_efforts.map((each) => (
-                    <ToggleGroupItem
-                      key={each}
-                      value={each}
-                      className="model-selection-option text-ui"
-                    >
-                      {each}
-                    </ToggleGroupItem>
-                  ))}
-                </ToggleGroup>
-              )}
-            {models.isError && shouldShowLoadError(models.error) && (
-              <RequestError
-                error={models.error}
-                onRetry={() => void models.refetch()}
-              />
-            )}
-            {models.isPending && (
-              <LatticeLoader aria-label={t("common.loading")} />
-            )}
-            {!models.data &&
-              models.isError &&
-              !shouldShowLoadError(models.error) && (
-                <Skeleton className="h-28 w-full" />
-              )}
-            <div className="max-h-[50svh] min-h-0 overflow-y-auto">
-              {filtered.map((group) => (
-                <div key={group.value} className="flex flex-col gap-1 pb-2">
-                  <OverflowTooltip
-                    render={
-                      <p className="truncate px-2 py-1 text-caption color-muted" />
+                  {group.value}
+                </OverflowTooltip>
+                {group.items.map((model) => (
+                  <Button
+                    key={model.ref.model_id}
+                    type="button"
+                    variant="ghost"
+                    className="model-selection-option w-full min-w-0 justify-start px-2 text-table"
+                    aria-pressed={isSameModel(model.ref, selectedRef)}
+                    disabled={selectionDisabled}
+                    onClick={() =>
+                      onChange({
+                        ref: model.ref,
+                        reasoning_effort:
+                          value?.reasoning_effort &&
+                          model.reasoning_efforts.includes(
+                            value.reasoning_effort
+                          )
+                            ? value.reasoning_effort
+                            : undefined,
+                      })
                     }
                   >
-                    {group.value}
-                  </OverflowTooltip>
-                  {group.items.map((model) => (
-                    <Button
-                      key={model.ref.model_id}
-                      type="button"
-                      variant="ghost"
-                      className="model-selection-option w-full min-w-0 justify-start px-2 text-table"
-                      aria-pressed={isSameModel(model.ref, selectedRef)}
-                      disabled={selectionDisabled}
-                      onClick={() =>
-                        onChange({
-                          ref: model.ref,
-                          reasoning_effort:
-                            value?.reasoning_effort &&
-                            model.reasoning_efforts.includes(
-                              value.reasoning_effort
-                            )
-                              ? value.reasoning_effort
-                              : undefined,
-                        })
+                    <OverflowTooltip
+                      render={
+                        <span className="min-w-0 flex-1 truncate text-left" />
                       }
                     >
-                      <OverflowTooltip
-                        render={
-                          <span className="min-w-0 flex-1 truncate text-left" />
-                        }
-                      >
-                        {getModelName(model)}
-                      </OverflowTooltip>
-                      {model.context_window > 0 && (
-                        <TokenNumberValue
-                          value={model.context_window}
-                          interactive={false}
-                          className="shrink-0 color-muted"
-                        />
-                      )}
-                      <CheckIcon
-                        aria-hidden
-                        className={cn(
-                          !isSameModel(model.ref, selectedRef) && "invisible"
-                        )}
+                      {getModelName(model)}
+                    </OverflowTooltip>
+                    {model.context_window > 0 && (
+                      <TokenNumberValue
+                        value={model.context_window}
+                        interactive={false}
+                        className="shrink-0 color-muted"
                       />
-                    </Button>
-                  ))}
-                </div>
-              ))}
-              {models.isSuccess && filtered.length === 0 && (
-                <p className="py-2 text-caption color-muted">
-                  {definitions.length === 0
-                    ? t("modelPicker.noModels")
-                    : t("common.selection.empty")}
-                </p>
-              )}
-            </div>
+                    )}
+                    <CheckIcon
+                      aria-hidden
+                      className={cn(
+                        !isSameModel(model.ref, selectedRef) && "invisible"
+                      )}
+                    />
+                  </Button>
+                ))}
+              </div>
+            ))}
+            {models.isSuccess && filtered.length === 0 && (
+              <p className="py-2 text-caption color-muted">
+                {definitions.length === 0
+                  ? t("modelPicker.noModels")
+                  : t("common.selection.empty")}
+              </p>
+            )}
           </div>
-        </DrawerContent>
+        </div>
+      </>
+    )
+    return isMobile ? (
+      <Drawer
+        open={compactOpen && !selectionDisabled}
+        onOpenChange={onCompactOpenChange}
+      >
+        <DrawerTrigger render={trigger} />
+        <DrawerContent className="text-body">{content}</DrawerContent>
       </Drawer>
+    ) : (
+      <Popover
+        open={compactOpen && !selectionDisabled}
+        onOpenChange={onCompactOpenChange}
+      >
+        <PopoverTrigger render={trigger} />
+        <PopoverContent
+          initialFocus={searchRef}
+          align={variant === "ghost" ? "end" : "start"}
+          side="top"
+          className="max-h-(--available-height) w-80 max-w-(--available-width) gap-0 p-0 text-body"
+        >
+          {content}
+        </PopoverContent>
+      </Popover>
     )
   }
   return (
@@ -461,7 +489,7 @@ export function ModelPicker({
               ? 1
               : 0,
         }}
-        transition={{ duration: reducedMotion ? 0 : 0.2 }}
+        transition={{ duration: 0.2 }}
         className="shrink-0"
         inert={
           selectionDisabled ||

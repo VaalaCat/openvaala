@@ -7,7 +7,7 @@ OpenVaala 支持 Linux 和 macOS，amd64 和 arm64 都可以，不支持 Windows
 | | 终端界面、Runtime 服务、编辑器、Codex | Web 界面 | 桌面端 |
 | --- | --- | --- | --- |
 | [GitHub Releases](#从-github-releases-安装) | 有 | 有 | 单独的安装包 |
-| [`go install`](#用-go-install-安装) | 有 | 有 | 没有 |
+| [`go install`](#用-go-install-安装) | 有 | 有 | 命令行程序，不是安装包 |
 | [从源码构建](#从源码构建) | 有 | 有 | 有 |
 
 ## 从 GitHub Releases 安装
@@ -32,7 +32,15 @@ OpenVaala 支持 Linux 和 macOS，amd64 和 arm64 都可以，不支持 Windows
 go install github.com/VaalaCat/openvaala/cmd/openvaala@latest
 ```
 
-发布版本的 tag 包含已经构建好的 Web 页面，所以用 `@latest` 或指定发布版本安装后，可以直接运行 `openvaala web`，不需要 Node.js 或 pnpm。开发分支不把生成的页面放进 Git，因此 `@main` 不带 Web 界面；要使用开发版的 Web 界面，请按下面的说明从源码构建。
+同一条命令换成 `cmd/openvaala-desktop`，会另外装一个名叫 `openvaala-desktop` 的程序，也放在 `$(go env GOPATH)/bin`。直接运行它会打开桌面窗口，里面同样有完整的命令行工具。这不是桌面端安装包：没有 `.app`、磁盘映像，也不会出现在应用菜单里。Linux 上仍然需要 GTK 3，WebView 还需要 WebKitGTK 4.1。见[桌面端](../guides/desktop.md)。
+
+```bash
+go install github.com/VaalaCat/openvaala/cmd/openvaala-desktop@latest
+openvaala-desktop                 # WebView 窗口
+openvaala-desktop app --native    # 原生界面
+```
+
+发布版本的 tag 包含已经构建好的 Web 页面，所以用 `@latest` 或指定发布版本安装上面两个程序后，都可以直接使用 Web 界面，不需要 Node.js 或 pnpm。开发分支不把生成的页面放进 Git，因此 `@main` 不带 Web 界面，这个桌面端程序也打不开 WebView；要使用开发版的 Web 界面，请按下面的说明从源码构建。在本仓库的检出目录里，用 `go install ./cmd/openvaala` 或 `go install ./cmd/openvaala-desktop` 安装你当前检出的版本。
 
 需要 Go 1.27.3 或更高版本。
 

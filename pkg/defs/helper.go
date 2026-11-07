@@ -1,9 +1,12 @@
 package defs
 
 import (
+	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 )
@@ -66,6 +69,8 @@ func (item *Item) Clone() *Item {
 		ExecutorsChange:   item.ExecutorsChange.Clone(),
 		SkillInstruction:  item.SkillInstruction.Clone(),
 		AgentsInstruction: item.AgentsInstruction.Clone(),
+		MemoryIndex:       item.MemoryIndex.Clone(),
+		ClientInstruction: item.ClientInstruction.Clone(),
 		HookRun:           item.HookRun.Clone(),
 	}
 }
@@ -185,16 +190,36 @@ func (definition *ToolDefinition) Clone() *ToolDefinition {
 
 // Clone 复制工具调用。
 func (call *ToolCall) Clone() *ToolCall {
-	// 1. nil 返回 nil，否则复制调用 ID、工具名、参数和状态。
+	// 1. nil 返回 nil，否则复制调用 ID、工具名、参数、状态和厂商数据。
 	if call == nil {
 		return nil
 	}
 	return &ToolCall{
-		CallID:    call.CallID,
-		Name:      call.Name,
-		Arguments: call.Arguments,
-		Status:    call.Status,
+		CallID:       call.CallID,
+		Name:         call.Name,
+		Arguments:    call.Arguments,
+		Status:       call.Status,
+		ProviderData: CloneToolCallProviderData(call.ProviderData),
 	}
+}
+
+// CloneToolCallProviderData 深拷贝工具调用的厂商数据。
+func CloneToolCallProviderData(data *llmkit.ToolCallProviderData) *llmkit.ToolCallProviderData {
+	// 1. nil 返回 nil，否则复制协议、模型名列表和每个原生字段的 JSON 字节。
+	if data == nil {
+		return nil
+	}
+	cloned := &llmkit.ToolCallProviderData{
+		Protocol: data.Protocol,
+		Models:   slices.Clone(data.Models),
+	}
+	if data.Fields != nil {
+		cloned.Fields = make(map[string]json.RawMessage, len(data.Fields))
+		for key, value := range data.Fields {
+			cloned.Fields[key] = slices.Clone(value)
+		}
+	}
+	return cloned
 }
 
 // Clone 复制工具结果。
@@ -443,3 +468,40 @@ func (instruction *AgentsInstruction) Clone() *AgentsInstruction {
 	copy := *instruction
 	return &copy
 }
+
+// Clone 复制客户端指令。
+func (instruction *ClientInstruction) Clone() *ClientInstruction {
+	// 1. nil 返回 nil，否则复制客户端指令的全部字段。
+	if instruction == nil {
+		return nil
+	}
+	copy := *instruction
+	return &copy
+}
+
+// Clone 复制记忆目录。
+func (index *MemoryIndex) Clone() *MemoryIndex {
+	// 1. nil 返回 nil，否则复制记忆目录的全部字段。
+	if index == nil {
+		return nil
+	}
+	copy := *index
+	return &copy
+}
+
+// buildVersion 由构建脚本用 -X github.com/VaalaCat/openvaala/pkg/defs.buildVersion=<版本> 注入。
+var buildVersion = "dev"
+
+// GetBuildVersion 返回构建时注入的版本；没注入时取 Go 写进二进制的模块版本，都没有时为 dev。
+var GetBuildVersion = sync.OnceValue(func() string {
+	// 1. 构建脚本注入过就直接用。
+	if buildVersion != "dev" {
+		return buildVersion
+	}
+	// 2. go install ...@v0.2.0 读到 v0.2.0；go run 读到 (devel)，保持 dev。
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return buildVersion
+	}
+	return info.Main.Version
+})

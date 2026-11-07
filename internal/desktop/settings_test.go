@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/VaalaCat/mygo-kit"
+	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
@@ -158,7 +160,7 @@ func TestSettingsNavigation(t *testing.T) {
 	}
 }
 
-// TestGeneralSettings 检查通用页：外观分段、减少动画和系统通知开关都写进偏好；通知默认开启。
+// TestGeneralSettings 检查通用页：外观分段和系统通知开关写进偏好；通知默认开启。
 func TestGeneralSettings(t *testing.T) {
 	d := testDesktop()
 	if !d.preferences.NotifyOnFinish {
@@ -175,7 +177,6 @@ func TestGeneralSettings(t *testing.T) {
 	}{
 		{"dark", func() error { return tester.Click("深色") }, func() bool { return d.preferences.Theme == "dark" }},
 		{"notification switch", func() error { return clickSettingSwitch(tester, "完成时发送系统通知") }, func() bool { return !d.preferences.NotifyOnFinish }},
-		{"reduce motion switch", func() error { return clickSettingSwitch(tester, "减少动画") }, func() bool { return d.preferences.ReduceMotion }},
 	} {
 		if err := tt.click(); err != nil {
 			t.Fatal(err)
@@ -183,6 +184,33 @@ func TestGeneralSettings(t *testing.T) {
 		if !tt.check() {
 			t.Fatalf("%s did not update the preferences: %+v", tt.name, d.preferences)
 		}
+	}
+}
+
+// TestGeneralSettingsControls 检查中英文通用页只显示现有外观和通知控件。
+func TestGeneralSettingsControls(t *testing.T) {
+	// 1. 渲染完整通用页并核对可交互控件。
+	for _, tt := range []struct {
+		language, locale, restore, notification, removed string
+	}{
+		{"zh-CN", "zh-Hans", "恢复默认外观", "完成时发送系统通知", "减少动画"},
+		{"en", "en", "Restore appearance defaults", "Send a system notification when finished", "Reduce motion"},
+	} {
+		t.Run(tt.language, func(t *testing.T) {
+			d := testDesktop()
+			d.preferences.Language = tt.language
+			d.navigate("general")
+			tester := ui.NewTester(d.view, 1280, 1000)
+			tester.SetLocale(tt.locale)
+			for _, label := range []string{tt.restore, tt.notification} {
+				if _, found := tester.Find(label); !found {
+					t.Fatalf("missing setting %q", label)
+				}
+			}
+			if _, found := tester.Find(tt.removed); found {
+				t.Fatalf("removed setting is still available: %q", tt.removed)
+			}
+		})
 	}
 }
 
@@ -194,6 +222,34 @@ func clickSettingSwitch(tester *ui.Tester, title string) error {
 	}
 	tester.ClickAt(907, rect.Y+rect.H/2)
 	return nil
+}
+
+// TestExecutorSettingsSource 检查 Executor 页的来源徽标：local、openvaala、memory 是内置的，其余来自 config.yaml。
+func TestExecutorSettingsSource(t *testing.T) {
+	// 1. 每种 Executor 单独列一页，核对它的来源徽标。
+	tests := []struct {
+		name         string
+		executorID   string
+		wantSource   string
+		wantNoSource string
+	}{
+		{name: "local", executorID: defs.LocalExecutorID, wantSource: "内置", wantNoSource: "config.yaml"},
+		{name: "openvaala", executorID: config.BuiltinExecutorID, wantSource: "内置", wantNoSource: "config.yaml"},
+		{name: "memory", executorID: defs.MemoryExecutorID, wantSource: "内置", wantNoSource: "config.yaml"},
+		{name: "custom", executorID: "sandbox", wantSource: "config.yaml", wantNoSource: "内置"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.page = "executors"
+			d.executors = []conversation.ExecutorDetails{{ID: tt.executorID}}
+			tester := ui.NewTester(d.view, 1280, 820)
+			tester.SetLocale("zh-Hans")
+			if !slices.Contains(tester.Texts(), tt.wantSource) || slices.Contains(tester.Texts(), tt.wantNoSource) {
+				t.Fatalf("texts = %q, want source %q and no %q", tester.Texts(), tt.wantSource, tt.wantNoSource)
+			}
+		})
+	}
 }
 
 // TestSettingsItems 检查 Executor、Hook、Skill 页：一项一行，点开才显示详情，原始数据默认收起。

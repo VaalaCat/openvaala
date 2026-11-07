@@ -865,7 +865,7 @@ func TestSSHWorkspace(t *testing.T) {
 				if _, err := f.workspace.GetMetadata(t.Context(), f.root, true); err != nil {
 					t.Fatal(err)
 				}
-				if err := f.workspace.(workspace.SSHWorkspace).Close(); err != nil {
+				if err := f.workspace.Close(); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := f.workspace.GetMetadata(t.Context(), f.root, true); !errors.Is(err, net.ErrClosed) {
@@ -882,7 +882,7 @@ func TestSSHWorkspace(t *testing.T) {
 				f.sshServer.silenceConnections(t)
 				// 远端静默消失后退出不应等待 keepalive 判定断开。
 				closed := make(chan error, 1)
-				go func() { closed <- f.workspace.(workspace.SSHWorkspace).Close() }()
+				go func() { closed <- f.workspace.Close() }()
 				select {
 				case err := <-closed:
 					if err != nil {
@@ -1033,7 +1033,7 @@ func TestSSHWorkspaceCloseDirectoryOperations(t *testing.T) {
 			}
 			// 2. 关闭整条连接，等待操作和连接的后台任务结束。
 			closed := make(chan error, 1)
-			go func() { closed <- f.workspace.(workspace.SSHWorkspace).Close() }()
+			go func() { closed <- f.workspace.Close() }()
 			select {
 			case err := <-closed:
 				if err != nil {

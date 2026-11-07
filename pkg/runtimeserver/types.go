@@ -26,12 +26,13 @@ type methodHandler struct {
 	handle func(ctx context.Context, connection *serverConnection, params json.RawMessage) (any, error)
 }
 
-// subscriptionKind 标识连接内的目标订阅或全局运行集合订阅。
+// subscriptionKind 标识连接内的目标订阅、全局运行集合订阅或运行中终端列表订阅。
 type subscriptionKind string
 
 const (
 	subscriptionKindTarget               subscriptionKind = "target"
 	subscriptionKindRunningConversations subscriptionKind = "running_conversations"
+	subscriptionKindTerminals            subscriptionKind = "terminals"
 )
 
 // subscriptionKey 标识连接内的订阅种类和目标：对话订阅的 sessionID 为空。

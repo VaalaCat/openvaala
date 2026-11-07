@@ -1,11 +1,17 @@
+import type { Locator, Page } from "@playwright/test"
 import {
   expect,
-  getComposer,
   getMessages,
+  openRightPanel,
   openTurnRaw,
   startConversation,
   test,
 } from "./fixture"
+
+// 子 Agent 的标签页面板：开在主对话右边的新区域里，是最后一个标签页面板
+function getSubAgentPanel(page: Page): Locator {
+  return page.locator('.flexlayout__tab[role="tabpanel"]').last()
+}
 
 test(
   "sub_agent_appears_in_tree_and_opens_read_only",
@@ -26,18 +32,22 @@ test(
     ).toBeVisible()
     await openTurnRaw(getMessages(page).locator("[data-turn-id]").last())
     // 2. 右栏「Agent」页签的树里出现 helper，等它跑完。
-    await page.getByRole("tab", { name: "Agent" }).click()
+    await page.getByRole("tab", { name: "Agent", exact: true }).click()
     const helper = page
-      .getByRole("tabpanel", { name: "Agent" })
+      .getByRole("tabpanel", { name: "Agent", exact: true })
       .getByRole("link", { name: /helper/ })
     await expect(helper).toBeVisible()
     await expect(helper).toContainText("空闲")
-    // 3. 点进去：先等页面换成子 Session（没有输入框），地址刚变时消息区可能还是主 Session 的，那里有任务摘要和好几条 ok；
-    //    子 Session 的消息区里是委派的消息和子 Agent 唯一的一条回复。
+    // 3. 点进去：子 Agent 在主对话旁边开成只读的新标签页（没有输入框），主对话的标签页和输入框仍在；
+    //    主对话的消息区里有任务摘要和好几条 ok，子 Agent 的消息区里是委派的消息和子 Agent 唯一的一条回复。
     await helper.click()
     await expect(page).toHaveURL(/\/sessions\/[^/]+$/)
-    await expect(getComposer(page)).toHaveCount(0)
-    const messages = getMessages(page)
+    const subAgent = getSubAgentPanel(page)
+    await expect(subAgent.getByRole("textbox", { name: "消息" })).toHaveCount(0)
+    await expect(
+      getMessages(page).getByText("派一个子 Agent", { exact: true })
+    ).toBeVisible()
+    const messages = subAgent.getByRole("region", { name: "消息" })
     await expect(messages.getByText("帮主 Agent 看一下")).toBeVisible()
     await expect(messages.getByText("帮主 Agent 看一下")).toHaveCSS(
       "mask-image",
@@ -80,14 +90,16 @@ test("long_agent_letters_preview_four_lines_with_fade_and_keep_expanded_content"
   })
   await fixture.openApp(page)
   await startConversation(page, "发送长来信")
+  await openRightPanel(page)
   await page.getByRole("tab", { name: "Agent" }).click()
   const helper = page
     .getByRole("tabpanel", { name: "Agent" })
     .getByRole("link", { name: /letter-helper/ })
   await expect(helper).toContainText("空闲")
   await helper.click()
-  await expect(getComposer(page)).toHaveCount(0)
-  const messages = getMessages(page)
+  const subAgent = getSubAgentPanel(page)
+  await expect(subAgent.getByRole("textbox", { name: "消息" })).toHaveCount(0)
+  const messages = subAgent.getByRole("region", { name: "消息" })
   const expand = messages.getByRole("button", { name: /^展开(?:\s|$)/ })
   await expect(expand).toBeVisible()
   const preview = messages.locator("p").filter({ hasText: letter }).first()

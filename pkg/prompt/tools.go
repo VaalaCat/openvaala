@@ -46,6 +46,11 @@ const (
 		"每页正文最多 64 KiB，按完整行返回；字节数超限时标 truncated，使用 next_offset 行号续读，eof 表示已到文件末尾。单行过长时报错，可用 bash 查看。" +
 		"PNG、JPEG、GIF、WebP 图片会直接作为图片交给你查看，此时 offset、limit 不起作用。"
 	ApplyPatchDescription = "使用 Begin Patch 格式新增、按完整行上下文更新或删除工作目录内的普通文件；结果列出实际修改的路径。"
+	GlobDescription       = "按通配符列出工作区里的文件路径，不读文件内容：pattern 相对 path，例如 **/*.go、src/**/test_*.py；path 省略时从工作区根目录开始。" +
+		"跳过 .git 和以 . 开头的文件、目录；在 git 仓库里还跳过 .gitignore 忽略的文件。结果按路径排序，最多 limit 条（默认 100，最多 1000），超出时 truncated 为 true。"
+	GrepDescription = "用正则逐行搜索文件内容，返回 path、line（从 1 开始）和这一行的文本（超过 500 个字符截断）。" +
+		"pattern 只用 rg 和 POSIX 扩展正则共有的写法：\\d、\\w、\\s 和它们的大写会自动换成等价的字符类；不支持 (?i) 这类内联标记，忽略大小写用 ignore_case。" +
+		"glob 只搜路径匹配的文件，例如 *.go。跳过二进制文件，其余跳过规则同 glob。结果按路径和行号排序，最多 limit 条（默认 100，最多 1000）。"
 )
 
 // FormatSpawnAgentDescription 生成 spawn_agent 的说明，附上可选的 Agent 和模型列表。

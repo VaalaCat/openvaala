@@ -4,7 +4,7 @@
 
 Agent 的工具分四组：
 
-- **文件工具**：`read_file`、`apply_patch`
+- **文件工具**：`read_file`、`apply_patch`、`glob`、`grep`
 - **命令工具**：`bash`、`read_command_output`、`write_stdin`、`stop_command`、`list_commands`
 - **协作工具**：`spawn_agent`、`send_message`、`wait_agent`、`interrupt_agent`、`list_agents`、`read_session_history`
 - **MCP 工具**：名字是 `mcp__<server>__<tool>`，见 [MCP server](extensions.md#mcp-server)
@@ -51,6 +51,38 @@ Agent 的工具分四组：
 - 新增要求文件不存在；修改和删除要求是普通文件。不支持重命名（`*** Move to:`）。
 - 一个补丁最多涉及 128 个文件、1024 个修改块，最大 4 MB。
 - 文件一个接一个地写。如果后面的文件失败，前面的已经改了，结果会说明补丁只应用了一部分。
+
+### glob
+
+按通配符列出文件路径，不读文件内容。
+
+- `pattern`：相对 `path` 的通配符，例如 `**/*.go`、`src/**/test_*.py`。不含 `/` 的通配符按文件名匹配任意深度，所以 `*.go` 能找到所有 Go 文件。
+- `path`：从哪个目录开始找，相对工作目录或者绝对路径。默认是工作目录。
+- `limit`：返回多少条路径，1 到 1000。默认 100。
+
+路径按顺序排好，写成相对工作目录的路径（`path` 指到工作目录之外时是绝对路径）。匹配数超过 `limit` 时，结果里 `truncated` 为 `true`。
+
+### grep
+
+用正则逐行搜索文件内容。
+
+- `pattern`：正则表达式。
+- `path`：目录或文件，相对工作目录或者绝对路径。默认是工作目录。
+- `glob`：只搜路径匹配这个通配符的文件，相对 `path`，例如 `*.go`。
+- `ignore_case`：忽略大小写。默认 false。
+- `limit`：返回多少条匹配行，1 到 1000。默认 100。
+
+每条匹配有 `path`、`line`（从 1 算起）和这一行的 `text`（超过 500 个字符截断）。二进制文件会跳过。结果按路径和行号排序，`truncated` 为 `true` 表示匹配数超过了 `limit`。
+
+### glob 和 grep 怎么搜
+
+隐藏的文件和目录（名字以 `.` 开头，包括 `.git`）一律跳过。在 `local` 和 `ssh` Executor 上，工具按下面的顺序，用机器上找到的第一种：
+
+1. `rg`（[ripgrep](https://github.com/BurntSushi/ripgrep)）。
+2. `git ls-files` 和 `git grep`，要求目录在 git 仓库里。`.gitignore` 排除的文件会跳过。
+3. `find` 和 `grep`。它们不读 `.gitignore`。
+
+不管用哪一种，结果都一样，所以正则只能用 ripgrep 和 POSIX 扩展正则两边都认的写法：`\d`、`\w`、`\s` 和它们的大写形式可以用，`(?i)` 这类内联标记会被拒绝，忽略大小写请用 `ignore_case`。`virtual` Executor 里没有命令可跑，直接遍历内存里的文件。匹配数超过 `limit` 时，三种命令保留下来的是哪几条，不保证相同。
 
 ## 命令工具
 
@@ -108,7 +140,7 @@ Agent 的 `tools` 列表只在文件和命令工具里挑：
 tools: [read_file, bash, read_command_output, write_stdin, stop_command, list_commands]
 ```
 
-- 合法的名字是 `read_file`、`apply_patch`、`bash`、`read_command_output`、`write_stdin`、`stop_command` 和 `list_commands`。写了其他名字，对话启动时会报错。
+- 合法的名字是 `read_file`、`apply_patch`、`glob`、`grep`、`bash`、`read_command_output`、`write_stdin`、`stop_command` 和 `list_commands`。写了其他名字，对话启动时会报错。
 - 不写 `tools` 表示全部都能用。
 - `bash` 只负责启动命令，最多等 `wait_seconds`；把其他命令工具一起列上，Agent 才能读输出、输入内容、停掉命令。
 - 协作工具总是可用。MCP 工具改用 Agent 的 `mcp_servers` 列表来选。

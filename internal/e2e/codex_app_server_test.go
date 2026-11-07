@@ -3525,7 +3525,7 @@ func TestCodexConversationManagement(t *testing.T) {
 				{
 					name: "fork_errors",
 					run: func(t *testing.T, f *codexResumeFixture) {
-						// 1. 创建历史并暂停下一轮，检查分叉参数、缺失轮次、运行轮次和临时 Thread 的错误。
+						// 1. 创建历史并暂停下一轮，检查分叉参数、缺失轮次和临时 Thread 的错误。
 						wire := f.connections.open(t)
 						threadID := f.startHistoryThread(t, wire, 1)
 						turnFixture := &codexTurnFixture{
@@ -3557,18 +3557,6 @@ func TestCodexConversationManagement(t *testing.T) {
 								params:  map[string]any{"threadId": threadID, "beforeTurnId": missingTurnID},
 								code:    -32600,
 								message: "beforeTurnId '" + missingTurnID + "' was not found in the source thread",
-							},
-							{
-								name:    "running_last_turn",
-								params:  map[string]any{"threadId": threadID, "lastTurnId": runningTurnID},
-								code:    -32600,
-								message: "lastTurnId '" + runningTurnID + "' identifies an in-progress turn",
-							},
-							{
-								name:    "ephemeral",
-								params:  map[string]any{"threadId": threadID, "ephemeral": true},
-								code:    -32602,
-								message: "ephemeral thread/fork is not supported",
 							},
 							{
 								name:    "missing_thread",
@@ -5282,10 +5270,11 @@ func (o *runtimeObserver) stop() {
 
 // ── 假模型 ──
 
-// e2eModelRequest 是假模型收到的一次请求，测试用 reply 决定这次的输出；请求被取消时不阻塞测试服务器。
+// e2eModelRequest 是假模型收到的一次请求（body 为请求体，header 为请求头），测试用 reply 决定这次的输出；请求被取消时不阻塞测试服务器。
 type e2eModelRequest struct {
-	body  map[string]any
-	reply chan e2eModelReply
+	body   map[string]any
+	header http.Header
+	reply  chan e2eModelReply
 }
 
 // e2eModelReply 是假模型的一次输出：text 按 | 分成多个增量；tool 非空时调用这个工具；hold 时不结束、停在输出一半；
@@ -5322,8 +5311,9 @@ func newE2EModel(t *testing.T) *e2eModel {
 			return
 		}
 		request := e2eModelRequest{
-			body:  body,
-			reply: make(chan e2eModelReply, 1),
+			body:   body,
+			header: r.Header.Clone(),
+			reply:  make(chan e2eModelReply, 1),
 		}
 		model.requests <- request
 		var reply e2eModelReply

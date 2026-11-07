@@ -2437,6 +2437,82 @@ func TestToolExecutorHooks(t *testing.T) {
 	}
 }
 
+// TestToolExecutorHooksSkipEnvironmentsWithoutCommands 验证不能跑命令的环境上的工具调用不跑 hook，工具照常执行。
+func TestToolExecutorHooksSkipEnvironmentsWithoutCommands(t *testing.T) {
+	// 1. 列出能跑命令和不能跑命令的环境；hook 都配置为拦下调用。
+	tests := []struct {
+		name         string
+		opt          *executor.ExecutionEnvironmentOpt
+		wantRequests int
+		wantCode     string
+	}{
+		{
+			name:         "commands_supported_runs_hooks",
+			opt:          executor.NewExecutionEnvironmentOpt("files", "文件", nil),
+			wantRequests: 1,
+			wantCode:     "hook_blocked",
+		},
+		{
+			name:         "commands_unsupported_skips_hooks",
+			opt:          executor.NewExecutionEnvironmentOpt("files", "文件", nil).WithoutCommands(),
+			wantRequests: 0,
+		},
+	}
+	// 2. 在环境里放一个探测工具，运行一次调用，核对 hook 请求数和工具结果。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			probe := &toolProbe{}
+			tt.opt.Tools = []executor.Tool{&probeTool{name: "probe", probe: probe}}
+			work, err := workspace.NewVirtualWorkspace(workspace.NewVirtualWorkspaceOpt("/workspace/files", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.opt.Workspace = work
+			environment, err := executor.NewExecutionEnvironment(tt.opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hooks := &stubHooks{outcomes: map[defs.HookEventName]*hook.HookOutcome{defs.HookEventPreToolUse: {
+				IsBlocked:   true,
+				BlockReason: "no",
+			}}}
+			toolOpt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{environment})
+			toolOpt.Hooks = hooks
+			toolExecutor, err := executor.NewToolExecutor(toolOpt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := collectToolEvents(t, toolExecutor, []*defs.Item{newHookToolCallItem(&defs.ToolCall{
+				CallID:    "call",
+				Name:      "probe",
+				Arguments: `{"path":"a"}`,
+			})})
+			var finished *executor.ExecutionFinishedEvent
+			for _, event := range events {
+				if event, ok := event.(*executor.ExecutionFinishedEvent); ok {
+					finished = event
+				}
+			}
+			if finished == nil {
+				t.Fatalf("events = %v, want a finished event", events)
+			}
+			var gotCode string
+			if finished.Result.Error != nil {
+				gotCode = finished.Result.Error.Code
+			}
+			if gotCode != tt.wantCode {
+				t.Fatalf("error code = %q, want %q", gotCode, tt.wantCode)
+			}
+			if got := len(hooks.getRequests()); got != tt.wantRequests {
+				t.Fatalf("hook requests = %d, want %d", got, tt.wantRequests)
+			}
+			if wantCalled := tt.wantRequests == 0; (len(probe.getArguments()) == 1) != wantCalled {
+				t.Fatalf("tool arguments = %v, want the tool called only when hooks are skipped", probe.getArguments())
+			}
+		})
+	}
+}
+
 // TestToolExecutorPreToolUseBeforeDispatch 验证所有前置 hook 并发完成后才开始执行工具。
 func TestToolExecutorPreToolUseBeforeDispatch(t *testing.T) {
 	// 1. 准备分别阻塞环境工具和协作工具前置 hook 的用例。

@@ -3,6 +3,7 @@ import { test } from "node:test"
 import { createInstance } from "i18next"
 import zhCN from "../i18n/locales/zh-CN.json"
 import en from "../i18n/locales/en.json"
+import { ClientInstructionItem } from "../components/conversation/items/client-instruction"
 import { FallbackItem } from "../components/conversation/items/fallback"
 import { BashTool } from "../components/conversation/tools/bash"
 import { DefaultTool } from "../components/conversation/tools/default"
@@ -13,7 +14,7 @@ import {
   getMessageRows,
   getMessageSource,
   getTurnResult,
-  getReplyToCopy,
+  getReplyKeysToCopy,
   getProcessFacts,
   getProcessActionText,
   type ProcessAction,
@@ -31,10 +32,15 @@ test("getItemRenderer falls back for unknown kinds", () => {
     { kind: "tool_call", isFallback: false },
     { kind: "tool_result", isFallback: false },
     { kind: "turn_interrupted", isFallback: false },
+    { kind: "memory_index", isFallback: false },
     { kind: "future_kind", isFallback: true },
   ]
   for (const { kind, isFallback } of cases)
     assert.equal(getItemRenderer(kind) === FallbackItem, isFallback, kind)
+})
+
+test("getItemRenderer shows client instructions as a collapsed notice", () => {
+  assert.equal(getItemRenderer("client_instruction"), ClientInstructionItem)
 })
 
 test("getToolRenderer shows MCP and unknown tools as JSON", () => {
@@ -194,6 +200,7 @@ test("getMessageRows retains Item references, order, CallID pairing and stable p
       view("hook", "t1", "hook_run"),
       view("skill", "t1", "skill_instruction"),
       view("agents", "t1", "agents_instruction"),
+      view("client", "t1", "client_instruction"),
     ].map((separator) => ({
       name: separator.key + "_breaks_group",
       items: [reasoning, call, separator, call2],
@@ -523,7 +530,7 @@ function getRowReferences(rows: MessageRow[]): Map<string, object> {
   return references
 }
 
-test("getReplyToCopy only selects the last finished reply without requiring full history", () => {
+test("getReplyKeysToCopy selects the last text of each turn without requiring full history", () => {
   const first: ViewItem = {
     ...view("first", "t1", "message"),
     ordinal: 4290,
@@ -546,34 +553,41 @@ test("getReplyToCopy only selects the last finished reply without requiring full
     turnID: "t2",
     item: { ...first.item, id: "last", turn_id: "t2" },
   }
-  const cases: { name: string; items: ViewItem[]; want?: string }[] = [
-    { name: "empty_history", items: [] },
-    { name: "latest_page_only", items: [last], want: "last" },
+  const cases: {
+    name: string
+    items: ViewItem[]
+    want: Record<string, string>
+  }[] = [
+    { name: "empty_history", items: [], want: {} },
+    { name: "latest_page_only", items: [last], want: { t2: "last" } },
     {
-      name: "one_copy_across_multiple_turns",
+      name: "one_copy_per_turn",
       items: [first, last],
-      want: "last",
+      want: { t1: "first", t2: "last" },
     },
     {
       name: "earlier_gap_does_not_block_copy",
       items: [{ ...first, ordinal: 20 }, last],
-      want: "last",
+      want: { t1: "first", t2: "last" },
     },
     {
       name: "new_reply_still_streaming",
       items: [first, { ...last, isStreaming: true }],
+      want: { t1: "first" },
     },
     {
       name: "new_reply_not_saved",
       items: [first, { ...last, ordinal: undefined }],
+      want: { t1: "first" },
     },
     {
       name: "later_tool_does_not_replace_reply",
       items: [last, view("tool", "t1", "tool_call", "call")],
-      want: "last",
+      want: { t2: "last" },
     },
     {
       name: "user_is_not_a_model_reply",
+      want: {},
       items: [
         {
           ...last,
@@ -589,6 +603,7 @@ test("getReplyToCopy only selects the last finished reply without requiring full
     },
     ...["", "  "].map((text) => ({
       name: `empty_last_reply_${JSON.stringify(text)}`,
+      want: { t1: "first" },
       items: [
         first,
         {
@@ -603,9 +618,42 @@ test("getReplyToCopy only selects the last finished reply without requiring full
         },
       ],
     })),
+    {
+      name: "same_turn_across_segments_only_last_text",
+      items: [first, last, { ...first, key: "later", ordinal: 4292 }],
+      want: { t1: "later", t2: "last" },
+    },
+    {
+      name: "same_turn_streaming_text_hides_only_its_copy",
+      items: [first, last, { ...first, key: "later", isStreaming: true }],
+      want: { t2: "last" },
+    },
+    {
+      name: "trailing_image_keeps_previous_text",
+      items: [
+        first,
+        {
+          ...first,
+          key: "image",
+          item: {
+            ...first.item,
+            message: {
+              ...first.item.message!,
+              content: [
+                {
+                  kind: "image",
+                  image: { data_url: "data:image/png;base64,abc" },
+                },
+              ],
+            },
+          },
+        },
+      ],
+      want: { t1: "first" },
+    },
   ]
   for (const { name, items, want } of cases)
-    assert.equal(getReplyToCopy(items)?.key, want, name)
+    assert.deepEqual(Object.fromEntries(getReplyKeysToCopy(items)), want, name)
 })
 
 test("getTurnResult only exposes all messages from a complete successful final call", () => {
@@ -1169,6 +1217,16 @@ test("process action previews follow real phases and explicit arguments", async 
       name: "reading",
       action: tool("read_file", { path: "/repo/www/src/lib/a.ts" }),
       want: "读取 .../src/lib/a.ts",
+    },
+    {
+      name: "finding_files",
+      action: tool("glob", { pattern: "**/*.go\nignored" }),
+      want: "查找文件 **/*.go",
+    },
+    {
+      name: "searching",
+      action: tool("grep", { pattern: "func Target" }),
+      want: "搜索 func Target",
     },
     {
       name: "preparing_read",

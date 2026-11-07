@@ -25,6 +25,7 @@ compact_model:                       # optional; model that writes context summa
 tools: [read_file, bash, read_command_output, write_stdin, stop_command, list_commands]
 skills: [code-review]                # optional; default: all skills
 mcp_servers: [serena]                # optional; default: all; [] for none
+max_steps: 50                        # optional; default: 0 (no limit)
 ```
 
 ## Fields
@@ -37,6 +38,7 @@ mcp_servers: [serena]                # optional; default: all; [] for none
 - `tools` — the file and command tools the agent may use. Omit it for all of them. See [Limit the tools an agent can use](tools.md#limit-the-tools-an-agent-can-use).
 - `skills` — the skills the agent may use, by name (plugin skills as `<plugin>:<skill>`). Omit it for all skills.
 - `mcp_servers` — the MCP server ids the agent may use. Omit it for all servers, including those your editor provides; write `[]` for none. Every id must exist in `mcp_servers/` or a plugin (disabled servers count).
+- `max_steps` — the most model calls one turn may make. Default `0` means no limit; it must not be negative. On the last allowed call the agent can no longer use tools and the model summarizes what is done and what remains. The turn then ends normally, and when you tell the agent to continue, it starts a new turn.
 
 Every model reference must resolve to a configured model, or the configuration fails to load.
 

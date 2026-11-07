@@ -2,11 +2,14 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -18,10 +21,14 @@ import (
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/docs"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
+	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
+	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"golang.org/x/net/http/httpguts"
 	"gopkg.in/yaml.v3"
 )
 
@@ -375,8 +382,8 @@ const builtinSkillDirectory = "/skills"
 // builtinDocsSkillName 是由 OpenVaala 文档组成的内置 skill 的目录名。
 const builtinDocsSkillName = "openvaala"
 
-// getBuiltinExecutorDefinition 组装内置 Executor：装着 openvaala 文档 skill 的 virtual Executor。
-func getBuiltinExecutorDefinition() (*defs.ExecutorDefinition, error) {
+// newBuiltinExecutor 创建内置 Executor：装着 openvaala 文档 skill 的 virtual Executor。
+func newBuiltinExecutor() (executor.Executor, error) {
 	// 1. 读取嵌入的文档，放到 /skills/openvaala 下对应的路径。
 	files := make(map[string][]byte)
 	err := fs.WalkDir(docs.Files, ".", func(filePath string, entry fs.DirEntry, err error) error {
@@ -393,42 +400,42 @@ func getBuiltinExecutorDefinition() (*defs.ExecutorDefinition, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read builtin skills: %w", err)
 	}
-	// 2. 返回 ID 为 openvaala 的定义，工作目录为 /workspace。
-	return &defs.ExecutorDefinition{
+	// 2. 创建 ID 为 openvaala 的 Executor，工作目录为 /workspace。
+	return executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
 		ID:                 BuiltinExecutorID,
 		Kind:               defs.ExecutorKindVirtual,
 		Description:        prompt.BuiltinExecutorDescription,
 		WorkspaceDirectory: virtualWorkspaceDirectory,
-		Files:              files,
-	}, nil
+	}, files)), nil
 }
 
-// getExecutorDefinition 把 Executor 配置转成运行定义。
-func getExecutorDefinition(executorConfig *ExecutorConfig) *defs.ExecutorDefinition {
-	// 1. 复制字段，有 SSH 段时另建连接参数。
+// newConfiguredExecutor 按种类把 executors/ 里的配置转成 Executor；种类在加载时已校验。
+func newConfiguredExecutor(executorConfig *ExecutorConfig) executor.Executor {
+	// 1. 复制定义字段。
 	definition := &defs.ExecutorDefinition{
 		ID:                 executorConfig.ID,
 		Kind:               executorConfig.Kind,
 		Description:        executorConfig.Description,
 		WorkspaceDirectory: executorConfig.WorkspaceDirectory,
 	}
-	if executorConfig.SSH != nil {
-		definition.SSH = &defs.SSHExecutorDefinition{
-			Address:      executorConfig.SSH.Address,
-			IdentityFile: executorConfig.SSH.IdentityFile,
-		}
+	// 2. 按种类调对应的构造函数。
+	switch executorConfig.Kind {
+	case defs.ExecutorKindLocal:
+		return executor.NewLocalExecutor(definition)
+	case defs.ExecutorKindVirtual:
+		return executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(definition, nil))
+	case defs.ExecutorKindSSH:
+		return executor.NewSSHExecutor(executor.NewSSHExecutorOpt(definition, executorConfig.SSH.Address, executorConfig.SSH.IdentityFile))
 	}
-	return definition
+	panic(fmt.Sprintf("executor %q has unvalidated kind %q", executorConfig.ID, executorConfig.Kind))
 }
 
-// getVirtualFiles 把文件路径到内容的映射转成虚拟工作区文件。
-func getVirtualFiles(files map[string][]byte) map[string]*workspace.VirtualFile {
-	// 1. 每个路径对应一个装着原内容的 VirtualFile。
-	virtualFiles := make(map[string]*workspace.VirtualFile, len(files))
-	for filePath, content := range files {
-		virtualFiles[filePath] = &workspace.VirtualFile{Content: content}
+// closeWorkspace 关闭用完的工作区，失败时记 Warn。
+func closeWorkspace(ctx context.Context, usedWorkspace workspace.Workspace) {
+	// 1. 关闭工作区，记录关闭错误。
+	if err := usedWorkspace.Close(); err != nil {
+		telemetry.GetLogger(ctx).Warn("close workspace failed", "error", err)
 	}
-	return virtualFiles
 }
 
 // Clone 复制 Agent 配置。
@@ -446,6 +453,7 @@ func (definition *AgentConfig) Clone() *AgentConfig {
 		Tools:        slices.Clone(definition.Tools),
 		Skills:       slices.Clone(definition.Skills),
 		MCPServers:   slices.Clone(definition.MCPServers),
+		MaxSteps:     definition.MaxSteps,
 	}
 }
 
@@ -553,4 +561,41 @@ func getModelInputs(inputs []string) ([]defs.ModelInput, error) {
 		return []defs.ModelInput{defs.ModelInputText}, nil
 	}
 	return converted, nil
+}
+
+// validateHeaderTemplates 按写法顺序检查 header 的名字和值合法、名字不重复、值里的变量都认识，返回第一条错误，错误以 "<名字>: " 开头。
+func validateHeaderTemplates(headers map[string]string) error {
+	// 1. 按写法排序，报错顺序稳定。
+	canonicalNames := make(map[string]bool, len(headers))
+	for _, writtenName := range slices.Sorted(maps.Keys(headers)) {
+		// 2. 名字不合法时按用户写的名字报错。
+		if !httpguts.ValidHeaderFieldName(writtenName) {
+			return fmt.Errorf("%s: invalid header name", strings.TrimSpace(writtenName))
+		}
+		// 3. viper 会把键名转成小写，统一成标准写法后，不分大小写同名的第二条报重复。
+		name := http.CanonicalHeaderKey(writtenName)
+		if canonicalNames[name] {
+			return fmt.Errorf("%s: duplicate header name", name)
+		}
+		canonicalNames[name] = true
+		// 4. 值不能含换行等非法字符，其中的变量都要认识。
+		value := headers[writtenName]
+		if !httpguts.ValidHeaderFieldValue(value) {
+			return fmt.Errorf("%s: invalid header value", name)
+		}
+		if err := httpclient.ValidateHeaderTemplate(value); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// getTargetHeaders 把 header 模板转成模型请求目标使用的格式，每个名字一个值。
+func getTargetHeaders(headers map[string]string) map[string][]string {
+	// 1. 逐条把值包成单元素列表。
+	targetHeaders := make(map[string][]string, len(headers))
+	for name, value := range headers {
+		targetHeaders[name] = []string{value}
+	}
+	return targetHeaders
 }

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // iso-architecture：运行时、对话、Session、Turn、Agent 五层由大到小叠在一起，
-// 循环开始时紧贴成一摞，随后逐层向上分开成爆炸图并标出层名，最上面信号蓝的 Agent 是正在运行的循环。
+// 循环开始时紧贴成一摞，随后从最上面一层开始逐层向上分开成爆炸图并标出层名（上层总在下层之上，不会互相穿过），
+// 最上面信号蓝的 Agent 是正在运行的循环。
 import { computed } from "vue"
 import { useData } from "vitepress"
 import IsoSlab from "../primitives/IsoSlab.vue"
@@ -37,7 +38,7 @@ const layers = computed(() =>
       label: layerNames.value[spec.key],
       labelX: labelX + 8,
       labelY: labelY + 2,
-      separateAt: 0.1 + index * 0.05,
+      separateAt: 0.1 + (layerSpecs.length - 1 - index) * 0.05,
     }
   }),
 )
@@ -64,7 +65,7 @@ function getLabelStops(separateAt: number): SceneStop[] {
 </script>
 
 <template>
-  <SceneCanvas view-box="-190 -126 380 214" :period="11000">
+  <SceneCanvas view-box="-162 -126 380 214" :period="11000">
     <g v-for="layer in layers" :key="layer.key" v-track="getSeparateStops(layer.z, layer.stackedZ, layer.separateAt)">
       <IsoSlab
         :at="layer.at"

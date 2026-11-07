@@ -124,6 +124,7 @@ export function ItemDebugTab({
         value={value}
         isStreaming={isStreaming}
         heightMode="host"
+        maxHeight="none"
       />
     </div>
   )

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onMounted, onUnmounted, ref, watch } from "vue"
 import { useData, withBase } from "vitepress"
-import { isReducedMotion, usePagePosition, useSiteText } from "../site"
+import { usePagePosition, useSiteText } from "../site"
 import type { ThemeConfig } from "../types"
 
 const props = defineProps<{ isOpen: boolean; isDrawerOnly: boolean }>()
@@ -31,7 +31,7 @@ function placeMarker(glide: boolean) {
     return
   }
   const hasMoved = markerTop.value !== activeLink.offsetTop
-  isMarkerGliding.value = glide && isMarkerVisible.value && !isReducedMotion()
+  isMarkerGliding.value = glide && isMarkerVisible.value
   markerTop.value = activeLink.offsetTop
   markerHeight.value = activeLink.offsetHeight
   isMarkerVisible.value = true

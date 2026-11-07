@@ -77,7 +77,9 @@ import {
   providerProtocolLabelKeys,
   providerProtocols,
   toProviderConfig,
+  toProviderHeaders,
   type ProviderDraft,
+  type ProviderHeaderDraft,
   type ProviderModelDraft,
   type ProviderModelIssues,
 } from "@/lib/provider-form"
@@ -201,6 +203,14 @@ export function ProviderEditor({
     })
   }
 
+  function changeHeader(index: number, patch: Partial<ProviderHeaderDraft>) {
+    change({
+      headers: draft.headers.map((each, i) =>
+        i === index ? { ...each, ...patch } : each
+      ),
+    })
+  }
+
   function addTypedModels() {
     change(addManualModels(draft, manualModelText))
     setManualModelText("")
@@ -231,6 +241,7 @@ export function ProviderEditor({
           .filter(([, value]) => value.trim())
           .map(([key, value]) => [key, value.trim()])
       ),
+      headers: toProviderHeaders(draft.headers),
       models: null,
     }
   }
@@ -549,6 +560,106 @@ export function ProviderEditor({
                       }
                     />
                   ))}
+                </FieldGroup>
+              </CollapsibleContent>
+            </Collapsible>
+            <Collapsible
+              defaultOpen={Object.keys(saved.headers ?? {}).length > 0}
+              className="flex min-w-0 flex-col"
+            >
+              <CollapsibleTrigger
+                render={
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="self-start text-ui"
+                  />
+                }
+              >
+                <ChevronDownIcon data-icon="inline-start" />
+                {t("settings.providerEditor.headers")}
+              </CollapsibleTrigger>
+              <CollapsibleContent
+                className="process-disclosure-panel"
+                render={(props, state) => (
+                  <div
+                    {...props}
+                    inert={!state.open}
+                    aria-hidden={!state.open || undefined}
+                  />
+                )}
+              >
+                <FieldGroup className="process-disclosure-content min-w-0 gap-3 pt-3">
+                  {draft.headers.map((header, index) => (
+                    <div
+                      key={index}
+                      className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_auto]"
+                    >
+                      <Input
+                        aria-label={t("settings.providerEditor.headerName")}
+                        className="text-ui"
+                        value={header.name}
+                        autoComplete="off"
+                        spellCheck={false}
+                        onChange={(event) =>
+                          changeHeader(index, { name: event.target.value })
+                        }
+                      />
+                      <Input
+                        aria-label={t("settings.providerEditor.headerValue")}
+                        className="text-ui"
+                        value={header.value}
+                        autoComplete="off"
+                        spellCheck={false}
+                        onChange={(event) =>
+                          changeHeader(index, { value: event.target.value })
+                        }
+                      />
+                      <Tooltip>
+                        <TooltipTrigger
+                          render={
+                            <Button
+                              className="col-start-2 row-span-2 row-start-1 text-ui sm:col-start-3 sm:row-span-1"
+                              type="button"
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={t(
+                                "settings.providerEditor.removeHeader"
+                              )}
+                              onClick={() =>
+                                change({
+                                  headers: draft.headers.filter(
+                                    (_, i) => i !== index
+                                  ),
+                                })
+                              }
+                            />
+                          }
+                        >
+                          <XIcon />
+                        </TooltipTrigger>
+                        <TooltipContent className="text-caption">
+                          {t("settings.providerEditor.removeHeader")}
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                  ))}
+                  <Button
+                    className="self-start text-ui"
+                    type="button"
+                    variant="outline"
+                    onClick={() =>
+                      change({
+                        headers: [...draft.headers, { name: "", value: "" }],
+                      })
+                    }
+                  >
+                    <PlusIcon data-icon="inline-start" />
+                    {t("settings.providerEditor.addHeader")}
+                  </Button>
+                  <p className="text-caption wrap-anywhere color-muted">
+                    {t("settings.providerEditor.headersHint")}
+                  </p>
                 </FieldGroup>
               </CollapsibleContent>
             </Collapsible>

@@ -356,6 +356,7 @@ func (a *acpAgent) openSession(ctx context.Context, request acpMessage, params a
 		initialRequest:   request,
 		done:             make(chan struct{}),
 		clientDirectory:  params.Cwd,
+		httpHeaders:      a.config.GetHTTPHeaders(),
 		clientMCPServers: getACPClientMCPServers(ctx, params.McpServers),
 	}
 	a.sessions[record.ID] = protocolSession

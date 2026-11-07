@@ -9,6 +9,11 @@ export function notifySuccess(message: string, description?: string): void {
   toast.success(message, { duration: 4000, description })
 }
 
+// 不是成功也不是失败的普通提示，例如旁支已经结束
+export function notifyInfo(message: string): void {
+  toast.info(message, { duration: 4000 })
+}
+
 export function notifyFailure(error: unknown, t: TFunction): void {
   const detail = getRpcErrorDetail(error)
   toast.error(getRpcErrorMessage(error, t), {

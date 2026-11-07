@@ -93,7 +93,7 @@ mygo_version=$(go list -m -f '{{.Version}}' github.com/egoist/mygo)
 [[ "$mygo_version" == v0.7.3 ]] || fail "MyGo 版本必须为 v0.7.3，实际为 $mygo_version"
 app_version=$(sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' mygo.json)
 [[ "$app_version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]*$ ]] || fail 'mygo.json 中的 version 不是有效版本号'
-export MYGO_LDFLAGS="${MYGO_LDFLAGS:-} -X main.version=$app_version"
+export MYGO_LDFLAGS="${MYGO_LDFLAGS:-} -X github.com/VaalaCat/openvaala/pkg/defs.buildVersion=$app_version"
 args=(build -platform "$platforms" -o "$output_dir")
 if "$debug"; then
   args+=(-debug)

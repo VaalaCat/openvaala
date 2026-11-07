@@ -20,6 +20,13 @@ openvaala app --native    # native interface
 
 Here `openvaala` is the desktop app's own executable (see [Use the CLI from the desktop app](#use-the-cli-from-the-desktop-app)). Each interface runs at most one window; launching the same one again brings the existing window to the front. You can have a WebView window and a native window open at the same time.
 
+A binary installed with [`go install`](../getting-started/install.md#with-go-install) is named `openvaala-desktop`, so it does not replace a command-line `openvaala`. With `$(go env GOPATH)/bin` on your `PATH`:
+
+```bash
+openvaala-desktop                 # WebView window
+openvaala-desktop app --native    # native interface
+```
+
 If no model provider is configured yet, add one in **Settings → Model providers**. The native interface offers an **Add a model provider** button on its empty screen.
 
 ## How it relates to the runtime server
@@ -41,7 +48,7 @@ Both interfaces use the local runtime server, starting it if needed, so they sha
 
 A runtime server started by the desktop app keeps running after you close the window, until you run `openvaala serve stop`.
 
-Closing a window does not stop anything you have sent: running turns continue and may keep using your model provider's quota. Terminals opened in the native interface's terminal panel are closed with the window.
+Closing a window does not stop anything you have sent: running turns continue and may keep using your model provider's quota. Terminals opened in the native interface's terminal panel keep running too, and come back in the terminal panel the next time you start the app.
 
 The desktop app always connects to the runtime server on this machine. To work against a server elsewhere, use the [terminal UI](terminal.md) with `--url`, or open that server's [web UI](web.md) in a browser.
 
@@ -78,7 +85,7 @@ Windows is not supported.
 
 ## Use the CLI from the desktop app
 
-The desktop app contains every `openvaala` command — `tui`, `serve`, `web`, `acp`, `codex` and the rest — but it does not put itself on your `PATH` or replace an `openvaala` you installed separately. To use its CLI, run the executable inside the app:
+The desktop package contains every `openvaala` command — `tui`, `serve`, `web`, `acp`, `codex` and the rest — but it does not put itself on your `PATH` or replace an `openvaala` you installed separately. The `openvaala-desktop` binary from `go install` is already on your `PATH` when `$(go env GOPATH)/bin` is. To use the package's CLI, run the executable inside the app:
 
 ```bash
 # macOS

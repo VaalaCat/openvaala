@@ -19,10 +19,17 @@ func TestGenerateProtocolTypes(t *testing.T) {
 
 	cases := []struct{ name, want string }{
 		{"header", "// 由 internal/protocolgen 生成，不要手改"},
-		{"protocol_version", `export const ProtocolVersion = "5"`},
+		{"protocol_version", `export const ProtocolVersion = "6"`},
 		{"agent_list_method", `"agent/list": ListAgentsResult`},
 		{"agent_info_fields", "export interface AgentInfo {\n    name: string;\n    description?: string;"},
 		{"terminal_open_method", `"terminal/open": TerminalOpenParams`},
+		{"terminal_attach_method", `"terminal/attach": TerminalAttachParams`},
+		{"terminal_attach_result", `"terminal/attach": TerminalAttachResult`},
+		{"terminal_reset_method", `"terminal/reset": TerminalParams`},
+		{"terminal_subscribe_result", `"terminal/subscribe": TerminalListResult`},
+		{"terminal_list_changed", `"terminal/listChanged": TerminalListResult`},
+		{"terminal_list_closed", `"terminal/listClosed": TerminalsClosedParams`},
+		{"terminal_item_started_at_string", "    started_at: string;"},
 		{"terminal_data_base64_string", "export interface TerminalOutputParams {\n    terminal_id: string;\n    data: string;"},
 		{"params_interface", "export interface SubmitInputParams"},
 		{"method_params", `"conversation/submitInput": SubmitInputParams`},
@@ -38,6 +45,7 @@ func TestGenerateProtocolTypes(t *testing.T) {
 		{"embedded_extends", "extends NotificationTarget"},
 		{"error_code_session_busy", "export const ErrorCodeSessionBusy = -32001"},
 		{"error_code_invalid_request", "export const ErrorCodeInvalidRequest = -32600"},
+		{"error_code_terminal_not_found", "export const ErrorCodeTerminalNotFound = -32004"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

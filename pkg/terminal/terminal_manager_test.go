@@ -8,13 +8,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VaalaCat/openvaala/pkg/telemetry"
+	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	"github.com/VaalaCat/openvaala/pkg/terminal"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 )
 
 // TestTerminalManager 验证终端管理和容量限制。
 func TestTerminalManager(t *testing.T) {
-	// 1. 准备淘汰、满载、环境隔离、启动失败、忙闲和关闭样例。
+	// 1. 准备淘汰、满载、环境隔离、启动失败、忙闲、关闭、跨环境查询、独占工作区和结束通知样例。
+	terminalFinished := make(chan struct{}, 1)
 	tests := []struct {
 		name string
 		// opt 为 nil 时用默认配置。
@@ -135,12 +138,238 @@ func TestTerminalManager(t *testing.T) {
 				f.stopManager(t)
 				for _, command := range commands {
 					info := command.GetInfo()
-					if info.Status != terminal.TerminalStatusExited || info.StopReason != terminal.TerminalStoppedBySession {
+					if info.Status != terminal.TerminalStatusExited || info.StopReason != terminal.TerminalStoppedByManager {
 						t.Fatalf("GetInfo() = %+v, want exited with session_closed", info)
 					}
 				}
 				if _, err := f.manager.StartTerminal(t.Context(), f.newRequest("true")); !errors.Is(err, terminal.ErrTerminalManagerStopped) {
 					t.Fatalf("StartTerminal after Run error = %v, want ErrTerminalManagerStopped", err)
+				}
+			},
+		},
+		{
+			name: "lookups_cross_environments",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				first := f.startTerminal(t, f.newRequest("sleep 30"))
+				secondRequest := f.newRequest("sleep 30")
+				secondRequest.EnvironmentID = "ssh"
+				second := f.startTerminal(t, secondRequest)
+				failedRequest := f.newRequest("true")
+				failedRequest.Directory = filepath.Join(f.root, "missing")
+				if _, err := f.manager.StartTerminal(t.Context(), failedRequest); err == nil {
+					t.Fatal("StartTerminal(missing directory) error = nil")
+				}
+				for _, command := range []terminal.Terminal{first, second} {
+					id := command.GetInfo().ID
+					if found, err := f.manager.GetTerminalByID(id); err != nil || found.GetInfo().ID != id {
+						t.Fatalf("GetTerminalByID(%s) = %v, %v, want the command", id, found, err)
+					}
+				}
+				if _, err := f.manager.GetTerminalByID("cmd_unknown"); !errors.Is(err, terminal.ErrTerminalNotFound) {
+					t.Fatalf("GetTerminalByID(unknown) error = %v, want ErrTerminalNotFound", err)
+				}
+				want := getTerminalIDs([]terminal.Terminal{first, second})
+				if listed := getTerminalIDs(f.manager.ListAllTerminals()); !slices.Equal(listed, want) {
+					t.Fatalf("ListAllTerminals() = %v, want %v in start order without the failed start", listed, want)
+				}
+			},
+		},
+		{
+			name: "owned_workspace_is_closed",
+			run: func(t *testing.T, _ *terminalManagerFixture) {
+				tests := []struct {
+					name           string
+					opt            *terminal.TerminalManagerOpt
+					ownsWorkspace  bool
+					wantCloseCount int
+					// run 触发工作区关闭的那一步：核对启动结果，返回时关闭已经发生。
+					run func(t *testing.T, f *terminalManagerFixture, request *terminal.TerminalRequest, fakeWorkspace *fakeProcessWorkspace)
+				}{
+					{
+						name:           "command_finished",
+						ownsWorkspace:  true,
+						wantCloseCount: 1,
+						run: func(t *testing.T, f *terminalManagerFixture, request *terminal.TerminalRequest, fakeWorkspace *fakeProcessWorkspace) {
+							command := f.startTerminal(t, request)
+							if closeCount := fakeWorkspace.getCloseCount(); closeCount != 0 {
+								t.Fatalf("Close count while running = %d, want 0", closeCount)
+							}
+							if _, err := command.Stop(t.Context()); err != nil {
+								t.Fatal(err)
+							}
+							waitFinished(t, command)
+						},
+					},
+					{
+						name:           "command_finished_without_ownership",
+						ownsWorkspace:  false,
+						wantCloseCount: 0,
+						run: func(t *testing.T, f *terminalManagerFixture, request *terminal.TerminalRequest, fakeWorkspace *fakeProcessWorkspace) {
+							command := f.startTerminal(t, request)
+							if _, err := command.Stop(t.Context()); err != nil {
+								t.Fatal(err)
+							}
+							waitFinished(t, command)
+						},
+					},
+					{
+						name:           "limit_reached",
+						opt:            &terminal.TerminalManagerOpt{MaxTerminals: 1, MaxOutputBytes: 1 << 20},
+						ownsWorkspace:  true,
+						wantCloseCount: 1,
+						run: func(t *testing.T, f *terminalManagerFixture, request *terminal.TerminalRequest, fakeWorkspace *fakeProcessWorkspace) {
+							f.startTerminal(t, f.newRequest("sleep 30"))
+							if _, err := f.manager.StartTerminal(t.Context(), request); !errors.Is(err, terminal.ErrTerminalLimitReached) {
+								t.Fatalf("StartTerminal() error = %v, want ErrTerminalLimitReached", err)
+							}
+						},
+					},
+					{
+						name:           "manager_stopped",
+						ownsWorkspace:  true,
+						wantCloseCount: 1,
+						run: func(t *testing.T, f *terminalManagerFixture, request *terminal.TerminalRequest, fakeWorkspace *fakeProcessWorkspace) {
+							f.stopManager(t)
+							if _, err := f.manager.StartTerminal(t.Context(), request); !errors.Is(err, terminal.ErrTerminalManagerStopped) {
+								t.Fatalf("StartTerminal() error = %v, want ErrTerminalManagerStopped", err)
+							}
+						},
+					},
+					{
+						name:           "start_failed",
+						ownsWorkspace:  true,
+						wantCloseCount: 1,
+						run: func(t *testing.T, f *terminalManagerFixture, request *terminal.TerminalRequest, fakeWorkspace *fakeProcessWorkspace) {
+							fakeWorkspace.startErr = errors.New("ssh dial failed")
+							if _, err := f.manager.StartTerminal(t.Context(), request); err == nil || err.Error() != "ssh dial failed" {
+								t.Fatalf("StartTerminal() error = %v, want the start error", err)
+							}
+						},
+					},
+				}
+				for _, tt := range tests {
+					t.Run(tt.name, func(t *testing.T) {
+						f := newTerminalManagerFixture(t, tt.opt)
+						fakeWorkspace := newFakeProcessWorkspace(newFakeInteractiveProcess(false))
+						request := f.newRequest("ignored")
+						request.Workspace = fakeWorkspace
+						request.Interactive = true
+						request.OwnsWorkspace = tt.ownsWorkspace
+						tt.run(t, f, request, fakeWorkspace)
+						if closeCount := fakeWorkspace.getCloseCount(); closeCount != tt.wantCloseCount {
+							t.Fatalf("Close count = %d, want %d", closeCount, tt.wantCloseCount)
+						}
+					})
+				}
+			},
+		},
+		{
+			// Terminate 卡住时，5 秒后关闭独占的工作区，卡住的 Terminate 随之返回。
+			name: "stuck_terminate_closes_workspace",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				pipeline := telemetrytest.NewPipeline(t)
+				process := newFakeInteractiveProcess(false)
+				fakeWorkspace := newFakeProcessWorkspace(process)
+				process.terminateUnblock = fakeWorkspace.closed
+				request := f.newRequest("ignored")
+				request.Workspace = fakeWorkspace
+				request.Interactive = true
+				request.OwnsWorkspace = true
+				command, err := f.manager.StartTerminal(telemetry.ContextWithTelemetry(t.Context(), pipeline.Telemetry), request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stopStarted := time.Now()
+				stopResult := make(chan error, 1)
+				go func() {
+					_, err := command.Stop(t.Context())
+					stopResult <- err
+				}()
+				select {
+				case <-fakeWorkspace.closed:
+					if elapsed := time.Since(stopStarted); elapsed < 4*time.Second {
+						t.Fatalf("workspace closed after %s, want after the 5 second Terminate limit", elapsed)
+					}
+				case <-time.After(8 * time.Second):
+					t.Fatal("workspace was not closed after Terminate got stuck")
+				}
+				select {
+				case err := <-stopResult:
+					if err == nil || err.Error() != "connection closed" {
+						t.Fatalf("Stop() error = %v, want the Terminate error", err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("Stop() did not return after the workspace was closed")
+				}
+			},
+		},
+		{
+			// Terminate 立刻失败：独占工作区的命令放手进程，让关标签页仍能结束 shell；不独占的命令继续受管。
+			name: "owned_workspace_stop_failure_closes_process",
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				tests := []struct {
+					name              string
+					ownsWorkspace     bool
+					wantProcessClosed bool
+				}{
+					{name: "owned", ownsWorkspace: true, wantProcessClosed: true},
+					{name: "not_owned", ownsWorkspace: false, wantProcessClosed: false},
+				}
+				for _, tt := range tests {
+					t.Run(tt.name, func(t *testing.T) {
+						pipeline := telemetrytest.NewPipeline(t)
+						process := newFakeInteractiveProcess(false)
+						process.terminateErr = errors.New("kill script failed")
+						request := f.newRequest("ignored")
+						request.Workspace = newFakeProcessWorkspace(process)
+						request.Interactive = true
+						request.OwnsWorkspace = tt.ownsWorkspace
+						command, err := f.manager.StartTerminal(telemetry.ContextWithTelemetry(t.Context(), pipeline.Telemetry), request)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if _, err := command.Stop(t.Context()); err == nil || err.Error() != "kill script failed" {
+							t.Fatalf("Stop() error = %v, want the Terminate error", err)
+						}
+						// Close 在 Terminate 失败后、Stop 返回之前调用，这里直接检查。
+						isProcessClosed := false
+						select {
+						case <-process.released:
+							isProcessClosed = true
+						default:
+						}
+						if isProcessClosed != tt.wantProcessClosed {
+							t.Fatalf("process closed = %v, want %v", isProcessClosed, tt.wantProcessClosed)
+						}
+						if !tt.wantProcessClosed && command.GetInfo().Status != terminal.TerminalStatusRunning {
+							t.Fatalf("Status = %q, want the command still running and managed", command.GetInfo().Status)
+						}
+					})
+				}
+			},
+		},
+		{
+			name: "finished_signal_is_sent",
+			opt:  terminal.NewTerminalManagerOpt().WithTerminalFinished(terminalFinished),
+			run: func(t *testing.T, f *terminalManagerFixture) {
+				first := f.startTerminal(t, f.newRequest("sleep 30"))
+				second := f.startTerminal(t, f.newRequest("sleep 30"))
+				select {
+				case <-terminalFinished:
+					t.Fatal("received a finished signal while both commands were running")
+				default:
+				}
+				// 通道没人取，第二条命令结束时的唤醒与第一条合并，不阻塞命令收尾。
+				for _, command := range []terminal.Terminal{first, second} {
+					if _, err := command.Stop(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					waitFinished(t, command)
+				}
+				select {
+				case <-terminalFinished:
+				case <-time.After(2 * time.Second):
+					t.Fatal("did not receive a finished signal after the commands finished")
 				}
 			},
 		},
@@ -215,6 +444,17 @@ func (f *terminalManagerFixture) startTerminal(t *testing.T, request *terminal.T
 		t.Fatal(err)
 	}
 	return command
+}
+
+// startFakeTerminal 启动一条进程由 fakeWorkspace 提供的交互命令，rows、cols 为零时按默认尺寸。
+func (f *terminalManagerFixture) startFakeTerminal(t *testing.T, fakeWorkspace *fakeProcessWorkspace, rows, cols uint16) terminal.Terminal {
+	t.Helper()
+	// 1. 使用假工作区、交互模式和初始尺寸填充请求，交给管理器启动。
+	request := f.newRequest("ignored")
+	request.Workspace = fakeWorkspace
+	request.Interactive = true
+	request.Rows, request.Cols = rows, cols
+	return f.startTerminal(t, request)
 }
 
 // stopManager 停止测试终端管理器。

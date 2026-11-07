@@ -39,3 +39,10 @@ export function getSlashToken(
   if (start === cursor || text[start] !== "/") return undefined
   return { start, end, prefix: text.slice(start + 1, cursor) }
 }
+
+// 输入以 /btw 命令开头（后面是空白或结束）时返回命令后面的问题，可以为空；其他输入返回 undefined
+export function getSideConversationQuestion(text: string): string | undefined {
+  return /^\/btw(\s|$)/.test(text)
+    ? text.slice("/btw".length).trim()
+    : undefined
+}

@@ -23,6 +23,25 @@ func mergeAttrs(existing, added []attribute.KeyValue) []attribute.KeyValue {
 	return merged
 }
 
+// newSessionCtxMetaAttrs 把 SessionCtxMeta 转成身份属性，只为非空字段生成，顺序为对话、Session、父 Session、Agent 名。
+func newSessionCtxMetaAttrs(meta defs.SessionCtxMeta) []attribute.KeyValue {
+	// 1. 依次为非空字段生成属性。
+	var attrs []attribute.KeyValue
+	if meta.ConversationID != "" {
+		attrs = append(attrs, conversationIDAttr(string(meta.ConversationID)))
+	}
+	if meta.SessionID != "" {
+		attrs = append(attrs, sessionIDAttr(string(meta.SessionID)))
+	}
+	if meta.ParentSessionID != "" {
+		attrs = append(attrs, parentSessionIDAttr(string(meta.ParentSessionID)))
+	}
+	if meta.AgentName != "" {
+		attrs = append(attrs, agentNameAttr(meta.AgentName))
+	}
+	return attrs
+}
+
 // getCallerFunctionName 返回调用栈指定层的函数全名。
 func getCallerFunctionName(skip int) string {
 	// 1. 按 skip 读取调用栈，0 指本函数；无法找到栈帧或函数时返回空串。
