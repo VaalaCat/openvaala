@@ -1,0 +1,1 @@
+import{Zn as e}from"./paths-mkbM0P-D.js";function t(t){return e(t.defaultTagName??`div`,t,t)}export{t};
