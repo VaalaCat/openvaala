@@ -7,6 +7,7 @@ import {
 } from "react"
 import { useTranslation } from "react-i18next"
 import { CopyButton } from "@/components/base/copy-button"
+import { useKeptViewState } from "@/components/base/kept-view-state"
 import { Button } from "@/components/ui/button"
 
 // 输出外框：工具栏固定在内容上方，正文共用一个滚动区，纵向溢出时可展开高度。
@@ -17,6 +18,7 @@ export function OutputBlock({
   maxHeight = 320,
   heightMode = "expandable",
   followOutput = false,
+  viewStateKey,
 }: {
   copyValue: string
   children: ReactNode
@@ -25,9 +27,11 @@ export function OutputBlock({
   // host 模式保留宿主限高，不提供解除限高的操作。
   heightMode?: "expandable" | "host"
   followOutput?: boolean
+  // 给出时，展开选择保存在消息区里，重新挂载后保留
+  viewStateKey?: string
 }) {
   const { t } = useTranslation()
-  const [isExpanded, setIsExpanded] = useState(false)
+  const [isExpanded, setIsExpanded] = useKeptViewState(viewStateKey, false)
   const [hasVerticalOverflow, setHasVerticalOverflow] = useState(false)
   const viewportRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)

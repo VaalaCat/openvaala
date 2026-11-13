@@ -74,7 +74,7 @@ openvaala serve stop
 openvaala serve reload
 ```
 
-让本机 Runtime 服务重新加载 Agent、模型、Executor、MCP server、hook、skill 和插件。打印 `configuration reloaded`，并列出因为正忙而继续用旧配置的对话。见[让改动生效](../configuration/overview.md#让改动生效)。
+让本机 Runtime 服务重新加载 Agent、模型、Executor、MCP server、hook、skill 和插件。打印 `configuration reloaded`，并列出已接收新配置、等待空闲后自动应用的对话，无需再执行一次。见[让改动生效](../configuration/overview.md#让改动生效)。
 
 ## web
 

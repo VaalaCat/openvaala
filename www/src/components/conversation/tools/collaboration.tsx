@@ -238,7 +238,12 @@ export function ReadSessionHistoryTool(props: ToolRendererProps) {
       target={sessionID && <SessionLink sync={sync} sessionID={sessionID} />}
     >
       {items.length > 0 && (
-        <JsonView value={items} defaultExpandDepth={1} maxHeight="24rem" />
+        <JsonView
+          value={items}
+          defaultExpandDepth={1}
+          maxHeight="24rem"
+          viewStateKey={props.viewKey + ":history"}
+        />
       )}
     </ToolCard>
   )

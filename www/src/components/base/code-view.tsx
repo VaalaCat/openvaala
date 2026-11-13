@@ -9,19 +9,27 @@ export function CodeView({
   lang,
   maxHeight,
   heightMode,
+  viewStateKey,
 }: {
   code: string
   // shiki 语言名、常见别名或文件扩展名，例如 diff、ts、json
   lang: string
   maxHeight?: CSSProperties["maxHeight"]
   heightMode?: "expandable" | "host"
+  // 给出时，展开选择保存在消息区里，重新挂载后保留
+  viewStateKey?: string
 }) {
   // 结尾的换行不单独显示成空行
   const text = code.endsWith("\n") ? code.slice(0, -1) : code
   const highlighted = useHighlightedLines(text, lang, true)
   const lines = useMemo(() => text.split("\n"), [text])
   return (
-    <OutputBlock copyValue={code} maxHeight={maxHeight} heightMode={heightMode}>
+    <OutputBlock
+      copyValue={code}
+      maxHeight={maxHeight}
+      heightMode={heightMode}
+      viewStateKey={viewStateKey}
+    >
       <pre className="w-max min-w-full code-padding text-code-reading">
         {lines.map((line, index) => (
           <Fragment key={index}>

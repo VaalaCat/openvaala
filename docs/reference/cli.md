@@ -74,7 +74,7 @@ Asks the local runtime server to shut down and waits up to 10 seconds. Prints `s
 openvaala serve reload
 ```
 
-Reloads agents, models, executors, MCP servers, hooks, skills and plugins in the local runtime server. Prints `configuration reloaded`, and lists conversations that keep the old configuration because they are busy. See [Apply changes](../configuration/overview.md#apply-changes).
+Reloads agents, models, executors, MCP servers, hooks, skills and plugins in the local runtime server. Prints `configuration reloaded`, and lists conversations with a prepared configuration waiting to apply automatically when idle; no second reload is needed. See [Apply changes](../configuration/overview.md#apply-changes).
 
 ## web
 

@@ -1,4 +1,4 @@
-import { useMemo, type ComponentProps } from "react"
+import { useCallback, useMemo, type ComponentProps } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { useStore } from "@nanostores/react"
 import type { ReadableAtom } from "nanostores"
@@ -71,6 +71,10 @@ export function ConversationTab({
     : (sessionID ?? "")
   const { $messageRows, $hasItems } = getConversationMessageStores(sync)
   const hasItems = useStore($hasItems)
+  const inspectTabItem = useCallback(
+    (target: ItemDebugTarget) => onInspect(tabID, sync, target),
+    [onInspect, tabID, sync]
+  )
   // 主对话标签页读对话记录里的分叉来源；旁支指回主对话标签页；子 Agent 没有来源提示
   const conversation = useQuery({
     ...conversationOptions(connection, sync.conversationID),
@@ -166,7 +170,7 @@ export function ConversationTab({
             />
           )
         }
-        onInspect={(target) => onInspect(tabID, sync, target)}
+        onInspect={inspectTabItem}
       />
     </div>
   )

@@ -65,6 +65,8 @@ type SessionStatus struct {
 	ActiveTurnID defs.TurnID `json:"active_turn_id,omitempty"`
 	// PendingInputCount 是排队等新 Turn 的输入条数，用户输入和 Agent 消息都算。
 	PendingInputCount int `json:"pending_input_count"`
+	// PendingContextItemCount 是等待交给下一个非压缩 Turn 的上下文 Item 数量。
+	PendingContextItemCount int `json:"pending_context_item_count"`
 	// LastTurnID 是最近一个 Turn。
 	LastTurnID defs.TurnID `json:"last_turn_id,omitempty"`
 	// LastTurnStatus 是最近一个 Turn 保存的终态，终态没保存时为空。

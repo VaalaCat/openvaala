@@ -357,18 +357,18 @@ func (f *mcpFixture) openConversation(t *testing.T, agentName string) *runtimeOb
 	return openRuntimeObserver(t, f.config, record.ID)
 }
 
-// reload 重新加载配置并检查没有跳过忙碌对话。
+// reload 重新加载空闲对话的配置并检查无需等待。
 func (f *mcpFixture) reload(t *testing.T) {
 	t.Helper()
-	// 1. 调用 ReloadConfig，检查请求成功且 BusyConversationIDs 为空。
+	// 1. 调用 ReloadConfig，检查请求成功且 PendingConversationIDs 为空。
 	ctx, cancel := context.WithTimeout(context.Background(), e2eTimeout)
 	defer cancel()
 	result, err := f.control.ReloadConfig(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.BusyConversationIDs) != 0 {
-		t.Fatalf("config/reload skipped busy conversations %v, want none", result.BusyConversationIDs)
+	if len(result.PendingConversationIDs) != 0 {
+		t.Fatalf("config/reload has pending conversations %v, want none", result.PendingConversationIDs)
 	}
 }
 

@@ -154,8 +154,8 @@ func (d *Desktop) setDefaultModel(model string) {
 			}
 			d.defaultModel = ref
 			d.showSuccess(d.t("default.model.saved"), "")
-			if len(result.BusyConversationIDs) > 0 {
-				d.showToast(kit.ToastOpt{Title: d.t("busy.conversations.keep.previous.configuration"), Description: joinConversationIDs(result.BusyConversationIDs), Kind: kit.ToastInfo})
+			if len(result.PendingConversationIDs) > 0 {
+				d.showToast(kit.ToastOpt{Title: fmt.Sprintf(d.t("pending.conversations.apply.when.idle"), len(result.PendingConversationIDs)), Description: joinConversationIDs(result.PendingConversationIDs), Kind: kit.ToastInfo})
 			}
 		})
 	})
@@ -339,6 +339,7 @@ func (d *Desktop) providerModelRows(c *ui.Context, model *providerModelDraft, pr
 	}
 	d.settingInputRow(c, "model-upstream", d.t("upstream.id"), "", &model.UpstreamModel, settingInputOpt{})
 	d.settingInputRow(c, "model-display", d.t("display.name"), "", &model.DisplayName, settingInputOpt{})
+	d.settingInputRow(c, "model-description", d.t("model.description"), "", &model.Description, settingInputOpt{})
 	kit.SettingRow(c, d.t("protocol"), "", func() {
 		d.settingSelectView(c, "model-protocol", d.t("protocol"), &model.Protocol, kit.SelectOpt{Options: selectOptions(append([]string{""}, protocols...), append([]string{d.t("inherit.provider.protocol")}, protocolLabels...))})
 	})
@@ -471,8 +472,8 @@ func (d *Desktop) saveProvider() {
 			draft.EditingID = provider.ID
 			d.providerBaseline = submitted
 			detail := ""
-			if len(result.BusyConversationIDs) > 0 {
-				detail = fmt.Sprintf("%s: %s", d.t("busy.conversations.require.reload.after.finishing"), joinConversationIDs(result.BusyConversationIDs))
+			if len(result.PendingConversationIDs) > 0 {
+				detail = fmt.Sprintf("%s: %s", fmt.Sprintf(d.t("pending.conversations.apply.when.idle"), len(result.PendingConversationIDs)), joinConversationIDs(result.PendingConversationIDs))
 			}
 			d.showSuccess(d.t("provider.saved"), detail)
 			d.loadProviders()
@@ -529,6 +530,7 @@ func modelToDraft(alias string, model *defs.ProviderModelConfig) *providerModelD
 		model = &defs.ProviderModelConfig{}
 	}
 	draft := &providerModelDraft{Key: alias, Alias: alias, UpstreamModel: model.UpstreamModel, DisplayName: model.DisplayName, Protocol: model.Protocol, Thinking: "inherit", InheritReasoning: model.ReasoningEfforts == nil, InheritInputs: model.Capabilities.Input == nil, InheritMerge: model.MergeMessageRoles == nil, ReasoningEfforts: strings.Join(model.ReasoningEfforts, ", "), DefaultReasoningEffort: model.DefaultReasoningEffort, Inputs: strings.Join(model.Capabilities.Input, ", "), MergeRoles: strings.Join(model.MergeMessageRoles, ", ")}
+	draft.Description = model.Description
 	if model.ContextWindow != 0 {
 		draft.ContextWindow = strconv.Itoa(model.ContextWindow)
 	}
@@ -634,6 +636,7 @@ func draftToProvider(draft *providerDraft, defaults defs.ModelDefaults) (defs.Pr
 			return provider, err
 		}
 		model := &defs.ProviderModelConfig{Protocol: draftModel.Protocol, UpstreamModel: strings.TrimSpace(draftModel.UpstreamModel), DisplayName: draftModel.DisplayName, ContextWindow: context, MaxOutputTokens: output, DefaultReasoningEffort: draftModel.DefaultReasoningEffort}
+		model.Description = draftModel.Description
 		if draftModel.Thinking != "inherit" {
 			enabled := draftModel.Thinking == "true"
 			model.Thinking = &enabled

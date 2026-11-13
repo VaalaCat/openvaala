@@ -4,6 +4,8 @@ import {
   getComposer,
   getMessages,
   getMessageScroller,
+  getFirstVisibleTurn,
+  getSmallestMountedTurn,
   test,
 } from "./fixture"
 
@@ -142,23 +144,12 @@ test.describe("pagination", () => {
       await expect(
         messages.getByText("长对话第 1 轮", { exact: true })
       ).toHaveCount(0)
-      // 2. 滚到顶，同一帧里记下已加载的最早一条用户消息离视口顶部的距离。
-      const earliest = await messages
-        .getByText(/^长对话第 \d+ 轮$/)
-        .first()
-        .innerText()
+      // 2. 滚到顶，记下视口里第一条用户消息（已加载的最早一条）离视口顶部的距离。
+      await getMessageScroller(page).evaluate((scroller) => {
+        scroller.scrollTop = 0
+      })
+      const { text: earliest, top: topBefore } = await getFirstVisibleTurn(page)
       const earliestTurn = Number(earliest.match(/\d+/)?.[0])
-      const topBefore = await getMessageScroller(page).evaluate(
-        (scroller, text) => {
-          scroller.scrollTop = 0
-          const element = [...scroller.querySelectorAll("p")].find(
-            (each) => each.textContent === text
-          )
-          return element?.getBoundingClientRect().top
-        },
-        earliest
-      )
-      expect(topBefore).toBeDefined()
       // 3. 更早的消息加载出来之后，这一条还在原来的位置。
       await expect(
         messages.getByText(`长对话第 ${earliestTurn - 1} 轮`, { exact: true })
@@ -378,4 +369,181 @@ test("short_grouped_history_loads_one_page_only_after_keyboard_up", async ({
     messages.getByRole("button", { name: "复制结果", exact: true })
   ).toHaveCount(1)
   expect(historyRequests.length).toBe(2)
+})
+
+test("long_history_mounts_only_rows_near_the_view", async ({
+  page,
+  fixture,
+}) => {
+  test.setTimeout(120_000)
+  // 1. 先种一个 30 轮长回复的对话（每条要点够长，窗口变窄时会多折行），再种 200 轮短回复的对话；
+  //    200 轮的对话打开后只挂底部附近的几轮。
+  const longReply =
+    "## 历史回复\n\n" +
+    Array.from(
+      { length: 12 },
+      (_, index) =>
+        `- 要点 ${index + 1}：` + "保留历史消息、阅读位置和文字选择。".repeat(8)
+    ).join("\n")
+  await fixture.replies(
+    ...Array.from({ length: 30 }, () => ({ text: longReply }))
+  )
+  const { longConversationID: longReplyConversationID } = await fixture.seed({
+    conversations: 0,
+    longConversationTurns: 30,
+  })
+  const turns = 200
+  const { longConversationID } = await fixture.seed({
+    conversations: 0,
+    longConversationTurns: turns,
+  })
+  await page.setViewportSize({ width: 1280, height: 844 })
+  await fixture.openApp(page)
+  await page.goto(page.url() + "/c/" + longConversationID)
+  const messages = getMessages(page)
+  const scroller = getMessageScroller(page)
+  const mountedTurns = messages.locator("[data-turn-id]")
+  await expect(
+    messages.getByText(`长对话第 ${turns} 轮`, { exact: true })
+  ).toBeVisible()
+  expect(await mountedTurns.count()).toBeLessThanOrEqual(20)
+
+  // 2. 一路往前加载到第 1 轮：每加载一页，视口顶部那一条不动，挂着的轮数不超过 20，视口中间始终有内容；
+  //    哨兵在第一个挂着的行上方，不和行重叠。
+  const oldest = messages.getByText("长对话第 1 轮", { exact: true })
+  let smallestTurn = await getSmallestMountedTurn(messages)
+  while ((await oldest.count()) === 0) {
+    await scroller.evaluate((node) => {
+      node.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }))
+      node.scrollTop = 0
+    })
+    const before = await getFirstVisibleTurn(page)
+    const sentinelGap = await scroller.evaluate((node) => {
+      const sentinel = node.querySelector(
+        '[aria-label="正在加载更早的消息"]'
+      )?.parentElement
+      return (
+        sentinel &&
+        node.querySelector("[data-row-key]")!.getBoundingClientRect().top -
+          sentinel.getBoundingClientRect().bottom
+      )
+    })
+    if (sentinelGap === undefined) continue
+    expect(sentinelGap).toBeGreaterThanOrEqual(0)
+    await scroller.evaluate((node) =>
+      node.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }))
+    )
+    smallestTurn = Math.min(smallestTurn, Number(before.text.match(/\d+/)![0]))
+    await expect
+      .poll(() => getSmallestMountedTurn(messages))
+      .toBeLessThan(smallestTurn)
+    smallestTurn = await getSmallestMountedTurn(messages)
+    const anchor = messages.getByText(before.text, { exact: true })
+    await expect
+      .poll(async () => Math.abs((await anchor.boundingBox())!.y - before.top))
+      .toBeLessThanOrEqual(2)
+    expect(await mountedTurns.count()).toBeLessThanOrEqual(20)
+    expect(
+      await scroller.evaluate((node) => {
+        const rect = node.getBoundingClientRect()
+        return !!document
+          .elementFromPoint(
+            rect.left + rect.width / 2,
+            rect.top + rect.height / 2
+          )
+          ?.closest("[data-row-key]")
+      })
+    ).toBe(true)
+  }
+  expect(await mountedTurns.count()).toBeLessThanOrEqual(20)
+
+  // 3. 停在顶部点「回到底部」：动画全程视口中间都有内容，最后停在最新一轮。
+  await scroller.evaluate((node) => {
+    const rect = node.getBoundingClientRect()
+    const samples: boolean[] = []
+    const timer = setInterval(() => {
+      const center = document.elementFromPoint(
+        rect.left + rect.width / 2,
+        rect.top + rect.height / 2
+      )
+      samples.push(!!center?.closest("[data-row-key]"))
+    }, 30)
+    Object.assign(window, {
+      stopCenterSamples: () => {
+        clearInterval(timer)
+        return samples
+      },
+    })
+  })
+  await page.getByRole("button", { name: "回到底部", exact: true }).click()
+  await expect
+    .poll(() =>
+      scroller.evaluate(
+        (node) => node.scrollHeight - node.clientHeight - node.scrollTop
+      )
+    )
+    .toBeLessThanOrEqual(2)
+  const centerSamples = await page.evaluate(() =>
+    (
+      window as unknown as { stopCenterSamples(): boolean[] }
+    ).stopCenterSamples()
+  )
+  expect(centerSamples.length).toBeGreaterThan(0)
+  expect(centerSamples.every(Boolean)).toBe(true)
+  await expect(
+    messages.getByText(`长对话第 ${turns} 轮`, { exact: true })
+  ).toBeInViewport()
+
+  // 4. 长回复的对话滚到中间某一轮放在视口顶部，窗口变窄后这一轮变高，这一条仍在原位。
+  await page.goto(page.url().split("/c/")[0] + "/c/" + longReplyConversationID)
+  await expect(
+    messages.getByText("长对话第 30 轮", { exact: true })
+  ).toBeVisible()
+  // 先发向上滚轮退出贴底：刚打开时行还在测量，程序改滚动位置会被滚动库当成尺寸变化，继续贴底
+  await scroller.evaluate((node) => {
+    node.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }))
+    node.scrollTop = (node.scrollHeight - node.clientHeight) / 2
+  })
+  // 每轮比视口高，视口里不一定露出用户消息：取视口里露出来的那一行的用户消息
+  const middle = await scroller.evaluate(async (node) => {
+    const scrollerRect = node.getBoundingClientRect()
+    for (let frame = 0; frame < 30; frame++) {
+      const row = [
+        ...node.querySelectorAll<HTMLElement>("[data-row-key]"),
+      ].find((each) => {
+        const rect = each.getBoundingClientRect()
+        return rect.bottom > scrollerRect.top && rect.top < scrollerRect.bottom
+      })
+      const message =
+        row &&
+        [...row.querySelectorAll("p")].find((each) =>
+          /^长对话第 \d+ 轮$/.test(each.textContent ?? "")
+        )
+      if (message) return message.textContent!
+      await new Promise((resolve) => requestAnimationFrame(resolve))
+    }
+    throw new Error("no row in view")
+  })
+  const middleMessage = messages.getByText(middle, { exact: true })
+  const getMiddleRowHeight = () =>
+    middleMessage.evaluate(
+      (node) => node.closest("[data-row-key]")!.getBoundingClientRect().height
+    )
+  await middleMessage.evaluate((node) =>
+    node.scrollIntoView({ block: "start" })
+  )
+  await page.waitForTimeout(300)
+  const middleTop = (await middleMessage.boundingBox())!.y
+  const middleRowHeight = await getMiddleRowHeight()
+  await page.setViewportSize({ width: 900, height: 844 })
+  await expect.poll(getMiddleRowHeight).toBeGreaterThan(middleRowHeight)
+  await expect
+    .poll(async () =>
+      Math.abs((await middleMessage.boundingBox())!.y - middleTop)
+    )
+    .toBeLessThanOrEqual(2)
+  await page.waitForTimeout(300)
+  expect(
+    Math.abs((await middleMessage.boundingBox())!.y - middleTop)
+  ).toBeLessThanOrEqual(2)
 })

@@ -334,7 +334,7 @@ func (t *connectionThread) newSessionTranslator() *codexItemTranslator {
 	for _, executorDetails := range t.executors {
 		workspaceDirectories[executorDetails.ID] = executorDetails.WorkspaceDirectory
 	}
-	return newCodexItemTranslator(t.sessionID, t.agentPaths, workspaceDirectories, getDefaultExecutorDetails(t.executors).ID)
+	return newCodexItemTranslator(t.conversationID, t.conversationRecord.RootSessionID, t.sessionID, t.agentPaths, workspaceDirectories, getDefaultExecutorDetails(t.executors).ID)
 }
 
 // newCodexThread 按对话记录、Session 详情和已报告状态创建 Thread。

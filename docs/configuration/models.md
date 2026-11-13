@@ -34,6 +34,7 @@ models:
       input: [text, image]
   mini:
     upstream_model: gpt-5-mini     # the name sent to the provider
+    description: Fast and inexpensive; suitable for search, extraction and simple edits.
 ```
 
 A provider that speaks several protocols can mix them. Here one gateway serves both OpenAI-style and Claude models, and the Claude endpoint lives on a different host:
@@ -107,6 +108,7 @@ Every field is optional. Fields you leave out come from `models.defaults` in `co
 - `upstream_model` — the model name sent to the provider. Defaults to the model id.
 - `protocol` — overrides the provider's protocol for this model only.
 - `display_name` — the name shown in model pickers. Defaults to the model id.
+- `description` — guidance for agents choosing a subagent's model, appended to the model list in `spawn_agent`. Describe suitable tasks and speed or cost trade-offs. Omit it to show no description; it is not inherited from `models.defaults`. Existing model inheritance and default-selection rules stay unchanged.
 - `context_window` — the model's context window in tokens. Automatic compaction is based on it, so set it to the real value.
 - `max_output_tokens` — sent with every request as the output limit. If your model's limit is lower than the default 32000, set it here.
 - `thinking` — whether to ask the model to think or reason before answering. `true` by default.

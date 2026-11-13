@@ -151,7 +151,7 @@ function directoryConnection(
   return {
     getServerID: () => serverID,
     async call(method: string, params: ListDirectoriesParams) {
-      if (method === "config/reload") return { busy_conversation_ids: [] }
+      if (method === "config/reload") return { pending_conversation_ids: [] }
       assert.equal(method, "executor/listDirectories")
       requests.push(params)
       beforeRead?.()

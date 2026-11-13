@@ -10,7 +10,13 @@ export function FallbackItem({ view }: ItemRendererProps) {
   return (
     <ItemNotice
       icon={Braces}
-      details={<JsonView value={view.item} maxHeight="24rem" />}
+      details={
+        <JsonView
+          value={view.item}
+          maxHeight="24rem"
+          viewStateKey={view.key + ":item"}
+        />
+      }
     >
       {t("conversation.notice.unknownItem", { kind: view.item.kind })}
     </ItemNotice>

@@ -525,13 +525,14 @@ func (cfg *Config) newModelDefinition(provider *defs.ProviderConfig, modelID str
 		endpoint = strings.TrimRight(provider.BaseURL, "/") + getDefaultEndpointSuffix(protocol)
 	}
 	baseURL, endpointPath := splitProviderURL(endpoint)
-	// 2. 填入模型引用、显示名、请求目标和输出设置，模型写了的字段覆盖全局默认；窗口和输出上限不能为负。
+	// 2. 填入模型引用、显示名、用途说明、请求目标和输出设置，模型写了的字段覆盖全局默认；窗口和输出上限不能为负。
 	definition := &defs.ModelDefinition{
 		Ref: defs.ModelRef{
 			ProviderID: provider.ID,
 			ModelID:    modelID,
 		},
 		DisplayName: cmp.Or(model.DisplayName, modelID),
+		Description: model.Description,
 		Target: &llmkit.Target{
 			Protocol:     protocol,
 			BaseURL:      baseURL,

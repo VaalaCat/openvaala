@@ -427,7 +427,7 @@ func (m *tuiModel) handleConfigReloaded(msg configReloadedMsg) tea.Cmd {
 		return m.showNotice("重新加载失败："+getServerErrorText(msg.err), true, noticeDuration)
 	}
 	// 2. 提示已重新加载，有正在执行的对话时附上数量，同时重新读取模型列表。
-	notice := m.showNotice("已重新加载"+formatBusyConversations(msg.result.BusyConversationIDs), false, noticeDuration)
+	notice := m.showNotice("已重新加载"+formatPendingConversations(msg.result.PendingConversationIDs), false, noticeDuration)
 	return tea.Batch(m.loadModelList(), notice)
 }
 

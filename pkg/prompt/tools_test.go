@@ -11,13 +11,14 @@ import (
 
 // TestFormatSpawnAgentDescription 核对委派说明、Agent 和模型目录。
 func TestFormatSpawnAgentDescription(t *testing.T) {
-	// 1. 生成委派说明，核对 Agent、模型、窗口和推理强度目录。
+	// 1. 生成委派说明，核对 Agent、模型、窗口、推理强度和用途说明。
 	alpha := &defs.ModelDefinition{
 		Ref: defs.ModelRef{
 			ProviderID: "p",
 			ModelID:    "alpha",
 		},
 		DisplayName:            "Alpha",
+		Description:            "适合复杂设计和疑难排查",
 		ContextWindow:          1000,
 		ReasoningEfforts:       []string{"low", "high"},
 		DefaultReasoningEffort: "low",
@@ -52,7 +53,7 @@ func TestFormatSpawnAgentDescription(t *testing.T) {
 				Description: "调查",
 			}, {Name: "assistant"}},
 			models: []*defs.ModelDefinition{beta, alpha},
-			want:   "可选 agent_name（省略时与当前 Agent 相同）：\n- assistant\n- worker：调查\n可选 model（省略时同一 Agent 继承你当前的模型，不同 Agent 使用它的默认模型）：\n- p/alpha（Alpha）：窗口 1000，reasoning_effort 可选 low|high，默认 low\n- p/beta（Beta）：窗口 2000",
+			want:   "可选 agent_name（省略时与当前 Agent 相同）：\n- assistant\n- worker：调查\n可选 model（省略时同一 Agent 继承你当前的模型，不同 Agent 使用它的默认模型）：\n- p/alpha（Alpha）：窗口 1000，reasoning_effort 可选 low|high，默认 low；适合复杂设计和疑难排查\n- p/beta（Beta）：窗口 2000",
 		},
 		{
 			name:   "without_efforts",

@@ -900,13 +900,14 @@ func (s *sessionImpl) wakeSteerWaiters(items [][]*defs.Item) {
 
 // getStatus 在事件循环里汇总当前状态、排队输入数和最近 Turn。
 func (s *sessionImpl) getStatus() SessionStatus {
-	// 1. 填写活动 Turn、排队输入数和最近 Turn；已开始停止时为 stopping，否则有活动 Turn 时为 running，都没有时为 idle。
+	// 1. 填写活动 Turn、排队输入和上下文数量、最近 Turn；已开始停止时为 stopping，否则有活动 Turn 时为 running，都没有时为 idle。
 	status := SessionStatus{
-		State:             SessionStateIdle,
-		ActiveTurnID:      s.activeTurnID,
-		PendingInputCount: countInboxGroups(s.pendingUserInputs) + countInboxGroups(s.pendingAgentMessages),
-		LastTurnID:        s.lastTurnID,
-		LastTurnStatus:    s.lastTurnStatus,
+		State:                   SessionStateIdle,
+		ActiveTurnID:            s.activeTurnID,
+		PendingInputCount:       countInboxGroups(s.pendingUserInputs) + countInboxGroups(s.pendingAgentMessages),
+		PendingContextItemCount: len(s.pendingContextItems),
+		LastTurnID:              s.lastTurnID,
+		LastTurnStatus:          s.lastTurnStatus,
 	}
 	if s.activeTurnID != "" {
 		status.State = SessionStateRunning

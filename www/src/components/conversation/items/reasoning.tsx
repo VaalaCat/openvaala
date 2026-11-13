@@ -25,7 +25,11 @@ export function ReasoningItem({ view }: ItemRendererProps) {
       }
       details={
         text ? (
-          <MarkdownView text={text} isStreaming={view.isStreaming} />
+          <MarkdownView
+            text={text}
+            isStreaming={view.isStreaming}
+            viewStateKey={view.key}
+          />
         ) : undefined
       }
     >

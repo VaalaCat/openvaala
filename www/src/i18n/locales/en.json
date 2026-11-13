@@ -161,6 +161,8 @@
       "copy": "Copy message",
       "from": "From",
       "context": "Attached context",
+      "expand": "Expand message",
+      "collapse": "Collapse message",
       "subagent": {
         "failed": "failed",
         "interrupted": "interrupted",
@@ -556,8 +558,8 @@
       "action": "Reload config",
       "done": "Config reloaded"
     },
-    "busyConversations_one": "{{count}} conversation is running and still uses the old config; reload again once it is idle",
-    "busyConversations_other": "{{count}} conversations are running and still use the old config; reload again once they are idle",
+    "pendingConversations_one": "{{count}} conversation will apply the new configuration automatically when idle",
+    "pendingConversations_other": "{{count}} conversations will apply the new configuration automatically when idle",
     "providers": {
       "add": "Add model provider",
       "empty": "No model providers yet",
@@ -630,6 +632,7 @@
       "alias": "Local alias",
       "upstreamID": "Upstream model ID",
       "displayName": "Display name",
+      "description": "Model description",
       "capacity": "Capacity",
       "maxOutputTokens": "Maximum output tokens",
       "reasoning": "Reasoning",

@@ -214,8 +214,8 @@ func (d *Desktop) reloadConfiguration() {
 				return
 			}
 			detail := ""
-			if len(result.BusyConversationIDs) > 0 {
-				detail = fmt.Sprintf("%s: %s", d.t("busy.conversations.keep.previous.configuration"), joinConversationIDs(result.BusyConversationIDs))
+			if len(result.PendingConversationIDs) > 0 {
+				detail = fmt.Sprintf("%s: %s", fmt.Sprintf(d.t("pending.conversations.apply.when.idle"), len(result.PendingConversationIDs)), joinConversationIDs(result.PendingConversationIDs))
 			}
 			// 配置变了：技能、Agent、Executor 和当前设置页的列表都要重新读取。
 			clear(d.skillCatalogs)

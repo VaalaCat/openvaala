@@ -65,6 +65,7 @@ func TestProviderPanel(t *testing.T) {
 			"c1": {
 				Protocol:         "claude",
 				DisplayName:      "C1",
+				Description:      "Careful code review",
 				ContextWindow:    200000,
 				ReasoningEfforts: defs.OptionalStringList{"high"},
 			},
@@ -667,6 +668,75 @@ func TestProviderPanel(t *testing.T) {
 				width = 100
 			}
 			tt.run(t, newTUIHarness(t, width, 40, presets...))
+		})
+	}
+}
+
+// TestProviderModelDescription 检查终端模型设置的描述编辑和保存。
+func TestProviderModelDescription(t *testing.T) {
+	// 1. 打开既有服务的模型设置，按实际键盘路径新增、清空或保留描述。
+	for _, tt := range []struct {
+		name, before, after string
+		edit                bool
+	}{
+		{
+			name:  "add",
+			after: "Fast extraction",
+			edit:  true,
+		},
+		{
+			name:   "clear",
+			before: "Code review",
+			edit:   true,
+		},
+		{
+			name:   "preserve",
+			before: "Careful code review",
+			after:  "Careful code review",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ref := defs.ModelRef{
+				ProviderID: "gw",
+				ModelID:    "c1",
+			}
+			h := newTUIHarness(t, 100, 40, func(c *fakeClient) {
+				c.providers = []defs.ProviderConfig{{
+					ID:       "gw",
+					Protocol: "openai_chat",
+					BaseURL:  "https://example.com/v1",
+					Models: map[string]*defs.ProviderModelConfig{
+						"c1": {Description: tt.before},
+					},
+				}}
+				c.providersDefaultModel = ref
+				c.modelList = runtime.ModelList{
+					Models:            []*defs.ModelDefinition{{Ref: ref}},
+					AgentDefaultModel: ref,
+				}
+				c.fetchedModels = map[string]*defs.ProviderModelConfig{"c1": {}}
+			})
+			h.emit(&runtimeclient.ConnectionChanged{State: runtimeclient.ConnectionConnected})
+			h.waitFor("model list loaded", func() bool { return h.model.agentDefaultModel == ref })
+			h.typeText("/provider")
+			h.press("enter")
+			h.waitFor("providers listed", func() bool { return strings.Contains(h.view(), "1 个模型") })
+			h.press("down", "enter", "enter")
+			h.waitFor("models listed", func() bool { return strings.Contains(h.view(), "○ c1") || strings.Contains(h.view(), "● c1") })
+			h.press("ctrl+e", "tab", "tab")
+			if tt.edit {
+				for range []rune(tt.before) {
+					h.press("backspace")
+				}
+				h.typeText(tt.after)
+			}
+			h.press("enter", "enter", "enter")
+			h.waitFor("panel closed", func() bool { return h.model.activePanel == nil })
+			h.client.set(func(c *fakeClient) {
+				if len(c.providerWrites) != 1 || c.providerWrites[0].provider.Models["c1"].Description != tt.after {
+					t.Fatalf("provider writes = %+v, want description %q", c.providerWrites, tt.after)
+				}
+			})
 		})
 	}
 }

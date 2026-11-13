@@ -3027,6 +3027,47 @@ func TestSessionIdleOnly(t *testing.T) {
 	}
 }
 
+// TestSessionPendingContextItems 检查待交付上下文计数，以及普通 Turn 和只压缩 Turn 的消费行为。
+func TestSessionPendingContextItems(t *testing.T) {
+	// 1. 追加两条上下文，分别保留、普通消费、只压缩和压缩后普通消费。
+	for _, tt := range []struct {
+		name      string
+		compact   bool
+		input     bool
+		wantCount int
+	}{
+		{name: "appended", wantCount: 2},
+		{name: "ordinary_turn", input: true},
+		{name: "compact_keeps_context", compact: true, wantCount: 2},
+		{name: "ordinary_after_compact", compact: true, input: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSessionHarness(t)
+			h.start(t, nil, true)
+			if err := h.session.AppendContextItems(t.Context(), []*defs.Item{sessionInput("context one"), sessionInput("context two")}); err != nil {
+				t.Fatal(err)
+			}
+			if tt.compact {
+				if _, err := h.session.CompactContext(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				requireFinished(t, h.nextTurnFinished(t), nil, defs.TurnStatusCompleted)
+			}
+			if tt.input {
+				input := h.submit(t, session.SessionInputModeNormal, "use context")
+				h.waitModelStarted(t)
+				h.model.replies <- modelReply{text: "done"}
+				requireFinished(t, h.nextTurnFinished(t), []defs.ItemID{input.ID}, defs.TurnStatusCompleted)
+			}
+			// 2. 上下文独立计数，不增加排队输入数。
+			status, err := h.session.GetStatus(t.Context())
+			if err != nil || status.PendingContextItemCount != tt.wantCount || status.PendingInputCount != 0 {
+				t.Fatalf("GetStatus() = %+v, %v; want context count %d and no queued input", status, err, tt.wantCount)
+			}
+		})
+	}
+}
+
 // TestSessionCompactContext 检查手动压缩：没历史时不请求模型、忙时返回 ErrSessionBusy、只压缩的 Turn 不写模型变更。
 func TestSessionCompactContext(t *testing.T) {
 	// 1. 准备检查忙的辅助函数，以及空历史、有活动 Turn、有排队输入和换模型场景。

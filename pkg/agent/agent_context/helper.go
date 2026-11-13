@@ -520,7 +520,7 @@ func newModelRequest(system string, sessionID defs.SessionID, model *defs.ModelD
 	req := &llmkit.Request{
 		Stream:           true,
 		MaxTokens:        model.MaxOutputTokens,
-		ThinkingEnabled:  model.ThinkingEnabled,
+		ThinkingEnabled:  new(model.ThinkingEnabled),
 		ReasoningEffort:  reasoningEffort,
 		ReasoningContext: model.ReasoningContext,
 		Tools:            tools,

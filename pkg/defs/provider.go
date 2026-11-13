@@ -34,13 +34,15 @@ type ProviderConfig struct {
 	Models map[string]*ProviderModelConfig `yaml:"models" json:"models"`
 }
 
-// ProviderModelConfig 将本地模型别名映射为上游模型名，并给出请求参数；省略的字段取 config.yaml 的 models.defaults。
+// ProviderModelConfig 将本地模型别名映射为上游模型名，给出用途说明和请求参数；省略的请求参数取 config.yaml 的 models.defaults。
 type ProviderModelConfig struct {
 	// Protocol 省略时用 Provider 的 protocol。
 	Protocol      string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
 	UpstreamModel string `yaml:"upstream_model,omitempty" json:"upstream_model,omitempty"`
 	// DisplayName 省略时用模型 id。
-	DisplayName     string `yaml:"display_name,omitempty" json:"display_name,omitempty"`
+	DisplayName string `yaml:"display_name,omitempty" json:"display_name,omitempty"`
+	// Description 是给 Agent 选模型时看的用途说明。
+	Description     string `yaml:"description,omitempty" json:"description,omitempty"`
 	ContextWindow   int    `yaml:"context_window,omitempty" json:"context_window,omitempty"`
 	MaxOutputTokens int    `yaml:"max_output_tokens,omitempty" json:"max_output_tokens,omitempty"`
 	Thinking        *bool  `yaml:"thinking,omitempty" json:"thinking,omitempty"`

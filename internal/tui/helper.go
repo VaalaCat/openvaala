@@ -1002,13 +1002,13 @@ func formatJSON(text string) string {
 	return formatted.String()
 }
 
-// formatBusyConversations 返回本次未更新配置的忙碌对话数量提示。
-func formatBusyConversations(busy []defs.ConversationID) string {
-	// 1. 没有忙碌对话时返回空，否则写出数量和下次 reload 更新提示。
-	if len(busy) == 0 {
+// formatPendingConversations 返回等待自动应用配置的对话数量提示。
+func formatPendingConversations(pending []defs.ConversationID) string {
+	// 1. 没有等待应用的对话时返回空，否则写出数量和空闲后自动应用提示。
+	if len(pending) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("，%d 个对话正在执行，下次 reload 时更新", len(busy))
+	return fmt.Sprintf("，%d 个对话将在空闲后自动应用", len(pending))
 }
 
 // formatAgentModelNotice 返回新对话仍使用 Agent 指定模型的提示。

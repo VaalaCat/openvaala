@@ -246,7 +246,7 @@ openvaala plugin uninstall review
 
 - `--path` points at the plugin inside the repository (default: the repository root); `--ref` picks a branch or tag (default: the default branch, git sources only). Installing from git needs `git`.
 - `plugin list` prints one line per plugin: name, version, `enabled` or `disabled`, and source.
-- These commands change only the plugins directory and `plugins.disabled`, and they do not need the configuration to load beforehand: you can disable, uninstall or update a plugin that keeps the configuration from loading. After the change they load the full configuration and undo the change if it fails to load. On success they reload the local runtime server. New plugin skills appear in conversations you start or reopen afterwards.
+- These commands change only the plugins directory and `plugins.disabled`, and they do not need the configuration to load beforehand: you can disable, uninstall or update a plugin that keeps the configuration from loading. After the change they load the full configuration and undo the change if it fails to load. On success they reload the local runtime server. New plugin skills apply immediately to idle conversations; busy conversations prepare the update and apply it automatically when idle. Conversations you start or reopen afterwards use them too.
 - You can also copy or symlink a plugin directory into `plugins/` yourself, then run `openvaala serve reload`.
 
 ### The manifest

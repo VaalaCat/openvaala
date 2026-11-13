@@ -344,9 +344,13 @@
   padding: var(--terminal-padding, 8px);
 }
 
-/* 收起来信只在溢出时淡出最后一行，展开正文不加遮罩。 */
-.agent-message-preview-fade {
-  mask-image: linear-gradient(to bottom, #000 calc(100% - 1lh), transparent);
+/* 长消息的最后一行渐隐；开合动画将底部不透明度从 0 过渡到 1。 */
+.message-preview-fade {
+  mask-image: linear-gradient(
+    to bottom,
+    #000 calc(100% - 1lh),
+    rgb(0 0 0 / var(--message-preview-opacity, 0))
+  );
 }
 
 /* 运行标题整体扫过明暗，普通文字和绝对定位的数字共用同一遮罩。 */

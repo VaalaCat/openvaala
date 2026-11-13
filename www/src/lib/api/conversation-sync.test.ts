@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { mock, test } from "node:test"
+import { setTimeout as delay } from "node:timers/promises"
 import { QueryClient } from "@tanstack/react-query"
 import { RpcError, rpcConnectionLostCode } from "../rpc-error"
 import {
@@ -402,6 +403,7 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
       )
       h.connection.push(textDelta("t1", 0, "你好"))
       h.connection.push(textDelta("t1", 0, "！"))
+      await delay(60)
       assert.equal(getText(h.sync.$items.get().at(-1)), "你好！")
       assert.equal(h.sync.$items.get().at(-1)?.isStreaming, true)
       // 3. 完成后换成完整 Item，不再生成。
@@ -563,6 +565,7 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
       await flush()
       // 3. 生成中的 Item 只有一条，之后的增量接着拼。
       h.connection.push(textDelta("t1", 0, "!"))
+      await delay(60)
       assert.deepEqual(getKeys(h.sync), ["reply"])
       assert.equal(getText(h.sync.$items.get()[0]), "今天sunny!")
     },
@@ -647,6 +650,36 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
         })
       )
       assert.deepEqual(getOrdinals(h.sync), [1])
+    },
+  },
+  {
+    name: "configuration_applied_after_turn_resyncs_without_duplicate_history",
+    async run(h) {
+      // 1. 已保存的输出已交付，空闲后应用配置关闭旧订阅。
+      await h.start()
+      h.connection.push(
+        notification("items/saved", {
+          turn_id: "t0",
+          items: loggedMessages(1),
+        })
+      )
+      h.connection.push(
+        notification("subscription/closed", {
+          reason: "conversation reconfigured",
+        })
+      )
+      await flush()
+      // 2. 沿现有恢复入口重新订阅；已交付历史不重复，后续输出照常到达。
+      assert.equal(countCalls(h, "conversation/open"), 2)
+      assert.equal(countCalls(h, "session/subscribe"), 2)
+      assert.equal(h.sync.$syncState.get(), "synced")
+      h.connection.push(
+        notification("items/saved", {
+          turn_id: "t1",
+          items: loggedMessages(2),
+        })
+      )
+      assert.deepEqual(getOrdinals(h.sync), [1, 2])
     },
   },
   {
@@ -1245,6 +1278,225 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
 ]
 
 for (const { name, run } of tests) test(name, () => run(createHarness()))
+
+for (const itemCount of [1, 3]) {
+  test(`streaming_deltas_publish_once_per_interval_for_${itemCount}_items`, async (t) => {
+    const h = createHarness()
+    const stop = await h.start()
+    t.mock.timers.enable({ apis: ["setTimeout"] })
+    try {
+      // 1. 已保存历史之后同时生成消息、工具参数和推理。
+      h.connection.push(
+        notification("items/saved", {
+          turn_id: "t0",
+          items: loggedMessages(
+            ...Array.from({ length: 100 }, (_, index) => index + 1)
+          ),
+        })
+      )
+      const items: Item[] = [
+        messageItem("reply", "t1", ""),
+        toolCallItem("call", "t1", "call-1"),
+        {
+          id: "reasoning",
+          turn_id: "t1",
+          kind: "reasoning",
+          reasoning: { status: "completed" },
+        },
+      ]
+      for (const [itemIndex, item] of items.slice(0, itemCount).entries())
+        h.connection.push(
+          notification("item/started", {
+            turn_id: "t1",
+            item_index: itemIndex,
+            item,
+          })
+        )
+      const before = h.sync.$items.get()
+      const beforeValue = structuredClone(before)
+      const listener = mock.fn()
+      const stopListening = h.sync.$items.listen(listener)
+      t.after(stopListening)
+      // 2. 一个间隔内交错发送每项 100 条增量；旧快照不变，还没有发布。
+      const chunks = Array.from({ length: 100 }, (_, index) => `${index},`)
+      for (const chunk of chunks)
+        for (let itemIndex = 0; itemIndex < itemCount; itemIndex++)
+          h.connection.push(
+            notification("item/delta", {
+              turn_id: "t1",
+              item_index: itemIndex,
+              delta: {
+                text: chunk,
+                arguments: chunk,
+                summary: [chunk],
+                content: [chunk],
+              },
+            })
+          )
+      assert.equal(h.sync.$items.get(), before)
+      assert.deepEqual(before, beforeValue)
+      assert.equal(listener.mock.callCount(), 0)
+      t.mock.timers.tick(49)
+      assert.equal(listener.mock.callCount(), 0)
+      // 3. 间隔到期提交一次，增量顺序完整，历史引用及此前快照保持不变。
+      t.mock.timers.tick(1)
+      assert.equal(listener.mock.callCount(), 1)
+      const after = h.sync.$items.get()
+      assert.equal(getText(after[100]), chunks.join(""))
+      if (itemCount === 3) {
+        assert.equal(after[101].item.tool_call?.arguments, chunks.join(""))
+        assert.deepEqual(after[102].item.reasoning?.summary, chunks)
+        assert.deepEqual(after[102].item.reasoning?.content, chunks)
+      }
+      for (let index = 0; index < 100; index++)
+        assert.equal(after[index], before[index])
+      assert.deepEqual(before, beforeValue)
+      h.connection.push(textDelta("t1", 0, "next"))
+      t.mock.timers.tick(50)
+      assert.equal(listener.mock.callCount(), 2)
+      assert.equal(getText(h.sync.$items.get()[100]), chunks.join("") + "next")
+    } finally {
+      stop()
+    }
+  })
+}
+
+for (const event of [
+  "item/started",
+  "item/completed",
+  "item/interrupted",
+  "items/saved",
+  "turn/finished",
+  "stop",
+  "reconnect",
+  "subscription/closed",
+] as const) {
+  test(`pending_deltas_flush_before_${event}`, async (t) => {
+    const h = createHarness()
+    const stop = await h.start()
+    t.mock.timers.enable({ apis: ["setTimeout"] })
+    try {
+      h.connection.push(
+        notification("item/started", {
+          turn_id: "t1",
+          item_index: 0,
+          item: messageItem("reply", "t1", "before"),
+        })
+      )
+      h.connection.push(textDelta("t1", 0, "-delta"))
+      const observed: (string | undefined)[] = []
+      const stopListening = h.sync.$items.listen((items) =>
+        observed.push(getText(items[0]))
+      )
+      t.after(stopListening)
+      const final = messageItem("reply", "t1", "final")
+      // 1. 生命周期通知不等待提交间隔；此前增量先交付，完整记录随后替换。
+      switch (event) {
+        case "item/started":
+        case "item/completed":
+          h.connection.push(
+            notification(event, { turn_id: "t1", item_index: 0, item: final })
+          )
+          break
+        case "item/interrupted":
+          h.connection.push(
+            notification(event, { turn_id: "t1", item_index: 0 })
+          )
+          break
+        case "items/saved":
+          h.connection.push(
+            notification(event, { turn_id: "t1", items: [logged(1, final)] })
+          )
+          break
+        case "turn/finished":
+          h.connection.push(
+            notification(event, {
+              turn_id: "t1",
+              status: "completed",
+              input_item_ids: [],
+            })
+          )
+          assert.equal(h.sync.$turns.get().t1.status, "completed")
+          break
+        case "stop":
+          stop()
+          break
+        case "reconnect":
+        case "subscription/closed":
+          h.connection.reply("session/subscribe", () => ({
+            pending_inputs: { inputs: [] },
+            last_saved_ordinal: 0,
+            streaming_items: [{ item_index: 0, item: final }],
+          }))
+          if (event === "reconnect") h.connection.connect()
+          else
+            h.connection.push(
+              notification(event, { reason: "subscriber too slow" })
+            )
+          break
+      }
+      assert.equal(observed[0], "before-delta")
+      await flush()
+      const expected =
+        event === "item/interrupted"
+          ? undefined
+          : event === "stop" || event === "turn/finished"
+            ? "before-delta"
+            : "final"
+      assert.equal(getText(h.sync.$items.get()[0]), expected)
+      // 2. 原定时器不能再发布，停止期间的新通知也不写入。
+      const settled = h.sync.$items.get()
+      const count = observed.length
+      if (event === "stop") h.connection.push(textDelta("t1", 0, "stopped"))
+      t.mock.timers.tick(100)
+      assert.equal(h.sync.$items.get(), settled)
+      assert.equal(observed.length, count)
+    } finally {
+      stop()
+    }
+  })
+}
+
+test("pending_deltas_find_their_item_after_history_is_prepended", async (t) => {
+  const h = createHarness()
+  h.connection.reply("session/subscribe", () => ({
+    pending_inputs: { inputs: [] },
+    last_saved_ordinal: 2,
+    streaming_items: [],
+  }))
+  h.connection.reply("session/items/list", () => ({
+    items: loggedMessages(2),
+    next_cursor: 2,
+  }))
+  const stop = await h.start()
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  try {
+    // 1. 增量暂存期间插入更早的历史，目标 Item 在数组中的位置改变。
+    h.connection.push(
+      notification("item/started", {
+        turn_id: "t1",
+        item_index: 0,
+        item: messageItem("reply", "t1", ""),
+      })
+    )
+    h.connection.push(textDelta("t1", 0, "a"))
+    h.connection.reply("session/items/list", () => ({
+      items: loggedMessages(1),
+    }))
+    await h.sync.loadEarlierItems()
+    h.connection.push(textDelta("t1", 0, "b"))
+    // 2. 提交时仍更新原消息，不覆盖插入的历史。
+    t.mock.timers.tick(50)
+    assert.deepEqual(getKeys(h.sync), ["item-1", "item-2", "reply"])
+    assert.deepEqual(h.sync.$items.get().map(getText), [
+      "第 1 条",
+      "第 2 条",
+      "ab",
+    ])
+  } finally {
+    stop()
+  }
+})
 
 // 真实订阅窗口里 Turn 可以先结束，再收到 Session 的终态；不要求漏掉的 turn/finished 重发。
 for (const { status, duringSync } of (

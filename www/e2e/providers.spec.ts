@@ -276,6 +276,9 @@ test(
       .getByRole("option", { name: "Claude Messages", exact: true })
       .click()
     await page.getByLabel("显示名", { exact: true }).fill("Primary")
+    await page
+      .getByLabel("模型描述", { exact: true })
+      .fill("复杂设计与代码审查")
     await selectValue(page, "思考", "关闭")
     await selectValue(page, "推理强度列表", "自定义")
     await page
@@ -329,6 +332,7 @@ test(
       protocol: "claude",
       upstream_model: "vendor/main",
       display_name: "Primary",
+      description: "复杂设计与代码审查",
       context_window: 128000,
       max_output_tokens: 1500,
       thinking: false,
@@ -353,6 +357,9 @@ test(
     await dialog.getByRole("button", { name: "确定", exact: true }).click()
     await expect(page.getByLabel("显示名", { exact: true })).toHaveValue(
       "Primary"
+    )
+    await expect(page.getByLabel("模型描述", { exact: true })).toHaveValue(
+      "复杂设计与代码审查"
     )
     await page.getByRole("button", { name: "应用", exact: true }).click()
     await expectToast(page, "已保存模型服务「" + providerID + "」")
@@ -387,6 +394,10 @@ test(
     await expect(page.locator("#model-fields-friendly")).toHaveCount(0)
 
     // 3. 显式空列表、false 和继承分别往返，空输入能力按文本处理。
+    await expect(page.getByLabel("模型描述", { exact: true })).toHaveValue(
+      "复杂设计与代码审查"
+    )
+    await page.getByLabel("模型描述", { exact: true }).fill("")
     await page.getByLabel("强度（逗号分隔）", { exact: true }).fill("")
     await selectValue(page, "默认推理强度", "自动（无）")
     for (const label of [
@@ -410,6 +421,7 @@ test(
       page.getByRole("button", { name: "应用", exact: true })
     ).toBeDisabled()
     const empty = (await readProvider()).models?.renamed
+    expect(empty).not.toHaveProperty("description")
     expect(empty).toMatchObject({
       thinking: false,
       reasoning_efforts: [],
@@ -432,6 +444,7 @@ test(
       page.getByRole("button", { name: "应用", exact: true })
     ).toBeDisabled()
     const inherited = (await readProvider()).models?.renamed
+    expect(inherited).not.toHaveProperty("description")
     for (const field of [
       "thinking",
       "context_window",

@@ -1115,6 +1115,12 @@ function ProviderModelFields({
             placeholder={alias}
             onChange={(event) => onChange({ display_name: event.target.value })}
           />
+          <FormInput
+            id={id + "description"}
+            label={t("settings.providerEditor.description")}
+            value={model.description ?? ""}
+            onChange={(event) => onChange({ description: event.target.value })}
+          />
           <ProviderFieldSelect
             id={id + "protocol"}
             label={t("settings.providerEditor.protocol")}

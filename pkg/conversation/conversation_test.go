@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -738,7 +739,7 @@ func TestConversationReconfigure(t *testing.T) {
 					Description: "新加的技能",
 					Path:        "/skills/added/SKILL.md",
 				}}
-				if err := h.c.SetDefinitions(t.Context(), definitions); err != nil {
+				if _, err := h.c.SetDefinitions(t.Context(), definitions); err != nil {
 					t.Fatalf("SetDefinitions() error = %v", err)
 				}
 				if !slices.ContainsFunc(h.c.GetSkills(), func(info skill.SkillInfo) bool { return info.Name == "added" }) {
@@ -755,7 +756,7 @@ func TestConversationReconfigure(t *testing.T) {
 				}
 				definitions := newDefinitions()
 				definitions.Agents = definitions.Agents[1:]
-				err = h.c.SetDefinitions(t.Context(), definitions)
+				_, err = h.c.SetDefinitions(t.Context(), definitions)
 				if want := `uses agent "assistant", which is not configured`; err == nil || !strings.Contains(err.Error(), want) {
 					t.Fatalf("SetDefinitions() error = %v, want error containing %q", err, want)
 				}
@@ -778,7 +779,7 @@ func TestConversationReconfigure(t *testing.T) {
 				}}); err != nil {
 					t.Fatalf("SetClientMCPServers() error = %v", err)
 				}
-				if err := h.c.SetDefinitions(t.Context(), newDefinitions()); err != nil {
+				if _, err := h.c.SetDefinitions(t.Context(), newDefinitions()); err != nil {
 					t.Fatalf("SetDefinitions() error = %v", err)
 				}
 				if !slices.ContainsFunc(h.c.GetMCPServers(), func(info MCPServerInfo) bool {
@@ -809,7 +810,7 @@ func TestConversationReconfigure(t *testing.T) {
 					_, err := h.c.SetExecutorSettings(t.Context(), defs.ExecutorSettings{ExecutorIDs: []string{"other"}})
 					errs <- err
 				}()
-				go func() { errs <- h.c.SetDefinitions(t.Context(), definitions) }()
+				go func() { _, err := h.c.SetDefinitions(t.Context(), definitions); errs <- err }()
 				for range 2 {
 					select {
 					case err := <-errs:
@@ -837,7 +838,7 @@ func TestConversationReconfigure(t *testing.T) {
 			run: func(t *testing.T, h *conversationHarness, newDefinitions func() *ConversationDefinitions) {
 				definitions := newDefinitions()
 				definitions.Agents[0].Instructions = "NEW_INSTRUCTIONS"
-				if err := h.c.SetDefinitions(t.Context(), definitions); err != nil {
+				if _, err := h.c.SetDefinitions(t.Context(), definitions); err != nil {
 					t.Fatalf("SetDefinitions() error = %v", err)
 				}
 				id := h.input(t, session.SessionInputModeNormal, "after reconfigure")
@@ -896,7 +897,7 @@ func TestConversationReconfigure(t *testing.T) {
 		{
 			name: "run_returns_after_reconfigure",
 			run: func(t *testing.T, h *conversationHarness, newDefinitions func() *ConversationDefinitions) {
-				if err := h.c.SetDefinitions(t.Context(), newDefinitions()); err != nil {
+				if _, err := h.c.SetDefinitions(t.Context(), newDefinitions()); err != nil {
 					t.Fatalf("SetDefinitions() error = %v", err)
 				}
 				if err := h.stop(t); !errors.Is(err, context.Canceled) {
@@ -926,6 +927,314 @@ func TestConversationReconfigure(t *testing.T) {
 			tt.run(t, startTestConversation(t, store, model, c), newDefinitions)
 		})
 	}
+}
+
+// TestConversationDeferredConfig 检查任务、输入和上下文处理完后自动应用配置，以及待用配置的替换和释放。
+func TestConversationDeferredConfig(t *testing.T) {
+	// 1. 各场景都使用可观察关闭次数的工作区和受控模型。
+	for _, scenario := range []string{
+		"busy_turn", "queued_inputs", "pending_context", "paused_agent_message", "busy_child",
+		"latest_pending", "failed_prepare_keeps_pending", "workspace_failure_keeps_pending",
+		"executor_settings_keep_pending_definitions", "stop_closes_pending", "status_timeout",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			store, model := openConversationDAO(t), newConversationModel(t)
+			recorded := newRecordingExecutor("local", defs.ExecutorKindVirtual, nil)
+			newDefinitions := func(instructions string) *ConversationDefinitions {
+				definitions := conversationDefinitions(model)
+				definitions.Executors = newTestExecutorProvider([]executor.Executor{recorded})
+				definitions.Agents[0].Instructions = instructions
+				return definitions
+			}
+			opt := conversationOpt(store, model)
+			opt.Definitions = newDefinitions("OLD_INSTRUCTIONS")
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := startTestConversation(t, store, model, c)
+			rootID := c.GetRootSessionID()
+			var first, queued defs.ItemID
+			var request modelRequest
+			var queried *deferredStatusSession
+			switch scenario {
+			case "pending_context":
+				input := conversationInput(session.SessionInputModeNormal, "CONTEXT_TO_KEEP")
+				if err := c.AppendContextItems(t.Context(), []*defs.Item{{
+					ID: defs.NewItemID(), Kind: defs.ItemMessage,
+					Message: &defs.Message{From: input.From, Content: input.Content},
+				}}); err != nil {
+					t.Fatal(err)
+				}
+			case "status_timeout":
+				root, _ := h.impl().runningSessions.Load(rootID)
+				queried = &deferredStatusSession{Session: root}
+				queried.block.Store(true)
+				h.impl().runningSessions.Store(rootID, queried)
+			case "busy_child":
+				childID := saveUsageAgent(t, store, c.GetID(), rootID, "assistant", nil)
+				record, _, err := store.query.GetSession(t.Context(), c.GetID(), childID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.impl().sessionRecords.Store(childID, record)
+				if err := h.impl().sendMessage(t.Context(), h.record(t, rootID), &SendMessageParam{
+					SessionID: childID, Mode: session.SessionInputModeNormal, Message: "child work",
+				}); err != nil {
+					t.Fatal(err)
+				}
+				request = receiveModelRequest(t, model)
+			default:
+				first = h.input(t, session.SessionInputModeNormal, "old work")
+				request = receiveModelRequest(t, model)
+				if scenario == "queued_inputs" {
+					queued = h.input(t, session.SessionInputModeNormal, "queued work")
+				}
+				if scenario == "paused_agent_message" {
+					if _, err := c.InterruptTurn(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					h.waitTurnFinished(t, first)
+					root, _ := h.impl().runningSessions.Load(rootID)
+					if _, err := root.HandleInput(t.Context(), &session.SessionInput{
+						Mode: session.SessionInputModeNormal,
+						Item: newAgentMessage(defs.Session{ID: "sender", AgentName: "assistant"}, rootID, defs.AgentRelationChild, "PAUSED_MESSAGE"),
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			// 2. 配置接收后仍使用旧定义，旧工作区不能提前关闭。
+			isPending, err := c.SetDefinitions(t.Context(), newDefinitions("NEW_INSTRUCTIONS"))
+			if err != nil || !isPending {
+				t.Fatalf("SetDefinitions() = %v, %v; want pending", isPending, err)
+			}
+			if got := recorded.openedWorkspaces[0].closeCount.Load(); got != 0 {
+				t.Fatalf("old workspace closed %d times while pending", got)
+			}
+			wantInstructions := "NEW_INSTRUCTIONS"
+			switch scenario {
+			case "latest_pending":
+				wantInstructions = "LATEST_INSTRUCTIONS"
+				if pending, err := c.SetDefinitions(t.Context(), newDefinitions(wantInstructions)); err != nil || !pending {
+					t.Fatalf("second SetDefinitions() = %v, %v", pending, err)
+				}
+				if got := recorded.openedWorkspaces[1].closeCount.Load(); got != 1 {
+					t.Fatalf("replaced pending workspace close count = %d", got)
+				}
+			case "failed_prepare_keeps_pending", "workspace_failure_keeps_pending":
+				invalid := newDefinitions("INVALID_INSTRUCTIONS")
+				if scenario == "failed_prepare_keeps_pending" {
+					invalid.Agents = invalid.Agents[1:]
+				} else {
+					recorded.newWorkspaceErr = errors.New("workspace unavailable")
+				}
+				if _, err := c.SetDefinitions(t.Context(), invalid); err == nil {
+					t.Fatal("invalid configuration accepted")
+				}
+				recorded.newWorkspaceErr = nil
+			case "stop_closes_pending":
+				h.stop(t)
+				recorded.requireClosedOnce(t, 2)
+				return
+			}
+			// 3. 至少经过一次定时检查仍没有切换，解除对应的忙碌条件。
+			time.Sleep(1100 * time.Millisecond)
+			requireNoEvent(t, h, func(event ConversationEvent) bool { _, ok := event.(*ConversationReconfigured); return ok })
+			switch scenario {
+			case "status_timeout":
+				queried.block.Store(false)
+				h.impl().runningSessions.Store(rootID, queried.Session)
+			case "pending_context", "paused_agent_message":
+				first = h.input(t, session.SessionInputModeNormal, "consume queued context")
+				request = receiveModelRequest(t, model)
+				if scenario == "pending_context" && !strings.Contains(requestText(t, request), "CONTEXT_TO_KEEP") {
+					t.Fatal("pending context did not reach model")
+				}
+				request.reply <- modelResponse{text: "done"}
+				h.waitTurnFinished(t, first)
+				if scenario == "paused_agent_message" {
+					agentRequest := receiveModelRequest(t, model)
+					if !strings.Contains(requestText(t, agentRequest), "PAUSED_MESSAGE") {
+						t.Fatal("paused message did not reach model")
+					}
+					agentRequest.reply <- modelResponse{text: "message handled"}
+				}
+			case "busy_child":
+				request.reply <- modelResponse{text: "child done"}
+				receiveModelRequest(t, model).reply <- modelResponse{text: "parent received"}
+			default:
+				request.reply <- modelResponse{text: "old work completed"}
+				if finished, _ := h.waitTurnFinished(t, first); finished.Status != defs.TurnStatusCompleted {
+					t.Fatalf("old Turn = %v", finished.Status)
+				}
+				if queued != "" {
+					next := receiveModelRequest(t, model)
+					if !strings.Contains(requestText(t, next), "OLD_INSTRUCTIONS") {
+						t.Fatal("queued work changed configuration before it completed")
+					}
+					next.reply <- modelResponse{text: "queued done"}
+					h.waitTurnFinished(t, queued)
+				}
+				if scenario == "executor_settings_keep_pending_definitions" {
+					if _, err := c.SetExecutorSettings(t.Context(), defs.ExecutorSettings{WorkspaceDirectories: map[string]string{"local": "/workspace/local/changed"}}); err != nil {
+						t.Fatal(err)
+					}
+					if got := c.GetExecutorSettings().WorkspaceDirectories["local"]; got != "/workspace/local/changed" {
+						t.Fatalf("workspace = %q", got)
+					}
+				}
+			}
+			// 4. 不再 reload，等待自动切换并用真实模型请求验证新定义；关闭时每份工作区只释放一次。
+			h.waitEvent(t, func(event ConversationEvent) bool { _, ok := event.(*ConversationReconfigured); return ok })
+			input := h.input(t, session.SessionInputModeNormal, "after reload")
+			next := receiveModelRequest(t, model)
+			if !strings.Contains(requestText(t, next), wantInstructions) {
+				t.Fatalf("new model request missing %s", wantInstructions)
+			}
+			next.reply <- modelResponse{text: "done"}
+			h.waitTurnFinished(t, input)
+			h.stop(t)
+			recorded.requireClosedOnce(t, len(recorded.openedWorkspaces))
+		})
+	}
+}
+
+// deferredStatusSession 在状态查询中模拟依赖超时，其余调用使用真实 Session。
+type deferredStatusSession struct {
+	session.Session
+	block atomic.Bool
+}
+
+// GetStatus 在 block 为 true 时等待请求取消，否则查询真实 Session。
+func (s *deferredStatusSession) GetStatus(ctx context.Context) (session.SessionStatus, error) {
+	// 1. 模拟未回复的状态请求。
+	if s.block.Load() {
+		<-ctx.Done()
+		return session.SessionStatus{}, ctx.Err()
+	}
+	return s.Session.GetStatus(ctx)
+}
+
+// TestConversationDeferredConfigNewAgent 检查等待期间新建子 Session 后，候选配置仍覆盖全部实际使用的 Agent。
+func TestConversationDeferredConfigNewAgent(t *testing.T) {
+	// 1. 分别保留和删除等待期间才使用的 worker Agent。
+	for _, removeWorker := range []bool{false, true} {
+		t.Run(strconv.FormatBool(removeWorker), func(t *testing.T) {
+			store, model := openConversationDAO(t), newConversationModel(t)
+			recorded := newRecordingExecutor("local", defs.ExecutorKindVirtual, nil)
+			opt := conversationOpt(store, model)
+			opt.Definitions.Executors = newTestExecutorProvider([]executor.Executor{recorded})
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := startTestConversation(t, store, model, c)
+			input := h.input(t, session.SessionInputModeNormal, "delegate later")
+			request := receiveModelRequest(t, model)
+			candidate := conversationDefinitions(model)
+			candidate.Executors = opt.Definitions.Executors
+			candidate.Agents[0].Instructions = "NEW_INSTRUCTIONS"
+			if removeWorker {
+				candidate.Agents = candidate.Agents[:1]
+			}
+			if pending, err := c.SetDefinitions(t.Context(), candidate); err != nil || !pending {
+				t.Fatalf("reload = %v, %v", pending, err)
+			}
+			// 2. pending 已接收后，原轮通过真实工具创建 worker 并让父子任务正常结束。
+			request.reply <- modelResponse{calls: []llmkit.ToolCall{{ID: "spawn-late", Name: "spawn_agent", Arguments: `{"task_name":"late-worker","message":"finish this","agent_name":"worker"}`}}}
+			root, child := receiveRootAndTask(t, model, "late-worker")
+			root.reply <- modelResponse{text: "delegated"}
+			h.waitTurnFinished(t, input)
+			child.reply <- modelResponse{text: "child finished"}
+			receiveSessionRequest(t, model, c.GetRootSessionID()).reply <- modelResponse{text: "received"}
+			// 3. 子 Session 被候选遗漏时，只关闭候选；仍有该 Agent 时正常重建。
+			deadline := time.Now().Add(5 * time.Second)
+			for recorded.openedWorkspaces[0].closeCount.Load() == 0 && recorded.openedWorkspaces[1].closeCount.Load() == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("pending configuration was neither applied nor rejected")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if removeWorker {
+				if recorded.openedWorkspaces[0].closeCount.Load() != 0 || recorded.openedWorkspaces[1].closeCount.Load() != 1 {
+					t.Fatal("candidate missing the newly spawned Agent replaced the working configuration")
+				}
+				for _, record := range h.impl().sessionRecords.Values() {
+					if record.AgentName == "worker" {
+						if _, err := c.GetSessionDetails(t.Context(), record.ID); err != nil {
+							t.Fatalf("late worker no longer usable: %v", err)
+						}
+					}
+				}
+			} else {
+				h.waitEvent(t, func(event ConversationEvent) bool { _, ok := event.(*ConversationReconfigured); return ok })
+			}
+			h.stop(t)
+			recorded.requireClosedOnce(t, 2)
+		})
+	}
+}
+
+// TestConversationReconfigureStartFailure 检查直接应用和延迟应用时，新根 Session 启动失败都会停止对话。
+func TestConversationReconfigureStartFailure(t *testing.T) {
+	// 1. 两条入口共用相同的重建失败和清理规则。
+	for _, deferred := range []bool{false, true} {
+		t.Run(strconv.FormatBool(deferred), func(t *testing.T) {
+			store, model := openConversationDAO(t), newConversationModel(t)
+			query := &reconfigureFailingQuery{Query: store.query}
+			recorded := newRecordingExecutor("local", defs.ExecutorKindVirtual, nil)
+			opt := conversationOpt(store, model)
+			opt.Query = query
+			opt.Definitions.Executors = newTestExecutorProvider([]executor.Executor{recorded})
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := startTestConversation(t, store, model, c)
+			if deferred {
+				id := h.input(t, session.SessionInputModeNormal, "work")
+				request := receiveModelRequest(t, model)
+				if pending, err := c.SetDefinitions(t.Context(), opt.Definitions); err != nil || !pending {
+					t.Fatalf("reload = %v, %v", pending, err)
+				}
+				request.reply <- modelResponse{text: "done"}
+				h.waitTurnFinished(t, id)
+			}
+			// 2. 原轮结束后，仅阻止新根读取启动所需的最后日志序号。
+			query.fail.Store(true)
+			if !deferred {
+				if _, err := c.SetDefinitions(t.Context(), opt.Definitions); err == nil {
+					t.Fatal("expected startup failure")
+				}
+			}
+			select {
+			case err := <-h.done:
+				h.ended, h.runErr = true, err
+				if err == nil || !strings.Contains(err.Error(), "reconfigure query failed") {
+					t.Fatalf("Run() = %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("conversation did not stop after startup failed")
+			}
+			recorded.requireClosedOnce(t, 2)
+		})
+	}
+}
+
+// reconfigureFailingQuery 在启用 fail 后拒绝读取日志页，其余查询仍使用真实 DAO。
+type reconfigureFailingQuery struct {
+	dao.Query
+	fail atomic.Bool
+}
+
+// ListItems 在重建测试启用故障时返回读取错误。
+func (q *reconfigureFailingQuery) ListItems(ctx context.Context, request dao.ListItemsRequest) (storage.Page[dao.LoggedItem, storage.Ordinal], error) {
+	// 1. 开启故障时拒绝，其他请求走真实日志查询。
+	if q.fail.Load() {
+		return storage.Page[dao.LoggedItem, storage.Ordinal]{}, errors.New("reconfigure query failed")
+	}
+	return q.Query.ListItems(ctx, request)
 }
 
 // getRootLifecycle 按事件顺序列出根 Session 的启动和停止。
@@ -1087,6 +1396,8 @@ func TestConversationAgentTools(t *testing.T) {
 			opt := conversationOpt(store, model)
 			opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
 			opt.Definitions.Agents[1].ToolNames = []string{"read_file"}
+			const modelDescription = "响应快，适合检索和简单修改"
+			opt.Definitions.Models[0].Description = modelDescription
 			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if err != nil {
 				t.Fatal(err)
@@ -1128,6 +1439,12 @@ func TestConversationAgentTools(t *testing.T) {
 			want := slices.Sorted(slices.Values(append(slices.Clone(tt.wantTools), collaborationToolNames...)))
 			if got := slices.Sorted(slices.Values(requestToolNames(request))); !slices.Equal(got, want) {
 				t.Fatalf("request tools=%v, want %v", got, want)
+			}
+			for _, tool := range request.body["tools"].([]any) {
+				function := tool.(map[string]any)["function"].(map[string]any)
+				if function["name"] == "spawn_agent" && !strings.Contains(function["description"].(string), modelDescription) {
+					t.Fatalf("spawn_agent description = %q; want model description %q", function["description"], modelDescription)
+				}
 			}
 		})
 	}

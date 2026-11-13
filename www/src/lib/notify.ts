@@ -34,15 +34,15 @@ export function notifyFailure(error: unknown, t: TFunction): void {
   })
 }
 
-// 配置改动生效的提示：有对话正在执行、这次没换上新定义时，说明它们空闲后重新加载配置才生效
+// 配置改动接收后的提示：有待用配置时，说明对话空闲后会自动应用
 export function notifyDefinitionsUpdated(
   message: string,
   result: SetDefinitionsResult,
   t: TFunction
 ): void {
-  const count = result.busy_conversation_ids.length
+  const count = result.pending_conversation_ids.length
   notifySuccess(
     message,
-    count > 0 ? t("settings.busyConversations", { count }) : undefined
+    count > 0 ? t("settings.pendingConversations", { count }) : undefined
   )
 }

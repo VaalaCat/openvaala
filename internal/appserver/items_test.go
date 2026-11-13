@@ -19,6 +19,8 @@ const (
 func newTestTranslator(sessionID defs.SessionID) *codexItemTranslator {
 	// 1. 设置 /root 层级路径，local 目录为 /work，ssh 目录为 /srv。
 	return newCodexItemTranslator(
+		"conversation",
+		testRootSessionID,
 		sessionID,
 		map[defs.SessionID]string{testRootSessionID: "/root", testChildSessionID: "/root/调研", testGrandSessionID: "/root/调研/子任务"},
 		map[string]string{"local": "/work", "ssh": "/srv"},
@@ -561,13 +563,22 @@ func TestCodexItemTranslatorGetThreadItems(t *testing.T) {
 			want: `[{"type":"subAgentActivity","id":"c-1","kind":"interacted","agentThreadId":"s-grand","agentPath":"/root/调研/子任务"}]`,
 		},
 		{
-			name:      "send_message_to_parent_uses_the_root_path",
+			name:      "send_message_to_root_uses_the_root_thread_id",
 			sessionID: testChildSessionID,
 			items: []*defs.Item{
 				newTestCall("c-1", "call-1", "send_message", map[string]any{"session_id": "s-root", "message": "done"}),
 				newTestResult("call-1", "", `{"session_id":"s-root","mode":"normal","status":"accepted"}`, nil),
 			},
-			want: `[{"type":"subAgentActivity","id":"c-1","kind":"interacted","agentThreadId":"s-root","agentPath":"/root"}]`,
+			want: `[{"type":"subAgentActivity","id":"c-1","kind":"interacted","agentThreadId":"conversation","agentPath":"/root"}]`,
+		},
+		{
+			name:      "send_message_to_non_root_parent_keeps_its_session_id",
+			sessionID: testGrandSessionID,
+			items: []*defs.Item{
+				newTestCall("c-1", "call-1", "send_message", map[string]any{"session_id": "s-child", "message": "done"}),
+				newTestResult("call-1", "", `{"session_id":"s-child","mode":"normal","status":"accepted"}`, nil),
+			},
+			want: `[{"type":"subAgentActivity","id":"c-1","kind":"interacted","agentThreadId":"s-child","agentPath":"/root/调研"}]`,
 		},
 		{
 			name: "send_message_to_unknown_session_falls_back_to_its_id",

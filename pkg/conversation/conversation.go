@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/dao"
@@ -64,8 +65,9 @@ type Conversation interface {
 	// SetExecutorSettings 按新设置装配配置，交给 Run 停掉旧 Session 和执行环境、重启根 Session，返回补上 local 目录的设置；客户端 MCP 登记保留。
 	// 调用方要先确认没有执行中的 Turn；装配失败时旧配置不变，换上后根 Session 启动失败则停止对话并返回错误。
 	SetExecutorSettings(ctx context.Context, settings defs.ExecutorSettings) (defs.ExecutorSettings, error)
-	// SetDefinitions 按新定义和当前设置重新装配并替换配置，校验全部 Session 的 Agent 都在新定义里；WithoutExecutors 的对话不装配 Executor 和 Skill。
-	SetDefinitions(ctx context.Context, definitions *ConversationDefinitions) error
+	// SetDefinitions 按新定义装配配置，空闲时替换，忙时暂存并在空闲后自动替换；isPending 表示仍等待应用。
+	// 校验全部 Session 的 Agent 都在新定义里；WithoutExecutors 的对话不装配 Executor 和 Skill。
+	SetDefinitions(ctx context.Context, definitions *ConversationDefinitions) (isPending bool, err error)
 	// SetClientMCPServers 替换指定客户端登记的全部 MCP server，空列表表示移除；等 Run 换完登记后返回，从下个 Turn 起生效。
 	// 创建连接失败、对话已停止或调用方取消时返回错误。
 	SetClientMCPServers(ctx context.Context, clientID string, servers []ClientMCPServer) error
@@ -81,15 +83,21 @@ type conversationImpl struct {
 	modelClient llmkit.Client
 	// config 是当前配置，只由 Run 在全部 Session 任务结束后整份替换；其他任务通过 Load 读取。
 	config atomic.Pointer[conversationConfig]
+	// pendingConfig 是已装配、等待应用的配置，只由 Run 读写。
+	pendingConfig *conversationConfig
+	// configApplyTimer 到期后尝试应用 pendingConfig，仍忙时重新计时，只由 Run 读写。
+	configApplyTimer *time.Timer
 	// clientMCPServers 给 Session 提供客户端登记的 MCP 工具，构造时建好，换配置时不动。
 	clientMCPServers executor.ClientMCPServers
 	// clientMCPRunCancels 以客户端 ID 为键，值是取消这个客户端全部连接的 Run 的函数；只由 Run 读写。
 	clientMCPRunCancels map[string]context.CancelFunc
 	// configChanges 是交给 Run 串行处理的换配置请求。
 	configChanges chan *configChange
+	// configBaseRequests 接收 setter 对装配 base 的查询。
+	configBaseRequests chan *configBaseRequested
 	// clientMCPChanges 是交给 Run 串行处理的客户端 MCP 登记。
 	clientMCPChanges chan *clientMCPChange
-	// stopped 在 Run 不再处理 configChanges、clientMCPChanges 时关闭。
+	// stopped 在 Run 不再处理配置请求和客户端 MCP 登记时关闭。
 	stopped chan struct{}
 
 	// sessionRecords 是全部 Session 的持久记录，每次写库后整条替换，不就地修改。
@@ -231,6 +239,7 @@ func newConversation(record defs.Conversation, records []defs.Session, opt *Conv
 		clientMCPServers:    executor.NewClientMCPServers(),
 		clientMCPRunCancels: make(map[string]context.CancelFunc),
 		configChanges:       make(chan *configChange),
+		configBaseRequests:  make(chan *configBaseRequested),
 		clientMCPChanges:    make(chan *clientMCPChange),
 		stopped:             make(chan struct{}),
 		started:             make(chan struct{}, 1),
@@ -338,16 +347,37 @@ func (c *conversationImpl) Run(ctx context.Context, events chan<- ConversationEv
 	}
 	// 4. 串行处理换配置和客户端 MCP 登记，直到对话 ctx 取消或根 Session 退出。
 	for c.runCtx.Err() == nil {
+		var configApplyDue <-chan time.Time
+		if c.configApplyTimer != nil {
+			configApplyDue = c.configApplyTimer.C
+		}
 		select {
 		case <-c.runCtx.Done():
+		case request := <-c.configBaseRequests:
+			base := c.pendingConfig
+			if base == nil {
+				base = c.config.Load()
+			}
+			request.reply <- base
 		case change := <-c.configChanges:
 			c.handleConfigChange(change)
+		case <-configApplyDue:
+			if _, err := c.applyPendingConfig(true); err != nil {
+				logger.Warn("apply pending conversation configuration failed", "error", err)
+			}
 		case change := <-c.clientMCPChanges:
 			c.handleClientMCPChange(change)
 		}
 	}
 	// 5. 停止接收请求，等全部 Session 任务结束，再停止执行环境和客户端 MCP 连接，最后关闭 events。
 	close(c.stopped)
+	if c.configApplyTimer != nil {
+		c.configApplyTimer.Stop()
+	}
+	if c.pendingConfig != nil {
+		closeWorkspaces(c.runCtx, c.pendingConfig.workspaces)
+		c.pendingConfig = nil
+	}
 	c.tasks.Wait()
 	c.stopEnvironments(c.config.Load())
 	for _, cancel := range c.clientMCPRunCancels {
@@ -369,37 +399,90 @@ func (c *conversationImpl) Run(ctx context.Context, events chan<- ConversationEv
 	return runErr
 }
 
-// handleConfigChange 停止旧配置的 Session 和环境，换上新配置并重启根 Session。
+// handleConfigChange 校验装配 base，接收新配置并尝试应用，回复是否仍等待空闲。
 func (c *conversationImpl) handleConfigChange(change *configChange) {
-	// 1. 装配时读到的配置已经不是当前配置时，关闭新配置的工作区，回复 errConfigChanged。
-	current := c.config.Load()
-	if change.base != current {
+	// 1. 装配 base 已被替换时，关闭新配置的工作区，回复 errConfigChanged。
+	base := c.pendingConfig
+	if base == nil {
+		base = c.config.Load()
+	}
+	if change.base != base {
 		closeWorkspaces(c.runCtx, change.next.workspaces)
-		change.reply <- errConfigChanged
+		change.reply <- configChangeReply{err: errConfigChanged}
 		return
 	}
-	// 2. 以 errConversationReconfiguring 取消旧 Session，等全部任务结束后停止旧环境。
+	// 2. 关闭被替换的备用工作区，接收并尝试应用新配置。
+	if c.pendingConfig != nil {
+		closeWorkspaces(c.runCtx, c.pendingConfig.workspaces)
+	}
+	c.pendingConfig = change.next
+	isPending, err := c.applyPendingConfig(change.deferIfBusy)
+	change.reply <- configChangeReply{isPending: isPending, err: err}
+}
+
+// applyPendingConfig 按 Session 状态延期，或停止旧 Session 和环境，应用待用配置并重启根 Session。
+func (c *conversationImpl) applyPendingConfig(deferIfBusy bool) (isPending bool, err error) {
+	// 1. 对话已停止时返回停止原因；没有待用配置时返回。
+	if err := c.runCtx.Err(); err != nil {
+		return false, context.Cause(c.runCtx)
+	}
+	if c.pendingConfig == nil {
+		return false, nil
+	}
+	// 2. reload 检查所有运行 Session；忙碌或查询失败时保留配置并安排下一次尝试。
+	if deferIfBusy {
+		ctx, cancel := context.WithTimeout(c.runCtx, time.Second)
+		defer cancel()
+		for _, instance := range c.runningSessions.Values() {
+			status, err := instance.GetStatus(ctx)
+			if err != nil || ctx.Err() != nil || status.State != session.SessionStateIdle ||
+				status.PendingInputCount != 0 || status.PendingContextItemCount != 0 || instance.IsTerminalBusy() {
+				if c.configApplyTimer == nil {
+					c.configApplyTimer = time.NewTimer(time.Second)
+				} else {
+					c.configApplyTimer.Reset(time.Second)
+				}
+				return true, nil
+			}
+		}
+	}
+	// 3. 停止计时，检查等待期间新增的 Session；候选缺少所需 Agent 时关闭候选并保留运行配置。
+	if c.configApplyTimer != nil {
+		c.configApplyTimer.Stop()
+		c.configApplyTimer = nil
+	}
+	next := c.pendingConfig
+	c.pendingConfig = nil
+	for _, record := range c.sessionRecords.Values() {
+		if _, found := next.agentDefinitions[record.AgentName]; !found {
+			closeWorkspaces(c.runCtx, next.workspaces)
+			return false, newAgentNotConfiguredError(record)
+		}
+	}
+	// 4. 以 errConversationReconfiguring 取消旧 Session，等全部任务结束后停止旧环境。
+	current := c.config.Load()
 	current.stopSessions(errConversationReconfiguring)
 	c.tasks.Wait()
 	c.stopEnvironments(current)
-	// 3. 换上新配置，启动执行环境和根 Session；根 Session 启动失败时停止对话。
-	next := change.next
+	// 5. 换上新配置，启动执行环境和根 Session；对话已取消时不再启动，根 Session 启动失败时停止对话。
 	next.sessionsCtx, next.stopSessions = context.WithCancelCause(c.runCtx)
 	c.config.Store(next)
+	if err := c.runCtx.Err(); err != nil {
+		return false, context.Cause(c.runCtx)
+	}
 	c.startEnvironments(next.environments)
 	root, _ := c.sessionRecords.Load(c.rootSessionID)
 	if _, err := c.startSession(root, false); err != nil {
 		c.stopRun(err)
-		change.reply <- err
-		return
+		return false, err
 	}
-	// 4. 发出新模型目录、Agent 默认模型和 Executor 设置，回复变更成功。
+	// 6. 发出新模型目录、Agent 默认模型和 Executor 设置。
 	c.sendEvent(&ConversationReconfigured{
 		Models:             next.models,
 		AgentDefaultModels: getAgentDefaultModels(next.definitions.Agents),
 		ExecutorSettings:   next.settings,
 	})
-	change.reply <- nil
+	return false, nil
 }
 
 // handleClientMCPChange 替换一个客户端登记的全部 MCP 连接。
@@ -452,15 +535,18 @@ func (c *conversationImpl) stopEnvironments(config *conversationConfig) {
 
 // SetExecutorSettings 装配并替换对话的 Executor 设置。
 func (c *conversationImpl) SetExecutorSettings(ctx context.Context, settings defs.ExecutorSettings) (defs.ExecutorSettings, error) {
-	// 1. 按新设置和当前定义装配配置，交给 Run 替换；装配期间对话换过配置时按最新配置重试，成功时返回补上 local 目录的设置。
+	// 1. 按新设置和最新定义装配配置；装配期间 base 被替换时重试，成功时返回补上 local 目录的设置。
 	ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: c.id})
 	for {
-		base := c.config.Load()
+		base, err := c.getConfigBase(ctx)
+		if err != nil {
+			return defs.ExecutorSettings{}, err
+		}
 		next, err := newConversationConfig(ctx, c.id, settings, base.settings, &c.opt, base.definitions, c.sessionRecords.Values())
 		if err != nil {
 			return defs.ExecutorSettings{}, err
 		}
-		err = c.applyConfig(ctx, base, next)
+		_, err = c.applyConfig(ctx, base, next, false)
 		if errors.Is(err, errConfigChanged) {
 			continue
 		}
@@ -471,41 +557,61 @@ func (c *conversationImpl) SetExecutorSettings(ctx context.Context, settings def
 	}
 }
 
-// SetDefinitions 按新定义重新装配并换上对话配置。
-func (c *conversationImpl) SetDefinitions(ctx context.Context, definitions *ConversationDefinitions) error {
-	// 1. 按新定义和当前设置装配配置，交给 Run 替换；装配期间对话换过配置时按最新配置重试。
+// SetDefinitions 按新定义重新装配配置，交给 Run 应用或暂存到空闲时应用。
+func (c *conversationImpl) SetDefinitions(ctx context.Context, definitions *ConversationDefinitions) (isPending bool, err error) {
+	// 1. 按新定义和最新设置装配配置；装配期间 base 被替换时重试。
 	ctx = defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: c.id})
 	for {
-		base := c.config.Load()
+		base, err := c.getConfigBase(ctx)
+		if err != nil {
+			return false, err
+		}
 		next, err := newConversationConfig(ctx, c.id, base.settings, base.settings, &c.opt, definitions, c.sessionRecords.Values())
 		if err != nil {
-			return err
+			return false, err
 		}
-		if err := c.applyConfig(ctx, base, next); !errors.Is(err, errConfigChanged) {
-			return err
+		if isPending, err := c.applyConfig(ctx, base, next, true); !errors.Is(err, errConfigChanged) {
+			return isPending, err
 		}
 	}
 }
 
+// getConfigBase 经 Run 查询下一次装配使用的配置，有待用配置时返回待用配置。
+func (c *conversationImpl) getConfigBase(ctx context.Context) (*conversationConfig, error) {
+	// 1. 提交查询，或返回对话停止、调用方取消的错误。
+	request := &configBaseRequested{reply: make(chan *conversationConfig, 1)}
+	select {
+	case c.configBaseRequests <- request:
+	case <-c.stopped:
+		return nil, fmt.Errorf("Conversation has stopped: %w", context.Cause(c.runCtx))
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	// 2. Run 收到请求后等待回复。
+	return <-request.reply, nil
+}
+
 // applyConfig 向 Run 提交换配置请求并等待回复。
-func (c *conversationImpl) applyConfig(ctx context.Context, base, next *conversationConfig) error {
+func (c *conversationImpl) applyConfig(ctx context.Context, base, next *conversationConfig, deferIfBusy bool) (isPending bool, err error) {
 	// 1. 提交装配好的配置；提交前对话已停止或调用方取消时，关闭新配置的工作区并返回错误。
 	change := &configChange{
-		base:  base,
-		next:  next,
-		reply: make(chan error, 1),
+		base:        base,
+		next:        next,
+		deferIfBusy: deferIfBusy,
+		reply:       make(chan configChangeReply, 1),
 	}
 	select {
 	case c.configChanges <- change:
 	case <-c.stopped:
 		closeWorkspaces(ctx, next.workspaces)
-		return fmt.Errorf("Conversation has stopped: %w", context.Cause(c.runCtx))
+		return false, fmt.Errorf("Conversation has stopped: %w", context.Cause(c.runCtx))
 	case <-ctx.Done():
 		closeWorkspaces(ctx, next.workspaces)
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 	// 2. Run 收到请求后等待它回复，不再因调用方取消而中断。
-	return <-change.reply
+	result := <-change.reply
+	return result.isPending, result.err
 }
 
 // SetClientMCPServers 创建客户端的新 MCP 连接交给 Run 替换登记，等替换完成后返回。

@@ -211,7 +211,7 @@ func (c *appServerConnection) listThreadTurns(ctx context.Context, params codexT
 	if err != nil {
 		return nil, getCodexError(err, params.ThreadID)
 	}
-	result.Data = newThreadTurns(thread.sessionID, getAgentPaths(sessions), page.Turns, itemsByTurn)
+	result.Data = newThreadTurns(thread.conversation.ID, thread.conversation.RootSessionID, thread.sessionID, getAgentPaths(sessions), page.Turns, itemsByTurn)
 	return result, nil
 }
 
@@ -315,7 +315,7 @@ func (c *appServerConnection) getItemEntries(ctx context.Context, thread history
 	}
 	agentPaths := getAgentPaths(sessions)
 	for _, segment := range segments {
-		translator := newTurnItemTranslator(thread.sessionID, agentPaths, recordsByID[segment[0].TurnID])
+		translator := newTurnItemTranslator(thread.conversation.ID, thread.conversation.RootSessionID, thread.sessionID, agentPaths, recordsByID[segment[0].TurnID])
 		entries = append(entries, translator.getThreadItems(segment)...)
 	}
 	return entries, nil
@@ -420,8 +420,15 @@ func (c *appServerConnection) readThreadTurns(ctx context.Context, conversationI
 	if err != nil {
 		return nil, err
 	}
-	// 3. 使用已提供的 Session 记录和每轮 Executor 设置转换。
-	return newThreadTurns(sessionID, getAgentPaths(sessions), records, itemsByTurn), nil
+	// 3. 从已提供的 Session 记录取得根 Session，使用每轮 Executor 设置转换。
+	var rootSessionID defs.SessionID
+	for _, sessionRecord := range sessions {
+		if sessionRecord.ParentSessionID == "" {
+			rootSessionID = sessionRecord.ID
+			break
+		}
+	}
+	return newThreadTurns(conversationID, rootSessionID, sessionID, getAgentPaths(sessions), records, itemsByTurn), nil
 }
 
 // readSessions 读取对话全部 Session 并补齐模型选择。
@@ -711,12 +718,12 @@ func (c *appServerConnection) readItemsPage(ctx context.Context, conversationID 
 }
 
 // newThreadTurns 将 Turn 记录和分组 Item 转换为完整 Codex Turn。
-func newThreadTurns(sessionID defs.SessionID, agentPaths map[defs.SessionID]string, records []defs.Turn, itemsByTurn map[defs.TurnID][]*defs.Item) []codexTurn {
+func newThreadTurns(conversationID defs.ConversationID, rootSessionID, sessionID defs.SessionID, agentPaths map[defs.SessionID]string, records []defs.Turn, itemsByTurn map[defs.TurnID][]*defs.Item) []codexTurn {
 	// 1. 按每轮记录的 Executor 设置转换 Item，标记 itemsView 为 full。
 	turns := make([]codexTurn, 0, len(records))
 	for _, record := range records {
 		turn := newCodexRecordTurn(record)
-		for _, entry := range newTurnItemTranslator(sessionID, agentPaths, record).getThreadItems(itemsByTurn[record.ID]) {
+		for _, entry := range newTurnItemTranslator(conversationID, rootSessionID, sessionID, agentPaths, record).getThreadItems(itemsByTurn[record.ID]) {
 			turn.Items = append(turn.Items, entry.Item)
 		}
 		turn.ItemsView = codexTurnItemsFull

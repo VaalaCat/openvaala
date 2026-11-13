@@ -68,6 +68,150 @@ func TestMarkdownNativeRendering(t *testing.T) {
 	}
 }
 
+// TestUserMessageFold 检查四行裁切、自动换行及展开收起的中间帧高度。
+func TestUserMessageFold(t *testing.T) {
+	// 1. 在真实消息滚动区比较文本可见区域，不用文本查找判断裁切。
+	for _, tt := range []struct {
+		name  string
+		text  string
+		fold  bool
+		theme string
+		width int
+	}{
+		{"four lines", strings.Repeat("MMMMMMMM\n", 3) + "MMMMMMMM", false, "light", 640},
+		{"six lines", strings.Repeat("MMMMMMMM\n", 5) + "MMMMMMMM", true, "light", 640},
+		{"dark six lines", strings.Repeat("MMMMMMMM\n", 5) + "MMMMMMMM", true, "dark", 640},
+		{"wrapped text", strings.Repeat("长消息自动换行", 25), true, "light", 390},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.preferences.Theme = tt.theme
+			d.items = []viewItem{{Ordinal: 1, Item: &defs.Item{ID: "user", Kind: defs.ItemMessage, Message: &defs.Message{From: &defs.Address{Kind: defs.IdentityUser}, Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: tt.text}}}}}}}
+			tester := ui.NewTester(func(c *ui.Context) { d.applyAppearance(c); ui.Column(c).Fill().Children(func() { d.itemsView(c) }) }, tt.width, 900)
+			tester.Frame()
+			bounds := func() ui.Rect {
+				t.Helper()
+				r, found := tester.Find(tt.text)
+				if !found {
+					t.Fatal("message missing")
+				}
+				return r
+			}
+			collapsed := bounds()
+			if math.Abs(float64(collapsed.H-80)) > 1 {
+				t.Fatalf("preview height=%v", collapsed.H)
+			}
+			if _, found := tester.Find("展开"); found != tt.fold {
+				t.Fatalf("expand=%v want=%v", found, tt.fold)
+			}
+			if !tt.fold {
+				return
+			}
+			// 2. 比较第四行的实际像素对比度，展开后渐隐消失。
+			lineInk := func() float64 {
+				r := bounds()
+				img := tester.Image()
+				background := img.RGBAAt(int(r.X+r.W)-2, int(r.Y)+61)
+				var ink float64
+				for y := int(r.Y) + 60; y < int(r.Y)+80; y++ {
+					for x := int(r.X); x < int(r.X+r.W)-2; x++ {
+						pixel := img.RGBAAt(x, y)
+						ink += math.Abs(float64(pixel.R)-float64(background.R)) + math.Abs(float64(pixel.G)-float64(background.G)) + math.Abs(float64(pixel.B)-float64(background.B))
+					}
+				}
+				return ink
+			}
+			previewInk := lineInk()
+			if err := tester.Click("展开"); err != nil {
+				t.Fatal(err)
+			}
+			tester.Advance(70 * time.Millisecond)
+			opening := bounds().H
+			tester.Advance(300 * time.Millisecond)
+			expanded := bounds().H
+			if !(opening > collapsed.H && opening < expanded) {
+				t.Fatalf("opening heights=%v/%v/%v", collapsed.H, opening, expanded)
+			}
+			if fullInk := lineInk(); previewInk <= 0 || previewInk >= fullInk*0.9 {
+				t.Fatalf("preview did not fade: ink=%v expanded=%v", previewInk, fullInk)
+			}
+			if err := tester.Click("收起"); err != nil {
+				t.Fatal(err)
+			}
+			tester.Advance(50 * time.Millisecond)
+			closing := bounds().H
+			tester.Advance(300 * time.Millisecond)
+			if !(closing > collapsed.H && closing < expanded) {
+				t.Fatalf("closing heights=%v/%v/%v", collapsed.H, closing, expanded)
+			}
+			if math.Abs(float64(bounds().H-collapsed.H)) > 1 {
+				t.Fatalf("collapsed height=%v", bounds().H)
+			}
+			// 3. 渐隐区域仍可拖选；复制消息始终取得完整原文。
+			r := bounds()
+			tester.Press(r.X+1, r.Y+10)
+			tester.Move(r.X+r.W-1, r.Y+70)
+			tester.Release(r.X+r.W-1, r.Y+70)
+			tester.Command("copy")
+			if tester.Clipboard() == "" {
+				t.Fatal("preview selection did not copy text")
+			}
+			if err := tester.Click("复制消息"); err != nil {
+				t.Fatal(err)
+			}
+			if tester.Clipboard() != tt.text {
+				t.Fatalf("message copy was truncated: %q", tester.Clipboard())
+			}
+		})
+	}
+}
+
+// TestUserMessageFoldVirtualList 检查消息离开虚拟视口后恢复展开选择和实际高度。
+func TestUserMessageFoldVirtualList(t *testing.T) {
+	// 1. 展开或收起首条消息，滚动到末尾让首条移出视口，再滚回首条。
+	for _, expanded := range []bool{false, true} {
+		t.Run(fmt.Sprint(expanded), func(t *testing.T) {
+			d := testDesktop()
+			text := strings.Repeat("用户正文\n", 5) + "最后一行"
+			for index := range 80 {
+				value := fmt.Sprintf("following row %d", index)
+				if index == 0 {
+					value = text
+				}
+				d.items = append(d.items, viewItem{Ordinal: storage.Ordinal(index + 1), Item: &defs.Item{ID: defs.ItemID(fmt.Sprint(index)), Kind: defs.ItemMessage, Message: &defs.Message{From: &defs.Address{Kind: defs.IdentityUser}, Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: value}}}}}})
+			}
+			tester := ui.NewTester(func(c *ui.Context) { d.applyAppearance(c); ui.Column(c).Fill().Children(func() { d.itemsView(c) }) }, 640, 480)
+			d.messageList.ScrollTo(0, ui.Start)
+			tester.Frame()
+			if expanded {
+				if err := tester.Click("展开"); err != nil {
+					t.Fatal(err)
+				}
+				tester.Advance(300 * time.Millisecond)
+			}
+			before, found := tester.Find(text)
+			if !found {
+				t.Fatal("first message missing")
+			}
+			d.messageList.ScrollTo(79, ui.End)
+			tester.Frame()
+			if err := tester.Click("following row 79"); err != nil {
+				t.Fatal(err)
+			}
+			tester.Frame()
+			if _, found := tester.Find(text); found {
+				t.Fatal("first message did not leave the virtual viewport")
+			}
+			d.messageList.ScrollTo(0, ui.Start)
+			tester.Frame()
+			after, found := tester.Find(text)
+			if !found || math.Abs(float64(before.H-after.H)) > 1 {
+				t.Fatalf("restored height before=%+v after=%+v found=%v", before, after, found)
+			}
+		})
+	}
+}
+
 // TestLoadImageHeaders 检查网络图片下载带上 http.headers，并允许跳到别的域名。
 func TestLoadImageHeaders(t *testing.T) {
 	// 1. 图片服务记录收到的 header；跳转用例让第一个服务重定向到另一个端口的服务。

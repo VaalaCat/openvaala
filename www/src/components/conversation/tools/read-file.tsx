@@ -49,6 +49,7 @@ export function ReadFileTool(props: ToolRendererProps) {
               lang={getFileLanguage(
                 getStringField(content, "path") ?? path ?? ""
               )}
+              viewStateKey={props.viewKey + ":content"}
             />
           ) : (
             <p className="text-ui color-muted">

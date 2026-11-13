@@ -51,7 +51,7 @@ Runtime              配置、已打开的对话
 
 从外到内：
 
-- **Runtime**：Runtime 服务里的根对象。它持有当前配置（Agent、模型、Executor、MCP server、hook、skill）和已打开对话的表，把每个请求转给对应的对话。重新加载配置时，在这里替换定义，再交给空闲的对话。
+- **Runtime**：Runtime 服务里的根对象。它持有当前配置（Agent、模型、Executor、MCP server、hook、skill）和已打开对话的表，把每个请求转给对应的对话。重新加载配置时，在这里替换定义，再交给已打开的对话；忙碌对话暂存新配置，空闲后自动应用。
 - **Conversation**：你正在做的一个任务，也就是一个对话。它拥有自己的工作位置（Executor 和工作目录）、到这些 Executor 和 MCP server 的连接、可用的 skill，以及参与其中的所有 Agent：一个根 Session 和任意多个子 Agent 的 Session。
 - **Session**：对话里一个 Agent 的工作线：用哪个 Agent、哪个模型，以及它的历史。一个 Session 同一时间只运行一个 Turn，并拥有等着它处理的输入队列，补充和排队就在这里决定。子 Agent 就是有父 Session 的 Session。
 - **Turn**：Agent 主循环的一次运行，由一条输入发起。它加载历史、运行 Agent、保存产出，结束时的状态是完成、失败或中断，并记下 token 用量。
@@ -75,7 +75,7 @@ ExecutorProvider   这个对话能用哪些 Executor
 - **`Executor`**：说明一个地方是什么（ID、种类、说明、默认目录），并在上面打开工作区。新增一种 Executor 只需要写一个类型，对话不用知道它的细节。
 - **`Workspace`**：工具真正打交道的对象。对话在它能用的每个 Executor 上打开自己的工作区，根目录是这个 Executor 的工作目录，对话停止时关闭，所以 SSH 连接和 MCP server 不会比对话活得更久。
 
-重新加载配置时，Provider 和其他定义一起被替换：空闲的对话换用新的列表，新对话从一开始就用新的。
+重新加载配置时，Provider 和其他定义一起被替换：空闲的对话换用新的列表，忙碌的对话先准备新配置，空闲后自动换用；新对话从一开始就用新的。
 
 已保存的对话如果没人查看，也没有在运行的 Turn 或后台命令，超过 `server.conversation_idle_timeout`（默认 30 分钟）后会被停止，它的工作区随之释放；再次打开时重新连接。见[配置总览](../configuration/overview.md)。
 

@@ -586,8 +586,8 @@ func handleProviderSet(ctx context.Context, connection *serverConnection, params
 	if err != nil {
 		return nil, err
 	}
-	// 4. 返回替换结果，空忙碌对话列表编码为空数组。
-	result.BusyConversationIDs = getNonNilSlice(result.BusyConversationIDs)
+	// 4. 返回替换结果，空等待应用对话列表编码为空数组。
+	result.PendingConversationIDs = getNonNilSlice(result.PendingConversationIDs)
 	return &result, nil
 }
 
@@ -598,12 +598,12 @@ func handleProviderDelete(ctx context.Context, connection *serverConnection, par
 	if err != nil {
 		return nil, err
 	}
-	// 2. 替换 Runtime 定义并返回结果，空忙碌对话列表编码为空数组。
+	// 2. 替换 Runtime 定义并返回结果，空等待应用对话列表编码为空数组。
 	result, err := connection.runtime.SetDefinitions(ctx, definitions)
 	if err != nil {
 		return nil, err
 	}
-	result.BusyConversationIDs = getNonNilSlice(result.BusyConversationIDs)
+	result.PendingConversationIDs = getNonNilSlice(result.PendingConversationIDs)
 	return &result, nil
 }
 
@@ -630,12 +630,12 @@ func handleConfigSetDefaultModel(ctx context.Context, connection *serverConnecti
 	if err != nil {
 		return nil, err
 	}
-	// 3. 替换 Runtime 定义并返回结果，空忙碌对话列表编码为空数组。
+	// 3. 替换 Runtime 定义并返回结果，空等待应用对话列表编码为空数组。
 	result, err := connection.runtime.SetDefinitions(ctx, definitions)
 	if err != nil {
 		return nil, err
 	}
-	result.BusyConversationIDs = getNonNilSlice(result.BusyConversationIDs)
+	result.PendingConversationIDs = getNonNilSlice(result.PendingConversationIDs)
 	return &result, nil
 }
 
@@ -646,12 +646,12 @@ func handleConfigReload(ctx context.Context, connection *serverConnection, _ *ru
 	if err != nil {
 		return nil, err
 	}
-	// 2. 替换 Runtime 定义并返回结果，空忙碌对话列表编码为空数组。
+	// 2. 替换 Runtime 定义并返回结果，空等待应用对话列表编码为空数组。
 	result, err := connection.runtime.SetDefinitions(ctx, definitions)
 	if err != nil {
 		return nil, err
 	}
-	result.BusyConversationIDs = getNonNilSlice(result.BusyConversationIDs)
+	result.PendingConversationIDs = getNonNilSlice(result.PendingConversationIDs)
 	return &result, nil
 }
 

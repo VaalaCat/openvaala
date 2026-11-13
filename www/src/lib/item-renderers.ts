@@ -91,6 +91,8 @@ export type ToolCallState =
 
 // 一种工具的显示组件拿到的内容；arguments 是解析后的参数，生成中或写坏了时是原文
 export interface ToolRendererProps {
+  // 所在 tool_call Item 的 view.key，展开状态按它保存
+  viewKey: string
   call: ToolCall
   arguments: ParsedToolArguments
   result?: ToolResult
@@ -131,6 +133,11 @@ export type MessageRow =
       items: ViewItem[]
       rows: TurnContentRow[]
     }
+
+// 顶层消息行的 key：轮次行用 Turn 的 key，轮外 Item 用它的 view.key
+export function getMessageRowKey(row: MessageRow): string {
+  return row.kind === "turn" ? row.key : row.view.key
+}
 
 // 调试选择只保存前端定位信息，内容始终从当前 Session 的消息行读取。
 export type ItemDebugTarget =

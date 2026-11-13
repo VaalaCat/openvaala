@@ -202,6 +202,10 @@ test("context_usage_restores_before_first_new_response_after_restart", async ({
     await page.emulateMedia({ colorScheme })
     for (const width of [1280, 390]) {
       await page.setViewportSize({ width, height: 844 })
+      // 等布局切换完成：只有桌面布局有右栏分隔条。
+      const panelSeparator = page.getByRole("separator")
+      if (width === 1280) await expect(panelSeparator).toBeVisible()
+      else await expect(panelSeparator).toHaveCount(0)
       if (!(await contextTab.isVisible()))
         await page.getByRole("button", { name: "切换对话详情" }).click()
       const estimate = contextTab.locator("dd").first()

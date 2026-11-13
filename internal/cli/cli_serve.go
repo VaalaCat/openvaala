@@ -323,18 +323,18 @@ func runServeReloadCommand(ctx context.Context, args *AppArgs, notRunningText st
 	if !isReachable {
 		return writeText(args.Stdout, notRunningText)
 	}
-	// 2. 重新加载配置，输出仍在执行、还没换上新配置的对话 ID。
+	// 2. 重新加载配置，输出等待空闲后自动应用的对话 ID。
 	result, err := reloadRuntimeServerConfig(ctx, file)
 	if err != nil {
 		return err
 	}
 	text := "configuration reloaded\n"
-	if count := len(result.BusyConversationIDs); count > 0 {
+	if count := len(result.PendingConversationIDs); count > 0 {
 		ids := make([]string, count)
-		for index, id := range result.BusyConversationIDs {
+		for index, id := range result.PendingConversationIDs {
 			ids[index] = string(id)
 		}
-		text += fmt.Sprintf("%d conversations are running and keep the old configuration until the next reload: %s\n", count, strings.Join(ids, ", "))
+		text += fmt.Sprintf("%d conversations will apply the new configuration automatically when idle: %s\n", count, strings.Join(ids, ", "))
 	}
 	return writeText(args.Stdout, text)
 }

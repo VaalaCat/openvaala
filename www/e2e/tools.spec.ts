@@ -782,6 +782,106 @@ test("command_output_follows_only_at_bottom_and_keeps_expansion_after_exit", asy
   }
 })
 
+test("expanded_tool_output_survives_scrolling_away", async ({
+  page,
+  fixture,
+}) => {
+  test.setTimeout(120_000)
+  // 1. 第一轮 bash 输出和 read_file 读到的文件都超过限高，展开过程组、两张工具卡和两段输出。
+  const readName = "scrolled-away-read.txt"
+  const readPath = path.join(fixture.state.workspaceDirectory, readName)
+  await writeFile(
+    readPath,
+    Array.from({ length: 300 }, (_, index) => `read-line-${index + 1}`).join(
+      "\n"
+    )
+  )
+  try {
+    await fixture.replies(
+      {
+        tools: [
+          { name: "bash", arguments: JSON.stringify({ command: "seq 1 300" }) },
+          { name: "read_file", arguments: JSON.stringify({ path: readName }) },
+        ],
+      },
+      { text: "命令完成" }
+    )
+    await fixture.openApp(page)
+    await startConversation(page, "展开输出翻远再回来")
+    const messages = getMessages(page)
+    const scroller = getMessageScroller(page)
+    await expect(messages.getByText("命令完成", { exact: true })).toBeVisible()
+    const firstTurnID = (await messages
+      .locator("[data-turn-id]")
+      .first()
+      .getAttribute("data-turn-id"))!
+    const firstTurn = messages.locator(`[data-turn-id="${firstTurnID}"]`)
+    await expect(
+      firstTurn.locator('[data-turn-status="completed"]')
+    ).toBeAttached()
+    await expandTurnProcess(firstTurn)
+    const tools = ["执行", "读取"].map((title) => {
+      const tool = firstTurn.locator("[data-item-key]").filter({
+        has: page.locator("[data-item-title]").filter({ hasText: title }),
+      })
+      return {
+        toggle: tool.locator(
+          'button[aria-expanded]:has([data-item-title]):not([tabindex="-1"]):visible'
+        ),
+        block: tool.locator("[data-output-block]"),
+      }
+    })
+    for (const { toggle, block } of tools) {
+      if ((await toggle.getAttribute("aria-expanded")) === "false")
+        await toggle.click()
+      await block.getByRole("button", { name: "展开输出", exact: true }).click()
+      await expect(
+        block.getByRole("button", { name: "收起输出", exact: true })
+      ).toBeVisible()
+    }
+
+    // 2. 再追加 6 轮长回复，等最后一轮完成。
+    const historyReply =
+      "## 历史回复\n\n" +
+      Array.from(
+        { length: 12 },
+        (_, index) => `- 要点 ${index + 1}：保留历史消息、阅读位置和文字选择。`
+      ).join("\n")
+    const conversationID = page.url().split("/c/")[1]
+    for (let index = 1; index <= 6; index++) {
+      await fixture.replies({ text: historyReply })
+      await fixture.submitInput(conversationID, [
+        { kind: "text", text: { text: `追加第 ${index} 轮` } },
+      ])
+      const lastTurn = messages.locator("[data-turn-id]").last()
+      await expect(lastTurn).toContainText(`追加第 ${index} 轮`)
+      await expect(
+        lastTurn.locator('[data-turn-status="completed"]')
+      ).toBeAttached({ timeout: 30_000 })
+    }
+
+    // 3. 滚到底，第一轮已经卸载。
+    await scroller.evaluate((node) => {
+      node.scrollTop = node.scrollHeight
+    })
+    await expect(firstTurn).toHaveCount(0)
+
+    // 4. 滚回顶部，第一轮重新挂上，两张工具卡和两段输出仍是展开的。
+    await scroller.evaluate((node) => {
+      node.scrollTop = 0
+    })
+    await expect(firstTurn).toHaveCount(1)
+    for (const { toggle, block } of tools) {
+      await expect(toggle).toHaveAttribute("aria-expanded", "true")
+      await expect(
+        block.getByRole("button", { name: "收起输出", exact: true })
+      ).toBeVisible()
+    }
+  } finally {
+    await rm(readPath, { force: true })
+  }
+})
+
 test("read_file_tool_images_use_the_same_preview", async ({
   page,
   fixture,

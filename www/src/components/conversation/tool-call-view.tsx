@@ -62,6 +62,7 @@ export function ToolCard({
   arguments: parsedArguments,
   result,
   state,
+  viewKey,
   argumentSummary,
   resultSummary,
   displayedArguments = [],
@@ -116,19 +117,28 @@ export function ToolCard({
       <>
         {hasArguments && (
           <DetailSection label={t("conversation.tool.arguments")}>
-            <JsonView value={argumentDetails} />
+            <JsonView
+              value={argumentDetails}
+              viewStateKey={viewKey + ":arguments"}
+            />
           </DetailSection>
         )}
         {children ??
           (result?.content !== undefined && result.content !== null && (
             <DetailSection label={t("conversation.tool.result")}>
-              <JsonView value={result.content} />
+              <JsonView
+                value={result.content}
+                viewStateKey={viewKey + ":result"}
+              />
             </DetailSection>
           ))}
       </>
     ) : undefined
   ) : parsedArguments.raw ? (
-    <RawArguments text={parsedArguments.raw} />
+    <RawArguments
+      text={parsedArguments.raw}
+      viewStateKey={viewKey + ":arguments"}
+    />
   ) : undefined
   const error = result?.error
   const images = (result?.images ?? []).flatMap((image) =>
@@ -204,11 +214,17 @@ export function ToolCard({
 }
 
 // 参数原文：生成中按纯文本逐字显示，生成完还解析不了时就是模型写坏的原文
-function RawArguments({ text }: { text: string }) {
+function RawArguments({
+  text,
+  viewStateKey,
+}: {
+  text: string
+  viewStateKey: string
+}) {
   const { t } = useTranslation()
   return (
     <DetailSection label={t("conversation.tool.arguments")}>
-      <OutputBlock copyValue={text}>
+      <OutputBlock copyValue={text} viewStateKey={viewStateKey}>
         <pre className="code-padding text-code-reading">{text}</pre>
       </OutputBlock>
     </DetailSection>

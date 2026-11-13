@@ -22,7 +22,11 @@ export function ToolResultItem({ view }: ItemRendererProps) {
       }
       details={
         <div className="flex flex-col gap-2">
-          <JsonView value={view.item} maxHeight="24rem" />
+          <JsonView
+            value={view.item}
+            maxHeight="24rem"
+            viewStateKey={view.key + ":item"}
+          />
           <ImagePreviewStrip
             images={(view.item.tool_result?.images ?? []).flatMap(
               (image, index) =>

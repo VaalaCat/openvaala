@@ -156,14 +156,27 @@ type conversationConfig struct {
 
 // ── Conversation Run 请求 ──
 
+// configBaseRequested 由配置 setter 查询下一次装配使用的配置。
+type configBaseRequested struct {
+	reply chan *conversationConfig
+}
+
 // configChange 由 SetExecutorSettings 或 SetDefinitions 在新配置装配完成后交给 Run。
 type configChange struct {
-	// base 是装配新配置时读到的当前配置；Run 收到时当前配置已经不是它，就回复 errConfigChanged 并关闭 next 的工作区。
+	// base 是装配时的最新配置；Run 收到时已有更新的配置，就回复 errConfigChanged 并关闭 next 的工作区。
 	base *conversationConfig
 	// next 是装配好的新配置。
 	next *conversationConfig
-	// reply 收 Run 的替换结果。
-	reply chan error
+	// deferIfBusy 为 true 时等待全部 Session 空闲再应用。
+	deferIfBusy bool
+	// reply 收 Run 的应用或暂存结果。
+	reply chan configChangeReply
+}
+
+// configChangeReply 是 Run 对已装配配置的接收结果。
+type configChangeReply struct {
+	isPending bool
+	err       error
 }
 
 // clientMCPChange 由 SetClientMCPServers 在新连接创建后交给 Run，替换 clientID 登记的全部连接。

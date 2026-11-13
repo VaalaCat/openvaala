@@ -69,6 +69,7 @@ test("model fields round trip with inheritance, false and explicit empty lists",
         protocol: "claude",
         upstream_model: "vendor/model",
         display_name: "Model",
+        description: "Fast extraction and simple edits",
         context_window: 128000,
         max_output_tokens: 1500,
         thinking: true,
@@ -81,6 +82,7 @@ test("model fields round trip with inheritance, false and explicit empty lists",
         protocol: "claude",
         upstream_model: "vendor/model",
         display_name: "Model",
+        description: "Fast extraction and simple edits",
         context_window: 128000,
         max_output_tokens: 1500,
         thinking: true,
@@ -99,6 +101,22 @@ test("model fields round trip with inheritance, false and explicit empty lists",
       each.model?.reasoning_efforts?.join(", "),
       each.name
     )
+  }
+})
+
+test("model description can be added, cleared and preserved while editing other fields", () => {
+  for (const each of [
+    { before: undefined, after: undefined },
+    { before: "Fast extraction", after: "Fast extraction" },
+    { before: undefined, after: "Careful code review" },
+    { before: "Fast extraction", after: "" },
+  ]) {
+    const draft = fromProviderConfig(
+      config({ main: { description: each.before } })
+    )
+    draft.modelConfigs.main.description = each.after
+    draft.modelConfigs.main.display_name = "Renamed"
+    assert.equal(toProviderConfig(draft).models?.main?.description, each.after)
   }
 })
 

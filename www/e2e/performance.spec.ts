@@ -2,8 +2,10 @@ import {
   expect,
   expandTurnProcess,
   getComposer,
+  getFirstVisibleTurn,
   getMessages,
   getMessageScroller,
+  loadEarlierTurnsUntilFirst,
   startConversation,
   test,
 } from "./fixture"
@@ -240,15 +242,14 @@ test("streaming_below_paginated_history_keeps_reading_position", async ({
   await getComposer(page).press("Enter")
   const streamingTurn = messages.locator("[data-turn-id]").last()
   await expect(streamingTurn).toContainText("持续输出 0。")
-  const earliest = await messages
-    .getByText(/^长对话第 \d+ 轮$/)
-    .first()
-    .innerText()
-  const earlierTurn = Number(earliest.match(/\d+/)![0]) - 1
 
   // 2. 用户向上滚动，顶部加载一页；选中的旧消息仍停在同一位置。
+  //    消息区只挂视口附近的行：等更早的一页加载完，视口里第一条用户消息就是原来已加载的最早一条。
   await getMessageScroller(page).hover()
   await page.mouse.wheel(0, -10_000)
+  await expect(page.locator('[aria-label="正在加载更早的消息"]')).toHaveCount(0)
+  const { text: earliest } = await getFirstVisibleTurn(page)
+  const earlierTurn = Number(earliest.match(/\d+/)![0]) - 1
   await expect(
     messages.getByText(`长对话第 ${earlierTurn} 轮`, { exact: true })
   ).toBeAttached()
@@ -309,3 +310,114 @@ test("streaming_below_paginated_history_keeps_reading_position", async ({
   ).toBeVisible()
   expect(errors).toEqual([])
 })
+
+for (const viewport of [
+  { name: "desktop", width: 1280, colorScheme: "light" as const },
+  { name: "mobile", width: 390, colorScheme: "dark" as const },
+]) {
+  test(`long_history_keeps_selection_and_streaming_${viewport.name}`, async ({
+    page,
+    fixture,
+  }) => {
+    test.setTimeout(120_000)
+    // 1. 预置多轮 Markdown 回复，经消息区分页加载全部历史。
+    const turns = 80
+    const historyReply =
+      "## 历史回复\n\n" +
+      Array.from(
+        { length: 12 },
+        (_, index) => `- 要点 ${index + 1}：保留历史消息、阅读位置和文字选择。`
+      ).join("\n")
+    const errors: string[] = []
+    page.on("pageerror", (error) => errors.push(error.message))
+    await page.setViewportSize({ width: viewport.width, height: 844 })
+    await page.emulateMedia({ colorScheme: viewport.colorScheme })
+    await fixture.replies(
+      ...Array.from({ length: turns }, () => ({ text: historyReply }))
+    )
+    const { longConversationID } = await fixture.seed({
+      conversations: 0,
+      longConversationTurns: turns,
+    })
+    // 记下打开对话期间同时挂着的最多行数：首屏不先多挂几行再卸掉
+    await page.addInitScript(() => {
+      const recorder = window as unknown as { __maxMountedRows: number }
+      recorder.__maxMountedRows = 0
+      new MutationObserver(() => {
+        recorder.__maxMountedRows = Math.max(
+          recorder.__maxMountedRows,
+          document.querySelectorAll(
+            '[data-slot="message-scroller"] [data-row-key]'
+          ).length
+        )
+      }).observe(document, { childList: true, subtree: true })
+    })
+    await fixture.openApp(page)
+    await page.goto(page.url() + "/c/" + longConversationID)
+    const messages = getMessages(page)
+    const scroller = getMessageScroller(page)
+    const oldest = messages.getByText("长对话第 1 轮", { exact: true })
+    await expect(
+      messages.getByText(`长对话第 ${turns} 轮`, { exact: true })
+    ).toBeVisible()
+    expect(
+      await messages.locator("[data-turn-id]").count()
+    ).toBeLessThanOrEqual(10)
+    expect(
+      await page.evaluate(
+        () =>
+          (window as unknown as { __maxMountedRows: number }).__maxMountedRows
+      )
+    ).toBeLessThanOrEqual(5)
+    await loadEarlierTurnsUntilFirst(page)
+
+    // 2. 来回滚动后在最早消息选中文字。
+    await scroller.evaluate((node) => {
+      node.scrollTop = 0
+    })
+    await expect(oldest).toBeInViewport()
+    await scroller.evaluate((node) => {
+      node.scrollTop = node.scrollHeight
+    })
+    await expect(
+      messages.getByText(`长对话第 ${turns} 轮`, { exact: true })
+    ).toBeInViewport()
+    await scroller.evaluate((node) => {
+      node.scrollTop = 0
+    })
+    await expect(oldest).toBeInViewport()
+    await oldest.evaluate((node) => {
+      const range = document.createRange()
+      range.selectNodeContents(node)
+      const selection = window.getSelection()!
+      selection.removeAllRanges()
+      selection.addRange(range)
+    })
+    const top = (await oldest.boundingBox())!.y
+
+    // 3. 另一客户端触发快速流式回复，页面完整接收，历史位置和选区不变。
+    const reply = "持续输出，保持阅读位置。".repeat(80) + "流式结束"
+    await fixture.replies({ text: reply, chunkDelayMs: 1 })
+    await fixture.submitInput(longConversationID, [
+      { kind: "text", text: { text: "继续长对话" } },
+    ])
+    const streamingTurn = messages.locator("[data-turn-id]").last()
+    await expect(streamingTurn).toContainText("继续长对话")
+    await expect(
+      streamingTurn.locator('[data-turn-status="completed"]')
+    ).toBeAttached({ timeout: 30_000 })
+    await expect(streamingTurn).toContainText(reply)
+    expect(Math.abs((await oldest.boundingBox())!.y - top)).toBeLessThanOrEqual(
+      2
+    )
+    expect(await page.evaluate(() => window.getSelection()?.toString())).toBe(
+      "长对话第 1 轮"
+    )
+    await page.evaluate(() => window.getSelection()?.removeAllRanges())
+    await page.getByRole("button", { name: "回到底部", exact: true }).click()
+    await expect(
+      streamingTurn.getByText(reply, { exact: true })
+    ).toBeInViewport()
+    expect(errors).toEqual([])
+  })
+}

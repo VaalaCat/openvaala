@@ -413,7 +413,7 @@ func TestAgentContextCompact(t *testing.T) {
 			if tt.name == "long_summary" && len(req.Messages) != 4 {
 				t.Fatalf("summary request messages = %d, want system, two covered messages, instruction", len(req.Messages))
 			}
-			if !req.Stream || !req.ThinkingEnabled || req.ToolChoice == nil || req.ToolChoice.Type != "none" || !reflect.DeepEqual(req.Tools, tools) || req.Extras["prompt_cache_key"] != string(contextSessionID) {
+			if !req.Stream || req.ThinkingEnabled == nil || !*req.ThinkingEnabled || req.ToolChoice == nil || req.ToolChoice.Type != "none" || !reflect.DeepEqual(req.Tools, tools) || req.Extras["prompt_cache_key"] != string(contextSessionID) {
 				t.Fatalf("request = %+v", req)
 			}
 			if req.Messages[0].Role != llmkit.RoleSystem || req.Messages[0].Content[0].Text != "original system" || req.Messages[len(req.Messages)-1].Role != llmkit.RoleUser {

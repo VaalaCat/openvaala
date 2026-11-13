@@ -1773,7 +1773,7 @@ func TestClientTerminals(t *testing.T) {
 // TestClientConfigurationMethods 检查模型配置和模型目录请求的参数及结果。
 func TestClientConfigurationMethods(t *testing.T) {
 	// 1. 准备默认模型、配置写入结果及预期调用记录。
-	noBusyConversations := runtime.SetDefinitionsResult{BusyConversationIDs: []defs.ConversationID{}}
+	noPendingConversations := runtime.SetDefinitionsResult{PendingConversationIDs: []defs.ConversationID{}}
 	ref := defs.ModelRef{
 		ProviderID: "gw",
 		ModelID:    "m1",
@@ -1810,7 +1810,7 @@ func TestClientConfigurationMethods(t *testing.T) {
 			call: func(t *testing.T, h *clientHarness) (any, error) {
 				return h.client.SetProvider(t.Context(), clientTestProvider, defs.ModelRef{})
 			},
-			want: noBusyConversations,
+			want: noPendingConversations,
 			wantCalls: []clientTestCall{{
 				method:   "SetProvider",
 				argument: clientTestProviderWrite{provider: clientTestProvider},
@@ -1822,7 +1822,7 @@ func TestClientConfigurationMethods(t *testing.T) {
 			call: func(t *testing.T, h *clientHarness) (any, error) {
 				return h.client.SetProvider(t.Context(), clientTestProvider, ref)
 			},
-			want: noBusyConversations,
+			want: noPendingConversations,
 			wantCalls: []clientTestCall{{
 				method: "SetProvider",
 				argument: clientTestProviderWrite{
@@ -1834,7 +1834,7 @@ func TestClientConfigurationMethods(t *testing.T) {
 		{
 			name: "delete_provider",
 			call: func(t *testing.T, h *clientHarness) (any, error) { return h.client.DeleteProvider(t.Context(), "gw") },
-			want: noBusyConversations,
+			want: noPendingConversations,
 			wantCalls: []clientTestCall{{
 				method:   "DeleteProvider",
 				argument: "gw",
@@ -1855,14 +1855,14 @@ func TestClientConfigurationMethods(t *testing.T) {
 		{
 			name: "set_default_model",
 			call: func(t *testing.T, h *clientHarness) (any, error) { return h.client.SetDefaultModel(t.Context(), ref) },
-			want: noBusyConversations,
+			want: noPendingConversations,
 			wantCalls: []clientTestCall{{
 				method:   "SetDefaultModel",
 				argument: ref,
 			}},
 		},
 		{
-			// 根 Session 正在等模型回复：这次 reload 不让对话换上新配置，结果里列出这个对话。
+			// 根 Session 正在等模型回复：reload 先返回 pending，旧轮完成后自动切换并重新同步。
 			name: "reload_config_with_running_conversation",
 			call: func(t *testing.T, h *clientHarness) (any, error) {
 				conversation := h.openNewConversation(t)
@@ -1874,9 +1874,13 @@ func TestClientConfigurationMethods(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				want := runtime.SetDefinitionsResult{BusyConversationIDs: []defs.ConversationID{conversation.ID}}
+				want := runtime.SetDefinitionsResult{PendingConversationIDs: []defs.ConversationID{conversation.ID}}
 				if !reflect.DeepEqual(result, want) {
 					t.Fatalf("ReloadConfig() = %+v, want %+v", result, want)
+				}
+				synced := h.waitSessionSynced(t)
+				if len(synced.Items) != 0 || synced.LastSavedOrdinal != 2 {
+					t.Fatalf("automatic resync = %+v; want no repeated history and last ordinal 2", synced)
 				}
 				return result, nil
 			},

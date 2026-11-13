@@ -3,8 +3,10 @@ import {
   expectShimmer,
   expandTurnProcess,
   getComposer,
+  getFirstVisibleTurn,
   getMessages,
   getMessageScroller,
+  getSmallestMountedTurn,
   openRightPanel,
   openTurnRaw,
   startConversation,
@@ -1536,15 +1538,12 @@ test("history_pagination_recovers_after_connection_error_without_reloading_page"
   await expect(
     messages.getByText("长对话第 1 轮", { exact: true })
   ).toHaveCount(0)
-  const earliest = await messages
-    .getByText(/^长对话第 \d+ 轮$/)
-    .first()
-    .innerText()
-  const earlierTurn = Number(earliest.match(/\d+/)![0]) - 1
   interruptPagination = true
   await scroller.evaluate((node) => {
     node.scrollTop = 0
   })
+  const { text: earliest } = await getFirstVisibleTurn(page)
+  const earlierTurn = Number(earliest.match(/\d+/)![0]) - 1
   await expect.poll(() => didInterrupt).toBe(true)
 
   // 2. 重连后继续上翻，连接错误不留下隐形的分页锁。
@@ -1636,7 +1635,8 @@ test("user_message_copies_only_typed_text_while_running", async ({
     const copyBounds = (await copy.boundingBox())!
     const rewindBounds = (await rewind.boundingBox())!
     const bubbleBounds = (await userItem
-      .getByText(textParts.join("\n"), { exact: true })
+      .locator("p")
+      .filter({ hasText: textParts.join("\n") })
       .locator("..")
       .boundingBox())!
     expect(rewindBounds.x - copyBounds.x - copyBounds.width).toBe(8)
@@ -1695,6 +1695,242 @@ for (const scenario of [
   { width: 1280, colorScheme: "light" },
   { width: 390, colorScheme: "dark" },
 ] as const) {
+  test(`long_user_messages_fold_after_four_lines_${scenario.width}`, async ({
+    page,
+    fixture,
+  }) => {
+    // 1. 五行消息默认只露出前四行，四行消息没有展开入口。
+    await page.setViewportSize({ width: scenario.width, height: 844 })
+    await page.emulateMedia({ colorScheme: scenario.colorScheme })
+    await fixture.openApp(page)
+    await startConversation(page, "用户消息折叠")
+    const conversationID = page.url().split("/c/")[1]
+    const longText = Array.from(
+      { length: 5 },
+      (_, index) => `用户第${index + 1}行`
+    ).join("\n")
+    const shortText = Array.from(
+      { length: 4 },
+      (_, index) => `短消息第${index + 1}行`
+    ).join("\n")
+    await fixture.replies({ text: "ok" })
+    await fixture.submitInput(conversationID, [
+      { kind: "text", text: { text: longText } },
+      { kind: "text", text: { text: "独立附带材料", is_context: true } },
+    ])
+    await fixture.submitInput(conversationID, [
+      { kind: "text", text: { text: shortText } },
+    ])
+    const messages = getMessages(page)
+    const longItem = messages.locator("[data-item-key]").filter({
+      hasText: "用户第1行",
+    })
+    const preview = longItem.locator("p").filter({ hasText: "用户第1行" })
+    const expand = longItem.getByRole("button", {
+      name: "展开消息",
+      exact: true,
+    })
+    await expect(expand).toBeVisible()
+    await expect(preview).toHaveCSS("height", "96px")
+    await expect(preview).toHaveCSS("font-size", "14px")
+    await expect(preview).toHaveCSS("line-height", "24px")
+    await expect(preview).toHaveCSS(
+      "mask-image",
+      /linear-gradient.*rgba\(0, 0, 0, 0\)/
+    )
+    expect(await preview.evaluate((node) => node.scrollHeight)).toBeGreaterThan(
+      96
+    )
+    const shortItem = messages.locator("[data-item-key]").filter({
+      hasText: "短消息第1行",
+    })
+    await expect(
+      shortItem.getByRole("button", { name: "展开消息", exact: true })
+    ).toHaveCount(0)
+    await expect(shortItem).toContainText("短消息第4行")
+    await expect(shortItem.locator("p")).toHaveCSS("mask-image", "none")
+
+    // 2. 逐帧检查展开和收起：高度与渐隐均经过中间值，完成后行与行不重叠。
+    await readFromTop(page)
+    for (const { name, height, opacity } of [
+      { name: "展开消息", height: 120, opacity: 1 },
+      { name: "收起消息", height: 96, opacity: 0 },
+    ]) {
+      const samples = await longItem
+        .getByRole("button", { name, exact: true })
+        .evaluate(async (button) => {
+          const text = document.getElementById(
+            button.getAttribute("aria-controls")!
+          )!
+          const samples: { height: number; opacity: number }[] = []
+          const start = performance.now()
+          ;(button as HTMLButtonElement).click()
+          while (performance.now() - start < 350) {
+            await new Promise((resolve) => requestAnimationFrame(resolve))
+            samples.push({
+              height: text.getBoundingClientRect().height,
+              opacity: Number(
+                getComputedStyle(text).getPropertyValue(
+                  "--message-preview-opacity"
+                )
+              ),
+            })
+          }
+          return samples
+        })
+      expect(
+        samples.some((sample) => sample.height > 96.1 && sample.height < 119.9)
+      ).toBe(true)
+      expect(
+        samples.some((sample) => sample.opacity > 0.01 && sample.opacity < 0.99)
+      ).toBe(true)
+      expect(samples.at(-1)!.height).toBeCloseTo(height, 0)
+      expect(samples.at(-1)!.opacity).toBe(opacity)
+      const rows = await messages
+        .locator("[data-row-key]")
+        .evaluateAll((nodes) =>
+          nodes.map((node) => {
+            const { top, bottom } = node.getBoundingClientRect()
+            return { top, bottom }
+          })
+        )
+      for (let index = 1; index < rows.length; index++)
+        expect(rows[index].top).toBeGreaterThanOrEqual(
+          rows[index - 1].bottom - 1
+        )
+    }
+
+    // 3. 附带材料与正文独立展开，复制始终是完整正文。
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"])
+    await expand.click()
+    await expect(preview).toContainText("用户第5行")
+    await expect(preview).toHaveCSS("height", "120px")
+    const context = longItem.getByRole("button", {
+      name: "附带材料",
+      exact: true,
+    })
+    await expect(context).toHaveAttribute("aria-expanded", "false")
+    await context.click()
+    await expect(
+      longItem.getByText("独立附带材料", { exact: true })
+    ).toBeVisible()
+    await longItem
+      .getByRole("button", { name: "复制消息", exact: true })
+      .click()
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(longText)
+    await longItem
+      .getByRole("button", { name: "收起消息", exact: true })
+      .click()
+    await expect(preview).toHaveCSS("height", "96px")
+    expect(await preview.evaluate((node) => node.scrollHeight)).toBeGreaterThan(
+      96
+    )
+    await expect(
+      longItem.getByText("独立附带材料", { exact: true })
+    ).toBeVisible()
+    await page.screenshot({
+      path: test.info().outputPath("user-message-folded.png"),
+    })
+  })
+}
+
+test("short_user_messages_mount_without_height_animation", async ({
+  page,
+  fixture,
+}) => {
+  // 1. 发送一至三行正文，从节点首次出现开始逐帧取高度。
+  await fixture.openApp(page)
+  await startConversation(page, "短消息初次显示")
+  const conversationID = page.url().split("/c/")[1]
+  for (const lines of [1, 2, 3]) {
+    const text = Array.from(
+      { length: lines },
+      (_, index) => `短消息${lines}：第${index + 1}行`
+    ).join("\n")
+    const sampleHeights = page.evaluate(async (text) => {
+      let paragraph: HTMLParagraphElement | undefined
+      while (!paragraph) {
+        await new Promise((resolve) => requestAnimationFrame(resolve))
+        paragraph = [
+          ...document.querySelectorAll<HTMLParagraphElement>(
+            "[data-item-key] p"
+          ),
+        ].find((node) => node.textContent === text)
+      }
+      const samples = []
+      for (let index = 0; index < 12; index++) {
+        samples.push(paragraph.getBoundingClientRect().height)
+        await new Promise((resolve) => requestAnimationFrame(resolve))
+      }
+      return samples
+    }, text)
+    await fixture.submitInput(conversationID, [
+      { kind: "text", text: { text } },
+    ])
+    // 2. 每一帧都是正文实际高度，不从四行预览高度收缩。
+    for (const height of await sampleHeights) expect(height).toBe(lines * 24)
+  }
+})
+
+test("user_message_expansion_survives_virtual_list_unmount", async ({
+  page,
+  fixture,
+}) => {
+  // 1. 展开第一条用户消息，再发送足够多的后续轮次让它离开挂载范围。
+  await fixture.openApp(page)
+  const text = Array.from(
+    { length: 8 },
+    (_, index) => `保留展开第${index + 1}行`
+  ).join("\n")
+  await startConversation(page, text)
+  const conversationID = page.url().split("/c/")[1]
+  const messages = getMessages(page)
+  const scroller = getMessageScroller(page)
+  const item = messages
+    .locator("[data-item-key]")
+    .filter({ has: page.getByText(text, { exact: true }) })
+  await item.getByRole("button", { name: "展开消息", exact: true }).click()
+  await expect(item.locator("p")).toHaveCSS("height", "192px")
+  const mountedText = await item.locator("p").elementHandle()
+  for (let index = 0; index < 24; index++)
+    await fixture.submitInput(conversationID, [
+      { kind: "text", text: { text: `后续第${index + 1}条` } },
+    ])
+  await expect(async () => {
+    await scroller.evaluate((node) => {
+      node.scrollTop = node.scrollHeight
+    })
+    await expect(messages.getByText("后续第24条", { exact: true })).toBeVisible(
+      { timeout: 1000 }
+    )
+  }).toPass()
+  await expect(item).toHaveCount(0)
+  expect(await mountedText!.evaluate((node) => node.isConnected)).toBe(false)
+  expect(await messages.locator("[data-turn-id]").count()).toBeLessThan(25)
+
+  // 2. 滚回后立即恢复已展开高度，不重播折叠动画；短消息没有多余入口。
+  await expect(async () => {
+    await scroller.evaluate((node) => {
+      node.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }))
+      node.scrollTop = 0
+    })
+    await expect(item).toBeVisible({ timeout: 1000 })
+  }).toPass()
+  await expect(
+    item.getByRole("button", { name: "收起消息", exact: true })
+  ).toBeVisible()
+  await expect(item.locator("p")).toHaveCSS("height", "192px")
+  await item.getByRole("button", { name: "收起消息", exact: true }).click()
+  await expect(item.locator("p")).toHaveCSS("height", "96px")
+  expect(await messages.locator("[data-turn-id]").count()).toBeLessThan(25)
+})
+
+for (const scenario of [
+  { width: 1280, colorScheme: "light" },
+  { width: 390, colorScheme: "dark" },
+] as const) {
   test(`each_turn_last_text_has_copy_${scenario.width}`, async ({
     page,
     fixture,
@@ -1715,8 +1951,17 @@ for (const scenario of [
       name: "复制结果",
       exact: true,
     })
+    // 挂着的每一轮各有几个复制入口，按轮的顺序用逗号连起来；消息区只挂视口附近的几轮
+    const getCopyCountsByTurn = async () => {
+      const turns = await messages.locator("[data-turn-id]").all()
+      const counts = await Promise.all(
+        turns.map((turn) =>
+          turn.getByRole("button", { name: "复制结果", exact: true }).count()
+        )
+      )
+      return counts.join(",")
+    }
     await expect.poll(() => copies.count()).toBeGreaterThan(1)
-    const initialCopies = await copies.count()
     const oldReplyKeys: string[] = []
     for (const round of [1, 2]) {
       const reply = `历史正文第 ${round} 条`
@@ -1747,7 +1992,7 @@ for (const scenario of [
         await expect(
           runningTurn.getByRole("button", { name: "复制结果", exact: true })
         ).toHaveCount(0)
-        await expect(copies).toHaveCount(initialCopies + round - 1)
+        await expect.poll(getCopyCountsByTurn).toMatch(/^(1,)+0$/)
         await gate.release()
         const replyItem = messages.locator("[data-item-key]").filter({
           has: page.getByText(reply, { exact: true }),
@@ -1755,7 +2000,7 @@ for (const scenario of [
         await expect(
           replyItem.getByRole("button", { name: "复制结果", exact: true })
         ).toBeVisible()
-        await expect(copies).toHaveCount(initialCopies + round)
+        await expect.poll(getCopyCountsByTurn).toMatch(/^1(,1)+$/)
         await expect(
           messages
             .locator("[data-turn-id]")
@@ -1791,7 +2036,7 @@ for (const scenario of [
     await expect(
       page.getByRole("button", { name: "中断", exact: true })
     ).toBeVisible()
-    await expect(copies).toHaveCount(initialCopies + 2)
+    await expect.poll(getCopyCountsByTurn).toMatch(/^(1,)+0$/)
     const latestInput = messages.locator("[data-item-key]").filter({
       has: page.getByText("最新流式输入", { exact: true }),
     })
@@ -1801,7 +2046,9 @@ for (const scenario of [
     await expect
       .poll(() => page.evaluate(() => navigator.clipboard.readText()))
       .toBe("最新流式输入")
-    await expect(copies).toHaveCount(initialCopies + 3, { timeout: 15_000 })
+    await expect
+      .poll(getCopyCountsByTurn, { timeout: 15_000 })
+      .toMatch(/^1(,1)+$/)
     const latestReply = messages.locator("[data-item-key]").filter({
       has: page.getByText("保留 Markdown", { exact: true }),
     })
@@ -1830,25 +2077,32 @@ for (const scenario of [
         .locator(`[data-item-key="${latestReplyKey}"]`)
         .getByRole("button", { name: "复制结果", exact: true })
     ).toHaveCount(1)
-    const earliest = await messages
-      .getByText(/^长对话第 \d+ 轮$/)
-      .first()
-      .innerText()
+    const scroller = getMessageScroller(page)
+    await scroller.evaluate((node) => {
+      node.scrollTop = 0
+    })
+    const { text: earliest } = await getFirstVisibleTurn(page)
     const earlierTurn = Number(earliest.match(/\d+/)![0]) - 1
     expect(earlierTurn).toBeGreaterThan(0)
-    const beforeEarlierCopies = await copies.count()
-    const scroller = getMessageScroller(page)
     await expect(async () => {
       await scroller.evaluate((node) => {
         node.scrollTop = 0
       })
       await scroller.hover()
       await page.mouse.wheel(0, -600)
-      await expect(
-        messages.getByText(`长对话第 ${earlierTurn} 轮`, { exact: true })
-      ).toBeAttached({ timeout: 1000 })
+      expect(await getSmallestMountedTurn(messages)).toBeLessThanOrEqual(
+        earlierTurn
+      )
     }).toPass({ timeout: 20_000 })
-    await expect.poll(() => copies.count()).toBeGreaterThan(beforeEarlierCopies)
+    const loadedTurn = await getSmallestMountedTurn(messages)
+    await expect(
+      messages
+        .locator("[data-turn-id]")
+        .filter({
+          has: page.getByText(`长对话第 ${loadedTurn} 轮`, { exact: true }),
+        })
+        .getByRole("button", { name: "复制结果", exact: true })
+    ).toHaveCount(1)
     for (const key of oldReplyKeys)
       await expect(
         messages

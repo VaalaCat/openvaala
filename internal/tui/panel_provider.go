@@ -57,8 +57,8 @@ type providerPanel struct {
 	manualModelIDs string
 	// modelsFailure 是拉不到模型的原因。
 	modelsFailure string
-	// limitEditor 非 nil 时处于第 3 步的第二层，编辑一个模型的上下文窗口和输出上限。
-	limitEditor *providerLimitEditor
+	// modelEditor 非 nil 时处于第 3 步的第二层，编辑一个模型的描述、上下文窗口和输出上限。
+	modelEditor *providerModelEditor
 
 	// defaultModelChoices 是第 4 步或第一层「默认模型」的选项，零值表示「保持当前默认模型」。
 	defaultModelChoices []defs.ModelRef
@@ -190,9 +190,9 @@ func (p *providerPanel) handleResult(m *tuiModel, msg panelResultMsg) tea.Cmd {
 
 // render 显示模型服务面板的当前步骤。
 func (p *providerPanel) render(m *tuiModel, width, maxHeight int) []string {
-	// 1. 模型上限编辑打开时显示上限表单。
-	if p.step == providerStepModels && p.limitEditor != nil {
-		return p.limitEditor.render(m, width, maxHeight)
+	// 1. 模型编辑打开时显示设置表单。
+	if p.step == providerStepModels && p.modelEditor != nil {
+		return p.modelEditor.render(m, width, maxHeight)
 	}
 	// 2. 按当前步骤读取正文和按键提示，再添加标题及边框。
 	var lines []string
@@ -318,7 +318,7 @@ func (p *providerPanel) handleDeleted(m *tuiModel, deleted providerDeleted, err 
 	}
 	// 2. 提示已删除（有正在执行的对话时附上数量），同时重新读取模型目录和服务列表。
 	p.loadingText = providerListLoadingText
-	notice := "已删除 " + deleted.providerID + formatBusyConversations(deleted.result.BusyConversationIDs)
+	notice := "已删除 " + deleted.providerID + formatPendingConversations(deleted.result.PendingConversationIDs)
 	return tea.Batch(m.loadModelList(), m.fetchForPanel(p.getProvidersFetch(m)), m.showNotice(notice, false, noticeDuration))
 }
 
@@ -407,7 +407,7 @@ func (p *providerPanel) handleDefaultModelSaved(m *tuiModel, saved defaultModelS
 	// 2. 成功时回到列表页，更新默认模型和可用目录，显示忙碌对话与 Agent 指定模型提示。
 	p.goToStep(providerStepList)
 	p.defaultModel = saved.ref
-	notice := "默认模型：" + saved.ref.String() + formatBusyConversations(saved.result.BusyConversationIDs)
+	notice := "默认模型：" + saved.ref.String() + formatPendingConversations(saved.result.PendingConversationIDs)
 	if saved.modelList != nil {
 		m.applyModelList(*saved.modelList, m.opt.AgentName)
 		notice += formatAgentModelNotice(m.agentDefaultModel, saved.ref)
@@ -600,10 +600,10 @@ func (p *providerPanel) submitForm(m *tuiModel) tea.Cmd {
 		p.failure = "已有 " + p.form.id + "，请换一个 ID，或在列表里编辑它"
 		return nil
 	}
-	// 2. 切到模型页，清除模型选择和上限编辑记录，显示加载提示。
+	// 2. 切到模型页，清除模型选择和设置编辑记录，显示加载提示。
 	p.goToStep(providerStepModels)
 	p.modelOptions, p.modelFilter, p.modelList = nil, "", listCursor{}
-	p.isManualModelInput, p.manualModelIDs, p.modelsFailure, p.limitEditor = false, "", "", nil
+	p.isManualModelInput, p.manualModelIDs, p.modelsFailure, p.modelEditor = false, "", "", nil
 	p.loadingText = providerModelsLoadingText
 	client, catalogProviderID, provider := m.opt.Client, p.catalogProviderID, p.getFormProvider()
 	// 3. 目录服务读取目录模型，自定义或已有 Provider 查询上游模型。
@@ -691,16 +691,16 @@ func (p *providerPanel) handleModelsLoaded(loaded providerModelsLoaded, err erro
 	p.modelOptions = options
 }
 
-// handleModelsKey 处理模型勾选、过滤、上限编辑和前进。
+// handleModelsKey 处理模型勾选、过滤、设置编辑和前进。
 func (p *providerPanel) handleModelsKey(m *tuiModel, msg tea.KeyPressMsg) (panelKeyResult, tea.Cmd) {
-	// 1. 上限编辑或手动输入打开时交给对应按键处理。
-	if p.limitEditor != nil {
-		return p.handleLimitEditorKey(msg)
+	// 1. 模型编辑或手动输入打开时交给对应按键处理。
+	if p.modelEditor != nil {
+		return p.handleModelEditorKey(msg)
 	}
 	if p.isManualModelInput {
 		return p.handleManualModelsKey(m, msg)
 	}
-	// 2. 读取过滤列表并修正位置；Esc 回表单，Enter 在没有请求进行时提交，Space 勾选，Ctrl+E 编辑上限，文字和退格修改过滤词。
+	// 2. 读取过滤列表并修正位置；Esc 回表单，Enter 在没有请求进行时提交，Space 勾选，Ctrl+E 编辑模型设置，文字和退格修改过滤词。
 	filtered, key := p.getFilteredModels(), msg.String()
 	p.modelList.clamp(len(filtered))
 	switch {
@@ -720,7 +720,7 @@ func (p *providerPanel) handleModelsKey(m *tuiModel, msg tea.KeyPressMsg) (panel
 		return panelKeyHandled, nil
 	case key == "ctrl+e":
 		if len(filtered) > 0 {
-			p.limitEditor = newProviderLimitEditor(filtered[p.modelList.selected])
+			p.modelEditor = newProviderModelEditor(filtered[p.modelList.selected])
 		}
 		return panelKeyHandled, nil
 	case key == "backspace":
@@ -890,7 +890,7 @@ func (p *providerPanel) renderModels(m *tuiModel, width, maxHeight int) ([]strin
 		action: "勾选",
 	}, {
 		key:    "ctrl+e",
-		action: "改窗口",
+		action: "改设置",
 	}, {
 		key:    "enter",
 		action: "下一步",
@@ -901,42 +901,45 @@ func (p *providerPanel) renderModels(m *tuiModel, width, maxHeight int) ([]strin
 	return lines, hints
 }
 
-// ── 第 3 步第二层：上限 ──
+// ── 第 3 步第二层：模型设置 ──
 
-// providerLimitEditor 保存一个模型的窗口、输出上限和输入校验错误；留空表示使用 models.defaults。
-type providerLimitEditor struct {
+// providerModelEditor 保存一个模型的描述、窗口、输出上限和输入校验错误。
+type providerModelEditor struct {
 	option          *providerModelOption
 	contextWindow   string
 	maxOutputTokens string
-	// isEditingOutput 焦点是否在输出上限栏？否则在上下文窗口栏。
-	isEditingOutput bool
+	description     string
+	focusedField    int
 	failure         string
 }
 
-// newProviderLimitEditor 创建预填模型窗口和输出上限的编辑页。
-func newProviderLimitEditor(option *providerModelOption) *providerLimitEditor {
+// newProviderModelEditor 创建预填模型描述、窗口和输出上限的编辑页。
+func newProviderModelEditor(option *providerModelOption) *providerModelEditor {
 	// 1. 保存模型选项，有配置时把正数上限转为输入文字。
-	editor := &providerLimitEditor{option: option}
+	editor := &providerModelEditor{option: option}
 	if option.config != nil {
 		editor.contextWindow = formatPositiveInt(option.config.ContextWindow)
 		editor.maxOutputTokens = formatPositiveInt(option.config.MaxOutputTokens)
+		editor.description = option.config.Description
 	}
 	return editor
 }
 
-// handleLimitEditorKey 处理模型上限编辑的栏位、输入和确认。
-func (p *providerPanel) handleLimitEditorKey(msg tea.KeyPressMsg) (panelKeyResult, tea.Cmd) {
+// handleModelEditorKey 处理模型设置编辑的栏位、输入和确认。
+func (p *providerPanel) handleModelEditorKey(msg tea.KeyPressMsg) (panelKeyResult, tea.Cmd) {
 	// 1. Tab 或上下键换栏，Enter 校验通过后写回并关闭，Esc 放弃，文字和退格修改所选栏。
-	editor := p.limitEditor
+	editor := p.modelEditor
 	switch key := msg.String(); {
 	case key == "esc":
-		p.limitEditor = nil
+		p.modelEditor = nil
 	case key == "enter":
 		if editor.apply() {
-			p.limitEditor = nil
+			p.modelEditor = nil
 		}
-	case key == "tab" || key == "shift+tab" || key == "up" || key == "down":
-		editor.isEditingOutput = !editor.isEditingOutput
+	case key == "tab" || key == "down":
+		editor.focusedField = (editor.focusedField + 1) % 3
+	case key == "shift+tab" || key == "up":
+		editor.focusedField = (editor.focusedField + 2) % 3
 	case key == "backspace":
 		p.trimText()
 	case msg.Text != "":
@@ -947,8 +950,8 @@ func (p *providerPanel) handleLimitEditorKey(msg tea.KeyPressMsg) (panelKeyResul
 	return panelKeyHandled, nil
 }
 
-// apply 校验两个上限并写回模型配置，返回是否写入了。
-func (e *providerLimitEditor) apply() bool {
+// apply 校验两个上限，连同描述写回模型配置，返回是否写入了。
+func (e *providerModelEditor) apply() bool {
 	// 1. 解析两个上限；任一个既不是正整数也不是空值时记录错误，不写入。
 	contextWindow, isContextWindowValid := parsePositiveInt(e.contextWindow)
 	maxOutputTokens, isMaxOutputValid := parsePositiveInt(e.maxOutputTokens)
@@ -956,28 +959,32 @@ func (e *providerLimitEditor) apply() bool {
 		e.failure = "只能填正整数，留空用 models.defaults"
 		return false
 	}
-	// 2. 复制已有配置并替换两个上限，保存副本且勾选模型。
+	// 2. 复制已有配置并替换两个上限和描述，保存副本且勾选模型。
 	var config defs.ProviderModelConfig
 	if e.option.config != nil {
 		config = *e.option.config
 	}
 	config.ContextWindow, config.MaxOutputTokens = contextWindow, maxOutputTokens
+	config.Description = e.description
 	e.option.config, e.option.isChecked = &config, true
 	return true
 }
 
-// getFocusedText 返回指向正在编辑那一栏上限文字的指针。
-func (e *providerLimitEditor) getFocusedText() *string {
-	// 1. 按编辑输出标记返回输出上限或窗口栏。
-	if e.isEditingOutput {
+// getFocusedText 返回指向正在编辑那一栏文字的指针。
+func (e *providerModelEditor) getFocusedText() *string {
+	// 1. 按焦点位置返回窗口、输出上限或描述栏。
+	switch e.focusedField {
+	case 0:
+		return &e.contextWindow
+	case 1:
 		return &e.maxOutputTokens
 	}
-	return &e.contextWindow
+	return &e.description
 }
 
-// render 生成窗口和输出上限编辑表单。
-func (e *providerLimitEditor) render(m *tuiModel, width, maxHeight int) []string {
-	// 1. 读取两栏的文字与焦点，生成表单行。
+// render 生成窗口、输出上限和描述编辑表单。
+func (e *providerModelEditor) render(m *tuiModel, width, maxHeight int) []string {
+	// 1. 读取各栏的文字与焦点，生成表单行。
 	fields := []struct {
 		label     string
 		value     string
@@ -986,12 +993,17 @@ func (e *providerLimitEditor) render(m *tuiModel, width, maxHeight int) []string
 		{
 			label:     "上下文窗口",
 			value:     e.contextWindow,
-			isFocused: !e.isEditingOutput,
+			isFocused: e.focusedField == 0,
 		},
 		{
 			label:     "输出上限",
 			value:     e.maxOutputTokens,
-			isFocused: e.isEditingOutput,
+			isFocused: e.focusedField == 1,
+		},
+		{
+			label:     "模型描述",
+			value:     e.description,
+			isFocused: e.focusedField == 2,
 		},
 	}
 	var lines []string
@@ -999,7 +1011,7 @@ func (e *providerLimitEditor) render(m *tuiModel, width, maxHeight int) []string
 		lines = append(lines, formatProviderFormRow(m, field.label, field.value, field.isFocused, true))
 	}
 	// 2. 追加正整数说明、校验失败原因和操作提示，再添加边框。
-	lines = append(lines, m.styles.faint.Render("只收正整数，留空用 models.defaults"))
+	lines = append(lines, m.styles.faint.Render("窗口和输出只收正整数，留空用 models.defaults；描述可留空"))
 	if e.failure != "" {
 		lines = append(lines, m.styles.failure.Render("✗ "+e.failure))
 	}
@@ -1013,7 +1025,7 @@ func (e *providerLimitEditor) render(m *tuiModel, width, maxHeight int) []string
 		key:    "esc",
 		action: "取消",
 	}}
-	return renderPanelFrame("模型上限 · "+e.option.id, hints, lines, width, maxHeight, m.styles)
+	return renderPanelFrame("模型设置 · "+e.option.id, hints, lines, width, maxHeight, m.styles)
 }
 
 // ── 第 4 步：选默认模型（也用于第一层换默认模型） ──
@@ -1077,7 +1089,7 @@ func (p *providerPanel) handleSaved(m *tuiModel, saved providerSaved, err error)
 	}
 	// 2. 成功后关闭面板，应用新目录并显示保存、忙碌对话和 Agent 模型提示。
 	m.closePanel()
-	notice := "已保存 " + saved.providerID + formatBusyConversations(saved.result.BusyConversationIDs)
+	notice := "已保存 " + saved.providerID + formatPendingConversations(saved.result.PendingConversationIDs)
 	if saved.modelList != nil {
 		m.applyModelList(*saved.modelList, m.opt.AgentName)
 		notice += formatAgentModelNotice(m.agentDefaultModel, saved.defaultModel)
@@ -1132,7 +1144,7 @@ func (p *providerPanel) close(m *tuiModel) (panelKeyResult, tea.Cmd) {
 
 // appendText 向当前步骤正在编辑的栏位追加文字。
 func (p *providerPanel) appendText(text string) {
-	// 1. 按目录、表单、模型上限、手动 ID 或过滤词分派文字，过滤变化时重置列表位置。
+	// 1. 按目录、表单、模型设置、手动 ID 或过滤词分派文字，过滤变化时重置列表位置。
 	switch {
 	case p.step == providerStepCatalog:
 		p.catalogFilter, p.catalogList = p.catalogFilter+text, listCursor{}
@@ -1141,8 +1153,8 @@ func (p *providerPanel) appendText(text string) {
 			*focused += text
 		}
 	case p.step != providerStepModels:
-	case p.limitEditor != nil:
-		*p.limitEditor.getFocusedText() += text
+	case p.modelEditor != nil:
+		*p.modelEditor.getFocusedText() += text
 	case p.isManualModelInput:
 		p.manualModelIDs += text
 	default:
@@ -1160,8 +1172,8 @@ func (p *providerPanel) trimText() {
 	case p.step == providerStepForm:
 		text = p.form.getFocusedText()
 	case p.step != providerStepModels:
-	case p.limitEditor != nil:
-		text = p.limitEditor.getFocusedText()
+	case p.modelEditor != nil:
+		text = p.modelEditor.getFocusedText()
 	case p.isManualModelInput:
 		text = &p.manualModelIDs
 	default:

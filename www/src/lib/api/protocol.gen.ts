@@ -1064,6 +1064,10 @@ export interface ModelDefaults {
 export interface ModelDefinition {
     ref: ModelRef;
     display_name: string;
+    /**
+     * Description 是给 Agent 选模型时看的用途说明。
+     */
+    description?: string;
     context_window: number;
     max_output_tokens: number;
     thinking_enabled: boolean;
@@ -1250,7 +1254,7 @@ export interface ProviderModelCapabilities {
 
 // From defs/provider.go
 /**
- * ProviderModelConfig 将本地模型别名映射为上游模型名，并给出请求参数；省略的字段取 config.yaml 的 models.defaults。
+ * ProviderModelConfig 将本地模型别名映射为上游模型名，给出用途说明和请求参数；省略的请求参数取 config.yaml 的 models.defaults。
  */
 export interface ProviderModelConfig {
     /**
@@ -1262,6 +1266,10 @@ export interface ProviderModelConfig {
      * DisplayName 省略时用模型 id。
      */
     display_name?: string;
+    /**
+     * Description 是给 Agent 选模型时看的用途说明。
+     */
+    description?: string;
     context_window?: number;
     max_output_tokens?: number;
     thinking?: boolean;
@@ -1628,13 +1636,13 @@ export interface SetDefaultModelParams {
 
 // From runtime/types.go
 /**
- * SetDefinitionsResult 是 SetDefinitions 返回的结果，列出这次没换上新定义的对话。
+ * SetDefinitionsResult 是 SetDefinitions 返回的结果，列出已接收新定义、等待空闲后应用的对话。
  */
 export interface SetDefinitionsResult {
     /**
-     * BusyConversationIDs 是正在执行 Turn 或有后台命令没结束、这次没有换上新定义的对话；它们空闲后再 reload 才用上新定义。
+     * PendingConversationIDs 是已准备新配置、等待全部 Session 空闲后自动应用的对话。
      */
-    busy_conversation_ids: ConversationID[];
+    pending_conversation_ids: ConversationID[];
 }
 
 // From runtimeprotocol/types.go
@@ -1983,7 +1991,7 @@ export interface ToolCall {
     /**
      * ProviderData 是模型厂商附在这次调用上的签名等数据；下一次请求原样还给 llmkit，否则 Gemini 等会拒绝或丢失签名。
      */
-    // external type "github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.ToolCallProviderData", to include this type the package must be explicitly included in the parsing
+    // external type "github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.ProviderData", to include this type the package must be explicitly included in the parsing
     provider_data?: unknown;
 }
 

@@ -573,9 +573,9 @@ func TestReloadCommand(t *testing.T) {
 			wantNotice: "已重新加载",
 		},
 		{
-			name:       "busy_conversations_keep_the_old_configuration",
-			result:     runtime.SetDefinitionsResult{BusyConversationIDs: []defs.ConversationID{"c1", "c2"}},
-			wantNotice: "已重新加载，2 个对话正在执行，下次 reload 时更新",
+			name:       "pending_conversations_apply_when_idle",
+			result:     runtime.SetDefinitionsResult{PendingConversationIDs: []defs.ConversationID{"c1", "c2"}},
+			wantNotice: "已重新加载，2 个对话将在空闲后自动应用",
 		},
 		{
 			// serve 的 JSON-RPC 错误只显示服务端原文，不带方法名和错误码。

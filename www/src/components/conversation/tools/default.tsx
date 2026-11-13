@@ -14,7 +14,10 @@ export function DefaultTool(props: ToolRendererProps) {
     <ToolCard {...props} argumentSummary={getFirstStringField(value)}>
       {result && result.content !== undefined && result.content !== null && (
         <DetailSection label={t("conversation.tool.result")}>
-          <JsonView value={result.content} />
+          <JsonView
+            value={result.content}
+            viewStateKey={props.viewKey + ":result"}
+          />
         </DetailSection>
       )}
     </ToolCard>

@@ -34,6 +34,7 @@ models:
       input: [text, image]
   mini:
     upstream_model: gpt-5-mini     # 发给 Provider 的模型名
+    description: 响应快、成本低，适合检索、信息提取和简单修改。
 ```
 
 支持多种协议的 Provider 可以混着用。下面这个网关同时提供 OpenAI 风格的模型和 Claude 模型，Claude 的接口在另一个主机上：
@@ -107,6 +108,7 @@ headers:
 - `upstream_model`：发给 Provider 的模型名。默认是模型 id。
 - `protocol`：只为这个模型覆盖 Provider 的协议。
 - `display_name`：模型选择里显示的名字。默认是模型 id。
+- `description`：给 Agent 选子 Agent 模型时看的用途说明，会附在 `spawn_agent` 的模型清单里。可以写擅长的任务、速度和成本取舍；不写时不显示说明，也不从 `models.defaults` 继承。不改变现有的模型继承和默认选择规则。
 - `context_window`：模型的上下文窗口，单位 token。自动压缩以它为准，请填真实的值。
 - `max_output_tokens`：每次请求都会带上的输出上限。如果模型的上限比默认的 32000 小，在这里设置。
 - `thinking`：是否要求模型先思考或推理再回答。默认 `true`。

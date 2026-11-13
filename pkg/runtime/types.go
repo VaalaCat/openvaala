@@ -675,10 +675,10 @@ type AgentInfo struct {
 	DefaultModel defs.ModelRef `json:"default_model,omitzero"`
 }
 
-// SetDefinitionsResult 是 SetDefinitions 返回的结果，列出这次没换上新定义的对话。
+// SetDefinitionsResult 是 SetDefinitions 返回的结果，列出已接收新定义、等待空闲后应用的对话。
 type SetDefinitionsResult struct {
-	// BusyConversationIDs 是正在执行 Turn 或有后台命令没结束、这次没有换上新定义的对话；它们空闲后再 reload 才用上新定义。
-	BusyConversationIDs []defs.ConversationID `json:"busy_conversation_ids"`
+	// PendingConversationIDs 是已准备新配置、等待全部 Session 空闲后自动应用的对话。
+	PendingConversationIDs []defs.ConversationID `json:"pending_conversation_ids"`
 }
 
 // ── runtimeConversation 事件循环请求 ──

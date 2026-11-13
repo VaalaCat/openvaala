@@ -160,6 +160,8 @@
       "copy": "复制消息",
       "from": "来自",
       "context": "附带材料",
+      "expand": "展开消息",
+      "collapse": "收起消息",
       "subagent": {
         "failed": "失败",
         "interrupted": "已中断",
@@ -545,7 +547,7 @@
       "action": "重新加载配置",
       "done": "已重新加载配置"
     },
-    "busyConversations_other": "{{count}} 个对话正在执行，没换上新配置；等它们空闲后再重新加载配置才会生效",
+    "pendingConversations_other": "{{count}} 个对话将在空闲后自动应用新配置",
     "providers": {
       "add": "新增模型服务",
       "empty": "还没有模型服务",
@@ -617,6 +619,7 @@
       "alias": "本地别名",
       "upstreamID": "上游模型 ID",
       "displayName": "显示名",
+      "description": "模型描述",
       "capacity": "容量",
       "maxOutputTokens": "最大输出 Token",
       "reasoning": "推理",

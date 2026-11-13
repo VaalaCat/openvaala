@@ -107,7 +107,7 @@ type Runtime interface {
 	SubscribeTerminals(ctx context.Context) (subscription *TerminalsSubscription, err error)
 	// GetWorkspaceDirectories 列出指定 Executor 上一个目录的普通直接子目录，请求结束后关闭临时工作区。
 	GetWorkspaceDirectories(ctx context.Context, request *GetWorkspaceDirectoriesRequest) (directories *conversation.WorkspaceDirectories, err error)
-	// SetDefinitions 替换整份定义，并行更新空闲对话；等待全部更新结束，结果列出未更新的忙碌对话，单个更新失败只记日志并保留原配置。
+	// SetDefinitions 替换整份定义，并行装配已打开对话；等待接收完成，结果列出等待空闲后自动应用的对话，单个装配失败只记日志。
 	SetDefinitions(ctx context.Context, request *Definitions) (SetDefinitionsResult, error)
 	// GetSkills 返回对话根 Agent 或草稿 Agent 的可用 Skill 目录；草稿按 Executor 设置扫描项目目录和主目录。
 	GetSkills(ctx context.Context, request *GetSkillsRequest) ([]skill.SkillInfo, error)
@@ -1260,7 +1260,7 @@ func (r *runtimeImpl) GetWorkspaceDirectories(ctx context.Context, request *GetW
 	return conversation.GetWorkspaceDirectories(ctx, executors, request.ExecutorID, request.Directory, request.BaseDirectory)
 }
 
-// SetDefinitions 替换 Runtime 定义，并行重新装配空闲对话。
+// SetDefinitions 替换 Runtime 定义，并行装配已打开对话，返回等待空闲后应用的对话。
 func (r *runtimeImpl) SetDefinitions(ctx context.Context, request *Definitions) (SetDefinitionsResult, error) {
 	// 1. 检查至少有一个 Agent，整理新定义。
 	if len(request.Agents) == 0 {
@@ -1279,31 +1279,36 @@ func (r *runtimeImpl) SetDefinitions(ctx context.Context, request *Definitions) 
 	case <-ctx.Done():
 		return SetDefinitionsResult{}, ctx.Err()
 	}
-	// 3. 按对话 ID 排序；跳过已退出对话，有 Turn 或后台命令在跑的对话记入结果，其余并行更新，失败只记日志。
+	// 3. 按对话 ID 排序；跳过已退出对话，并行装配并接收新配置，失败只记日志。
 	runningConversations := <-change.reply
 	slices.SortFunc(runningConversations, func(a, b *runtimeConversation) int {
 		return cmp.Compare(a.conversation.GetID(), b.conversation.GetID())
 	})
 	var result SetDefinitionsResult
+	pending := make([]bool, len(runningConversations))
 	var tasks sync.WaitGroup
-	for _, running := range runningConversations {
+	for index, running := range runningConversations {
 		if running.isStopped() {
 			continue
 		}
 		conversationID := running.conversation.GetID()
-		if running.isBusy(ctx) {
-			result.BusyConversationIDs = append(result.BusyConversationIDs, conversationID)
-			continue
-		}
 		tasks.Go(func() {
-			if err := running.conversation.SetDefinitions(ctx, definitions.conversationDefinitions); err != nil {
+			isPending, err := running.conversation.SetDefinitions(ctx, definitions.conversationDefinitions)
+			if err != nil {
 				logCtx := defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: conversationID})
 				telemetry.GetLogger(logCtx).Warn("set conversation definitions failed", "error", err)
+				return
 			}
+			pending[index] = isPending
 		})
 	}
-	// 4. 等待所有更新任务结束，返回忙碌对话列表。
+	// 4. 等待全部接收完成，按对话 ID 收集等待应用的对话。
 	tasks.Wait()
+	for index, isPending := range pending {
+		if isPending {
+			result.PendingConversationIDs = append(result.PendingConversationIDs, runningConversations[index].conversation.GetID())
+		}
+	}
 	return result, nil
 }
 

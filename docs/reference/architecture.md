@@ -51,7 +51,7 @@ Runtime              configuration, open conversations
 
 From the outside in:
 
-- **Runtime** — the root object in the runtime server. It holds the current configuration (agents, models, executors, MCP servers, hooks, skills), the table of open conversations, and routes each request to the right conversation. Reloading configuration swaps the definitions here and hands them to idle conversations.
+- **Runtime** — the root object in the runtime server. It holds the current configuration (agents, models, executors, MCP servers, hooks, skills), the table of open conversations, and routes each request to the right conversation. Reloading configuration swaps the definitions here and hands them to open conversations; busy conversations hold a prepared configuration and apply it automatically when idle.
 - **Conversation** — one task you are working on. It owns its work location (executors and working directories), the connections to those executors and MCP servers, the available skills, and all the agents taking part: one root session and any number of subagent sessions.
 - **Session** — one agent's line of work inside a conversation: which agent and model, and its history. A session runs one turn at a time and owns the queue of inputs waiting for it, which is where steering and queuing are decided. Subagents are sessions with a parent.
 - **Turn** — one run of the agent loop, started by an input. It loads the history, runs the agent, saves what comes out, and ends as completed, failed or interrupted, with its token usage.
@@ -75,7 +75,7 @@ ExecutorProvider   which executors this conversation may use
 - **`Executor`** describes one place (its ID, kind, description and default directory) and opens workspaces on it. Adding a new kind of executor means writing one type; the conversation does not need to know about it.
 - **`Workspace`** is what the tools actually talk to. A conversation opens its own workspace on each executor it may use, rooted at that executor's working directory, and closes them when the conversation stops, so SSH connections and MCP servers do not outlive it.
 
-Reloading configuration swaps the provider along with the rest of the definitions: idle conversations pick up the new list, and new conversations use it from the start.
+Reloading configuration swaps the provider along with the rest of the definitions: idle conversations pick up the new list, busy conversations prepare it and switch automatically when idle, and new conversations use it from the start.
 
 A saved conversation that nobody is viewing and that has no running turn or background command is stopped after `server.conversation_idle_timeout` (default 30 minutes), which releases its workspaces. Opening it again reconnects them. See [configuration overview](../configuration/overview.md).
 

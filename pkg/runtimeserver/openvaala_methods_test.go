@@ -1589,8 +1589,8 @@ func TestOpenVaalaConfigurationMethods(t *testing.T) {
 		name   string
 		method string
 		params any
-		// busyConversationIDs 是假 Runtime 的 SetDefinitions 返回的忙对话。
-		busyConversationIDs []defs.ConversationID
+		// pendingConversationIDs 是假 Runtime 的 SetDefinitions 返回的忙对话。
+		pendingConversationIDs []defs.ConversationID
 		// defaultModel 是 Configuration.ListProviders 返回的默认模型。
 		defaultModel defs.ModelRef
 		// wantCalls 是 Configuration、ModelCatalog 和 Runtime.SetDefinitions 按顺序收到的调用。
@@ -1615,15 +1615,15 @@ func TestOpenVaalaConfigurationMethods(t *testing.T) {
 			wantResult: `{"providers":[` + providerJSON + `],"default_model":"","defaults":` + defaultsJSON + `}`,
 		},
 		{
-			name:                "provider_set",
-			method:              "provider/set",
-			params:              map[string]any{"provider": json.RawMessage(providerJSON)},
-			busyConversationIDs: []defs.ConversationID{"busy-1", "busy-2"},
+			name:                   "provider_set",
+			method:                 "provider/set",
+			params:                 map[string]any{"provider": json.RawMessage(providerJSON)},
+			pendingConversationIDs: []defs.ConversationID{"busy-1", "busy-2"},
 			wantCalls: []testCall{{
 				method:   "SetProvider",
 				argument: testProviderWrite{provider: provider},
 			}, definitionsSet},
-			wantResult: `{"busy_conversation_ids":["busy-1","busy-2"]}`,
+			wantResult: `{"pending_conversation_ids":["busy-1","busy-2"]}`,
 		},
 		{
 			// 带 default_model 时 Provider 和默认模型一起交给 Configuration，只替换一次 Runtime。
@@ -1640,24 +1640,24 @@ func TestOpenVaalaConfigurationMethods(t *testing.T) {
 					},
 				},
 			}, definitionsSet},
-			wantResult: `{"busy_conversation_ids":[]}`,
+			wantResult: `{"pending_conversation_ids":[]}`,
 		},
 		{
-			name:                "provider_delete",
-			method:              "provider/delete",
-			params:              map[string]any{"provider_id": "gw"},
-			busyConversationIDs: []defs.ConversationID{"busy-1"},
+			name:                   "provider_delete",
+			method:                 "provider/delete",
+			params:                 map[string]any{"provider_id": "gw"},
+			pendingConversationIDs: []defs.ConversationID{"busy-1"},
 			wantCalls: []testCall{{
 				method:   "DeleteProvider",
 				argument: "gw",
 			}, definitionsSet},
-			wantResult: `{"busy_conversation_ids":["busy-1"]}`,
+			wantResult: `{"pending_conversation_ids":["busy-1"]}`,
 		},
 		{
-			name:                "set_default_model",
-			method:              "config/setDefaultModel",
-			params:              map[string]any{"model": "gw/m1"},
-			busyConversationIDs: []defs.ConversationID{"busy-1"},
+			name:                   "set_default_model",
+			method:                 "config/setDefaultModel",
+			params:                 map[string]any{"model": "gw/m1"},
+			pendingConversationIDs: []defs.ConversationID{"busy-1"},
 			wantCalls: []testCall{{
 				method: "SetDefaultModel",
 				argument: defs.ModelRef{
@@ -1665,14 +1665,14 @@ func TestOpenVaalaConfigurationMethods(t *testing.T) {
 					ModelID:    "m1",
 				},
 			}, definitionsSet},
-			wantResult: `{"busy_conversation_ids":["busy-1"]}`,
+			wantResult: `{"pending_conversation_ids":["busy-1"]}`,
 		},
 		{
 			// 没有忙的对话时输出 []，不是 null。
 			name:       "reload_without_busy_conversations",
 			method:     "config/reload",
 			wantCalls:  []testCall{{method: "Reload"}, definitionsSet},
-			wantResult: `{"busy_conversation_ids":[]}`,
+			wantResult: `{"pending_conversation_ids":[]}`,
 		},
 		{
 			name:       "catalog_providers_list",
@@ -1706,7 +1706,7 @@ func TestOpenVaalaConfigurationMethods(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			calls := make(testCalls, 16)
 			recording := &definitionsRecordingRuntime{
-				result: runtime.SetDefinitionsResult{BusyConversationIDs: tt.busyConversationIDs},
+				result: runtime.SetDefinitionsResult{PendingConversationIDs: tt.pendingConversationIDs},
 				calls:  calls,
 			}
 			h := startTestServer(t, func(opt *runtimeserver.RuntimeServerOpt) {

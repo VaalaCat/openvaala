@@ -38,6 +38,8 @@ func ParseModelRef(text string) (ModelRef, error) {
 type ModelDefinition struct {
 	Ref         ModelRef `json:"ref"`
 	DisplayName string   `json:"display_name"`
+	// Description 是给 Agent 选模型时看的用途说明。
+	Description string `json:"description,omitempty"`
 	// Target 是连接参数，含凭证，不序列化。
 	Target          *llmkit.Target `json:"-"`
 	ContextWindow   int            `json:"context_window"`

@@ -24,6 +24,9 @@ import (
 // codexItemTranslator 把一个 Session 日志里的 OpenVaala Item 翻成 Codex 的 ThreadItem。
 // 翻译只依赖 Item 和下面这些只读事实，不持有运行状态；实时流和历史翻页走同一套。
 type codexItemTranslator struct {
+	// conversationID 和 rootSessionID 将根 Session 的协作目标换成根 Thread ID；子 Thread ID 仍是子 Session ID。
+	conversationID defs.ConversationID
+	rootSessionID  defs.SessionID
 	// sessionID 是被翻译日志所属的 Session；spawn_agent 新建的子 Agent 路径接在它的 agent 路径后面。
 	sessionID defs.SessionID
 	// agentPaths 是对话里每个 Session 的 Codex agent 路径：根是 /root，子 Session 沿 ParentSessionID 链是 /root/<任务名>/<任务名>…。
@@ -35,9 +38,11 @@ type codexItemTranslator struct {
 }
 
 // newCodexItemTranslator 创建指定 Session 的 Item 翻译器。
-func newCodexItemTranslator(sessionID defs.SessionID, agentPaths map[defs.SessionID]string, workspaceDirectories map[string]string, defaultExecutorID string) *codexItemTranslator {
-	// 1. 保存 Session、Agent 路径、Executor 目录和默认 Executor。
+func newCodexItemTranslator(conversationID defs.ConversationID, rootSessionID, sessionID defs.SessionID, agentPaths map[defs.SessionID]string, workspaceDirectories map[string]string, defaultExecutorID string) *codexItemTranslator {
+	// 1. 保存对话与根 Session 身份、日志所属 Session、Agent 路径和 Executor 设置。
 	return &codexItemTranslator{
+		conversationID:       conversationID,
+		rootSessionID:        rootSessionID,
 		sessionID:            sessionID,
 		agentPaths:           agentPaths,
 		workspaceDirectories: workspaceDirectories,
@@ -184,7 +189,7 @@ func (t *codexItemTranslator) getMessageItem(item *defs.Item) codexThreadItem {
 			Content: content,
 		}
 	case message.SubagentNotification != nil:
-		return newCodexSubAgentActivity(item.ID, codexActivityCompleted, message.From.ID, t.getSessionAgentPath(defs.SessionID(message.From.ID)))
+		return t.newTargetedSubAgentActivity(item.ID, codexActivityCompleted, message.From.ID)
 	case message.From.Kind == defs.IdentityAgent && item.ModelCallID != "":
 		return &codexAgentMessageItem{
 			Type: codexItemAgentMessage,
@@ -412,11 +417,15 @@ func (t *codexItemTranslator) getSubAgentActivityItem(call, result *defs.Item, a
 
 // newTargetedSubAgentActivity 创建指向指定 Session 的子 Agent 活动。
 func (t *codexItemTranslator) newTargetedSubAgentActivity(id defs.ItemID, kind, targetSessionID string) *codexSubAgentActivityItem {
-	// 1. 缺少目标时返回 nil，否则填入目标 Session 的 Agent 路径。
+	// 1. 缺少目标时返回 nil，根 Session 目标换成对话 ID，子 Session 目标保留 Session ID。
 	if targetSessionID == "" {
 		return nil
 	}
-	return newCodexSubAgentActivity(id, kind, targetSessionID, t.getSessionAgentPath(defs.SessionID(targetSessionID)))
+	threadID := targetSessionID
+	if defs.SessionID(targetSessionID) == t.rootSessionID {
+		threadID = string(t.conversationID)
+	}
+	return newCodexSubAgentActivity(id, kind, threadID, t.getSessionAgentPath(defs.SessionID(targetSessionID)))
 }
 
 // getSessionAgentPath 读取 Session 的 Agent 路径。
@@ -756,7 +765,7 @@ func newCodexRecordTurn(record defs.Turn) codexTurn {
 }
 
 // newTurnItemTranslator 按 Turn 开始时记录的 Executor 设置创建 Item 翻译器。
-func newTurnItemTranslator(sessionID defs.SessionID, agentPaths map[defs.SessionID]string, record defs.Turn) *codexItemTranslator {
+func newTurnItemTranslator(conversationID defs.ConversationID, rootSessionID, sessionID defs.SessionID, agentPaths map[defs.SessionID]string, record defs.Turn) *codexItemTranslator {
 	// 1. 收集各 Executor 工作目录，第一个作为默认 Executor；记录无 Executor 时目录和默认 ID 为空。
 	workspaceDirectories := make(map[string]string, len(record.Executors))
 	var defaultExecutorID string
@@ -766,7 +775,7 @@ func newTurnItemTranslator(sessionID defs.SessionID, agentPaths map[defs.Session
 			defaultExecutorID = turnExecutor.ID
 		}
 	}
-	return newCodexItemTranslator(sessionID, agentPaths, workspaceDirectories, defaultExecutorID)
+	return newCodexItemTranslator(conversationID, rootSessionID, sessionID, agentPaths, workspaceDirectories, defaultExecutorID)
 }
 
 // outputSchemaInstruction 是 turn/start 带 outputSchema 时接在输入文字后面的格式要求，后面再接 schema 原文；开头的空行把它和输入文字隔开。

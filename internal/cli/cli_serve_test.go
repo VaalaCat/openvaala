@@ -513,7 +513,7 @@ func TestServe(t *testing.T) {
 			},
 		},
 		{
-			// 对话正在等模型回复：reload 不让它换上新配置，第二行列出它。
+			// 对话正在等模型回复：reload 暂存新配置，第二行列出等待自动应用的对话。
 			name: "reload_with_running_conversation",
 			run: func(t *testing.T, _ string) {
 				// 模型等待 release 或请求取消，收尾先释放请求再关闭模型服务。
@@ -558,7 +558,7 @@ func TestServe(t *testing.T) {
 					t.Fatal("the turn did not reach the model")
 				}
 				requireServeReload(t, configPath, "configuration reloaded\n"+
-					"1 conversations are running and keep the old configuration until the next reload: "+string(conversation.ID)+"\n", "")
+					"1 conversations will apply the new configuration automatically when idle: "+string(conversation.ID)+"\n", "")
 			},
 		},
 		{

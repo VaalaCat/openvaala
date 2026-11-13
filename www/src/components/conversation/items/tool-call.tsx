@@ -21,6 +21,7 @@ export function ToolCallItem({ view, toolResult, sync }: ItemRendererProps) {
   )
   return (
     <ToolCallView
+      viewKey={view.key}
       call={call}
       arguments={parsedArguments}
       result={result}

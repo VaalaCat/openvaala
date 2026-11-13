@@ -61,7 +61,11 @@ export function BashTool(props: ToolRendererProps) {
       }
       displayedArguments={["command"]}
     >
-      <CommandOutput command={command} output={output} />
+      <CommandOutput
+        command={command}
+        output={output}
+        viewStateKey={props.viewKey + ":output"}
+      />
       {commandResult && (
         <CommandStatus
           result={commandResult}
@@ -88,7 +92,10 @@ export function ReadCommandOutputTool(props: ToolRendererProps) {
     >
       {commandResult && (
         <>
-          <CommandOutput output={commandResult.output} />
+          <CommandOutput
+            output={commandResult.output}
+            viewStateKey={props.viewKey + ":output"}
+          />
           <CommandStatus result={commandResult} />
         </>
       )}
@@ -210,14 +217,20 @@ export function ListCommandsTool(props: ToolRendererProps) {
 function CommandOutput({
   command,
   output,
+  viewStateKey,
 }: {
   // 给出时在第一行显示「$ 命令」
   command?: string
   output: string
+  viewStateKey: string
 }) {
   return (
-    <OutputBlock copyValue={stripAnsi(output)} followOutput>
-      <pre className="code-padding w-max min-w-full text-code-reading">
+    <OutputBlock
+      copyValue={stripAnsi(output)}
+      followOutput
+      viewStateKey={viewStateKey}
+    >
+      <pre className="w-max min-w-full code-padding text-code-reading">
         {command !== undefined && (
           <span className="color-muted">
             {"$ " + command + (output ? "\n" : "")}

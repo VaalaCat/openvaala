@@ -2,15 +2,18 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
-	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 )
 
@@ -33,7 +36,8 @@ func TestConfigReload(t *testing.T) {
 					"executors/extra.yaml":  "id: extra\nkind: virtual\ndescription: reload 之后加的环境\n",
 				})
 				// 2. 重新加载配置，检查对话的 Skill 列表、Executor 列表和根 Session 的 Executor 里都有新加的项。
-				f.reloadWhenIdle(t)
+				f.reloadConfig(t)
+				f.waitReloadedExecutor(t, observer.conversation, true)
 				ctx, cancel := context.WithTimeout(context.Background(), e2eTimeout)
 				defer cancel()
 				skills, err := f.control.GetSkills(ctx, &runtimeclient.GetSkillsRequest{ConversationID: conversationID})
@@ -55,7 +59,7 @@ func TestConfigReload(t *testing.T) {
 			run: func(t *testing.T, f *conversationManagementFixture) {
 				// 1. 加上 extra，新建以它为默认 Executor 的对话并跑完一轮。
 				f.writeConfigFiles(t, map[string]string{"executors/extra.yaml": "id: extra\nkind: virtual\ndescription: 用完要删的环境\n"})
-				f.reloadWhenIdle(t)
+				f.reloadConfig(t)
 				record, err := f.control.CreateConversation(t.Context(), &runtimeclient.CreateConversationRequest{
 					AgentName:        "assistant",
 					ExecutorSettings: defs.ExecutorSettings{DefaultExecutorID: "extra"},
@@ -70,7 +74,8 @@ func TestConfigReload(t *testing.T) {
 				if err := os.Remove(filepath.Join(filepath.Dir(f.config), "executors", "extra.yaml")); err != nil {
 					t.Fatal(err)
 				}
-				f.reloadWhenIdle(t)
+				f.reloadConfig(t)
+				f.waitReloadedExecutor(t, record, false)
 				details, err := f.control.GetSessionDetails(t.Context(), record.ID, record.RootSessionID)
 				if err != nil || slices.ContainsFunc(details.Executors, isExtraExecutor) {
 					t.Fatalf("root Session executors = %+v, %v; want extra gone", details.Executors, err)
@@ -106,15 +111,100 @@ func (f *conversationManagementFixture) writeConfigFiles(t *testing.T, files map
 	}
 }
 
-// reloadWhenIdle 重新加载配置，有对话在忙时重试，直到全部对话都换上新配置。
-func (f *conversationManagementFixture) reloadWhenIdle(t *testing.T) {
+// reloadConfig 只重新加载一次配置，忙碌对话由服务自动应用。
+func (f *conversationManagementFixture) reloadConfig(t *testing.T) {
 	t.Helper()
-	// 1. 把忙碌的对话当作 ErrSessionBusy 交给 callWhenIdle 重试。
-	callWhenIdle(t, func(ctx context.Context) error {
-		result, err := f.control.ReloadConfig(ctx)
-		if err == nil && len(result.BusyConversationIDs) != 0 {
-			return session.ErrSessionBusy
+	// 1. 提交一次请求，配置的实际应用由调用场景观察。
+	ctx, cancel := context.WithTimeout(t.Context(), e2eTimeout)
+	defer cancel()
+	if _, err := f.control.ReloadConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitReloadedExecutor 等待根 Session 使用的 Executor 列表出现预期变更。
+func (f *conversationManagementFixture) waitReloadedExecutor(t *testing.T, record defs.Conversation, wantExtra bool) {
+	t.Helper()
+	// 1. 只查询实际配置，不重新发送 reload。
+	ctx, cancel := context.WithTimeout(t.Context(), e2eTimeout)
+	defer cancel()
+	for {
+		details, err := f.control.GetSessionDetails(ctx, record.ID, record.RootSessionID)
+		if err == nil && slices.ContainsFunc(details.Executors, isExtraExecutor) == wantExtra {
+			return
 		}
-		return err
-	})
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for extra executor = %v: %v", wantExtra, err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// TestConfigReloadDeferred 检查一次真实 reload 在 Turn 或后台命令结束后自动应用，并恢复客户端订阅。
+func TestConfigReloadDeferred(t *testing.T) {
+	// 1. Turn 场景走 CLI，命令场景走 RPC；两者只提交一次 reload。
+	binary := buildOpenVaala(t)
+	for _, background := range []bool{false, true} {
+		t.Run(fmt.Sprintf("background_%v", background), func(t *testing.T) {
+			f := newConversationManagementFixture(t, binary)
+			observer := f.openNewConversation(t)
+			observer.startTurn(t, "keep working")
+			request := f.model.next(t)
+			release := filepath.Join(observer.conversation.ExecutorSettings.WorkspaceDirectories[defs.LocalExecutorID], "release-command")
+			if background {
+				command := fmt.Sprintf("while [ ! -f '%s' ]; do sleep 0.05; done", release)
+				request.reply <- e2eModelReply{tool: "bash", arguments: fmt.Sprintf(`{"command":%q,"wait_seconds":0}`, command)}
+				f.model.next(t).reply <- e2eModelReply{text: "command running"}
+				readTurnFinished(t, observer, defs.TurnStatusCompleted)
+			}
+			f.writeConfigFiles(t, map[string]string{
+				"skills/added/SKILL.md": "---\nname: added\ndescription: automatically added skill\n---\nADDED_BODY\n",
+				"executors/extra.yaml":  "id: extra\nkind: virtual\ndescription: automatically added executor\n",
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), e2eTimeout)
+			defer cancel()
+			if background {
+				result, err := f.control.ReloadConfig(ctx)
+				if err != nil || !slices.Equal(result.PendingConversationIDs, []defs.ConversationID{observer.conversation.ID}) {
+					t.Fatalf("ReloadConfig() = %+v, %v", result, err)
+				}
+			} else {
+				command := exec.CommandContext(ctx, binary, "--config-file", f.config, "serve", "reload")
+				command.Env = getE2EEnvironment(filepath.Dir(f.config))
+				output, err := command.CombinedOutput()
+				if err != nil || !strings.Contains(string(output), "automatically when idle") || !strings.Contains(string(output), string(observer.conversation.ID)) {
+					t.Fatalf("serve reload: %v\n%s", err, output)
+				}
+			}
+			// 2. 经过一次定时检查仍不换环境，原任务自然完成后才切换。
+			time.Sleep(1100 * time.Millisecond)
+			details, err := f.control.GetSessionDetails(ctx, observer.conversation.ID, observer.conversation.RootSessionID)
+			if err != nil || slices.ContainsFunc(details.Executors, isExtraExecutor) {
+				t.Fatalf("configuration changed while busy: %+v, %v", details, err)
+			}
+			if background {
+				if err := os.WriteFile(release, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				request.reply <- e2eModelReply{text: "old turn completed"}
+				readTurnFinished(t, observer, defs.TurnStatusCompleted)
+			}
+			for {
+				if synced, ok := observer.next(t).(*runtimeclient.SessionSynced); ok {
+					if len(synced.Items) != 0 {
+						t.Fatalf("resync repeated delivered items: %+v", synced.Items)
+					}
+					break
+				}
+			}
+			f.waitReloadedExecutor(t, observer.conversation, true)
+			// 3. 沿用同一个客户端继续发消息，新 Skill 进入下一轮请求。
+			next, _ := f.runTurn(t, observer, "after automatic reload", e2eModelReply{text: "new configuration"})
+			if !strings.Contains(fmt.Sprint(next.body), "automatically added skill") {
+				t.Fatal("new skill did not reach model")
+			}
+		})
+	}
 }

@@ -1203,7 +1203,7 @@ func TestConfigFilesModelDefaults(t *testing.T) {
 
 // TestConfigFilesProviderModelRoundTrip 验证整份 Provider 写入保留未设置、false、空列表与协议地址，并沿用加载校验。
 func TestConfigFilesProviderModelRoundTrip(t *testing.T) {
-	// 1. 准备继承模型、显式覆盖和无效协议地址的样例。
+	// 1. 准备继承模型、用途说明、显式覆盖和无效协议地址的样例。
 	thinking := false
 	tests := []struct {
 		name      string
@@ -1217,6 +1217,12 @@ func TestConfigFilesProviderModelRoundTrip(t *testing.T) {
 		{
 			name:  "unset_fields_inherit_defaults",
 			model: &defs.ProviderModelConfig{},
+		},
+		{
+			name: "model_description",
+			model: &defs.ProviderModelConfig{
+				Description: "响应快，适合检索和简单修改。\n复杂设计优先用其他模型。",
+			},
 		},
 		{
 			name: "false_and_empty_lists_override_defaults",
@@ -1295,6 +1301,13 @@ func TestConfigFilesProviderModelRoundTrip(t *testing.T) {
 				t.Fatalf("ListProviders() = %+v, %v, %+v, %v; want original Provider and defaults", providers, defaultModel, defaults, err)
 			}
 			model := definitions.Models[0]
+			var wantDescription string
+			if tt.model != nil {
+				wantDescription = tt.model.Description
+			}
+			if model.Description != wantDescription {
+				t.Fatalf("model description = %q; want %q", model.Description, wantDescription)
+			}
 			if tt.model != nil && tt.model.Thinking != nil {
 				if model.ThinkingEnabled || len(model.ReasoningEfforts) != 0 || len(model.MergeMessageRoles) != 0 || !slices.Equal(model.Capabilities.Input, []defs.ModelInput{defs.ModelInputText}) || model.Target.Protocol != "claude" || model.Target.BaseURL != "https://claude.example" || model.Target.EndpointPath != "/custom/messages" {
 					t.Fatalf("explicit overrides = %+v, target %+v", model, model.Target)

@@ -1,4 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react"
 import { useStore } from "@nanostores/react"
 import { useTranslation } from "react-i18next"
 import {
@@ -139,25 +145,24 @@ function ConversationWorkspace({ workspace }: { workspace: TabWorkspace }) {
   }
 
   // 打开选择的记录并显示现有详情区域，不切换正文的展开选择。
-  function inspectItem(
-    tabID: string,
-    sync: ConversationSync,
-    target: ItemDebugTarget
-  ) {
-    // 1. 先把这个标签页设成最近选中的对话，保存定位信息，切到调试页签，再展开当前尺寸下的详情布局。
-    workspace.selectTab(tabID)
-    setDebugSelection({ sync, target })
-    $rightPanelTab.set("debug")
-    if (!isDesktop) {
-      setIsDrawerOpen(true)
-      return
-    }
-    const panel = rightPanelRef.current
-    if (!panel?.isCollapsed()) return
-    panelGroupRef.current?.setAttribute("data-panel-transition", "")
-    if (layout[rightPanelID]) panel.resize(layout[rightPanelID] + "%")
-    else panel.expand()
-  }
+  const inspectItem = useCallback(
+    (tabID: string, sync: ConversationSync, target: ItemDebugTarget) => {
+      // 1. 先把这个标签页设成最近选中的对话，保存定位信息，切到调试页签，再展开当前尺寸下的详情布局。
+      workspace.selectTab(tabID)
+      setDebugSelection({ sync, target })
+      $rightPanelTab.set("debug")
+      if (!isDesktop) {
+        setIsDrawerOpen(true)
+        return
+      }
+      const panel = rightPanelRef.current
+      if (!panel?.isCollapsed()) return
+      panelGroupRef.current?.setAttribute("data-panel-transition", "")
+      if (layout[rightPanelID]) panel.resize(layout[rightPanelID] + "%")
+      else panel.expand()
+    },
+    [workspace, isDesktop, rightPanelRef, layout]
+  )
 
   return (
     // 工作区占满内容区域，右栏在它右边。

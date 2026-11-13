@@ -150,6 +150,7 @@ type providerDraft struct {
 type providerHeaderDraft struct{ Name, Value string }
 
 type providerModelDraft struct {
+	Description                                                                                                                                              string
 	Key, Alias, UpstreamModel, DisplayName, Protocol, ContextWindow, MaxOutputTokens, Thinking, ReasoningEfforts, DefaultReasoningEffort, Inputs, MergeRoles string
 	InheritReasoning, InheritInputs, InheritMerge                                                                                                            bool
 	Error                                                                                                                                                    string

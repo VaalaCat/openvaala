@@ -319,26 +319,71 @@ func (d *Desktop) messageView(c *ui.Context, view viewItem, key string, finalKno
 
 // userMessageView 绘制用户整宽卡片：原文不按 Markdown 渲染，图片缩略图跟在下面，右上角是悬停出现的「复制消息」和「从这里分叉」。
 func (d *Desktop) userMessageView(c *ui.Context, view viewItem) {
-	// 1. 只有主 Session 已保存的消息可以从这里分叉；右侧按钮贴着卡片右缘，让右缘与对话列右缘对齐。
+	// 1. 正文超过 4 行时默认只显示 4 行，展开状态按消息 key 记在桌面上。
 	item := view.Item
 	t := kit.GetTheme(c)
 	canFork := item.TurnID != "" && view.Ordinal != 0 && d.readingTarget.SessionID == d.conversation.RootSessionID
+	parts := make([]string, 0, len(item.Message.Content))
+	for _, part := range item.Message.Content {
+		if part != nil && part.Text != nil {
+			parts = append(parts, part.Text.Text)
+		}
+	}
+	text := strings.Join(parts, "\n")
+	key := "user-message:" + string(item.ID)
+	open := d.itemExpanded[key]
 	card := ui.Row(c).Padding(t.Space(1), 0, t.Space(1), t.Space(3)).Gap(t.Space(2)).AlignItems(ui.Start).Radius(t.Metrics.RadiusLarge).Background(t.Colors.Editor).Border(1, t.Colors.Border)
 	card.Children(func() {
 		ui.Column(c).Grow(1).Shrink(1).Padding(t.Space(1), 0).Gap(t.Space(2)).Children(func() {
+			// 2. 完整正文按实际宽度排版，裁切框在四行和全文高度之间过渡，最后一行渐隐。
+			long := false
+			if text != "" {
+				previewHeight := 4 * t.Space(5)
+				clip := ui.Column(c.Key("user-message-body")).ClipY().Shrink(0)
+				var body ui.Element
+				clip.Children(func() {
+					body = t.TextRole(ui.Text(c, text).Shrink(0), kit.TextCode)
+				})
+				fullHeight := body.Bounds().H
+				long = fullHeight > previewHeight
+				if fullHeight == 0 {
+					c.AnimationFrame()
+				}
+				target := float32(0)
+				duration := t.Motion.DisclosureClose
+				if open {
+					target, duration = 1, t.Motion.DisclosureOpen
+				}
+				progress := clip.Animate("user-message-open", target, duration)
+				if fullHeight > 0 {
+					clip.Height(min(fullHeight, previewHeight) + max(0, fullHeight-previewHeight)*progress)
+				} else if !open {
+					clip.MaxHeight(previewHeight)
+				}
+				if long && progress < 1 {
+					clip.DrawOver(func(p *ui.Painter, r ui.Rect) {
+						r.Y += r.H - t.Space(5)
+						r.H = t.Space(5)
+						p.FillGradient(r, ui.LinearGradient{From: t.Colors.Editor.Alpha(0), To: t.Colors.Editor.Alpha(1 - progress), Angle: 180}, 0)
+					})
+				}
+			}
 			for _, part := range item.Message.Content {
-				if part == nil {
-					continue
-				}
-				if part.Text != nil {
-					t.TextRole(ui.Text(c, part.Text.Text), kit.TextCode)
-				}
-				if part.Image != nil {
+				if part != nil && part.Image != nil {
 					d.imageView(c, part.Image.DataURL, part.Image.Alt, 240)
 				}
 			}
+			if long {
+				label := d.t("expand")
+				if open {
+					label = d.t("collapse")
+				}
+				if kit.FlushButton(c, label).Clicked() {
+					open = !open
+				}
+			}
 		})
-		// 2. 两个 28 见方图标按钮，平时透明，悬停或聚焦卡片时出现。
+		// 3. 两个 28 见方图标按钮，平时透明，悬停或聚焦卡片时出现。
 		actions := ui.Row(c).Shrink(0).AlignItems(ui.Center)
 		if !card.Hovered() && !card.FocusWithin() {
 			actions.Opacity(0)
@@ -355,6 +400,7 @@ func (d *Desktop) userMessageView(c *ui.Context, view viewItem) {
 			}
 		})
 	})
+	d.itemExpanded[key] = open
 }
 
 // reasoningView 绘制思考条目：思考中闪烁，完成或中断后显示对应标题，展开看摘要或原文。

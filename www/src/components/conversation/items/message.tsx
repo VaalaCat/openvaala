@@ -1,6 +1,8 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react"
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react"
 import { MessageSquare } from "lucide"
+import { animate, motion, useMotionValue } from "motion/react"
 import { ImagePreview } from "@/components/base/image-preview"
+import { useKeptViewState } from "@/components/base/kept-view-state"
 import type { ParseKeys } from "i18next"
 import { useTranslation } from "react-i18next"
 import {
@@ -11,6 +13,7 @@ import {
 } from "@/components/conversation/item-notice"
 import { MarkdownView } from "@/components/conversation/markdown-view"
 import { SessionLink } from "@/components/conversation/session-link"
+import { Button } from "@/components/ui/button"
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible"
 import { getContentText } from "@/lib/api/conversation-items"
 import type { Content, TurnStatus } from "@/lib/api/protocol.gen"
@@ -61,7 +64,8 @@ export function MessageItem({
     each ? [each] : []
   )
   const source = getMessageSource(view.item)
-  if (source === "user") return <UserMessage contents={contents} />
+  if (source === "user")
+    return <UserMessage contents={contents} viewStateKey={view.key} />
   const text = getContentText(contents)
   if (source === "reply")
     return (
@@ -96,7 +100,11 @@ export function MessageItem({
                 "process-disclosure-content ml-2 border-l py-2 pr-2 pl-6"
             )}
           >
-            <MarkdownView text={text} isStreaming={view.isStreaming} />
+            <MarkdownView
+              text={text}
+              isStreaming={view.isStreaming}
+              viewStateKey={view.key}
+            />
             <MessageImages contents={contents} />
           </div>
         </CollapsibleContent>
@@ -137,6 +145,7 @@ export function MessageItem({
       tone={status ? subagentStatuses[status].tone : undefined}
       text={text}
       contents={contents}
+      viewStateKey={view.key}
       open={disclosure?.open ?? false}
       isChosen={disclosure?.isChosen ?? false}
       onOpenChange={disclosure?.onOpenChange}
@@ -152,6 +161,7 @@ function AgentMessageBody({
   tone,
   text,
   contents,
+  viewStateKey,
   open,
   isChosen,
   onOpenChange,
@@ -162,6 +172,8 @@ function AgentMessageBody({
   tone?: "warning" | "destructive"
   text: string
   contents: Content[]
+  // 正文 Markdown 保存展开选择用的 key
+  viewStateKey: string
   open: boolean
   isChosen: boolean
   onOpenChange?: (open: boolean) => void
@@ -201,7 +213,7 @@ function AgentMessageBody({
           ref={previewRef}
           className={cn(
             "max-h-[4lh] overflow-hidden text-reading wrap-anywhere whitespace-pre-wrap color-muted",
-            !open && isLong && "agent-message-preview-fade"
+            !open && isLong && "message-preview-fade"
           )}
           hidden={open}
           aria-hidden={open || undefined}
@@ -211,7 +223,7 @@ function AgentMessageBody({
         <CollapsibleContent keepMounted className="process-disclosure-panel">
           {isChosen && (
             <div className="process-disclosure-content flex flex-col gap-2">
-              <MarkdownView text={text} />
+              <MarkdownView text={text} viewStateKey={viewStateKey} />
               <MessageImages contents={contents} />
             </div>
           )}
@@ -221,21 +233,112 @@ function AgentMessageBody({
   )
 }
 
-// 用户输入：文字和图片在靠右的气泡里；附带材料（is_context）默认收起
-function UserMessage({ contents }: { contents: Content[] }) {
+// 用户输入：文字和图片在靠右的气泡里；正文超过四行收起，附带材料（is_context）默认收起
+function UserMessage({
+  contents,
+  viewStateKey,
+}: {
+  contents: Content[]
+  viewStateKey: string
+}) {
   const { t } = useTranslation()
   const disclosure = useItemDisclosure()
   const typed = contents.filter((each) => !each.text?.is_context)
   const context = contents.filter((each) => each.text?.is_context)
   const typedText = getContentText(typed)
+  const textID = useId()
+  const textRef = useRef<HTMLSpanElement>(null)
+  const [textHeights, setTextHeights] = useState<{
+    full: number
+    preview: number
+  }>()
+  const [open, setOpen] = useKeptViewState(
+    "user-message:" + viewStateKey,
+    false
+  )
+  const previousOpenRef = useRef(open)
+  const visibleHeight = useMotionValue<number | string>("auto")
+  const isLong = !!textHeights && textHeights.full > textHeights.preview + 1
+  // 1. 测量未裁切正文的自然高度；宽度和字号变化时更新四行预览高度。
+  useLayoutEffect(() => {
+    const text = textRef.current
+    if (!text) return
+    const measure = () => {
+      if (text.clientHeight === 0) return
+      const full = text.scrollHeight
+      const preview = 4 * Number.parseFloat(getComputedStyle(text).lineHeight)
+      setTextHeights((previous) =>
+        previous?.full === full && previous.preview === preview
+          ? previous
+          : { full, preview }
+      )
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(text)
+    return () => observer.disconnect()
+  }, [typedText])
+  // 2. 只有开合播放高度动画；首次挂载和重新排版直接采用实测高度。
+  useLayoutEffect(() => {
+    if (!textHeights) return
+    const height = open
+      ? textHeights.full
+      : Math.min(textHeights.full, textHeights.preview)
+    const toggled = previousOpenRef.current !== open
+    previousOpenRef.current = open
+    if (!toggled) {
+      visibleHeight.set(height)
+      return
+    }
+    const animation = animate(visibleHeight, height, {
+      duration: open ? 0.2 : 0.15,
+      ease: [0.22, 1, 0.36, 1],
+    })
+    return () => animation.stop()
+  }, [open, textHeights, visibleHeight])
+  // 3. 裁切与遮罩不替换正文节点，附带材料独立展开。
   return (
     <div className="ml-auto flex max-w-[85%] min-w-0 flex-col gap-2 bg-muted px-3 py-2">
       {typedText && (
-        <p className="text-reading wrap-anywhere whitespace-pre-wrap">
-          {typedText}
-        </p>
+        <motion.p
+          id={textID}
+          initial={false}
+          style={{
+            height: visibleHeight,
+            maxHeight: !open && !textHeights ? "4lh" : undefined,
+          }}
+          animate={{
+            "--message-preview-opacity": open ? 1 : 0,
+          }}
+          transition={{
+            duration: open ? 0.2 : 0.15,
+            ease: [0.22, 1, 0.36, 1],
+          }}
+          className={cn(
+            "overflow-hidden text-reading wrap-anywhere whitespace-pre-wrap",
+            isLong && "message-preview-fade"
+          )}
+        >
+          <span ref={textRef} className="block">
+            {typedText}
+          </span>
+        </motion.p>
       )}
       <MessageImages contents={typed} />
+      {(isLong || open) && (
+        <Button
+          type="button"
+          variant="ghost"
+          className="h-8 w-fit px-1 text-ui color-muted"
+          aria-expanded={open}
+          aria-controls={textID}
+          onClick={() => setOpen((previous) => !previous)}
+        >
+          {open
+            ? t("conversation.message.collapse")
+            : t("conversation.message.expand")}
+        </Button>
+      )}
       {context.length > 0 && (
         <Collapsible
           open={disclosure?.open ?? false}

@@ -1003,8 +1003,8 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 				collectUntil(t, statuses.Events, isTurnCompletedInfo)
 				unsaved := h.create(t)
 				result := h.setDefinitions(t, testModelRef, newModel(h, testModelRef, "test"), newModel(h, addedModelRef, "model-c"))
-				if len(result.BusyConversationIDs) != 0 {
-					t.Fatalf("BusyConversationIDs = %v, want none", result.BusyConversationIDs)
+				if len(result.PendingConversationIDs) != 0 {
+					t.Fatalf("PendingConversationIDs = %v, want none", result.PendingConversationIDs)
 				}
 				// 对话原地换上新定义，reload 之前的订阅随之关闭。
 				waitEventsClosed(t, statuses.Events)
@@ -1028,7 +1028,7 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 			},
 		},
 		{
-			name: "running_conversation_is_busy",
+			name: "running_conversation_applies_when_idle",
 			run: func(t *testing.T, h *runtimeHarness) {
 				conv := h.create(t)
 				statuses := h.subscribeConversation(t, conv.ID)
@@ -1036,17 +1036,27 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 				request := h.model.receive(t)
 				collectUntil(t, statuses.Events, func(info runtime.SessionRuntimeInfo) bool { return info.State == session.SessionStateRunning })
 				result := h.setDefinitions(t, testModelRef, newModel(h, testModelRef, "test"), newModel(h, addedModelRef, "model-c"))
-				if !reflect.DeepEqual(result.BusyConversationIDs, []defs.ConversationID{conv.ID}) {
-					t.Fatalf("BusyConversationIDs = %v, want [%s]", result.BusyConversationIDs, conv.ID)
+				if !reflect.DeepEqual(result.PendingConversationIDs, []defs.ConversationID{conv.ID}) {
+					t.Fatalf("PendingConversationIDs = %v, want [%s]", result.PendingConversationIDs, conv.ID)
 				}
-				// 没有换定义：旧订阅仍在，这一轮照常结束。
+				// 旧轮照常结束，随后订阅因自动应用配置关闭；无需再次 reload 就能选新模型。
 				request.reply <- runtimeModelResponse{chunks: []string{"完成"}}
 				collectUntil(t, statuses.Events, isTurnCompletedInfo)
+				waitEventsClosed(t, statuses.Events)
+				if _, err := h.rt.SetSessionModel(t.Context(), &runtime.SetSessionModelRequest{
+					ConversationID: conv.ID,
+					SessionID:      conv.RootSessionID,
+					Model:          defs.ModelSelection{Ref: addedModelRef},
+				}); err != nil {
+					t.Fatalf("select automatically applied model: %v", err)
+				}
+				h.submit(t, conv.ID, "新模型", "")
+				requireModelRequest(t, h, conv, "model-c", 5)
 			},
 		},
 		{
-			// 只有后台命令在运行时，reload 同样跳过该对话，保留命令。
-			name:      "reload_skips_conversation_with_command",
+			// 只有后台命令在运行时，reload 暂存配置，保留命令，命令结束后自动切换。
+			name:      "reload_defers_conversation_with_command",
 			executors: newLocalExecutors,
 			run: func(t *testing.T, h *runtimeHarness) {
 				conv := h.create(t)
@@ -1056,13 +1066,25 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 					t.Fatalf("bash result = %+v, want a running command", started)
 				}
 				result := h.setDefinitions(t, testModelRef, newModel(h, testModelRef, "test"), newModel(h, addedModelRef, "model-c"))
-				if !slices.Equal(result.BusyConversationIDs, []defs.ConversationID{conv.ID}) {
-					t.Fatalf("BusyConversationIDs = %v, want [%s]", result.BusyConversationIDs, conv.ID)
+				if !slices.Equal(result.PendingConversationIDs, []defs.ConversationID{conv.ID}) {
+					t.Fatalf("PendingConversationIDs = %v, want [%s]", result.PendingConversationIDs, conv.ID)
 				}
 				// 没有换定义：旧订阅仍在，命令还在跑。
 				read := h.runCommandToolRound(t, conv, watcher, "call-read", "read_command_output", `{"command_id":"`+started.CommandID+`","wait_seconds":0}`)
 				if read.ToolError != nil || read.Status != "running" {
 					t.Fatalf("read_command_output result = %+v, want the command still running", read)
+				}
+				stopped := h.runCommandToolRound(t, conv, watcher, "call-stop", "stop_command", `{"command_id":"`+started.CommandID+`"}`)
+				if stopped.ToolError != nil || stopped.Status != "exited" {
+					t.Fatalf("stop_command result = %+v", stopped)
+				}
+				waitEventsClosed(t, watcher.Events)
+				if _, err := h.rt.SetSessionModel(t.Context(), &runtime.SetSessionModelRequest{
+					ConversationID: conv.ID,
+					SessionID:      conv.RootSessionID,
+					Model:          defs.ModelSelection{Ref: addedModelRef},
+				}); err != nil {
+					t.Fatalf("select model after command stopped: %v", err)
 				}
 			},
 		},
@@ -1099,8 +1121,8 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 				conv := h.create(t)
 				statuses := h.subscribeConversation(t, conv.ID)
 				result := h.setDefinitions(t, testModelRef, newModel(h, addedModelRef, "model-c"))
-				if len(result.BusyConversationIDs) != 0 {
-					t.Fatalf("BusyConversationIDs = %v, want none", result.BusyConversationIDs)
+				if len(result.PendingConversationIDs) != 0 {
+					t.Fatalf("PendingConversationIDs = %v, want none", result.PendingConversationIDs)
 				}
 				h.submit(t, conv.ID, "旧目录", "")
 				requireModelRequest(t, h, conv, "test", 2)
@@ -1145,8 +1167,8 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 				if !<-watched {
 					t.Fatal("IsConversationOpen() reported the conversation closed while it was reconfigured")
 				}
-				if len(result.BusyConversationIDs) != 0 {
-					t.Fatalf("BusyConversationIDs = %v, want none", result.BusyConversationIDs)
+				if len(result.PendingConversationIDs) != 0 {
+					t.Fatalf("PendingConversationIDs = %v, want none", result.PendingConversationIDs)
 				}
 				if reason := statuses.GetCloseReason(); !errors.Is(reason, runtime.ErrConversationReconfigured) {
 					t.Fatalf("subscription close reason = %v, want %v", reason, runtime.ErrConversationReconfigured)
@@ -1407,8 +1429,8 @@ func TestRuntimeMCPServers(t *testing.T) {
 						Model:    "model-c",
 					},
 				}
-				if result := f.h.setDefinitionsRequest(t, f.newDefinitions("fake", added)); len(result.BusyConversationIDs) != 0 {
-					t.Fatalf("BusyConversationIDs = %v, want none", result.BusyConversationIDs)
+				if result := f.h.setDefinitionsRequest(t, f.newDefinitions("fake", added)); len(result.PendingConversationIDs) != 0 {
+					t.Fatalf("PendingConversationIDs = %v, want none", result.PendingConversationIDs)
 				}
 				// 订阅关闭，说明对话已经换上新配置。
 				waitEventsClosed(t, statuses.Events)
@@ -1426,8 +1448,8 @@ func TestRuntimeMCPServers(t *testing.T) {
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
 				f.waitMCPServers(t, connectedFake)
 				oldPID := f.waitPID(t, "fake", 0)
-				if result := f.h.setDefinitionsRequest(t, f.newDefinitions("fake-2")); len(result.BusyConversationIDs) != 0 {
-					t.Fatalf("BusyConversationIDs = %v, want none", result.BusyConversationIDs)
+				if result := f.h.setDefinitionsRequest(t, f.newDefinitions("fake-2")); len(result.PendingConversationIDs) != 0 {
+					t.Fatalf("PendingConversationIDs = %v, want none", result.PendingConversationIDs)
 				}
 				newPID := f.waitPID(t, "fake-2", 0)
 				waitProcessExited(t, oldPID)
@@ -1438,7 +1460,7 @@ func TestRuntimeMCPServers(t *testing.T) {
 			},
 		},
 		{
-			// 正在跑的对话不换定义：列进 BusyConversationIDs，执行环境和进程都不动，新定义的进程不启动。
+			// 正在跑的对话暂存配置：列进 PendingConversationIDs，等待期间执行环境和进程不动，新定义的进程不启动。
 			name: "busy_conversation_keeps_process",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
 				conv := f.conversation
@@ -1449,8 +1471,8 @@ func TestRuntimeMCPServers(t *testing.T) {
 				request := f.model.receive(t)
 				collectUntil(t, statuses.Events, func(info runtime.SessionRuntimeInfo) bool { return info.State == session.SessionStateRunning })
 				result := f.h.setDefinitionsRequest(t, f.newDefinitions("fake-2"))
-				if !slices.Equal(result.BusyConversationIDs, []defs.ConversationID{conv.ID}) {
-					t.Fatalf("BusyConversationIDs = %v, want [%s]", result.BusyConversationIDs, conv.ID)
+				if !slices.Equal(result.PendingConversationIDs, []defs.ConversationID{conv.ID}) {
+					t.Fatalf("PendingConversationIDs = %v, want [%s]", result.PendingConversationIDs, conv.ID)
 				}
 				request.reply <- runtimeModelResponse{chunks: []string{"完成"}}
 				collectUntil(t, statuses.Events, isTurnCompletedInfo)
@@ -5509,6 +5531,31 @@ func TestRuntimeTerminals(t *testing.T) {
 					t.Fatal(err)
 				}
 				requireIdle(true)
+			},
+		},
+		{
+			name: "deferred_reload_keeps_interactive_terminal",
+			run: func(t *testing.T, f *terminalFixture) {
+				conv := f.h.create(t)
+				statuses := f.h.subscribeConversation(t, conv.ID)
+				opened := f.open(t, conv.ID)
+				f.h.submit(t, conv.ID, "work during reload", "")
+				request := f.h.model.receive(t)
+				definitions := newTestRuntimeOpt(f.h.store, f.h.model).Definitions
+				definitions.Executors = executor.NewConfigExecutorProvider([]executor.Executor{f.executor})
+				result := f.h.setDefinitionsRequest(t, definitions)
+				if !slices.Equal(result.PendingConversationIDs, []defs.ConversationID{conv.ID}) {
+					t.Fatalf("pending = %v", result.PendingConversationIDs)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"completed"}}
+				collectUntil(t, statuses.Events, isTurnCompletedInfo)
+				waitEventsClosed(t, statuses.Events)
+				if info := opened.Terminal.GetInfo(); info.Status != terminal.TerminalStatusRunning {
+					t.Fatalf("interactive terminal after reload = %+v", info)
+				}
+				if _, err := opened.Terminal.WriteInput(t.Context(), "echo still-running\n"); err != nil {
+					t.Fatalf("write after reload: %v", err)
+				}
 			},
 		},
 		{

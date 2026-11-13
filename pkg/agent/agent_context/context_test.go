@@ -801,7 +801,7 @@ func TestAgentContextBuildModelRequest(t *testing.T) {
 			}
 			want := &llmkit.Request{
 				Stream:          true,
-				ThinkingEnabled: true,
+				ThinkingEnabled: new(true),
 				Tools:           tt.tools,
 				Messages:        tt.want,
 				Extras:          map[string]any{"prompt_cache_key": string(contextSessionID)},
@@ -927,11 +927,11 @@ func TestBuildModelRequestEncodesToolResultImages(t *testing.T) {
 			}
 			var results []int
 			for index, entry := range entries {
-				if strings.Contains(string(entry), tt.toolResult) {
+				for range strings.Count(string(entry), tt.toolResult) {
 					results = append(results, index)
 				}
 			}
-			if len(results) != 2 || results[1] != results[0]+1 || results[1]+2 >= len(entries) {
+			if len(results) != 2 || results[1] > results[0]+1 || results[1]+2 >= len(entries) {
 				t.Fatalf("tool results at %v of %d entries, want two adjacent results followed by images and hook: %s", results, len(entries), body)
 			}
 			afterResults, hook := string(entries[results[1]+1]), string(entries[results[1]+2])
@@ -1700,7 +1700,7 @@ func TestBuildModelRequestUsesModelParameters(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if req.MaxTokens != tt.wantMaxTokens || req.ThinkingEnabled != tt.wantThinking || req.ReasoningEffort != tt.effort ||
+			if req.MaxTokens != tt.wantMaxTokens || req.ThinkingEnabled == nil || *req.ThinkingEnabled != tt.wantThinking || req.ReasoningEffort != tt.effort ||
 				req.ReasoningContext != tt.wantReasoningContext {
 				t.Fatalf("request = max %d thinking %v effort %q context %q", req.MaxTokens, req.ThinkingEnabled, req.ReasoningEffort, req.ReasoningContext)
 			}

@@ -38,7 +38,12 @@ export function ApplyPatchTool(props: ToolRendererProps) {
     >
       {summary && <pre className="overflow-x-auto text-code">{summary}</pre>}
       {patch !== undefined && (
-        <CodeView code={patch} lang="diff" maxHeight="24rem" />
+        <CodeView
+          code={patch}
+          lang="diff"
+          maxHeight="24rem"
+          viewStateKey={props.viewKey + ":patch"}
+        />
       )}
       {getStringField(content, "outcome") === "partially_applied" && (
         <p className="text-ui wrap-anywhere color-warning">

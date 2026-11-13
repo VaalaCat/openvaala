@@ -71,7 +71,7 @@ func FormatSpawnAgentDescription(agents []AgentEntry, models []*defs.ModelDefini
 			description.WriteString("：" + definition.Description)
 		}
 	}
-	// 3. 按模型引用排序列出窗口和可选的推理强度。
+	// 3. 按模型引用排序列出窗口、可选的推理强度和用途说明。
 	description.WriteString("\n可选 model（省略时同一 Agent 继承你当前的模型，不同 Agent 使用它的默认模型）：")
 	for _, model := range slices.SortedFunc(slices.Values(models), func(a, b *defs.ModelDefinition) int {
 		return strings.Compare(a.Ref.String(), b.Ref.String())
@@ -79,6 +79,9 @@ func FormatSpawnAgentDescription(agents []AgentEntry, models []*defs.ModelDefini
 		fmt.Fprintf(&description, "\n- %s（%s）：窗口 %d", model.Ref, model.DisplayName, model.ContextWindow)
 		if len(model.ReasoningEfforts) > 0 {
 			fmt.Fprintf(&description, "，reasoning_effort 可选 %s，默认 %s", strings.Join(model.ReasoningEfforts, "|"), model.DefaultReasoningEffort)
+		}
+		if model.Description != "" {
+			description.WriteString("；" + model.Description)
 		}
 	}
 	return description.String()

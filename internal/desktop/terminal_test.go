@@ -610,6 +610,7 @@ func TestRunningTerminalsBecomeTabs(t *testing.T) {
 		wantClosed   []string
 	}{
 		{name: "new terminals get tabs", existing: []string{"a"}, event: &runtimeclient.TerminalsChanged{IsKnown: true, Terminals: items("a", "b", "c")}, wantIDs: []string{"a", "b", "c"}, wantAttached: []string{"b:0", "c:0"}},
+		{name: "new tabs retain server order", existing: []string{"a"}, event: &runtimeclient.TerminalsChanged{IsKnown: true, Terminals: items("a", "c", "b")}, wantIDs: []string{"a", "c", "b"}, wantAttached: []string{"c:0", "b:0"}},
 		{name: "same list adds nothing", existing: []string{"a"}, event: &runtimeclient.TerminalsChanged{IsKnown: true, Terminals: items("a")}, wantIDs: []string{"a"}},
 		{name: "unknown list keeps tabs", existing: []string{"a"}, event: &runtimeclient.TerminalsChanged{Err: errors.New("lost")}, wantIDs: []string{"a"}},
 		{name: "list_before_open_result", opening: true, event: &runtimeclient.TerminalsChanged{IsKnown: true, Terminals: items("opened")}, wantIDs: []string{""}, wantFinalIDs: []string{"opened"}},
@@ -637,7 +638,10 @@ func TestRunningTerminalsBecomeTabs(t *testing.T) {
 			for _, tab := range d.terminals {
 				ids = append(ids, tab.TerminalID)
 			}
-			if tt.wantIDs != nil && (!slices.Equal(ids, tt.wantIDs) || !slices.Equal(client.attached, tt.wantAttached)) {
+			// 标签保持列表顺序；并发接入记录排序后比较，仍核对数量和每次接入的参数。
+			attached := slices.Sorted(slices.Values(client.attached))
+			wantAttached := slices.Sorted(slices.Values(tt.wantAttached))
+			if tt.wantIDs != nil && (!slices.Equal(ids, tt.wantIDs) || !slices.Equal(attached, wantAttached)) {
 				t.Fatalf("tabs=%v attached=%v", ids, client.attached)
 			}
 			for _, tab := range d.terminals {

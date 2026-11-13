@@ -1,4 +1,8 @@
-import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query"
+import {
+  infiniteQueryOptions,
+  keepPreviousData,
+  queryOptions,
+} from "@tanstack/react-query"
 import type { ServerConnection } from "../api/server-connection"
 import type {
   ConversationID,
@@ -50,6 +54,7 @@ export function turnsOptions(
         turn_ids: turnIDs,
       }),
     enabled: turnIDs.length > 0,
+    placeholderData: keepPreviousData,
   })
 }
 

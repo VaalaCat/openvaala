@@ -1,8 +1,9 @@
-import { memo, useCallback, useMemo, useState, type CSSProperties } from "react"
+import { memo, useCallback, useMemo, type CSSProperties } from "react"
 import { ChevronRightIcon } from "lucide-react"
 import { FoldVertical, UnfoldVertical } from "lucide"
 import { MorphIcon } from "morphicons/react"
 import { useTranslation } from "react-i18next"
+import { useKeptViewState } from "@/components/base/kept-view-state"
 import { CodeTokens } from "@/components/base/code-view"
 import { Button } from "@/components/ui/button"
 import {
@@ -34,6 +35,7 @@ export function JsonView({
   isStreaming = false,
   maxHeight,
   heightMode,
+  viewStateKey,
 }: {
   value: unknown
   // 层级小于它的对象和数组默认展开
@@ -41,20 +43,33 @@ export function JsonView({
   isStreaming?: boolean
   maxHeight?: CSSProperties["maxHeight"]
   heightMode?: "expandable" | "host"
+  // 给出时，展开和折叠选择保存在消息区里，重新挂载后保留
+  viewStateKey?: string
 }) {
   const { t } = useTranslation()
-  const [expandedNestedPaths, setExpandedNestedPaths] = useState(
+  const keptKey = (suffix: string) =>
+    viewStateKey === undefined ? undefined : `${viewStateKey}:${suffix}`
+  const [expandedNestedPaths, setExpandedNestedPaths] = useKeptViewState(
+    keptKey("nested"),
     () => new Set<string>()
   )
-  const [expandedStringPaths, setExpandedStringPaths] = useState(
+  const [expandedStringPaths, setExpandedStringPaths] = useKeptViewState(
+    keptKey("strings"),
     () => new Set<string>()
   )
   // 用户点过折叠箭头的节点，折叠状态与默认相反
-  const [toggledFoldPaths, setToggledFoldPaths] = useState(
+  const [toggledFoldPaths, setToggledFoldPaths] = useKeptViewState(
+    keptKey("folds"),
     () => new Set<string>()
   )
-  const [isShowingAllRows, setIsShowingAllRows] = useState(false)
-  const [foldMode, setFoldMode] = useState<JsonFoldMode>("default")
+  const [isShowingAllRows, setIsShowingAllRows] = useKeptViewState(
+    keptKey("allRows"),
+    false
+  )
+  const [foldMode, setFoldMode] = useKeptViewState<JsonFoldMode>(
+    keptKey("foldMode"),
+    "default"
+  )
   const lines = useMemo(
     () => formatJsonLines(value, { expandedNestedPaths, expandedStringPaths }),
     [value, expandedNestedPaths, expandedStringPaths]
@@ -75,23 +90,35 @@ export function JsonView({
     ? t("jsonView.collapseAll")
     : t("jsonView.expandAll")
 
-  const handleToggleFold = useCallback((line: JsonLine) => {
-    setToggledFoldPaths((paths) => toggleKey(paths, getJsonPathKey(line.path)))
-  }, [])
-  const handleToggleNested = useCallback((line: JsonLine) => {
-    setExpandedNestedPaths((paths) =>
-      toggleKey(paths, getJsonPathKey(line.path))
-    )
-  }, [])
-  const handleToggleString = useCallback((line: JsonLine) => {
-    setExpandedStringPaths((paths) =>
-      toggleKey(paths, getJsonPathKey(line.path))
-    )
-  }, [])
+  const handleToggleFold = useCallback(
+    (line: JsonLine) => {
+      setToggledFoldPaths((paths) =>
+        toggleKey(paths, getJsonPathKey(line.path))
+      )
+    },
+    [setToggledFoldPaths]
+  )
+  const handleToggleNested = useCallback(
+    (line: JsonLine) => {
+      setExpandedNestedPaths((paths) =>
+        toggleKey(paths, getJsonPathKey(line.path))
+      )
+    },
+    [setExpandedNestedPaths]
+  )
+  const handleToggleString = useCallback(
+    (line: JsonLine) => {
+      setExpandedStringPaths((paths) =>
+        toggleKey(paths, getJsonPathKey(line.path))
+      )
+    },
+    [setExpandedStringPaths]
+  )
 
   return (
     <OutputBlock
       copyValue={copyValue}
+      viewStateKey={keptKey("output")}
       maxHeight={maxHeight}
       heightMode={heightMode}
       toolbar={

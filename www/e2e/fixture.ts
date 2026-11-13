@@ -273,6 +273,75 @@ export function getMessageScroller(page: Page): Locator {
   return page.locator('[data-slot="message-scroller"]')
 }
 
+// 消息区里挂着的「长对话第 N 轮」中最小的 N
+export async function getSmallestMountedTurn(
+  messages: Locator
+): Promise<number> {
+  // 1. 消息区只挂视口附近的行，从挂着的用户消息里取轮号。
+  const texts = await messages.getByText(/^长对话第 \d+ 轮$/).allInnerTexts()
+  return Math.min(...texts.map((text) => Number(text.match(/\d+/)![0])))
+}
+
+// 消息区视口里第一条露出顶部的「长对话第 N 轮」：文字和离页面顶部的距离；视口附近的行还没挂上时等几帧
+export async function getFirstVisibleTurn(
+  page: Page
+): Promise<{ text: string; top: number }> {
+  // 1. 每帧找一次视口里的用户消息，滚动后虚拟列表在滚动事件里挂上新的行。
+  return getMessageScroller(page).evaluate(async (node) => {
+    const scrollerTop = node.getBoundingClientRect().top
+    for (let frame = 0; frame < 30; frame++) {
+      const message = [...node.querySelectorAll("p")].find((each) => {
+        const { top } = each.getBoundingClientRect()
+        return (
+          /^长对话第 \d+ 轮$/.test(each.textContent ?? "") &&
+          top >= scrollerTop &&
+          top < scrollerTop + node.clientHeight
+        )
+      })
+      if (message)
+        return {
+          text: message.textContent!,
+          top: message.getBoundingClientRect().top,
+        }
+      await new Promise((resolve) => requestAnimationFrame(resolve))
+    }
+    throw new Error("no user message in view")
+  })
+}
+
+// 反复滚到顶往前加载，每次等挂过的最小轮号变小，直到「长对话第 1 轮」挂出来
+export async function loadEarlierTurnsUntilFirst(page: Page): Promise<void> {
+  // 1. 滚到顶并发一次向上滚轮：哨兵或手势触发加载，更早的行挂到视口附近。
+  const messages = getMessages(page)
+  const scroller = getMessageScroller(page)
+  const first = messages.getByText("长对话第 1 轮", { exact: true })
+  let smallestTurn = await getSmallestMountedTurn(messages)
+  while ((await first.count()) === 0) {
+    await scroller.evaluate((node) => {
+      node.scrollTop = 0
+      node.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }))
+    })
+    await expect
+      .poll(() => getSmallestMountedTurn(messages))
+      .toBeLessThan(smallestTurn)
+    smallestTurn = await getSmallestMountedTurn(messages)
+    // 2. 加载后视口里有内容：视口中心落在某一行上，不是空白。
+    await expect
+      .poll(() =>
+        scroller.evaluate((node) => {
+          const rect = node.getBoundingClientRect()
+          return !!document
+            .elementFromPoint(
+              rect.left + rect.width / 2,
+              rect.top + rect.height / 2
+            )
+            ?.closest("[data-row-key]")
+        })
+      )
+      .toBe(true)
+  }
+}
+
 // 输入框
 export function getComposer(page: Page): Locator {
   return page.getByRole("textbox", { name: "消息" })

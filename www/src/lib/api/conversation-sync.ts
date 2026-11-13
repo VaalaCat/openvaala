@@ -64,6 +64,8 @@ interface SyncResult {
 }
 
 const historyPageSize = 50
+// 流式增量合并提交的间隔（毫秒）
+const itemDeltaFlushIntervalMs = 50
 // 执行中的终端输出最多保留的字符数，超出时丢掉最早的部分；与着色上限一致
 const maxToolProgressLength = 200 * 1024
 
@@ -104,6 +106,9 @@ export class ConversationSync {
   private syncGeneration = 0
   // 同步期间到达的通知，按到达顺序，同步完成后交付
   private stagedNotifications: ConversationNotification[] = []
+  // 尚未提交到消息列的增量，按通知到达顺序保存。
+  private pendingItemDeltas: ItemEventParams[] = []
+  private itemDeltaTimeout: ReturnType<typeof setTimeout> | undefined
   // 实时新增且尚未经过消息列展示的 Item；折叠成员也在展示提交后消耗。
   private readonly unpresentedLiveItemKeys = new Set<string>()
 
@@ -151,6 +156,7 @@ export class ConversationSync {
     this.startSync()
     // 2. 停止：作废进行中的同步，取消登记，退订跟随的两个订阅；连接已断开时退订失败不处理。
     return () => {
+      this.flushItemDeltas()
       this.syncGeneration++
       this.stagedNotifications = []
       stopListening()
@@ -254,6 +260,7 @@ export class ConversationSync {
 
   // 作废上一次同步，开始暂存通知并同步；完成后写入结果，失败时断线等重连、其他错误标记失败
   private startSync(): void {
+    this.flushItemDeltas()
     const generation = ++this.syncGeneration
     this.stagedNotifications = []
     this.unpresentedLiveItemKeys.clear()
@@ -395,11 +402,13 @@ export class ConversationSync {
     this.stagedNotifications = []
     for (const notification of staged)
       this.deliverNotification(notification, false)
+    this.flushItemDeltas()
   }
 
   // 按跟随的 Session 的运行信息更新 Turn 状态：记为 running 但已不在执行的轮次（断开期间结束的）清掉，
   // 最近一轮记下终态，正在执行的一轮记为 running
   private applyFollowedSessionTurns(followed: SessionRuntimeInfo | undefined) {
+    this.flushItemDeltas()
     for (const [turnID, turn] of Object.entries(this.$turns.get()))
       if (turn.status === "running" && turnID !== followed?.active_turn_id)
         this.$turns.setKey(turnID, undefined)
@@ -451,12 +460,14 @@ export class ConversationSync {
     notification: ConversationNotification,
     isLive: boolean
   ): void {
-    // 1. 订阅被 serve 关闭时重新同步。
+    // 1. 其他通知先提交此前收到的增量，再更新内容或状态。
+    if (notification.method !== "item/delta") this.flushItemDeltas()
+    // 2. 订阅被 serve 关闭时重新同步。
     if (notification.method === "subscription/closed") {
       this.startSync()
       return
     }
-    // 2. 按通知更新对话内容和状态。
+    // 3. 按通知更新对话内容和状态。
     switch (notification.method) {
       case "item/started":
         if (notification.params.item)
@@ -517,7 +528,7 @@ export class ConversationSync {
         this.$title.set(notification.params.title)
         break
     }
-    // 3. 让受这条通知影响的查询失效。
+    // 4. 让受这条通知影响的查询失效。
     invalidateForNotification(
       this.queryClient,
       this.connection.getServerID(),
@@ -525,22 +536,46 @@ export class ConversationSync {
     )
   }
 
-  // item/delta：增量接到同一位置的生成中 Item；找不到时丢弃
+  // item/delta：暂存增量，按固定间隔合并提交。
   private handleItemDelta(params: ItemEventParams): void {
-    const items = this.$items.get()
-    const index = findStreamingItemIndex(
-      items,
-      params.turn_id,
-      params.item_index
+    // 1. 按到达顺序暂存。
+    if (!params.delta) return
+    this.pendingItemDeltas.push(params)
+    // 2. 同一批只安排一次提交。
+    if (this.itemDeltaTimeout !== undefined) return
+    this.itemDeltaTimeout = setTimeout(
+      () => this.flushItemDeltas(),
+      itemDeltaFlushIntervalMs
     )
-    if (index < 0 || !params.delta) return
-    const view = items[index]
-    this.$items.set(
-      items.with(index, {
+  }
+
+  // 提交暂存增量：取消待执行的定时器，顺序更新消息，整批只复制和发布一次数组。
+  private flushItemDeltas(): void {
+    // 1. 取消定时器，取走本批增量。
+    if (this.pendingItemDeltas.length === 0) return
+    clearTimeout(this.itemDeltaTimeout)
+    this.itemDeltaTimeout = undefined
+    const pending = this.pendingItemDeltas
+    this.pendingItemDeltas = []
+    // 2. 第一条可应用的增量才复制数组，后续增量写入同一份数组。
+    let items: ViewItem[] | undefined
+    for (const params of pending) {
+      const source = items ?? this.$items.get()
+      const index = findStreamingItemIndex(
+        source,
+        params.turn_id,
+        params.item_index
+      )
+      if (index < 0) continue
+      const view = source[index]
+      items ??= source.slice()
+      items[index] = {
         ...view,
-        item: applyItemDelta(view.item, params.delta),
-      })
-    )
+        item: applyItemDelta(view.item, params.delta!),
+      }
+    }
+    // 3. 只发布本批更新后的消息。
+    if (items) this.$items.set(items)
   }
 
   // item/completed、item/interrupted：换成完整 Item 并结束生成；中断且不保存（没有 item）时移除

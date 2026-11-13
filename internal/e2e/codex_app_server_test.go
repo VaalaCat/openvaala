@@ -3979,6 +3979,109 @@ func TestCodexSubAgents(t *testing.T) {
 	}
 }
 
+// TestCodexSubAgentParentActivity 检查子 Agent 向父 Agent 发消息时的根 Thread 身份与历史。
+func TestCodexSubAgentParentActivity(t *testing.T) {
+	// 1. 分别启动 stdio 和 Unix app-server，从模型请求取得根 Session 身份。
+	binary := buildOpenVaala(t)
+	for _, mode := range []string{"stdio", "unix"} {
+		t.Run(mode, func(t *testing.T) {
+			model := newE2EModel(t)
+			connections := newCodexConnections(t, binary, writeE2EConfig(t, model.server.URL), mode)
+			wire := connections.open(t)
+			fixture := &codexResumeFixture{connections: connections, model: model}
+			rootID := fixture.startThread(t, wire)
+			requestID := wire.request(t, "turn/start", map[string]any{"threadId": rootID, "input": []any{codexTextInput("delegate")}})
+			root := model.next(t)
+			rootSessionID := root.header.Get("Session-Id")
+			if rootSessionID == "" || rootSessionID == rootID {
+				t.Fatalf("root Session-Id = %q, want a session distinct from thread %s", rootSessionID, rootID)
+			}
+			root.reply <- e2eModelReply{tool: "spawn_agent", arguments: `{"task_name":"review","message":"check"}`}
+			afterSpawn, child := model.nextRootAndTask(t, "review")
+			childID := child.header.Get("Session-Id")
+			if childID == "" || childID == rootSessionID {
+				t.Fatalf("child Session-Id = %q, want a distinct child session", childID)
+			}
+
+			// 2. 保持根 Agent 在运行，让子 Agent 用根 Session ID 发送 steer 消息并完成。
+			rootReply := make(chan string, 1)
+			afterSpawn.reply <- e2eModelReply{stream: rootReply}
+			child.reply <- e2eModelReply{
+				tool:      "send_message",
+				arguments: fmt.Sprintf(`{"session_id":%q,"message":"review update","mode":"steer"}`, rootSessionID),
+			}
+			afterSend := model.next(t)
+			if got := afterSend.header.Get("Session-Id"); got != childID {
+				t.Fatalf("request after child send_message belongs to %q, want child %s", got, childID)
+			}
+			afterSend.reply <- e2eModelReply{text: "child done"}
+			childMessages := wire.readTurn(t, childID, nil)
+			assertCodexTurnCompleted(t, childMessages, "completed")
+			rootReply <- "root done"
+			close(rootReply)
+			model.replyAll(t, e2eModelReply{text: "received"})
+			rootMessages := wire.readTurn(t, rootID, requestID)
+			assertCodexTurnCompleted(t, rootMessages, "completed")
+			wire.waitThreadStatus(t, childID, "idle", childMessages)
+			wire.waitThreadStatus(t, rootID, "idle", rootMessages)
+
+			// 3. 收集实时活动与三种历史查询中的同一个向父消息 Item。
+			activity := childMessages.getItemWhere(t, "item/completed", func(item map[string]any) bool {
+				return item["type"] == "subAgentActivity" && item["kind"] == "interacted"
+			})
+			activityID, ok := activity["id"].(string)
+			if !ok || activityID == "" {
+				t.Fatalf("parent activity id = %v, want a non-empty item id", activity["id"])
+			}
+			started := childMessages.getItemWhere(t, "item/started", func(item map[string]any) bool { return item["id"] == activityID })
+			var read codexWireThreadRead
+			wire.call(t, "thread/read", map[string]any{"threadId": childID, "includeTurns": true}, &read)
+			var turns codexWireTurnPage
+			wire.call(t, "thread/turns/list", map[string]any{"threadId": childID, "itemsView": "full"}, &turns)
+			var readItems, turnItems, pagedItems []map[string]any
+			for _, turn := range read.Thread.Turns {
+				readItems = append(readItems, turn.Items...)
+			}
+			for _, turn := range turns.Data {
+				turnItems = append(turnItems, turn.Items...)
+			}
+			for _, page := range pageThreadItems(t, wire, map[string]any{"threadId": childID, "limit": 1}) {
+				for _, entry := range page.Data {
+					pagedItems = append(pagedItems, entry.Item)
+				}
+			}
+
+			// 4. 每个入口只返回一次该活动，目标都是根 Conversation，而不是内部根 Session。
+			for _, test := range []struct {
+				name  string
+				items []map[string]any
+			}{
+				{name: "item_started", items: []map[string]any{started}},
+				{name: "item_completed", items: []map[string]any{activity}},
+				{name: "thread_read", items: readItems},
+				{name: "thread_turns_list", items: turnItems},
+				{name: "thread_items_list", items: pagedItems},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					count := 0
+					for _, item := range test.items {
+						if item["id"] != activityID {
+							continue
+						}
+						count++
+						if item["agentThreadId"] != rootID || item["agentThreadId"] == rootSessionID || !reflect.DeepEqual(item, activity) {
+							t.Errorf("parent activity = %v, want the live activity targeting root thread %s, not session %s", item, rootID, rootSessionID)
+						}
+					}
+					if count != 1 {
+						t.Fatalf("parent activity count = %d, want 1", count)
+					}
+				})
+			}
+		})
+	}
+}
+
 // codexSubAgentFixture 是 runSubAgentScenario 跑完的结果：三条跟随了子 Thread 的连接、它们读到的消息和 thread/loaded/list。
 type codexSubAgentFixture struct {
 	connections *codexConnections

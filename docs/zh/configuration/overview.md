@@ -237,7 +237,9 @@ openvaala serve reload
 
 也可以在终端界面用 `/reload`，或者在 Web 界面点 **设置 → 重新加载配置**。通过终端界面或 Web 界面的模型服务设置、以及 `openvaala plugin` 做的修改，会自动重新加载。
 
-重新加载会替换 Agent、模型、Executor、MCP server、hook、skill、插件和 `server.workspace_directory`。已打开且空闲的对话立即换用新定义，之后打开的对话也用新定义。有 Turn 或后台命令在运行的对话继续用旧定义；命令会列出这些对话，等它们结束后再重新加载一次即可。新配置有错误时，重新加载会失败，服务继续用旧配置；启动时遇到同样的错误，Runtime 服务就启动不了。
+重新加载会替换 Agent、模型、Executor、MCP server、hook、skill、插件和 `server.workspace_directory`。已打开且空闲的对话立即换用新定义，之后打开的对话也用新定义。忙碌对话先准备并暂存新配置，等全部 Session 的 Turn、排队输入、待交付上下文和后台命令处理完后自动应用；命令列出等待应用的对话，不需要再次重新加载。持续运行的后台命令、暂停的 Agent 消息或尚未交付的上下文会延长等待；后两者可能需要下一条用户输入才会被消费。
+
+新配置文件加载失败时，服务保留原定义；某个已有对话准备新配置失败时，该对话保留原配置及此前成功准备的待用配置，其他对话照常更新，错误记录在服务日志里。等待期间新建的 Session 若需要新配置里没有的 Agent，这份待用更新会被取消，对话继续使用原运行配置，并在服务日志里记录错误。等待列表为空不代表所有对话都准备成功。真正应用时会重建 Session 和执行环境：已保存历史保留，虚拟工作区运行期文件和已结束命令的输出不迁移。
 
 有些设置只在启动时读取。要修改 `server.listen`、`server.token`、`server.conversation_idle_timeout`、`tools.max_image_kb` 或 `telemetry` 下的任何设置，先停掉服务，再让它重新启动：
 

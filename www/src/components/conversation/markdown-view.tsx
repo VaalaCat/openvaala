@@ -1,4 +1,4 @@
-import { memo } from "react"
+import { createContext, memo, useContext } from "react"
 import { Streamdown, type Components } from "streamdown"
 import { CodeView } from "@/components/base/code-view"
 import { ImagePreview } from "@/components/base/image-preview"
@@ -8,23 +8,47 @@ import { ImagePreview } from "@/components/base/image-preview"
 export const MarkdownView = memo(function MarkdownView({
   text,
   isStreaming = false,
+  viewStateKey,
 }: {
   text: string
   isStreaming?: boolean
+  // 给出时，代码块的展开选择保存在消息区里，重新挂载后保留
+  viewStateKey?: string
 }) {
   return (
-    <Streamdown
-      className="markdown-view text-reading"
-      isAnimating={isStreaming}
-      controls={false}
-      linkSafety={{ enabled: false }}
-      lineNumbers={false}
-      components={markdownComponents}
-    >
-      {text}
-    </Streamdown>
+    <MarkdownViewStateKeyContext value={viewStateKey}>
+      <Streamdown
+        className="markdown-view text-reading"
+        isAnimating={isStreaming}
+        controls={false}
+        lineNumbers={false}
+        components={markdownComponents}
+      >
+        {text}
+      </Streamdown>
+    </MarkdownViewStateKeyContext>
   )
 })
+
+// 这段 Markdown 的 viewStateKey，交给模块级 markdownComponents 里的代码块
+const MarkdownViewStateKeyContext = createContext<string | undefined>(undefined)
+
+// 回复里的代码块：按所在 Markdown 的 key、语言和代码原文区分展开选择
+function MarkdownCode({ code, lang }: { code: string; lang: string }) {
+  // 1. 没给 key 时不保存展开选择。
+  const viewStateKey = useContext(MarkdownViewStateKeyContext)
+  return (
+    <CodeView
+      code={code}
+      lang={lang}
+      viewStateKey={
+        viewStateKey === undefined
+          ? undefined
+          : `${viewStateKey}:code:${lang}:${code}`
+      }
+    />
+  )
+}
 
 // 标题、链接和代码换成项目的文字角色；其余标签用 streamdown 自带的样式。
 // 回复里的标题从 h3 起，不和页面标题抢层级
@@ -52,7 +76,7 @@ const markdownComponents: Components = {
     <code className="bg-muted px-1 text-code-reading">{children}</code>
   ),
   code: ({ className, children }) => (
-    <CodeView
+    <MarkdownCode
       code={String(children ?? "")}
       lang={/language-(\S+)/.exec(className ?? "")?.[1] ?? "text"}
     />

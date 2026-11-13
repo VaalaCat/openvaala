@@ -2,7 +2,9 @@ import type { Locator, Page } from "@playwright/test"
 import {
   expect,
   getComposer,
+  getFirstVisibleTurn,
   getMessages,
+  loadEarlierTurnsUntilFirst,
   openRightPanel,
   recordRequests,
   startConversation,
@@ -315,6 +317,68 @@ test.describe("desktop", () => {
     await expect(getVisibleScroller(page)).toHaveCount(0)
     await getTabButtons(page).filter({ hasText: "滚动桌面第一条" }).click()
     await expectScrollAt(page, before)
+  })
+
+  test("hidden_tab_keeps_reading_position_in_a_long_conversation", async ({
+    page,
+    fixture,
+  }) => {
+    test.setTimeout(120_000)
+    // 1. 60 轮长回复的对话加载到第 1 轮，滚到中间，记下视口顶部那一条和视口里的行。
+    const turns = 60
+    const historyReply =
+      "## 历史回复\n\n" +
+      Array.from(
+        { length: 12 },
+        (_, index) => `- 要点 ${index + 1}：保留历史消息、阅读位置和文字选择。`
+      ).join("\n")
+    await fixture.replies(
+      ...Array.from({ length: turns }, () => ({ text: historyReply }))
+    )
+    const { longConversationID } = await fixture.seed({
+      conversations: 0,
+      longConversationTurns: turns,
+    })
+    await fixture.openApp(page)
+    await page.goto(page.url() + "/c/" + longConversationID)
+    const messages = getMessages(page)
+    await expect(
+      messages.getByText(`长对话第 ${turns} 轮`, { exact: true })
+    ).toBeVisible()
+    await loadEarlierTurnsUntilFirst(page)
+    await scrollToMiddle(page)
+    const { text } = await getFirstVisibleTurn(page)
+    const message = messages.getByText(text, { exact: true })
+    const top = (await message.boundingBox())!.y
+    const getRowKeys = (isVisibleOnly: boolean) =>
+      getVisibleScroller(page).evaluate((node, isVisibleOnly) => {
+        const viewport = node.getBoundingClientRect()
+        return [...node.querySelectorAll<HTMLElement>("[data-row-key]")]
+          .filter((row) => {
+            const rect = row.getBoundingClientRect()
+            return (
+              !isVisibleOnly ||
+              (rect.bottom > viewport.top && rect.top < viewport.bottom)
+            )
+          })
+          .map((row) => row.dataset.rowKey!)
+      }, isVisibleOnly)
+    const visibleRowKeys = await getRowKeys(true)
+    expect(visibleRowKeys.length).toBeGreaterThan(0)
+    // 2. 同一个区域里新开一个终端标签页（主对话被隐藏），过一会儿再切回来。
+    await openAreaMenu(getAreas(page).first())
+    await page.getByRole("menuitem", { name: "新终端", exact: true }).click()
+    await expect(getTabButtons(page)).toHaveCount(2)
+    await expect(getVisibleScroller(page)).toHaveCount(0)
+    await page.waitForTimeout(500)
+    await getTabButtons(page).filter({ hasText: "长对话第 1 轮" }).click()
+    // 3. 同一条消息回到原位，隐藏前视口里的行仍然挂着。
+    await expect
+      .poll(async () => Math.abs((await message.boundingBox())!.y - top))
+      .toBeLessThanOrEqual(2)
+    expect(await getRowKeys(false)).toEqual(
+      expect.arrayContaining(visibleRowKeys)
+    )
   })
 
   test("hidden_tab_at_the_bottom_keeps_following_new_output", async ({

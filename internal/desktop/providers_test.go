@@ -100,6 +100,67 @@ func TestProviderDraftValues(t *testing.T) {
 	}
 }
 
+// TestProviderModelDescription 检查模型描述在设置表单中的编辑和保存。
+func TestProviderModelDescription(t *testing.T) {
+	// 1. 从已保存配置生成实际控件，编辑后写回完整模型配置。
+	for _, tt := range []struct {
+		name, before, after string
+		edit                bool
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:   "preserve",
+			before: "Fast extraction",
+			after:  "Fast extraction",
+		},
+		{
+			name:  "add",
+			after: "Careful code review",
+			edit:  true,
+		},
+		{
+			name:   "clear",
+			before: "Fast extraction",
+			edit:   true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.navigate("providers")
+			d.providerDraft = providerToDraft(defs.ProviderConfig{
+				ID: "provider",
+				Models: map[string]*defs.ProviderModelConfig{
+					"model": {Description: tt.before},
+				},
+			})
+			d.providerBaseline = cloneProviderDraft(d.providerDraft)
+			model := d.providerDraft.Models[0]
+			tester := ui.NewTester(d.view, 1280, 2400)
+			if tt.edit {
+				title, found := tester.Find("模型描述")
+				if !found {
+					t.Fatal("model description row missing")
+				}
+				// 设置标题在左，输入框在同一行右侧。
+				tester.ClickAt(907, title.Y+title.H/2)
+				tester.Key(ui.Cmd, ui.KeyA)
+				tester.Key(0, ui.KeyBackspace)
+				tester.Type(tt.after)
+			}
+			model.DisplayName = "Renamed"
+			provider, err := draftToProvider(d.providerDraft, defs.ModelDefaults{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := provider.Models["model"].Description; got != tt.after {
+				t.Fatalf("description = %q, want %q", got, tt.after)
+			}
+		})
+	}
+}
+
 // TestProviderDraftHeaders 检查请求头行与配置的互相转换：行按名称排序，保存时名称去空白、空名称的行忽略、空值照常保留。
 func TestProviderDraftHeaders(t *testing.T) {
 	// 1. 从配置生成草稿，追加编辑行后写回，比较保存的 headers。

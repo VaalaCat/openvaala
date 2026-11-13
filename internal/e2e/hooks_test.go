@@ -243,7 +243,7 @@ func TestHooksEndToEnd(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), e2eTimeout)
 				defer cancel()
 				result, err := f.control.ReloadConfig(ctx)
-				if err != nil || len(result.BusyConversationIDs) != 0 {
+				if err != nil || len(result.PendingConversationIDs) != 0 {
 					t.Fatalf("config/reload = %+v, error %v, want it to succeed with no busy conversation", result, err)
 				}
 				assertListedHooks(t, f.listHooks(t), []hooksExpectedListing{
