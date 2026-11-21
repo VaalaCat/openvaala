@@ -13,7 +13,7 @@ import (
 // SessionNamespace 是 Session 索引记录所在的记录分组；索引记录由 metadata 日志生成。
 const SessionNamespace = "sessions"
 
-// sessionDAOImpl 读写 Session 的 metadata 日志和索引记录，删除 Session 时一并删除它的 Item 日志。
+// sessionDAOImpl 读写 Session 的 metadata 日志和索引记录，删除 Session 时一并删除它的 Item 和 checkpoint 日志。
 type sessionDAOImpl struct {
 	records storage.RecordStorage
 	logs    storage.LogStorage
@@ -45,7 +45,7 @@ func (d *sessionDAOImpl) SetSession(ctx context.Context, value defs.Session) err
 	return nil
 }
 
-// DeleteSession 先追加 session_deleted，再删除 Turn 索引、Item 日志，最后删除 Session 索引。
+// DeleteSession 先追加 session_deleted，再删除 Turn 索引和各日志，最后删除 Session 索引。
 func (d *sessionDAOImpl) DeleteSession(ctx context.Context, conversationID defs.ConversationID, id defs.SessionID) error {
 	// 1. 检查 ID 并读取 Session，不存在时直接返回。
 	if id == "" || conversationID == "" {
@@ -66,13 +66,16 @@ func (d *sessionDAOImpl) DeleteSession(ctx context.Context, conversationID defs.
 	if _, err := appendMetadata(ctx, d.logs, conversationID, entry); err != nil {
 		return fmt.Errorf("delete Session %q: %w", id, err)
 	}
-	// 3. 依次删除 Turn 索引、Item 日志和 Session 索引，任一步失败时返回错误。
+	// 3. 依次删除 Turn 索引、Item 日志、checkpoint 日志和 Session 索引，任一步失败时返回错误。
 	start, end := turnRange(id)
 	if err := d.records.DeleteRange(ctx, turnNamespace, start, end); err != nil {
 		return fmt.Errorf("delete Session %q Turns: %w", id, err)
 	}
 	if err := d.logs.Delete(ctx, storage.StreamPath(conversationID), storage.StreamID(id)); err != nil {
 		return fmt.Errorf("delete Session %q Items: %w", id, err)
+	}
+	if err := d.DeleteSessionCheckpoints(ctx, conversationID, id); err != nil {
+		return err
 	}
 	if err := d.records.Delete(ctx, SessionNamespace, sessionKey(conversationID, id)); err != nil {
 		return fmt.Errorf("delete Session %q: %w", id, err)

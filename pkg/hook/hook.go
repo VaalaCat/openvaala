@@ -10,7 +10,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
@@ -29,8 +28,6 @@ type Hooks interface {
 	// 每个命中的 hook 先发一次 running 记录，结束时再发一次最终记录（同一个 ID）；RunEvent 返回后不再发送。
 	// runUpdates 由调用方创建和关闭，接收方须在 RunEvent 运行期间持续接收；ctx 取消时运行中的命令被结束，记为 failed。
 	RunEvent(ctx context.Context, request *HookEventRequest, runUpdates chan<- *defs.HookRun) *HookOutcome
-	// GetHookInfos 返回配置的全部 hook，按 DisplayOrder 排列，供 hooks/list 显示。
-	GetHookInfos() []*HookInfo
 }
 
 // hooksImpl 保存一版配置的 hook 定义，记着各 Executor 上已经拷过的脚本和插件目录。
@@ -83,32 +80,6 @@ func (h *hooksImpl) RunEvent(ctx context.Context, request *HookEventRequest, run
 	}
 	tasks.Wait()
 	return mergeOutcomes(outcomes)
-}
-
-// GetHookInfos 返回按展示顺序排列的 hook 信息。
-func (h *hooksImpl) GetHookInfos() []*HookInfo {
-	// 1. 提取事件、matcher、显示命令、超时、来源、定义哈希和插件名。
-	infos := make([]*HookInfo, 0, len(h.opt.Definitions))
-	for _, definition := range h.opt.Definitions {
-		pluginName := ""
-		if definition.Plugin != nil {
-			pluginName = definition.Plugin.Name
-		}
-		infos = append(infos, &HookInfo{
-			Key:            definition.Key,
-			Event:          definition.Event,
-			Matcher:        definition.Matcher.String(),
-			Handler:        getHandler(definition),
-			TimeoutSeconds: int(definition.Timeout / time.Second),
-			SourcePath:     definition.SourcePath,
-			DisplayOrder:   definition.DisplayOrder,
-			CurrentHash:    getDefinitionHash(definition),
-			PluginName:     pluginName,
-		})
-	}
-	// 2. 按 DisplayOrder 稳定排序。
-	slices.SortStableFunc(infos, func(a, b *HookInfo) int { return a.DisplayOrder - b.DisplayOrder })
-	return infos
 }
 
 // runDefinition 运行一个 hook，开始和结束时各发一次运行记录，返回它的决定。

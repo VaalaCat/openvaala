@@ -772,7 +772,7 @@ func (s *runtimeSession) handleAgentEvent(event *agent.AgentEvent) {
 		}
 		s.info.Usage = s.info.Usage.Add(*call.Usage)
 		// 3. 普通调用上报 Usage 后，保存实际用量和请求前的本地估算。
-		if call.Purpose == agent.ModelCallPurposeConversation {
+		if call.Purpose == defs.ModelCallPurposeConversation {
 			s.lastRequest = &LastRequestUsage{
 				ModelCallID:     call.ModelCallID,
 				Model:           s.info.ActiveTurnModel.Ref,

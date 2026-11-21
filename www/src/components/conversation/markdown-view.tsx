@@ -20,6 +20,7 @@ export const MarkdownView = memo(function MarkdownView({
       <Streamdown
         className="markdown-view text-reading"
         isAnimating={isStreaming}
+        remend={{ pendingInlineMarkers: isStreaming }}
         controls={false}
         lineNumbers={false}
         components={markdownComponents}

@@ -52,26 +52,34 @@ func (item *Item) Clone() *Item {
 	if item == nil {
 		return nil
 	}
+	var usage *TurnContextUsage
+	if item.ModelCallUsage != nil {
+		report := *item.ModelCallUsage
+		usage = &report
+	}
 	return &Item{
-		ID:                item.ID,
-		UpdatedAt:         item.UpdatedAt,
-		TurnID:            item.TurnID,
-		ModelCallID:       item.ModelCallID,
-		Kind:              item.Kind,
-		Message:           item.Message.Clone(),
-		Reasoning:         item.Reasoning.Clone(),
-		ToolCall:          item.ToolCall.Clone(),
-		ToolResult:        item.ToolResult.Clone(),
-		ModelError:        item.ModelError.Clone(),
-		ContextSummary:    item.ContextSummary.Clone(),
-		SessionFork:       item.SessionFork.Clone(),
-		ModelChange:       item.ModelChange.Clone(),
-		ExecutorsChange:   item.ExecutorsChange.Clone(),
-		SkillInstruction:  item.SkillInstruction.Clone(),
-		AgentsInstruction: item.AgentsInstruction.Clone(),
-		MemoryIndex:       item.MemoryIndex.Clone(),
-		ClientInstruction: item.ClientInstruction.Clone(),
-		HookRun:           item.HookRun.Clone(),
+		ID:                   item.ID,
+		UpdatedAt:            item.UpdatedAt,
+		TurnID:               item.TurnID,
+		ModelCallID:          item.ModelCallID,
+		ModelCallResult:      item.ModelCallResult,
+		ModelCallUsage:       usage,
+		Kind:                 item.Kind,
+		Message:              item.Message.Clone(),
+		Reasoning:            item.Reasoning.Clone(),
+		ToolCall:             item.ToolCall.Clone(),
+		ToolResult:           item.ToolResult.Clone(),
+		ModelError:           item.ModelError.Clone(),
+		ContextSummary:       item.ContextSummary.Clone(),
+		SessionFork:          item.SessionFork.Clone(),
+		ModelChange:          item.ModelChange.Clone(),
+		ExecutorsChange:      item.ExecutorsChange.Clone(),
+		SkillInstruction:     item.SkillInstruction.Clone(),
+		AgentsInstruction:    item.AgentsInstruction.Clone(),
+		MemoryIndex:          item.MemoryIndex.Clone(),
+		ClientInstruction:    item.ClientInstruction.Clone(),
+		HookRun:              item.HookRun.Clone(),
+		HandedOffInputItemID: item.HandedOffInputItemID,
 	}
 }
 
@@ -418,7 +426,7 @@ func SelectContextHistoryItems(items []*Item) ([]*Item, error) {
 		}
 	}
 	for _, item := range items[start:] {
-		if item.Kind != ItemSessionFork && item.Kind != ItemContextSummary && !failedModelCalls[item.ModelCallID] {
+		if item.Kind != ItemSessionFork && item.Kind != ItemContextSummary && item.Kind != ItemModelCallResult && !failedModelCalls[item.ModelCallID] {
 			result = append(result, item.Clone())
 		}
 	}

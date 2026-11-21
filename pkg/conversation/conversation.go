@@ -51,6 +51,8 @@ type Conversation interface {
 	CompactContext(ctx context.Context) (defs.TurnID, error)
 	// IsTerminalBusy 运行中的根或子 Session 是否还有未结束的后台命令？
 	IsTerminalBusy() bool
+	// IsBusy 对话内是否有活动 Turn、待处理输入或未结束的后台命令？查询失败时返回错误。
+	IsBusy(ctx context.Context) (bool, error)
 	// IsRestorableFromRecord 对话停止后按记录重新打开，能否回到同样的状态？
 	IsRestorableFromRecord() bool
 	// ListSessionInfos 按 SessionID 返回全部 Session 的记录、状态、已保存用量和所选模型窗口。
@@ -129,8 +131,10 @@ type conversationImpl struct {
 
 // ConversationOpt 是对话整个生命周期都不变的依赖，加上建对话时的定义。
 type ConversationOpt struct {
-	Query    dao.Query
-	Mutation dao.Mutation
+	// ModelClient 是本对话共用的模型客户端，须支持并发调用；nil 时创建默认客户端。
+	ModelClient llmkit.Client
+	Query       dao.Query
+	Mutation    dao.Mutation
 	// Definitions 是建对话时的定义；之后由 SetDefinitions 整份替换。
 	Definitions *ConversationDefinitions
 	// Environment 是客户端的环境变量（格式同 os.Environ），只给 local 种类的 Executor 执行命令用；
@@ -140,6 +144,13 @@ type ConversationOpt struct {
 	MaxImageBytes int
 	// WithoutExecutors 是否不装配 Executor 和 Skill？换定义时也不装配。
 	WithoutExecutors bool
+}
+
+// WithModelClient 设置本对话使用的模型客户端。
+func (opt *ConversationOpt) WithModelClient(client llmkit.Client) *ConversationOpt {
+	// 1. 保存客户端并返回配置。
+	opt.ModelClient = client
+	return opt
 }
 
 // CreateConversation 用 conversationID 装配配置并保存新对话，返回还没启动的对话。
@@ -235,7 +246,7 @@ func newConversation(record defs.Conversation, records []defs.Session, opt *Conv
 		opt:                 *opt,
 		id:                  record.ID,
 		rootSessionID:       record.RootSessionID,
-		modelClient:         llmkit.NewClient(llmkit.ClientOptions{HTTPClient: httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt())}),
+		modelClient:         opt.ModelClient,
 		clientMCPServers:    executor.NewClientMCPServers(),
 		clientMCPRunCancels: make(map[string]context.CancelFunc),
 		configChanges:       make(chan *configChange),
@@ -244,6 +255,9 @@ func newConversation(record defs.Conversation, records []defs.Session, opt *Conv
 		stopped:             make(chan struct{}),
 		started:             make(chan struct{}, 1),
 		rootStarted:         make(chan struct{}),
+	}
+	if c.modelClient == nil {
+		c.modelClient = llmkit.NewClient(llmkit.ClientOptions{HTTPClient: httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt())})
 	}
 	// 2. 保存初始配置和各 Session 记录。
 	c.config.Store(config)
@@ -433,17 +447,13 @@ func (c *conversationImpl) applyPendingConfig(deferIfBusy bool) (isPending bool,
 	if deferIfBusy {
 		ctx, cancel := context.WithTimeout(c.runCtx, time.Second)
 		defer cancel()
-		for _, instance := range c.runningSessions.Values() {
-			status, err := instance.GetStatus(ctx)
-			if err != nil || ctx.Err() != nil || status.State != session.SessionStateIdle ||
-				status.PendingInputCount != 0 || status.PendingContextItemCount != 0 || instance.IsTerminalBusy() {
-				if c.configApplyTimer == nil {
-					c.configApplyTimer = time.NewTimer(time.Second)
-				} else {
-					c.configApplyTimer.Reset(time.Second)
-				}
-				return true, nil
+		if busy, err := c.IsBusy(ctx); err != nil || ctx.Err() != nil || busy {
+			if c.configApplyTimer == nil {
+				c.configApplyTimer = time.NewTimer(time.Second)
+			} else {
+				c.configApplyTimer.Reset(time.Second)
 			}
+			return true, nil
 		}
 	}
 	// 3. 停止计时，检查等待期间新增的 Session；候选缺少所需 Agent 时关闭候选并保留运行配置。
@@ -725,6 +735,22 @@ func (c *conversationImpl) AppendContextItems(ctx context.Context, items []*defs
 	return root.AppendContextItems(ctx, items)
 }
 
+// IsBusy 对话内是否有活动 Turn、待处理输入或未结束的后台命令？
+func (c *conversationImpl) IsBusy(ctx context.Context) (bool, error) {
+	// 1. 向各 Session 查询执行状态与待处理输入，再检查它的后台命令。
+	for _, instance := range c.runningSessions.Values() {
+		status, err := instance.GetStatus(ctx)
+		if err != nil {
+			return false, err
+		}
+		if status.State == session.SessionStateRunning || status.PendingInputCount != 0 ||
+			status.PendingContextItemCount != 0 || instance.IsTerminalBusy() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // IsTerminalBusy 对话内运行的 Session 是否还有未结束的后台命令？
 func (c *conversationImpl) IsTerminalBusy() bool {
 	// 1. 逐个询问运行中的 Session，有一个还有未结束的后台命令就算忙。
@@ -853,7 +879,7 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 	opt.AgentTools = collaborationTools
 	opt.ClientMCPServers = c.clientMCPServers
 	opt.Skills = skills
-	opt.Hooks = config.definitions.Hooks
+	opt.Hooks = config.hooks
 	lastSavedOrdinal, err := dao.GetLastOrdinal(config.sessionsCtx, c.opt.Query, c.id, record.ID)
 	if err != nil {
 		return nil, err

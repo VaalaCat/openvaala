@@ -22,8 +22,8 @@ import (
 	"github.com/creack/pty"
 )
 
-// terminalOutputDrainTimeout 是 TTY 命令的 shell 退出后，Wait 继续等待终端输出读完的上限；超时后关闭 PTY master，不再等待。
-const terminalOutputDrainTimeout = time.Second
+// localOutputDrainTimeout 是 Bash 退出后等待输出读完的时限，超时后关闭输出读端。
+const localOutputDrainTimeout = time.Second
 
 // localWorkspaceImpl 是本机目录上的工作区：读取直接访问本机文件系统，写入经 os.Root 限制在根目录内，命令由真实 bash 执行。
 type localWorkspaceImpl struct {
@@ -262,6 +262,8 @@ func (w *localWorkspaceImpl) StartProcess(ctx context.Context, request *ProcessR
 		closeFiles(stdout, stderr)
 		return nil, err
 	}
+	process.stdoutReader = stdout
+	process.stderrReader = stderr
 	process.copyOutput(stdout, request.Stdout)
 	process.copyOutput(stderr, request.Stderr)
 	return process, nil
@@ -335,12 +337,15 @@ func syncDirectory(root *os.Root, directory string) error {
 	return errors.Join(handle.Sync(), handle.Close())
 }
 
-// localProcessImpl 是本机 bash 进程：输出由复制任务写入请求的 Writer，Wait 在 bash 退出后结束整个进程组并等待复制完成，TTY 命令的等待有时限。
+// localProcessImpl 保存本机 Bash 进程、输出读端和复制任务。
 type localProcessImpl struct {
 	command *exec.Cmd
 	// terminal 是 TTY 命令的 PTY master，非 TTY 时为 nil：WriteTerminalInput 写它，输出复制任务读它并在复制结束后关闭。
 	// Linux 上它由运行时轮询，关闭会打断程序没读走的写入。
-	terminal     *os.File
+	terminal *os.File
+	// 非 TTY 命令的输出读端由复制任务在退出时关闭，Wait 也可在排空超时时关闭。
+	stdoutReader *os.File
+	stderrReader *os.File
 	outputCopies sync.WaitGroup
 }
 
@@ -358,14 +363,9 @@ func (p *localProcessImpl) Wait() (int, error) {
 	return p.command.ProcessState.ExitCode(), nil
 }
 
-// waitOutputCopies 等待输出复制任务结束；TTY 命令最多等 terminalOutputDrainTimeout，超时后关闭 PTY master 并返回。
+// waitOutputCopies 限时排空本机命令的输出，超时后关闭输出读端。
 func (p *localProcessImpl) waitOutputCopies() {
-	// 1. 非 TTY 命令直接等待复制结束。
-	if p.terminal == nil {
-		p.outputCopies.Wait()
-		return
-	}
-	// 2. TTY 命令限时等待，超时后关闭 PTY master，不再等复制任务。
+	// 1. 等待复制任务读完已有输出。
 	copied := make(chan struct{})
 	go func() {
 		p.outputCopies.Wait()
@@ -373,9 +373,16 @@ func (p *localProcessImpl) waitOutputCopies() {
 	}()
 	select {
 	case <-copied:
-	case <-time.After(terminalOutputDrainTimeout):
-		_ = p.terminal.Close()
+		return
+	case <-time.After(localOutputDrainTimeout):
 	}
+	// 2. 超时后关闭 PTY master 或管道读端，非 TTY 命令等复制任务退出。
+	if p.terminal != nil {
+		_ = p.terminal.Close()
+		return
+	}
+	closeFiles(p.stdoutReader, p.stderrReader)
+	<-copied
 }
 
 // Terminate 结束本机命令的整个进程组。

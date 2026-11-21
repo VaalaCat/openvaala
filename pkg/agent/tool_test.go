@@ -15,10 +15,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent"
+	"github.com/VaalaCat/openvaala/pkg/agent/agent_context"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/executor/tools"
@@ -396,7 +398,7 @@ func TestAgentToolCancellationKeepsTerminalResults(t *testing.T) {
 			_, _ = io.WriteString(w, toolCallResponse)
 		}))
 	defer server.Close()
-	backend := &testToolExecutor{waitForCancel: true}
+	backend := &testToolExecutor{waitForCancel: true, exitedCalls: make(chan string, 2)}
 	history := newTestContext(t, "", []*defs.Item{userMessage("查询")})
 	opt := agent.NewAgentOpt(testTurnID, testSessionID, llmkit.NewClient(llmkit.ClientOptions{}), newTestModel(&llmkit.Target{
 		Protocol: llmkit.ProtocolOpenAIChat,
@@ -422,6 +424,9 @@ func TestAgentToolCancellationKeepsTerminalResults(t *testing.T) {
 	}()
 	result, err := instance.Run(ctx, events)
 	<-done
+	if len(backend.exitedCalls) != 2 {
+		t.Fatal("Agent returned before both tool calls exited")
+	}
 	if !errors.Is(err, context.Canceled) || result.FinalModelCallID != "" {
 		t.Fatalf("error = %v, final model call = %q", err, result.FinalModelCallID)
 	}
@@ -502,17 +507,23 @@ func (c *scriptedAgentClient) Call(
 
 // testToolExecutor 是提供 lookup 工具的测试执行器，可按配置返回失败、等待取消或并行执行。
 type testToolExecutor struct {
-	toolError      *defs.ToolError
-	argumentsError error
-	runError       error
-	waitForCancel  bool
-	parallel       bool
-	calls          []string
-	finished       bool
-	callsStarted   chan struct{}
-	callsReleased  chan struct{}
-	callBFinished  chan struct{}
-	receivedCalls  chan string
+	toolError                   *defs.ToolError
+	argumentsError              error
+	runError                    error
+	waitForCancel               bool
+	parallel                    bool
+	calls                       []string
+	callAStarted                chan struct{}
+	callBStarted                chan struct{}
+	callAFinished               chan struct{}
+	callBFinished               chan struct{}
+	receivedCalls               chan string
+	exitedCalls                 chan string
+	blockedCallID               string
+	releaseCall                 <-chan struct{}
+	preparedCallID              string
+	beforePreparedCallsReturned func()
+	agentsInstructions          []*defs.AgentsInstruction
 }
 
 // GetTools 返回测试查询工具定义。
@@ -531,68 +542,80 @@ func (e *testToolExecutor) GetDefinition() *defs.ToolDefinition {
 	}
 }
 
-// Run 执行一批测试工具调用。
-func (e *testToolExecutor) Run(ctx context.Context, calls []*defs.Item, events chan<- executor.ExecutorEvent) {
-	// 1. 设置事件关闭和取消清理，并按并行模式创建启动、释放和结束通知通道。
-	defer close(events)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	e.finished = false
+// PrepareCalls 记录整批测试工具调用，初始化受控同步通道并返回调用副本。
+func (e *testToolExecutor) PrepareCalls(_ context.Context, calls []*defs.Item, events chan<- executor.ExecutorEvent) []*executor.PreparedToolCall {
+	// 1. 按并行或顺序模式准备受控同步通道。
+	e.callAFinished = nil
 	if e.parallel {
-		e.callsStarted = make(chan struct{}, len(calls))
-		e.callsReleased = make(chan struct{})
+		e.callAStarted = make(chan struct{})
+		e.callBStarted = make(chan struct{})
 		e.callBFinished = make(chan struct{})
+	} else if len(calls) > 1 {
+		e.callAFinished = make(chan struct{})
 	}
-	// 2. 逐个记录调用，按配置顺序或并行执行。
-	var tasks sync.WaitGroup
-	for _, callItem := range calls {
-		call := callItem.ToolCall
-		e.calls = append(e.calls, call.CallID)
-		if e.parallel {
-			tasks.Go(func() {
-				e.execCall(ctx, callItem, events)
-			})
-			continue
+	// 2. 记录调用 ID 并返回克隆后的 PreparedToolCall 列表。
+	preparedCalls := make([]*executor.PreparedToolCall, len(calls))
+	for index, callItem := range calls {
+		e.calls = append(e.calls, callItem.ToolCall.CallID)
+		preparedCalls[index] = &executor.PreparedToolCall{Call: callItem.Clone()}
+		if callItem.ToolCall.CallID == e.preparedCallID {
+			finished := &executor.ExecutionFinishedEvent{Result: &defs.ToolResult{
+				CallID: e.preparedCallID, Error: &defs.ToolError{Code: "hook_blocked", Message: "blocked before dispatch"},
+			}}
+			events <- finished
+			preparedCalls[index].Finished = finished
 		}
-		e.execCall(ctx, callItem, events)
 	}
-	// 3. 并行时等待所有工具发出进度，再一起放行完成步骤。
-	if e.parallel {
-		for range calls {
-			select {
-			case <-e.callsStarted:
-			case <-ctx.Done():
-			}
-		}
-		close(e.callsReleased)
+	if e.beforePreparedCallsReturned != nil {
+		e.beforePreparedCallsReturned()
 	}
-	// 4. 等待所有执行任务结束，记录整批已完成，返回时关闭事件通道。
-	tasks.Wait()
-	e.finished = true
+	return preparedCalls
 }
 
-// execCall 执行一次测试调用，转发进度后发送工具结果。
-func (e *testToolExecutor) execCall(ctx context.Context, callItem *defs.Item, events chan<- executor.ExecutorEvent) {
-	// 1. 启动进度转发，将每条进度发给执行事件通道。
+// Run 执行单次测试工具调用，转发进度后发送工具结果。
+func (e *testToolExecutor) Run(ctx context.Context, call *executor.PreparedToolCall, events chan<- executor.ExecutorEvent) {
+	// 1. 非并行双调用时，让第二个调用等待第一个调用先完成；启动进度转发并在并行模式下登记启动。
+	callItem := call.Call
+	callID := callItem.ToolCall.CallID
+	if e.exitedCalls != nil {
+		defer func() { e.exitedCalls <- callID }()
+	}
+	if !e.parallel && e.callAFinished != nil {
+		if callID == "call_a" {
+			defer close(e.callAFinished)
+		} else if callID == "call_b" {
+			<-e.callAFinished
+		}
+	}
 	progress := make(chan *executor.ExecutionProgressEvent)
 	var forwarding sync.WaitGroup
 	forwarding.Go(func() {
 		for event := range progress {
 			events <- event
 			if e.parallel {
-				e.callsStarted <- struct{}{}
+				if callID == "call_a" {
+					close(e.callAStarted)
+				} else if callID == "call_b" {
+					close(e.callBStarted)
+				}
 			}
 		}
 	})
 	// 2. 执行工具后关闭进度并等待转发，再发送结果和并行结束通知。
+	if callID == e.blockedCallID {
+		select {
+		case <-e.releaseCall:
+		case <-ctx.Done():
+		}
+	}
 	result := (&testTool{backend: e}).Execute(ctx, callItem, progress)
 	close(progress)
 	forwarding.Wait()
 	events <- &executor.ExecutionFinishedEvent{
 		Result:             result.Result,
-		AgentsInstructions: result.AgentsInstructions,
+		AgentsInstructions: slices.Concat(result.AgentsInstructions, e.agentsInstructions),
 	}
-	if e.parallel && callItem.ToolCall.CallID == "call_b" {
+	if e.parallel && callID == "call_b" {
 		close(e.callBFinished)
 	}
 }
@@ -652,7 +675,12 @@ func (t *testTool) Execute(ctx context.Context, callItem *defs.Item, progress ch
 	}
 	if backend.parallel {
 		select {
-		case <-backend.callsReleased:
+		case <-backend.callAStarted:
+		case <-ctx.Done():
+			return canceledResult()
+		}
+		select {
+		case <-backend.callBStarted:
 		case <-ctx.Done():
 			return canceledResult()
 		}
@@ -1074,20 +1102,17 @@ type hookRunExecutor struct {
 	savedRuns []*defs.HookRun
 }
 
-// Run 发送工具 hook 的实时记录和执行结果。
-func (e *hookRunExecutor) Run(_ context.Context, calls []*defs.Item, events chan<- executor.ExecutorEvent) {
-	// 1. 依次克隆发送实时记录，再填写本次 CallID 并发送完成事件；退出时关闭通道。
-	defer close(events)
-	for _, call := range calls {
-		for _, run := range e.liveRuns {
-			events <- &executor.ExecutionHookRunEvent{Run: run.Clone()}
-		}
-		result := *e.result
-		result.CallID = call.ToolCall.CallID
-		events <- &executor.ExecutionFinishedEvent{
-			Result:   &result,
-			HookRuns: e.savedRuns,
-		}
+// Run 发送单次工具调用的 hook 实时记录和执行结果。
+func (e *hookRunExecutor) Run(_ context.Context, call *executor.PreparedToolCall, events chan<- executor.ExecutorEvent) {
+	// 1. 依次克隆发送实时记录，再填写本次 CallID 并发送完成事件。
+	for _, run := range e.liveRuns {
+		events <- &executor.ExecutionHookRunEvent{Run: run.Clone()}
+	}
+	result := *e.result
+	result.CallID = call.Call.ToolCall.CallID
+	events <- &executor.ExecutionFinishedEvent{
+		Result:   &result,
+		HookRuns: e.savedRuns,
 	}
 }
 
@@ -1096,30 +1121,47 @@ type progressBatchExecutor struct {
 	testToolExecutor
 	finished          chan struct{}
 	progressDelivered chan struct{}
+	firstFinished     chan struct{}
 }
 
-// Run 发送两个工具调用的进度和结果。
-func (e *progressBatchExecutor) Run(ctx context.Context, calls []*defs.Item, events chan<- executor.ExecutorEvent) {
-	// 1. 发送第一个结果和第二个调用的进度。
-	defer close(events)
+// PrepareCalls 初始化首个调用完成通知并返回调用副本。
+func (e *progressBatchExecutor) PrepareCalls(_ context.Context, calls []*defs.Item, _ chan<- executor.ExecutorEvent) []*executor.PreparedToolCall {
+	// 1. 创建顺序同步通道并返回克隆后的调用列表。
+	e.firstFinished = make(chan struct{})
+	preparedCalls := make([]*executor.PreparedToolCall, len(calls))
+	for index, call := range calls {
+		preparedCalls[index] = &executor.PreparedToolCall{Call: call.Clone()}
+	}
+	return preparedCalls
+}
+
+// Run 通过受控通道按原顺序发送两个工具调用的结果和进度。
+func (e *progressBatchExecutor) Run(ctx context.Context, call *executor.PreparedToolCall, events chan<- executor.ExecutorEvent) {
+	// 1. 第一个调用发送结果后放行第二个调用。
+	callID := call.Call.ToolCall.CallID
+	if callID == "first" {
+		events <- &executor.ExecutionFinishedEvent{Result: &defs.ToolResult{
+			CallID:   callID,
+			Executor: "remote",
+			Content:  json.RawMessage(`"first result"`),
+		}}
+		close(e.firstFinished)
+		return
+	}
+	// 2. 第二个调用等待第一个完成后发送进度，再等待进度交付或取消后发送结果并关闭整批完成通知。
+	<-e.firstFinished
 	defer close(e.finished)
-	events <- &executor.ExecutionFinishedEvent{Result: &defs.ToolResult{
-		CallID:   calls[0].ToolCall.CallID,
-		Executor: "remote",
-		Content:  json.RawMessage(`"first result"`),
-	}}
 	events <- &executor.ExecutionProgressEvent{
-		CallID:  calls[1].ToolCall.CallID,
+		CallID:  callID,
 		Stream:  executor.ExecutionStreamTypeTerminal,
 		Content: json.RawMessage(`"progress"`),
 	}
-	// 2. 等待进度交付或取消，再发送第二个结果；退出时关闭整批通知和事件通道。
 	select {
 	case <-e.progressDelivered:
 	case <-ctx.Done():
 	}
 	events <- &executor.ExecutionFinishedEvent{Result: &defs.ToolResult{
-		CallID:   calls[1].ToolCall.CallID,
+		CallID:   callID,
 		Executor: "remote",
 		Content:  json.RawMessage(`"second result"`),
 	}}
@@ -1142,4 +1184,80 @@ func (w *afterToolsWorkspace) GetMetadata(ctx context.Context, path string, foll
 	default:
 		return nil, errors.New("rules probed before tool batch finished")
 	}
+}
+
+// TestAgentToolCancellationReturnsRuleAppendError 检查取消排空时追加规则的错误如何返回。
+func TestAgentToolCancellationReturnsRuleAppendError(t *testing.T) {
+	ruleErr := errors.New("rule append failed")
+	resultErr := errors.New("result append failed")
+	for _, tt := range []struct {
+		name            string
+		failLaterResult bool
+		wantErr         error
+	}{
+		{name: "rule_error_before_cancellation", wantErr: ruleErr},
+		{name: "preserves_first_result_error", failLaterResult: true, wantErr: resultErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// 1. 两个工具按顺序收尾，第一项带回规则；在工具进度回调处取消。
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				first := newToolLoopResponses()[0]
+				first[0].ToolCall.CallID = "call_a"
+				first = slices.Insert(first, 1, llmkit.Event{Type: llmkit.EventToolCallEnd, ToolCall: &llmkit.StreamingToolCall{
+					CallID: "call_b", Name: "lookup", Arguments: `{}`,
+				}})
+				history := &toolRuleAppendContext{AgentContext: newTestContext(t, "", []*defs.Item{userMessage("查询")}), ruleErr: ruleErr}
+				if tt.failLaterResult {
+					history.resultErr = resultErr
+				}
+				opt := agent.NewAgentOpt(testTurnID, testSessionID, &scriptedAgentClient{events: first}, testModel, history)
+				opt.ToolExecutor = &testToolExecutor{waitForCancel: true, agentsInstructions: []*defs.AgentsInstruction{{
+					Executor: "local", Path: "/project/AGENTS.md", Text: "目录规则",
+				}}}
+				instance, err := agent.NewAgent(opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				events := make(chan *agent.AgentEvent)
+				drained := make(chan struct{})
+				go func() {
+					defer close(drained)
+					for event := range events {
+						if event.Type == agent.AgentEventToolProgress {
+							cancel()
+						}
+					}
+				}()
+				// 2. 规则追加仍发生；已有的工具结果写入错误优先于追加规则错误。
+				_, err = instance.Run(ctx, events)
+				<-drained
+				if !errors.Is(ctx.Err(), context.Canceled) || history.ruleAttempts != 1 || !errors.Is(err, tt.wantErr) {
+					t.Fatalf("Run() error=%v, want %v; cancellation=%v, rule attempts=%d", err, tt.wantErr, ctx.Err(), history.ruleAttempts)
+				}
+			})
+		})
+	}
+}
+
+// toolRuleAppendContext 记录工具规则写入，并可令第二个工具结果写入失败。
+type toolRuleAppendContext struct {
+	agent_context.AgentContext
+	ruleErr      error
+	resultErr    error
+	ruleAttempts int
+}
+
+func (c *toolRuleAppendContext) AppendItems(items ...*defs.Item) error {
+	for _, item := range items {
+		if item.Kind == defs.ItemAgentsInstruction {
+			c.ruleAttempts++
+			return c.ruleErr
+		}
+		if c.resultErr != nil && item.Kind == defs.ItemToolResult && item.ToolResult.CallID == "call_b" {
+			return c.resultErr
+		}
+	}
+	return c.AgentContext.AppendItems(items...)
 }

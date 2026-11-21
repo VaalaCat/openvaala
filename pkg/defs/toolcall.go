@@ -2,6 +2,7 @@ package defs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -56,6 +57,36 @@ type ToolResult struct {
 	Error  *ToolError      `json:"error,omitempty"`
 	// Truncated 工具输出是否超长被截断了？
 	Truncated bool `json:"truncated,omitempty"`
+}
+
+// ToolErrorMaxStepsReached 是最后一步的工具拒绝错误码。
+const ToolErrorMaxStepsReached = "max_steps_reached"
+
+// ToolErrorHookStopped 是前置工具 hook 要求结束本轮时写入的错误码。
+const ToolErrorHookStopped = "hook_stopped"
+
+// ErrMaxStepsToolRequested 表示最后一步禁用了工具，模型仍然请求工具。
+var ErrMaxStepsToolRequested = errors.New("agent reached max steps but model still requested tools")
+
+// NewRejectedToolResult 为达到步数上限的调用创建拒绝结果。
+func NewRejectedToolResult(callID string) *ToolResult {
+	// 1. 使用原调用 ID 和步数上限错误。
+	return &ToolResult{CallID: callID, Error: &ToolError{Code: ToolErrorMaxStepsReached, Message: ErrMaxStepsToolRequested.Error()}}
+}
+
+// unknownToolResultContent 是恢复时写入的未知结果正文。
+const unknownToolResultContent = `{"code":"outcome_unknown","message":"执行结果未知，请先检查现场，不要直接重复原操作"}`
+
+// NewUnknownToolResult 为已放行但缺少结果的调用创建未知结果。
+func NewUnknownToolResult(callID string) *ToolResult {
+	// 1. 使用原调用 ID，正文提示检查现场，不设置工具错误或执行器。
+	return &ToolResult{CallID: callID, Content: json.RawMessage(unknownToolResultContent)}
+}
+
+// IsOutcomeUnknown 这条结果是否由 Turn 在核对已放行的工具批时补写？
+func (result *ToolResult) IsOutcomeUnknown() bool {
+	// 1. 检查恢复专用正文；实际执行环境和工具错误均为空。
+	return result.Error == nil && result.Executor == "" && string(result.Content) == unknownToolResultContent
 }
 
 // ToolCallStatus 是工具调用参数已经完整还是被中断。

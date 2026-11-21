@@ -14,6 +14,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/executor/tools"
+	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/skill"
@@ -26,6 +27,7 @@ func newConversationConfig(ctx context.Context, conversationID defs.Conversation
 	definitions *ConversationDefinitions, sessionRecords []defs.Session) (*conversationConfig, error) {
 	// 1. 保存设置和定义，装配配置；失败时关闭已经建好的工作区。
 	config := &conversationConfig{
+		hooks:       hook.NewHooks(hook.NewHooksOpt(definitions.Hooks)),
 		settings:    settings,
 		definitions: definitions,
 	}

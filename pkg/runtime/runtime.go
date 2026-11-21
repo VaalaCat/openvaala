@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
@@ -41,6 +42,9 @@ type Runtime interface {
 	CreateConversation(ctx context.Context, request *CreateConversationRequest) (defs.Conversation, error)
 	// OpenConversation 对话已打开时返回最新记录，否则按记录里的设置装配并启动；同一对话同时打开只装配一次，记录不存在返回 ErrConversationNotFound。
 	OpenConversation(ctx context.Context, request *OpenConversationRequest) (defs.Conversation, error)
+	// CloseConversation 关闭空闲对话并保留已保存历史；活动 Turn、待处理输入或后台命令返回 session.ErrSessionBusy，未打开返回 nil。
+	// 临时和未保存对话被丢弃；独立交互终端不关闭。调用方应串行协调同一对话的输入与关闭。
+	CloseConversation(ctx context.Context, request *CloseConversationRequest) error
 	// IsConversationOpen 对话是否有尚未退出的运行实例？
 	IsConversationOpen(ctx context.Context, request *GetConversationRequest) (bool, error)
 	// SetConversationExecutorSettings 更新完整 Executor 设置并返回记录；有 Session 在执行 Turn 时返回 session.ErrSessionBusy，新增未知 Executor 返回 conversation.ErrInvalidExecutorSettings。
@@ -168,6 +172,8 @@ type runtimeImpl struct {
 
 // RuntimeOpt 保存全部对话共享的依赖，构造后只读。
 type RuntimeOpt struct {
+	// ModelClient 是全部对话共用的模型客户端，须支持并发调用；nil 时每个对话创建默认客户端。
+	ModelClient llmkit.Client
 	// Records、Logs 是共用库的记录和日志存储；Runtime 用它们建共用的 DAO，也用作新对话暂存记录的目标。
 	Records storage.RecordStorage
 	Logs    storage.LogStorage
@@ -197,6 +203,13 @@ func NewRuntimeOpt(records storage.RecordStorage, logs storage.LogStorage, defin
 		UnsavedConversationIdleTimeout: 60 * time.Second,
 		MaxImageBytes:                  500 << 10,
 	}
+}
+
+// WithModelClient 设置全部对话使用的模型客户端。
+func (opt *RuntimeOpt) WithModelClient(client llmkit.Client) *RuntimeOpt {
+	// 1. 保存客户端并返回配置。
+	opt.ModelClient = client
+	return opt
 }
 
 // WithUnsavedConversationIdleTimeout 修改未保存对话的空闲丢弃时长。
@@ -285,6 +298,8 @@ func (r *runtimeImpl) Run(ctx context.Context) error {
 				r.handleConversationArchiveChangeRequested(request)
 			case *conversationDeleteRequested:
 				r.handleConversationDeleteRequested(ctx, request)
+			case *conversationCloseRequested:
+				r.handleConversationCloseRequested(ctx, request)
 			case *runningConversationsRequested:
 				r.handleRunningConversationsRequested(request)
 			case *definitionsChangeRequested:
@@ -343,6 +358,7 @@ func (r *runtimeImpl) createConversation(ctx context.Context, request *CreateCon
 	}
 	// 3. 按环境变量、Executor 设置和原设置装配对话；设置无效时返回 conversation.ErrInvalidExecutorSettings，装配失败时关闭内存库。
 	opt := &conversation.ConversationOpt{
+		ModelClient:      r.opt.ModelClient,
 		Query:            store.query,
 		Mutation:         store.mutation,
 		Definitions:      definitions.conversationDefinitions,
@@ -757,6 +773,7 @@ func (r *runtimeImpl) ForkConversation(ctx context.Context, request *ForkConvers
 	// 5. 临时分叉用自己的内存库装配并登记，写入补齐的设置；任一步失败都关闭内存库。
 	if request.Ephemeral {
 		opt := &conversation.ConversationOpt{
+			ModelClient:   r.opt.ModelClient,
 			Query:         store.query,
 			Mutation:      store.mutation,
 			Definitions:   definitions.conversationDefinitions,
@@ -853,6 +870,48 @@ func saveConversationArchived(ctx context.Context, mutation dao.Mutation, record
 	return record, nil
 }
 
+// CloseConversation 经 Runtime 事件循环关闭对话运行实例。
+func (r *runtimeImpl) CloseConversation(ctx context.Context, request *CloseConversationRequest) error {
+	// 1. 提交关闭请求，或返回 Runtime 停止及调用方取消错误。
+	change := &conversationCloseRequested{request: request, reply: make(chan error, 1)}
+	select {
+	case r.requests <- change:
+	case <-r.stopped:
+		return ErrRuntimeStopped
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// 2. 等待已接收的关闭操作完成。
+	return <-change.reply
+}
+
+// handleConversationCloseRequested 检查待处理工作，停止空闲实例并移除运行记录。
+func (r *runtimeImpl) handleConversationCloseRequested(ctx context.Context, request *conversationCloseRequested) {
+	// 1. 未打开时直接成功；运行中的实例有待处理工作或查询失败时保持不变。
+	running := r.runningConversations[request.request.ConversationID]
+	if running == nil {
+		request.reply <- nil
+		return
+	}
+	if !running.isStopped() {
+		busy, err := running.conversation.IsBusy(ctx)
+		if err != nil {
+			request.reply <- err
+			return
+		}
+		if busy {
+			request.reply <- session.ErrSessionBusy
+			return
+		}
+		// 2. 取消并等待 Session、连接和工作区结束。
+		running.cancel()
+		<-running.stopped
+	}
+	// 3. 移除实例并丢弃未保存内存库；后续旧退出通知按实例身份跳过。
+	r.handleConversationStopped(ctx, &conversationStopped{runningConversation: running})
+	request.reply <- nil
+}
+
 // DeleteConversation 经 Runtime 事件循环删除已保存对话。
 func (r *runtimeImpl) DeleteConversation(ctx context.Context, request *DeleteConversationRequest) error {
 	// 1. 提交删除请求；Runtime 停止或上下文结束时返回对应错误。
@@ -879,9 +938,9 @@ func (r *runtimeImpl) handleConversationDeleteRequested(ctx context.Context, req
 		request.reply <- err
 		return
 	}
-	// 2. 实例仍在运行时检查 Session，有 Session 在执行 Turn 时回复 session.ErrSessionBusy；否则取消并等待实例退出。
+	// 2. 实例仍在运行时检查 Turn 和后台命令，忙时回复 session.ErrSessionBusy；否则取消并等待实例退出。
 	if running := r.runningConversations[conversationID]; running != nil && !running.isStopped() {
-		if running.isAnySessionRunning(ctx) {
+		if running.isBusy(ctx) {
 			request.reply <- session.ErrSessionBusy
 			return
 		}
@@ -1019,7 +1078,7 @@ func (r *runtimeImpl) ListModels(_ context.Context, request *ListModelsRequest) 
 // GetHooks 返回当前配置中的 Hook 说明。
 func (r *runtimeImpl) GetHooks(_ context.Context) ([]*hook.HookInfo, error) {
 	// 1. 读取当前定义并取出 Hook 信息。
-	return r.definitions.Load().conversationDefinitions.Hooks.GetHookInfos(), nil
+	return hook.GetHookInfos(r.definitions.Load().conversationDefinitions.Hooks), nil
 }
 
 // ListAgents 按定义顺序返回 Agent 的公开说明。
@@ -1472,6 +1531,7 @@ func (r *runtimeImpl) openConversation(ctx context.Context, record defs.Conversa
 	// 2. 选择对话存储，按记录设置、原存储设置和客户端环境装配实例。
 	query, mutation, unsavedStore := r.getConversationDAO(record.ID)
 	opt := &conversation.ConversationOpt{
+		ModelClient:   r.opt.ModelClient,
 		Query:         query,
 		Mutation:      mutation,
 		Definitions:   definitions.conversationDefinitions,

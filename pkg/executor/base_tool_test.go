@@ -247,7 +247,7 @@ func TestBaseToolRun(t *testing.T) {
 			defer cancel()
 			events := make(chan executor.ExecutorEvent)
 			var tasks sync.WaitGroup
-			tasks.Go(func() { instance.Run(ctx, executorCallItems(tt.calls), events) })
+			tasks.Go(func() { executeToolBatch(ctx, instance, executorCallItems(tt.calls), events) })
 			greetings := make(map[string][]string)
 			for event := range events {
 				switch event := event.(type) {

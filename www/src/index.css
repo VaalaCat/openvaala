@@ -166,6 +166,7 @@
   }
   html {
     @apply font-serif;
+    overscroll-behavior: none;
   }
 }
 :root {

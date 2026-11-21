@@ -33,6 +33,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
+	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/session"
@@ -43,6 +44,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	"github.com/VaalaCat/openvaala/pkg/terminal"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
+	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
@@ -102,6 +104,523 @@ func isRaceEnabled() bool {
 	return ok && slices.ContainsFunc(info.Settings, func(setting debug.BuildSetting) bool {
 		return setting.Key == "-race" && setting.Value == "true"
 	})
+}
+
+// injectedModelClient 把模型请求转给测试服务并统计宿主客户端的调用。
+type injectedModelClient struct {
+	client llmkit.Client
+	url    string
+	calls  atomic.Int64
+	fail   atomic.Bool
+}
+
+// Call 使用宿主指定的模型服务发送请求。
+func (c *injectedModelClient) Call(ctx context.Context, request llmkit.Request, target llmkit.Target, options llmkit.CallOptions) (<-chan llmkit.Event, error) {
+	// 1. 记录调用并替换目标地址。
+	c.calls.Add(1)
+	if c.fail.Load() {
+		return nil, errors.New("host model unavailable")
+	}
+	target.BaseURL = c.url
+	return c.client.Call(ctx, request, target, options)
+}
+
+// TestRuntimeModelClient 检查新建、恢复、分叉和压缩都使用宿主客户端。
+func TestRuntimeModelClient(t *testing.T) {
+	// 1. 各场景仅通过注入客户端才能访问受控模型服务。
+	for _, name := range []string{"create", "ephemeral", "reopen", "fork", "ephemeral_fork", "empty_fork", "compact", "auto_compact", "subagent"} {
+		t.Run(name, func(t *testing.T) {
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			client := &injectedModelClient{client: llmkit.NewClient(llmkit.ClientOptions{}), url: model.server.URL}
+			opt := newTestRuntimeOpt(store, model).WithModelClient(client)
+			for _, definition := range opt.Definitions.Models {
+				definition.Target.BaseURL = "http://127.0.0.1:1"
+			}
+			if name == "auto_compact" {
+				opt.Definitions.Models[0].ContextWindow = 1000
+			}
+			h := startTestRuntimeWithOpt(t, store, model, opt)
+			conv, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{AgentName: "assistant", Ephemeral: name == "ephemeral"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+			input := "hello"
+			reply := "first"
+			if name == "auto_compact" {
+				input = strings.Repeat("large history ", 2000)
+				reply = strings.Repeat("retained reply ", 500)
+			}
+			first := h.runRootTurn(t, conv, watcher, input, runtimeModelResponse{chunks: []string{reply}})
+			switch name {
+			case "reopen":
+				h.stop(t)
+				h = startTestRuntimeWithOpt(t, store, model, opt)
+				conv, err = h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID})
+			case "fork", "ephemeral_fork", "empty_fork":
+				request := &runtime.ForkConversationRequest{ConversationID: conv.ID, Ephemeral: name == "ephemeral_fork"}
+				if name == "empty_fork" {
+					request.BeforeTurnID = first
+				}
+				conv, err = h.rt.ForkConversation(t.Context(), request)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			watcher = h.subscribeSession(t, conv.ID, conv.RootSessionID)
+			if name == "subagent" {
+				h.submit(t, conv.ID, "delegate", "")
+				model.receive(t).reply <- runtimeModelResponse{calls: []llmkit.ToolCall{{ID: "spawn", Name: "spawn_agent", Arguments: `{"task_name":"review","message":"check"}`}}}
+				root, child := model.receiveRootAndTask(t, "review")
+				root.reply <- runtimeModelResponse{chunks: []string{"delegated"}}
+				collectUntil(t, watcher.Events, isTurnFinished)
+				child.reply <- runtimeModelResponse{chunks: []string{"reviewed"}}
+				model.receive(t).reply <- runtimeModelResponse{chunks: []string{"summary"}}
+				collectUntil(t, watcher.Events, isTurnFinished)
+				if got := client.calls.Load(); got != 5 {
+					t.Fatalf("host calls = %d, want 5", got)
+				}
+				return
+			}
+			if name == "auto_compact" {
+				h.submit(t, conv.ID, "continue", "")
+				request := model.receive(t)
+				if request.body["tool_choice"] != "none" {
+					t.Fatal("expected automatic summary request")
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"summary"}}
+				model.receive(t).reply <- runtimeModelResponse{chunks: []string{"second"}}
+				collectUntil(t, watcher.Events, isTurnFinished)
+				if got := client.calls.Load(); got != 3 {
+					t.Fatalf("host calls = %d, want 3", got)
+				}
+				return
+			}
+			h.runRootTurn(t, conv, watcher, "continue", runtimeModelResponse{chunks: []string{"second"}})
+			if name == "compact" {
+				turnID := h.compactContextWhenIdle(t, conv.ID)
+				model.receive(t).reply <- runtimeModelResponse{chunks: []string{"summary"}}
+				h.waitTurnStatus(t, conv.RootSessionID, turnID, defs.TurnStatusCompleted)
+			}
+			want := int64(2)
+			if name == "compact" {
+				want++
+			}
+			if got := client.calls.Load(); got != want {
+				t.Fatalf("host calls = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+// TestRuntimeCloseConversation 检查显式关闭的忙检查、历史保留与临时数据丢弃。
+func TestRuntimeCloseConversation(t *testing.T) {
+	// 1. 通过公开请求建立空闲、运行和排队场景。
+	for _, name := range []string{"saved", "unsaved", "ephemeral", "missing", "turn", "context", "agent_input", "command", "terminal"} {
+		t.Run(name, func(t *testing.T) {
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			h := startTestRuntimeWithOpt(t, store, model, newExecutorRuntimeOpt(store, model, newLocalExecutor(t, "local")))
+			conv, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{AgentName: "assistant", Ephemeral: name == "ephemeral"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+			var opened *runtime.OpenedTerminal
+			switch name {
+			case "saved", "terminal":
+				h.runRootTurn(t, conv, watcher, "hello", runtimeModelResponse{chunks: []string{"saved reply"}})
+				if name == "terminal" {
+					opened, err = h.rt.OpenTerminal(t.Context(), &runtime.OpenTerminalRequest{ConversationID: conv.ID, Rows: 24, Cols: 80})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "turn", "agent_input":
+				h.submit(t, conv.ID, "run", "")
+				model.receive(t)
+				if name == "agent_input" {
+					if _, err := h.rt.InterruptTurn(t.Context(), &runtime.InterruptTurnRequest{ConversationID: conv.ID}); err != nil {
+						t.Fatal(err)
+					}
+					collectUntil(t, watcher.Events, isTurnFinished)
+					request := newSubmitInputRequest(conv.ID, "queued agent message", "")
+					request.From = &defs.Address{Kind: defs.IdentityAgent, ID: "other-agent"}
+					if _, err := h.rt.SubmitInput(t.Context(), request); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "context":
+				h.appendContextItems(t, conv.ID, newClientInstructionItem("pending context"))
+			case "command":
+				result := h.runCommandToolRound(t, conv, watcher, "background", "bash", `{"command":"sleep 30","wait_seconds":0}`)
+				if result.Status != "running" {
+					t.Fatalf("command = %+v", result)
+				}
+			case "missing":
+				conv.ID = defs.NewConversationID()
+			}
+			// 2. 忙时拒绝并保留实例；后台命令同时阻止删除。
+			err = h.rt.CloseConversation(t.Context(), &runtime.CloseConversationRequest{ConversationID: conv.ID})
+			busy := name == "turn" || name == "agent_input" || name == "context" || name == "command"
+			if busy {
+				if !errors.Is(err, session.ErrSessionBusy) {
+					t.Fatalf("close = %v, want busy", err)
+				}
+				isOpen, err := h.rt.IsConversationOpen(t.Context(), &runtime.GetConversationRequest{ConversationID: conv.ID})
+				if err != nil || !isOpen {
+					t.Fatalf("open = %v, %v", isOpen, err)
+				}
+				if name == "command" {
+					if err := h.rt.DeleteConversation(t.Context(), &runtime.DeleteConversationRequest{ConversationID: conv.ID}); !errors.Is(err, session.ErrSessionBusy) {
+						t.Fatalf("delete = %v", err)
+					}
+				}
+				if name == "context" || name == "agent_input" {
+					h.submit(t, conv.ID, "continue", "")
+					request := model.receive(t)
+					if name == "agent_input" {
+						// 用户输入优先处理，排队的 Agent 消息随后单独开始一轮。
+						request.reply <- runtimeModelResponse{chunks: []string{"user done"}}
+						request = model.receive(t)
+					}
+					body, _ := json.Marshal(request.body)
+					want := "pending context"
+					if name == "agent_input" {
+						want = "queued agent message"
+					}
+					if !strings.Contains(string(body), want) {
+						t.Fatalf("input lost: %s", body)
+					}
+					request.reply <- runtimeModelResponse{chunks: []string{"done"}}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.rt.CloseConversation(t.Context(), &runtime.CloseConversationRequest{ConversationID: conv.ID}); err != nil {
+				t.Fatal(err)
+			}
+			isOpen, err := h.rt.IsConversationOpen(t.Context(), &runtime.GetConversationRequest{ConversationID: conv.ID})
+			if err != nil || isOpen {
+				t.Fatalf("open = %v, %v", isOpen, err)
+			}
+			// 3. 已保存对话可重开；临时对话和未输入对话不能恢复。
+			_, err = h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID})
+			if name == "saved" || name == "terminal" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if items := h.listRootItems(t, conv); len(items) < 2 {
+					t.Fatalf("history = %v", items)
+				}
+			} else if !errors.Is(err, runtime.ErrConversationNotFound) {
+				t.Fatalf("reopen = %v", err)
+			}
+			if opened != nil && opened.Terminal.GetInfo().Status != terminal.TerminalStatusRunning {
+				t.Fatal("independent terminal stopped")
+			}
+		})
+	}
+}
+
+// isolatedTestExecutor 为测试对话提供独立主目录并记录资源释放。
+type isolatedTestExecutor struct {
+	definition defs.ExecutorDefinition
+	closed     atomic.Int64
+}
+
+// GetDefinition 返回测试执行环境的定义。
+func (e *isolatedTestExecutor) GetDefinition() *defs.ExecutorDefinition { return &e.definition }
+
+// NewWorkspace 打开根目录和主目录相同的测试工作区。
+func (e *isolatedTestExecutor) NewWorkspace(_ context.Context, request *executor.NewWorkspaceRequest) (workspace.Workspace, error) {
+	// 1. 创建真实文件工作区并记录关闭通知。
+	w, err := workspace.NewLocalWorkspace(workspace.NewLocalWorkspaceOpt(request.RootDirectory))
+	if err != nil {
+		return nil, err
+	}
+	return &isolatedTestWorkspace{Workspace: w, closed: &e.closed}, nil
+}
+
+type isolatedTestWorkspace struct {
+	workspace.Workspace
+	closed *atomic.Int64
+}
+
+// GetHomeDirectory 返回本测试工作区的独立主目录。
+func (w *isolatedTestWorkspace) GetHomeDirectory(context.Context) (string, error) {
+	return w.GetRootDirectory(), nil
+}
+
+// Close 记录释放次数并关闭真实工作区。
+func (w *isolatedTestWorkspace) Close() error {
+	w.closed.Add(1)
+	return w.Workspace.Close()
+}
+
+// TestRuntimeHookWorkspaceIsolation 检查同名 Executor 的脚本及插件在各工作区分别拷贝。
+func TestRuntimeHookWorkspaceIsolation(t *testing.T) {
+	// 1. 以真实脚本输出其路径，区分插件和普通 script 的拷贝缓存。
+	for _, plugin := range []bool{false, true} {
+		t.Run(fmt.Sprintf("plugin=%v", plugin), func(t *testing.T) {
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			source := t.TempDir()
+			script := filepath.Join(source, "hook.sh")
+			if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' \"$0\"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			definition := &hook.HookDefinition{Key: "path", Event: defs.HookEventUserPromptSubmit, ScriptPath: script, Timeout: 5 * time.Second}
+			if plugin {
+				definition.Plugin = &defs.Plugin{Name: "test-plugin", Directory: source}
+			}
+			first := &isolatedTestExecutor{definition: defs.ExecutorDefinition{ID: "sandbox", Kind: "test", WorkspaceDirectory: t.TempDir()}}
+			second := &isolatedTestExecutor{definition: defs.ExecutorDefinition{ID: "sandbox", Kind: "test", WorkspaceDirectory: t.TempDir()}}
+			opt := newTestRuntimeOpt(store, model)
+			opt.Definitions.Hooks = []*hook.HookDefinition{definition}
+			opt.Definitions.Executors = &recordingExecutorProvider{newExecutors: func(id defs.ConversationID) []executor.Executor {
+				if id == "first" {
+					return []executor.Executor{first}
+				}
+				return []executor.Executor{second}
+			}}
+			h := startTestRuntimeWithOpt(t, store, model, opt)
+			for _, tt := range []struct {
+				id          defs.ConversationID
+				environment *isolatedTestExecutor
+			}{{"first", first}, {"second", second}} {
+				conv, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{ConversationID: tt.id, AgentName: "assistant"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, stage := range []string{"initial", "reuse", "reopen", "reload"} {
+					if stage == "reopen" {
+						if err := h.rt.CloseConversation(t.Context(), &runtime.CloseConversationRequest{ConversationID: conv.ID}); err != nil {
+							t.Fatal(err)
+						}
+						if tt.environment.closed.Load() == 0 {
+							t.Fatal("workspace not released")
+						}
+						if err := os.RemoveAll(filepath.Join(tt.environment.definition.WorkspaceDirectory, ".cache")); err != nil {
+							t.Fatal(err)
+						}
+						if _, err := h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if stage == "reload" {
+						if err := os.RemoveAll(filepath.Join(tt.environment.definition.WorkspaceDirectory, ".cache")); err != nil {
+							t.Fatal(err)
+						}
+						h.setDefinitionsRequest(t, opt.Definitions)
+					}
+					watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+					h.submit(t, conv.ID, stage, "")
+					request := model.receive(t)
+					payload, _ := json.Marshal(request.body["messages"])
+					if !strings.Contains(string(payload), filepath.Join(tt.environment.definition.WorkspaceDirectory, ".cache", "openvaala")) {
+						t.Fatalf("%s/%s hook path not in its own cache: %s", tt.id, stage, payload)
+					}
+					request.reply <- runtimeModelResponse{chunks: []string{"done"}}
+					collectUntil(t, watcher.Events, isTurnFinished)
+				}
+			}
+		})
+	}
+}
+
+// TestRuntimeEmbeddedSkills 检查宿主工作区的 Skill 正文与共享 Skill，并验证重载重读。
+func TestRuntimeEmbeddedSkills(t *testing.T) {
+	// 1. 准备两个隔离工作区和一份共享 Skill。
+	store, model := openRuntimeStore(t), newRuntimeModel(t)
+	sharedDirectory := t.TempDir()
+	writeRuntimeTestSkill(t, sharedDirectory, "shared")
+	sharedWorkspace, err := workspace.NewLocalWorkspace(workspace.NewLocalWorkspaceOpt(sharedDirectory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sharedWorkspace.Close()
+	shared, err := skill.LoadSkills(t.Context(), []skill.SkillDirectory{{Workspace: sharedWorkspace, ExecutorID: "sandbox", Path: sharedDirectory, Strict: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	environments := map[defs.ConversationID]*isolatedTestExecutor{}
+	for _, id := range []defs.ConversationID{"alpha", "beta"} {
+		directory := t.TempDir()
+		writeRuntimeTestSkill(t, filepath.Join(directory, ".agents", "skills"), string(id))
+		environments[id] = &isolatedTestExecutor{definition: defs.ExecutorDefinition{ID: "sandbox", Kind: "test", WorkspaceDirectory: directory}}
+	}
+	opt := newTestRuntimeOpt(store, model)
+	opt.Definitions.Skills = shared
+	opt.Definitions.Executors = &recordingExecutorProvider{newExecutors: func(id defs.ConversationID) []executor.Executor { return []executor.Executor{environments[id]} }}
+	h := startTestRuntimeWithOpt(t, store, model, opt)
+	// 2. 两个对话各自读取独有正文，共享正文仍可用。
+	for _, id := range []defs.ConversationID{"alpha", "beta"} {
+		t.Run(string(id), func(t *testing.T) {
+			conv, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{ConversationID: id, AgentName: "assistant"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, stage := range []string{"initial", "reloaded"} {
+				if stage == "reloaded" {
+					path := filepath.Join(environments[id].definition.WorkspaceDirectory, ".agents", "skills", string(id), "SKILL.md")
+					if err := os.WriteFile(path, []byte(fmt.Sprintf("---\nname: %s\ndescription: revised\n---\nupdated-body-%s", id, id)), 0600); err != nil {
+						t.Fatal(err)
+					}
+					h.setDefinitionsRequest(t, opt.Definitions)
+				}
+				infos, err := h.rt.GetSkills(t.Context(), &runtime.GetSkillsRequest{ConversationID: id})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var names []string
+				for _, info := range infos {
+					names = append(names, info.Name)
+				}
+				if !slices.Equal(names, []string{string(id), "shared"}) {
+					t.Fatalf("skills = %v", names)
+				}
+				watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+				h.submit(t, id, "/skill:"+string(id)+" /skill:shared", "")
+				request := model.receive(t)
+				payload, _ := json.Marshal(request.body["messages"])
+				want := string(id) + " 技能"
+				if stage == "reloaded" {
+					want = "updated-body-" + string(id)
+				}
+				if !strings.Contains(string(payload), want) || !strings.Contains(string(payload), "shared 技能") {
+					t.Fatalf("missing skill body: %s", payload)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{"done"}}
+				collectUntil(t, watcher.Events, isTurnFinished)
+			}
+		})
+	}
+}
+
+// embeddedMCPTransport 在测试进程内提供 ping 工具，或模拟连接不可用。
+type embeddedMCPTransport struct{ unavailable bool }
+
+// Connect 建立进程内工具连接。
+func (transport embeddedMCPTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	// 1. 按场景拒绝连接或注册 ping 工具。
+	if transport.unavailable {
+		return nil, errors.New("host tool unavailable")
+	}
+	server := mcp.NewServer(&mcp.Implementation{Name: "host", Version: "1"}, nil)
+	server.AddTool(&mcp.Tool{Name: "ping", InputSchema: json.RawMessage(`{"type":"object"}`)}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "pong"}}}, nil
+	})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	if _, err := server.Connect(ctx, serverTransport, nil); err != nil {
+		return nil, err
+	}
+	return clientTransport.Connect(ctx)
+}
+
+// TestRuntimeEmbeddedMCP 检查进程内工具、重开重新登记和异步连接失败。
+func TestRuntimeEmbeddedMCP(t *testing.T) {
+	// 1. 每个场景先打开对话，按登记状态检查模型工具表。
+	for _, name := range []string{"connected", "reopen_without_registration", "reopen_registered", "unavailable"} {
+		t.Run(name, func(t *testing.T) {
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			h := startTestRuntime(t, store, model)
+			conv := h.create(t)
+			watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+			register := &runtime.SetClientMCPServersRequest{ConversationID: conv.ID, ClientID: "host", Servers: []conversation.ClientMCPServer{{ID: "host", Transport: embeddedMCPTransport{unavailable: name == "unavailable"}}}}
+			if err := h.rt.SetClientMCPServers(t.Context(), register); err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(name, "reopen") {
+				h.runRootTurn(t, conv, watcher, "save", runtimeModelResponse{chunks: []string{"saved"}})
+				if err := h.rt.CloseConversation(t.Context(), &runtime.CloseConversationRequest{ConversationID: conv.ID}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID}); err != nil {
+					t.Fatal(err)
+				}
+				if name == "reopen_registered" {
+					if err := h.rt.SetClientMCPServers(t.Context(), register); err != nil {
+						t.Fatal(err)
+					}
+				}
+				watcher = h.subscribeSession(t, conv.ID, conv.RootSessionID)
+			}
+			h.submit(t, conv.ID, "ping", "")
+			request := model.receive(t)
+			tools, _ := json.Marshal(request.body["tools"])
+			want := name == "connected" || name == "reopen_registered"
+			if strings.Contains(string(tools), "mcp__host__ping") != want {
+				t.Fatalf("tools = %s, want host=%v", tools, want)
+			}
+			if want {
+				request.reply <- runtimeModelResponse{calls: []llmkit.ToolCall{{ID: "ping", Name: "mcp__host__ping", Arguments: "{}"}}}
+				request = model.receive(t)
+				messages, _ := json.Marshal(request.body["messages"])
+				if !strings.Contains(string(messages), "pong") {
+					t.Fatalf("missing tool response: %s", messages)
+				}
+			}
+			request.reply <- runtimeModelResponse{chunks: []string{"done"}}
+			collectUntil(t, watcher.Events, isTurnFinished)
+		})
+	}
+}
+
+// TestRuntimeEmbeddedStorage 检查宿主提供的记录库与日志库保存结果并由新 Runtime 恢复。
+func TestRuntimeEmbeddedStorage(t *testing.T) {
+	// 1. 使用外部构造的 SQLite 记录库和文件日志库，分别验证结束与中断。
+	for _, outcome := range []string{"completed", "interrupted", "failed"} {
+		t.Run(outcome, func(t *testing.T) {
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			client := &injectedModelClient{client: llmkit.NewClient(llmkit.ClientOptions{}), url: model.server.URL}
+			opt := newTestRuntimeOpt(store, model).WithModelClient(client)
+			h := startTestRuntimeWithOpt(t, store, model, opt)
+			conv := h.create(t)
+			watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+			h.runRootTurn(t, conv, watcher, "first", runtimeModelResponse{chunks: []string{"saved"}, usage: &runtimeModelUsage{input: 20, output: 10}})
+			wantStatus := defs.TurnStatusCompleted
+			if outcome == "interrupted" {
+				h.submit(t, conv.ID, "interrupt", "")
+				model.receive(t)
+				if _, err := h.rt.InterruptTurn(t.Context(), &runtime.InterruptTurnRequest{ConversationID: conv.ID}); err != nil {
+					t.Fatal(err)
+				}
+				collectUntil(t, watcher.Events, isTurnFinished)
+				wantStatus = defs.TurnStatusInterrupted
+			}
+			if outcome == "failed" {
+				client.fail.Store(true)
+				h.submit(t, conv.ID, "fail", "")
+				collectUntil(t, watcher.Events, isTurnFinished)
+				wantStatus = defs.TurnStatusFailed
+			}
+			// 2. 宿主等待整个 Runtime 返回后，复用仍打开的外部存储。
+			h.stop(t)
+			h = startTestRuntime(t, store, model)
+			if _, err := h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID}); err != nil {
+				t.Fatal(err)
+			}
+			turns, err := h.rt.ListTurns(t.Context(), &runtime.ListTurnsRequest{ConversationID: conv.ID, SessionID: conv.RootSessionID, Order: storage.Order{Direction: storage.DirectionDesc}, Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(turns.Items) == 0 || turns.Items[0].Status != wantStatus {
+				t.Fatalf("turns = %+v", turns.Items)
+			}
+			if outcome == "failed" && !strings.Contains(turns.Items[0].Error, "host model unavailable") {
+				t.Fatalf("failure not saved: %+v", turns.Items[0])
+			}
+			infos := h.subscribeConversation(t, conv.ID)
+			if len(infos.Sessions) != 1 || infos.Sessions[0].Usage.Input != 20 || infos.Sessions[0].Usage.Output != 10 {
+				t.Fatalf("usage after restart = %+v", infos.Sessions)
+			}
+			if len(h.listRootItems(t, conv)) < 2 {
+				t.Fatal("history lost")
+			}
+			h.stop(t)
+		})
+	}
 }
 
 // TestNewRuntime 检查 Runtime 必需依赖和空闲时长校验。
@@ -259,8 +778,8 @@ func TestRuntime(t *testing.T) {
 					Order:     storage.Order{Direction: storage.DirectionDesc},
 					Limit:     1,
 				})
-				if err != nil || len(page.Items) != 1 || page.Items[0].Status != defs.TurnStatusInterrupted {
-					t.Fatalf("latest Turn = %+v, %v; want interrupted before Run returned", page.Items, err)
+				if err != nil || len(page.Items) != 1 || page.Items[0].Status != defs.TurnStatusRunning {
+					t.Fatalf("latest Turn = %+v, %v; want unfinished after service shutdown", page.Items, err)
 				}
 				if _, err := h.rt.SubmitInput(t.Context(), newSubmitInputRequest(conv.ID, "停止后", "")); !errors.Is(err, runtime.ErrRuntimeStopped) {
 					t.Fatalf("SubmitInput() after stop = %v, want ErrRuntimeStopped", err)
@@ -4035,6 +4554,363 @@ func TestRuntimeCompactContext(t *testing.T) {
 	}
 }
 
+// TestRuntimeTaskWorkflow 检查 Runtime 的并行工具、执行中断、自动压缩及重开后的 Turn。
+func TestRuntimeTaskWorkflow(t *testing.T) {
+	// 1. 列出每轮的模型调用和保存顺序。
+	const (
+		answer           = "最终答复"
+		oldInput         = "历史原文"
+		summaryText      = "历史摘要"
+		firstFile        = "first.txt"
+		secondFile       = "second.txt"
+		conversationCall = defs.ModelCallPurposeConversation
+		compactionCall   = defs.ModelCallPurposeCompaction
+	)
+	tests := []struct {
+		name              string
+		files             []string
+		interrupt         bool
+		overBudget        bool
+		summaryTarget     string
+		wantCalls         []defs.ModelCallPurpose
+		wantSavedKinds    []defs.ItemKind
+		wantResultCallIDs []string
+		wantStatus        defs.TurnStatus
+	}{
+		{
+			name:              "parallel_tools_then_generate_and_reopen",
+			files:             []string{firstFile, secondFile},
+			wantCalls:         []defs.ModelCallPurpose{conversationCall, conversationCall},
+			wantSavedKinds:    []defs.ItemKind{defs.ItemMessage, defs.ItemMessage, defs.ItemToolCall, defs.ItemToolCall, defs.ItemToolResult, defs.ItemToolResult, defs.ItemMessage},
+			wantResultCallIDs: []string{secondFile, firstFile},
+			wantStatus:        defs.TurnStatusCompleted,
+		},
+		{
+			name:              "interrupt_during_tool_execution",
+			files:             []string{firstFile},
+			interrupt:         true,
+			wantCalls:         []defs.ModelCallPurpose{conversationCall},
+			wantSavedKinds:    []defs.ItemKind{defs.ItemMessage, defs.ItemToolCall, defs.ItemToolResult, defs.ItemTurnInterrupted},
+			wantResultCallIDs: []string{firstFile},
+			wantStatus:        defs.TurnStatusInterrupted,
+		},
+		{
+			name:           "compact_then_generate",
+			overBudget:     true,
+			summaryTarget:  "test",
+			wantCalls:      []defs.ModelCallPurpose{compactionCall, conversationCall},
+			wantSavedKinds: []defs.ItemKind{defs.ItemMessage, defs.ItemContextSummary, defs.ItemMessage},
+			wantStatus:     defs.TurnStatusCompleted,
+		},
+		{
+			name:           "compact_with_distinct_model",
+			overBudget:     true,
+			summaryTarget:  "model-b",
+			wantCalls:      []defs.ModelCallPurpose{compactionCall, conversationCall},
+			wantSavedKinds: []defs.ItemKind{defs.ItemMessage, defs.ItemContextSummary, defs.ItemMessage},
+			wantStatus:     defs.TurnStatusCompleted,
+		},
+		{
+			name:           "over_budget_without_compaction_source",
+			overBudget:     true,
+			wantCalls:      []defs.ModelCallPurpose{conversationCall},
+			wantSavedKinds: []defs.ItemKind{defs.ItemMessage, defs.ItemMessage},
+			wantStatus:     defs.TurnStatusCompleted,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. 配置真实 HTTP 模型和可暂停文件读取的虚拟 Executor。
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			opt := newTestRuntimeOpt(store, model)
+			input := "开始任务"
+			if tt.overBudget {
+				opt.Definitions.Models[0].ContextWindow = 2_048
+				input = strings.Repeat(" recent", 2_400)
+				if tt.summaryTarget == "model-b" || tt.summaryTarget == "" {
+					opt.Definitions.Agents[0].CompactModel = opt.Definitions.Models[1].Ref
+				}
+			}
+			const root = "/workflow"
+			reads := make(map[string]*runtimeTaskFileRead)
+			var toolCalls []llmkit.ToolCall
+			if len(tt.files) > 0 {
+				files := make(map[string][]byte)
+				for _, name := range tt.files {
+					path := filepath.Join(root, name)
+					files[path] = []byte("file contents: " + name)
+					reads[path] = &runtimeTaskFileRead{
+						entered: make(chan struct{}),
+						release: make(chan struct{}),
+						exited:  make(chan struct{}),
+					}
+					toolCalls = append(toolCalls, llmkit.ToolCall{ID: name, Name: "read_file", Arguments: fmt.Sprintf(`{"path":%q}`, name)})
+				}
+				virtual := executor.NewVirtualExecutor(executor.NewVirtualExecutorOpt(&defs.ExecutorDefinition{
+					ID: "workflow", Kind: defs.ExecutorKindVirtual, WorkspaceDirectory: root,
+				}, files))
+				opt.Definitions.Executors = executor.NewConfigExecutorProvider([]executor.Executor{&runtimeTaskExecutor{Executor: virtual, reads: reads}})
+			}
+			h := startTestRuntimeWithOpt(t, store, model, opt)
+			conv := h.create(t)
+			watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+			var historyEnd defs.ItemID
+			if tt.summaryTarget != "" {
+				h.runRootTurn(t, conv, watcher, oldInput, runtimeModelResponse{chunks: []string{"旧回答"}})
+				items := h.listRootItems(t, conv)
+				historyEnd = items[len(items)-1].Item.ID
+			}
+
+			// 2. 提交输入；需要压缩时先回复摘要，检查普通生成改用摘要。
+			inputID := h.submit(t, conv.ID, input, "")
+			if tt.summaryTarget != "" {
+				request := model.receive(t)
+				if request.body["model"] != tt.summaryTarget || request.body["tool_choice"] != "none" ||
+					!slices.Contains(getRequestUserTexts(request.body), oldInput) {
+					t.Fatalf("summary request = %v, want %q with history and tools disabled", request.body, tt.summaryTarget)
+				}
+				request.reply <- runtimeModelResponse{chunks: []string{summaryText}}
+			}
+			request := model.receive(t)
+			if request.body["model"] != "test" || request.body["tool_choice"] == "none" {
+				t.Fatalf("generation request model = %v, tool_choice = %v", request.body["model"], request.body["tool_choice"])
+			}
+			if userText := strings.Join(getRequestUserTexts(request.body), "\n"); !strings.Contains(userText, input) ||
+				strings.Contains(userText, oldInput) || strings.Contains(userText, summaryText) != (tt.summaryTarget != "") {
+				t.Fatal("generation request did not use the expected input and summary")
+			}
+
+			// 3. 观察流式首段；工具开始后，中断阻塞读取或先放行第二个工具。
+			var events []conversation.ConversationEvent
+			var interruptedTurnID defs.TurnID
+			if len(toolCalls) > 0 {
+				response := runtimeModelResponse{calls: toolCalls}
+				if !tt.interrupt {
+					streamRelease := make(chan struct{})
+					response.chunks, response.release = []string{"先读取文件"}, streamRelease
+					request.reply <- response
+					events = collectUntil(t, watcher.Events, isMessageDelta)
+					delta := getSessionEvent(events[len(events)-1]).(*session.SessionAgentEvent).Event.Delta
+					if delta.Text != "先读取文件" {
+						t.Fatalf("first stream text = %q, want the pre-tool message", delta.Text)
+					}
+					close(streamRelease)
+				} else {
+					request.reply <- response
+				}
+				for _, name := range tt.files {
+					select {
+					case <-reads[filepath.Join(root, name)].entered:
+					case <-time.After(5 * time.Second):
+						t.Fatalf("tool reading %s did not start", name)
+					}
+				}
+				if tt.interrupt {
+					var err error
+					interruptedTurnID, err = h.rt.InterruptTurn(t.Context(), &runtime.InterruptTurnRequest{ConversationID: conv.ID})
+					if err != nil || interruptedTurnID == "" {
+						t.Fatalf("InterruptTurn() = %q, %v", interruptedTurnID, err)
+					}
+				} else {
+					close(reads[filepath.Join(root, secondFile)].release)
+					events = append(events, collectUntil(t, watcher.Events, func(event conversation.ConversationEvent) bool {
+						sessionEvent, ok := getSessionEvent(event).(*session.SessionAgentEvent)
+						if !ok || sessionEvent.Event.Type != agent.AgentEventItemCompleted {
+							return false
+						}
+						item := sessionEvent.Event.Item
+						return item.Kind == defs.ItemToolResult && item.ToolResult.CallID == secondFile
+					})...)
+					select {
+					case early := <-model.requests:
+						t.Fatalf("model called with the first tool still blocked: %v", early.body)
+					default:
+					}
+					close(reads[filepath.Join(root, firstFile)].release)
+					request = model.receive(t)
+					if request.body["model"] != "test" {
+						t.Fatalf("model after tools = %v, want test", request.body["model"])
+					}
+					var resultIDs []string
+					for _, value := range request.body["messages"].([]any) {
+						message := value.(map[string]any)
+						if message["role"] == "tool" {
+							id, _ := message["tool_call_id"].(string)
+							if id == "" || !strings.Contains(fmt.Sprint(message["content"]), "file contents: "+id) {
+								t.Fatalf("model received a mismatched tool result: %v", message)
+							}
+							resultIDs = append(resultIDs, id)
+						}
+					}
+					slices.Sort(resultIDs)
+					if !slices.Equal(resultIDs, tt.files) {
+						t.Fatalf("model received tool results %v, want %v", resultIDs, tt.files)
+					}
+				}
+			}
+			if !tt.interrupt {
+				request.reply <- runtimeModelResponse{chunks: []string{answer}}
+			}
+
+			// 4. 从订阅读取模型调用、工具结果和终态，与日志顺序及保存的 Turn 对照。
+			events = append(events, collectUntil(t, watcher.Events, isTurnFinished)...)
+			finished := getSessionEvent(events[len(events)-1]).(*session.SessionTurnFinished)
+			if finished.Status != tt.wantStatus || !slices.Equal(finished.InputItemIDs, []defs.ItemID{inputID}) {
+				t.Fatalf("finished Turn = %+v, want %s for input %s", finished, tt.wantStatus, inputID)
+			}
+			if tt.interrupt {
+				if finished.TurnID != interruptedTurnID {
+					t.Fatalf("finished Turn %s, want interrupted Turn %s", finished.TurnID, interruptedTurnID)
+				}
+				select {
+				case <-reads[filepath.Join(root, firstFile)].exited:
+				default:
+					t.Fatal("Turn finished before the tool exited")
+				}
+			}
+			var modelCalls []defs.ModelCallPurpose
+			var resultCallIDs []string
+			var savedEvents []dao.LoggedItem
+			var overBudget bool
+			for _, event := range events {
+				switch event := getSessionEvent(event).(type) {
+				case *session.SessionItemsSaved:
+					savedEvents = append(savedEvents, event.Items...)
+				case *session.SessionAgentEvent:
+					switch event.Event.Type {
+					case agent.AgentEventModelCallFinished:
+						modelCalls = append(modelCalls, event.Event.ModelCall.Purpose)
+					case agent.AgentEventContextMeasured:
+						measurement := event.Event.Measurement
+						overBudget = overBudget || (measurement.Window > 0 && measurement.RequestTokens >= measurement.ThresholdTokens)
+					case agent.AgentEventItemCompleted, agent.AgentEventItemInterrupted:
+						if item := event.Event.Item; item != nil && item.Kind == defs.ItemToolResult {
+							resultCallIDs = append(resultCallIDs, item.ToolResult.CallID)
+						}
+					}
+				}
+			}
+			if !slices.Equal(modelCalls, tt.wantCalls) || overBudget != tt.overBudget {
+				t.Fatalf("model calls = %v, over budget = %v; want %v, %v", modelCalls, overBudget, tt.wantCalls, tt.overBudget)
+			}
+			if !slices.Equal(resultCallIDs, tt.wantResultCallIDs) {
+				t.Fatalf("terminal tool events = %v, want %v", resultCallIDs, tt.wantResultCallIDs)
+			}
+			var savedKinds []defs.ItemKind
+			var savedCallIDs, savedResultIDs []string
+			turnItems := slices.DeleteFunc(h.listRootItems(t, conv), func(logged dao.LoggedItem) bool {
+				return logged.Item.TurnID != finished.TurnID
+			})
+			if !slices.EqualFunc(savedEvents, turnItems, func(event, log dao.LoggedItem) bool {
+				return event.Ordinal == log.Ordinal && event.Item.ID == log.Item.ID && event.Item.Kind == log.Item.Kind
+			}) {
+				t.Fatalf("saved items from subscription do not match the %d logged Turn items: %v", len(turnItems), savedEvents)
+			}
+			for _, logged := range turnItems {
+				item := logged.Item
+				savedKinds = append(savedKinds, item.Kind)
+				switch item.Kind {
+				case defs.ItemToolCall:
+					savedCallIDs = append(savedCallIDs, item.ToolCall.CallID)
+				case defs.ItemToolResult:
+					result := item.ToolResult
+					savedResultIDs = append(savedResultIDs, result.CallID)
+					if tt.interrupt {
+						if result.Error == nil || !strings.Contains(result.Error.Message, context.Canceled.Error()) {
+							t.Fatalf("saved tool result = %+v, want cancellation", result)
+						}
+					} else if result.Error != nil || !strings.Contains(string(result.Content), "file contents: "+result.CallID) {
+						t.Fatalf("saved tool result = %+v, want the matching file contents", result)
+					}
+				case defs.ItemContextSummary:
+					if item.ContextSummary.Text != summaryText || item.ContextSummary.CoveredThroughItemID != historyEnd {
+						t.Fatalf("saved summary = %+v, want %q covering through %s", item.ContextSummary, summaryText, historyEnd)
+					}
+				}
+			}
+			if !slices.Equal(savedKinds, tt.wantSavedKinds) || !slices.Equal(savedCallIDs, tt.files) || !slices.Equal(savedResultIDs, tt.wantResultCallIDs) {
+				t.Fatalf("saved kinds/calls/results = %v/%v/%v, want %v/%v/%v", savedKinds, savedCallIDs, savedResultIDs, tt.wantSavedKinds, tt.files, tt.wantResultCallIDs)
+			}
+			if !tt.interrupt && (messageText(turnItems[len(turnItems)-1].Item) != answer || messageText(savedEvents[len(savedEvents)-1].Item) != answer) {
+				t.Fatal("final answer missing from the Session log or subscription")
+			}
+			turn, found, err := store.query.GetTurn(t.Context(), conv.RootSessionID, finished.TurnID)
+			if err != nil || !found || turn.Status != tt.wantStatus {
+				t.Fatalf("saved Turn = %+v, found %v, error %v; want %s", turn, found, err, tt.wantStatus)
+			}
+			t.Logf("model calls=%v, summary target=%q, saved kinds=%v, tool results=%v, Turn=%s", modelCalls, tt.summaryTarget, savedKinds, resultCallIDs, finished.Status)
+
+			// 5. 跨 Runtime 重开工具轮，检查原 Turn 仍完成且没有新轮或模型请求。
+			h.stop(t)
+			if len(toolCalls) == 2 {
+				h = startTestRuntimeWithOpt(t, store, model, opt)
+				if _, err := h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID}); err != nil {
+					t.Fatal(err)
+				}
+				infos := h.subscribeConversation(t, conv.ID)
+				isReopenedTurnCompleted := func(info runtime.SessionRuntimeInfo) bool {
+					return info.Session.ID == conv.RootSessionID && info.LastTurnID == finished.TurnID && isTurnCompletedInfo(info)
+				}
+				if !slices.ContainsFunc(infos.Sessions, isReopenedTurnCompleted) {
+					collectUntil(t, infos.Events, isReopenedTurnCompleted)
+				}
+				if ids := h.listRootTurnIDs(t, conv); !slices.Equal(ids, []defs.TurnID{finished.TurnID}) {
+					t.Fatalf("reopened Turn IDs = %v, want only %s", ids, finished.TurnID)
+				}
+				h.waitTurnStatus(t, conv.RootSessionID, finished.TurnID, defs.TurnStatusCompleted)
+				h.stop(t)
+			}
+			select {
+			case extra := <-model.requests:
+				t.Fatalf("unexpected additional model request: %v", extra.body)
+			default:
+			}
+		})
+	}
+}
+
+// runtimeTaskExecutor 给真实 read_file 工具提供可暂停的虚拟工作区。
+type runtimeTaskExecutor struct {
+	executor.Executor
+	reads map[string]*runtimeTaskFileRead
+}
+
+// NewWorkspace 创建虚拟工作区并接入受控的文件读取。
+func (e *runtimeTaskExecutor) NewWorkspace(ctx context.Context, request *executor.NewWorkspaceRequest) (workspace.Workspace, error) {
+	// 1. 打开工作区，返回带受控读取的工作区。
+	work, err := e.Executor.NewWorkspace(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeTaskWorkspace{Workspace: work, reads: e.reads}, nil
+}
+
+type runtimeTaskFileRead struct {
+	entered chan struct{}
+	release chan struct{}
+	exited  chan struct{}
+}
+
+type runtimeTaskWorkspace struct {
+	workspace.Workspace
+	reads map[string]*runtimeTaskFileRead
+}
+
+// OpenFileReader 在指定路径收到放行或取消后结束等待。
+func (w *runtimeTaskWorkspace) OpenFileReader(ctx context.Context, path string) (io.ReadCloser, error) {
+	// 1. 暂停指定文件的读取，其余文件按常规打开。
+	if read := w.reads[path]; read != nil {
+		close(read.entered)
+		defer close(read.exited)
+		select {
+		case <-read.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return w.Workspace.OpenFileReader(ctx, path)
+}
+
 // TestRuntimeAppendContextItems 检查注入的 Item 暂存到下一个非压缩 Turn，写在本轮输入之前。
 func TestRuntimeAppendContextItems(t *testing.T) {
 	// 1. 列出写入顺序、活动 Turn 期间注入、有效消息、无效 Item、压缩 Turn、Session 停止和对话没打开七种场景。
@@ -4118,10 +4994,16 @@ func TestRuntimeAppendContextItems(t *testing.T) {
 		{
 			name: "invalid item rejected",
 			run: func(t *testing.T, h *runtimeHarness) {
+				withResult := newClientInstructionItem("带模型调用结果")
+				withResult.ModelCallResult = defs.ModelCallResultReply
+				withUsage := newClientInstructionItem("带模型调用用量")
+				withUsage.ModelCallUsage = &defs.TurnContextUsage{ModelCallID: defs.NewModelCallID(), InputThroughItemID: defs.NewItemID()}
 				invalid := []struct {
 					name  string
 					items []*defs.Item
 				}{
+					{name: "client instruction with model call result", items: []*defs.Item{withResult}},
+					{name: "client instruction with model call usage", items: []*defs.Item{withUsage}},
 					{
 						name:  "missing payload",
 						items: []*defs.Item{{ID: defs.NewItemID(), Kind: defs.ItemClientInstruction}},
@@ -4170,13 +5052,18 @@ func TestRuntimeAppendContextItems(t *testing.T) {
 						if err := h.rt.AppendContextItems(t.Context(), &runtime.AppendContextItemsRequest{ConversationID: conv.ID, Items: tt.items}); err == nil {
 							t.Fatal("AppendContextItems() error = nil, want the invalid item rejected")
 						}
+						if logged := h.listRootItems(t, conv); len(logged) != 0 {
+							t.Fatalf("log after rejection = %+v, want empty", logged)
+						}
 						h.submit(t, conv.ID, "你好", "")
 						request := h.model.receive(t)
 						if texts := getRequestUserTexts(request.body); len(texts) != 1 || texts[0] != "你好" {
 							t.Fatalf("model user messages = %q, want only the input", texts)
 						}
 						request.reply <- runtimeModelResponse{chunks: []string{"好"}}
-						for _, entry := range h.waitLog(t, conv.ID, conv.RootSessionID, 2) {
+						logged := h.waitLog(t, conv.ID, conv.RootSessionID, 2)
+						h.waitConversationTurnStatus(t, conv, logged[0].Item.TurnID, defs.TurnStatusCompleted)
+						for _, entry := range logged {
 							if slices.ContainsFunc(tt.items, func(item *defs.Item) bool { return item.ID == entry.Item.ID }) {
 								t.Fatalf("log has the rejected item %+v, want none", entry.Item)
 							}
@@ -4838,8 +5725,9 @@ func TestRuntimeEphemeralFork(t *testing.T) {
 					t.Fatalf("fork details executors = %+v, tools = %v, %v; want the Executor tools", details.Executors, details.Tools, err)
 				}
 
-				// 分叉里没结束的第 2 轮由分叉的 Session 改成 interrupted，来源的第 2 轮不动。
+				// 分叉只保留第 2 轮已保存的部分，不产生旧轮的模型请求，也不停止来源轮。
 				h.waitConversationTurnStatus(t, forked, secondTurn, defs.TurnStatusInterrupted)
+				h.model.requireNoRequest(t)
 				h.waitTurnStatus(t, source.RootSessionID, secondTurn, defs.TurnStatusRunning)
 
 				// 给分叉输入后这一轮正常完成，没有结果的工具调用带 missing_output。
@@ -6199,6 +7087,63 @@ func TestRuntimeMaxSteps(t *testing.T) {
 			// 5. 下一轮能正常完成。
 			next := h.runRootTurn(t, conv, watcher, "继续", runtimeModelResponse{chunks: []string{"接着做"}})
 			h.waitTurnStatus(t, conv.RootSessionID, next, defs.TurnStatusCompleted)
+		})
+	}
+}
+
+// TestRuntimeReopenRootOnly 重开持久对话只恢复根轮，显式发送到原子 Session 才继续其未完成轮。
+func TestRuntimeReopenRootOnly(t *testing.T) {
+	for _, ephemeral := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ephemeral_%t", ephemeral), func(t *testing.T) {
+			ctx := t.Context()
+			store, model := openRuntimeStore(t), newRuntimeModel(t)
+			h := startTestRuntime(t, store, model)
+			conv, err := h.rt.CreateConversation(ctx, &runtime.CreateConversationRequest{AgentName: "assistant", Ephemeral: ephemeral})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.submit(t, conv.ID, "delegate", "")
+			model.receive(t).reply <- runtimeModelResponse{calls: []llmkit.ToolCall{{ID: "spawn", Name: "spawn_agent", Arguments: `{"task_name":"review","message":"original child work"}`}}}
+			model.receiveRootAndTask(t, "review")
+			var childID defs.SessionID
+			var original *defs.Turn
+			if !ephemeral {
+				childID = h.getChildSessionID(t, conv)
+				original, err = store.query.GetLatestLoggedTurn(ctx, conv.ID, childID)
+				if err != nil || original == nil {
+					t.Fatalf("child = %+v, %v", original, err)
+				}
+			}
+			h.stop(t)
+			h = startTestRuntime(t, store, model)
+			model.requireNoRequest(t)
+			_, err = h.rt.OpenConversation(ctx, &runtime.OpenConversationRequest{ConversationID: conv.ID})
+			if ephemeral {
+				if !errors.Is(err, runtime.ErrConversationNotFound) {
+					t.Fatalf("open ephemeral: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := model.receive(t)
+			model.requireNoRequest(t)
+			request.reply <- runtimeModelResponse{calls: []llmkit.ToolCall{{ID: "list", Name: "list_agents", Arguments: "{}"}}}
+			listed := model.receive(t)
+			if !strings.Contains(fmt.Sprint(listed.body["messages"]), "stopped") {
+				t.Fatalf("list = %v", listed.body["messages"])
+			}
+			model.requireNoRequest(t)
+			listed.reply <- runtimeModelResponse{calls: []llmkit.ToolCall{{ID: "resume", Name: "send_message", Arguments: fmt.Sprintf(`{"session_id":%q,"mode":"steer","message":"follow up"}`, childID)}}}
+			_, child := model.receiveRootAndTask(t, "review")
+			child.reply <- runtimeModelResponse{chunks: []string{"reviewed"}}
+			next := model.receive(t)
+			if !strings.Contains(fmt.Sprint(next.body["messages"]), "follow up") {
+				t.Fatal(next.body["messages"])
+			}
+			next.reply <- runtimeModelResponse{chunks: []string{"done"}}
+			h.waitTurnStatus(t, childID, original.ID, defs.TurnStatusCompleted)
 		})
 	}
 }

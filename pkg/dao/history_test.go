@@ -601,3 +601,31 @@ func TestLoadContextHistoryModelFailures(t *testing.T) {
 		})
 	}
 }
+
+// TestModelRequestHistoryCutoff 检查旧请求的输入不会受后来轮次的摘要和模型切换影响。
+func TestModelRequestHistoryCutoff(t *testing.T) {
+	for _, kind := range []defs.ItemKind{defs.ItemContextSummary, defs.ItemModelChange} {
+		t.Run(string(kind), func(t *testing.T) {
+			query, mutation, _ := openDAO(t)
+			ctx := t.Context()
+			conv, sid := defs.NewConversationID(), defs.NewSessionID()
+			cp := &defs.TurnCheckpoint{TurnID: "original", Step: 1, Phase: defs.TurnCheckpointPhaseRequest, Request: &defs.TurnRequestCheckpoint{Purpose: defs.ModelCallPurposeConversation, ModelCallID: "original-call", ModelCallThroughItemID: "input"}}
+			if err := mutation.AppendTurnCheckpoint(ctx, conv, sid, cp); err != nil {
+				t.Fatal(err)
+			}
+			entries := []historyEntry{{id: "thinking", turn: "older", reasoning: true}, {id: "input", turn: "original"}, {id: "future", turn: "future", change: kind == defs.ItemModelChange}}
+			if kind == defs.ItemContextSummary {
+				entries[2].covers = "thinking"
+			}
+			for _, e := range entries {
+				if _, err := mutation.AppendItems(ctx, conv, sid, e.item()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := query.GetModelRequestHistory(ctx, conv, sid, cp)
+			if err != nil || len(got) != 2 || got[0].Reasoning == nil || !slices.Equal(got[0].Reasoning.Summary, []string{"r"}) || got[1].ID != "input" {
+				t.Fatalf("request history=%+v, err=%v", got, err)
+			}
+		})
+	}
+}

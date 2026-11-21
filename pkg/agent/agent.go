@@ -4,24 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent/agent_context"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
-	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
-	"github.com/failsafe-go/failsafe-go"
-	"github.com/failsafe-go/failsafe-go/retrypolicy"
 )
 
 // Agent 在一次 Turn 内生成模型回复、执行工具并发送输出事件。
@@ -32,24 +27,80 @@ type Agent interface {
 	Run(ctx context.Context, events chan<- *AgentEvent) (AgentResult, error)
 }
 
+// agentTask 是 Agent 按阶段启动、等待并结算的一次内存任务。
+type agentTask interface {
+	// GetID 返回构造时分配的任务标识。
+	GetID() agentTaskID
+	// GetStatus 返回任务的阶段状态，只在 Run 外读取。
+	GetStatus() agentTaskStatus
+	// GetWaitingTaskIDs 返回只读的依赖 ID，只在 Run 外读取。
+	GetWaitingTaskIDs() []agentTaskID
+	// GetCompletion 返回任务的终态结果，只在 Run 返回后读取。
+	GetCompletion() agentTaskCompletion
+	// Run 执行至下一次等待或终态，返回前发完本次事件。
+	Run(ctx context.Context, input agentTaskInput, events chan<- agentTaskEvent) (result agentTaskRunResult, err error)
+	// Cancel 将尚未运行或正在等待的任务记为取消。
+	Cancel(cause error)
+}
+
 // agentImpl 是一次 Turn 的 Agent，保存配置、本轮草稿、已读的目录规则和记忆目录，以及运行统计。
 type agentImpl struct {
+	// 本轮配置与输入
 	opt *AgentOpt
+	// modelTools 是 Run 开始时从 ToolExecutor 读取并转换的本轮工具定义，供构建请求和测量上下文复用。
+	modelTools []llmkit.Tool
+	// generationOpt 是 Run 初始化时组装的只读生成任务配置，创建首个和后续生成任务时传入。
+	generationOpt *generationTaskOpt
+	// workspaceAgentsInstructions 按 Executor 保存本轮读到的全局和目录规则；键存在就表示已经读过，值可以为空。
+	workspaceAgentsInstructions map[string][]*defs.AgentsInstruction
+	// memoryIndexes 是本轮开始时读到的 MEMORY.md；文件不存在、读失败或内容为空时没有对应的项。
+	memoryIndexes []*defs.MemoryIndex
 
-	// agentEventChannel 是 Run 传入的事件通道；nil 时不发事件。
-	agentEventChannel chan<- *AgentEvent
+	// 任务执行
+	// tasks 保存本轮尚未结算的任务实例，包括等待依赖或待交付结果的任务；结果交付给等待者、独立任务结束或取消清理后移除。
+	tasks map[agentTaskID]agentTask
+	// runningTaskIDs 启动任务 Run 时加入，Agent 收到该次 Run 的返回通知后移除。等待依赖的任务仍在 tasks 中。
+	runningTaskIDs map[agentTaskID]struct{}
+	// nextTaskID 是单次 Run 内递增的任务 ID 计数器，每创建一个新任务前加 1。
+	nextTaskID agentTaskID
+	// taskRuns 跟踪所有已启动的任务 goroutine，Run 在事件循环退出后等待它们全部结束。
+	taskRuns sync.WaitGroup
+	// taskEvents 接收各任务发回的进度事件、同步请求和 Run 返回通知；由 Run 创建并在全部任务退出后关闭。
+	taskEvents chan agentTaskEvent
+	// executorEvents 由 ToolTask 直接传给 ToolExecutor.Run，接收执行器向 Agent 直发的进度、hook 和结果事件；由 Run 创建并在全部任务退出后关闭。
+	executorEvents chan executor.ExecutorEvent
+
+	// 输出草稿
 	// draftItems 是本轮输出草稿，按首次出现顺序排列。
 	draftItems []*defs.Item
 	// draftItemIndexes 是每个草稿在 draftItems 里的位置。
 	draftItemIndexes map[*defs.Item]int
 	// draftItemFinishReason 记录已结束草稿的结束事件类型（完成或中断）；不在表里的草稿还没结束。
 	draftItemFinishReason map[*defs.Item]AgentEventType
-	// workspaceAgentsInstructions 按 Executor 保存本轮读到的全局和目录规则；键存在就表示已经读过，值可以为空。
-	workspaceAgentsInstructions map[string][]*defs.AgentsInstruction
-	// memoryIndexes 是本轮开始时读到的 MEMORY.md；文件不存在、读失败或内容为空时没有对应的项。
-	memoryIndexes []*defs.MemoryIndex
+	// compactionDraft 保存已发出开始事件但尚未写入上下文的摘要草稿；应用成功后清空，失败或 Run 退出未应用时发中断事件并移除。
+	compactionDraft *defs.Item
+	// checkpointAfterItemID 是最近交给 Turn 的历史末项；本次运行还没有交付 Item 时为空。
+	checkpointAfterItemID defs.ItemID
+	// checkpointAfterDraftCount 是该末项之前（含末项本身）的草稿数，供按首次出现顺序更新末项；尚无交付时为零。
+	checkpointAfterDraftCount int
+
+	// 当前模型调用与工具批次
+	// modelStream 保存当前正在接收事件的普通模型调用状态；收到开始请求时创建，开始处理完成请求时取出并清空。
+	modelStream *agentModelStream
+	// toolCallsByCallID 按 CallID 暂存本批工具草稿及已合并的执行结果；模型返回工具调用时建立，准备阶段已结束或被 ToolTask 取走结果后移除。
+	toolCallsByCallID map[string]agentToolCall
+	// toolBatchModelCallID 记录当前工具批次所属的模型调用 ID，供 Run 退出前补加残留目录规则时使用。
+	toolBatchModelCallID defs.ModelCallID
+	// toolAgentsInstructions 暂存本批工具执行结果带回的目录规则；在批收尾时追加并清空，未及批收尾则在 Run 退出前补加。
+	toolAgentsInstructions []*defs.AgentsInstruction
+
+	// 对外事件与最终结果
+	// agentEventChannel 是 Run 传入的事件通道；nil 时不发事件。
+	agentEventChannel chan<- *AgentEvent
 	// turnStats 是本次运行的统计，随循环累计，Run 返回时交给调用方。
 	turnStats AgentStats
+	// finalModelCallID 普通生成不再请求下一步时记下的模型调用 ID，供组装 AgentResult 使用。
+	finalModelCallID defs.ModelCallID
 }
 
 // AgentOpt 指定本轮模型、上下文、工具、输入通道和 hook 环境。
@@ -65,23 +116,22 @@ type AgentOpt struct {
 	ToolExecutor executor.ToolExecutor
 	// Environments 保存本对话的执行环境；第一个是默认环境，提供目录规则和 Stop hook 的工作区。
 	Environments []executor.ExecutionEnvironment
-	// InputRequests 向 Turn 请求补充输入；nil 时不读补充输入。
-	InputRequests chan<- AgentInputRequest
+	// Requests 供 Agent 请求 Turn 读取补充输入或保存 checkpoint；nil 时独立运行，不读补充输入也不等待持久化。
+	Requests chan<- AgentRequest
+	// Resume 是 Turn 根据已保存历史计算的本次 Run 恢复输入；nil 表示从第一步开始。
+	Resume *AgentResumeInput
 	// IsCompactOnly 这个 Agent 是否只压缩上下文？是的话 Run 只把历史压成摘要就返回，不调用普通模型。
 	IsCompactOnly bool
 	// Hooks 在模型这一步没有工具调用时触发 Stop 或 SubagentStop；为 nil 或 Environments 为空时不触发。
 	Hooks hook.Hooks
 	// Session 是本 Agent 运行所在的 Session，随 hook 事件交给脚本；ParentSessionID 非空表示子 Session，触发 SubagentStop。
 	Session defs.Session
-	// MaxSteps 是本轮最多调用模型的次数；0 表示不限。最后一步禁用工具并要求模型总结进度。
+	// MaxSteps 是本轮普通生成的步数上限，不含摘要或重试；0 表示不限。最后一步禁用工具并要求模型总结进度。
 	MaxSteps int
 }
 
 // maxMemoryIndexBytes 是每份 MEMORY.md 放进上下文的字节数上限。
 const maxMemoryIndexBytes = 8 << 10
-
-// maxStopHookContinuations 是 Stop、SubagentStop 连续拦下结束时，模型最多续跑的次数。
-const maxStopHookContinuations = 8
 
 // NewAgentOpt 填写本轮身份、模型和上下文。
 func NewAgentOpt(
@@ -103,9 +153,13 @@ func NewAgentOpt(
 
 // NewAgent 检查依赖并创建本轮 Agent。
 func NewAgent(opt *AgentOpt) (Agent, error) {
-	// 1. 检查身份、模型客户端、请求目标和上下文。
-	if opt == nil || opt.TurnID == "" || opt.SessionID == "" || opt.Client == nil || opt.Model == nil || opt.Model.Target == nil || opt.Context == nil {
-		return nil, errors.New("agent requires a turn ID, session ID, model client, model with target and context")
+	// 1. 检查身份和执行依赖；只收尾或只压缩时不需要普通模型。
+	if opt == nil || opt.TurnID == "" || opt.SessionID == "" || opt.Client == nil {
+		return nil, errors.New("agent requires a turn ID, session ID and model client")
+	}
+	finishOnly := opt.Resume != nil && (opt.Resume.Finish != nil || opt.Resume.ToolBatch != nil && opt.Resume.ToolBatch.IsTurnStopped)
+	if !finishOnly && (opt.Context == nil || !opt.IsCompactOnly && (opt.Model == nil || opt.Model.Target == nil)) {
+		return nil, errors.New("agent requires a model with target and context")
 	}
 	// 2. 保存配置，创建草稿索引、结束状态和工作区规则表。
 	return &agentImpl{
@@ -116,215 +170,380 @@ func NewAgent(opt *AgentOpt) (Agent, error) {
 	}, nil
 }
 
-// Run 执行本轮生成和工具调用，返回草稿、最终模型调用 ID 和统计。
-func (a *agentImpl) Run(ctx context.Context, events chan<- *AgentEvent) (AgentResult, error) {
-	// 1. 保存事件通道，非 nil 时在返回前关闭。
+// Run 初始化本轮，串行合并任务事件，等待任务结束后返回草稿和统计。
+func (a *agentImpl) Run(ctx context.Context, events chan<- *AgentEvent) (result AgentResult, runErr error) {
+	// 1. 接管输出通道；从回复或工具批收尾恢复时先不读取工具定义。
 	a.agentEventChannel = events
 	if events != nil {
 		defer close(events)
 	}
-	// 2. 运行模型循环并返回本轮结果。
-	finalModelCallID, err := a.callModelUntilFinished(ctx)
-	return AgentResult{
-		Items:            a.draftItems,
-		FinalModelCallID: finalModelCallID,
-		Stats:            a.turnStats,
-	}, err
-}
-
-// callModelUntilFinished 运行模型和工具循环，返回最后一次成功普通模型调用的 ID。
-func (a *agentImpl) callModelUntilFinished(ctx context.Context) (finalModelCallID defs.ModelCallID, runErr error) {
-	// 1. 获取本轮工具，退出模型循环前发送最终上下文用量。
-	tools, err := a.getTools(ctx)
-	if err != nil {
-		return "", err
+	resumeAtSettlement := a.opt.Resume != nil && (a.opt.Resume.Finish != nil || a.opt.Resume.ToolBatch != nil)
+	if !resumeAtSettlement {
+		tools, err := a.getTools(ctx)
+		if err != nil {
+			return result, err
+		}
+		a.modelTools = tools
 	}
 	defer func() {
-		if _, err := a.measureContext(tools); err != nil {
-			runErr = errors.Join(runErr, err)
+		result = AgentResult{Items: a.draftItems, Stats: a.turnStats}
+		if runErr == nil {
+			result.FinalModelCallID = a.finalModelCallID
+		}
+		if (!resumeAtSettlement || a.turnStats.Steps != 0) && a.opt.Context != nil {
+			if _, err := a.measureContext(a.modelTools); err != nil {
+				runErr = errors.Join(runErr, err)
+			}
 		}
 	}()
-	// 2. 只压缩时手动压缩历史，然后返回。
+
+	// 2. 初始化任务事件循环；按运行模式启动手动压缩或首次普通生成。
+	taskCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	a.taskEvents = make(chan agentTaskEvent)
+	a.executorEvents = make(chan executor.ExecutorEvent)
+	a.tasks = make(map[agentTaskID]agentTask)
+	a.runningTaskIDs = make(map[agentTaskID]struct{})
+	start := generationTaskStart{Step: 1}
+	if resume := a.opt.Resume; resume != nil {
+		start.Step = resume.Step
+		start.StopHookContinuations = resume.StopHookContinuations
+		start.IsContinuedByStopHook = resume.IsContinuedByStopHook
+		start.SkipInputRead = resume.Retry != nil
+		start.ResumeFinish = resume.Finish
+		start.ResumeToolBatch = resume.ToolBatch
+		start.ResumeCompaction = resume.Compaction
+		a.turnStats.Usage = resume.Usage
+		if resume.Finish != nil {
+			a.finalModelCallID = resume.Finish.ModelCallID
+		}
+		if resume.Retry != nil {
+			a.checkpointAfterItemID = resume.Retry.InputThroughItemID
+		}
+		for _, item := range resume.ExistingItems {
+			cloned := item.Clone()
+			a.appendDraftItem(cloned)
+			a.draftItemFinishReason[cloned] = AgentEventItemCompleted
+		}
+		a.checkpointAfterDraftCount = len(a.draftItems)
+	}
+	defer close(a.taskEvents)
+	defer close(a.executorEvents)
+	var manualCompaction agentTask
 	if a.opt.IsCompactOnly {
-		_, err := a.compactContext(ctx, tools, true)
+		input, err := a.prepareCompaction(true, start.ResumeCompaction)
+		if err != nil || input == nil {
+			return result, err
+		}
+		input.Generation = start
+		a.nextTaskID++
+		manualCompaction = newCompactionTask(a.nextTaskID)
+		a.startTask(taskCtx, manualCompaction, input)
+	} else {
+		var defaultEnvironment executor.ExecutionEnvironment
+		if len(a.opt.Environments) > 0 {
+			defaultEnvironment = a.opt.Environments[0]
+		}
+		if a.opt.Resume == nil {
+			if err := a.loadGenerationEnvironment(ctx, defaultEnvironment); err != nil {
+				return result, err
+			}
+		}
+		a.generationOpt = &generationTaskOpt{
+			Client: a.opt.Client, Model: a.opt.Model, ToolExecutor: a.opt.ToolExecutor, Hooks: a.opt.Hooks,
+			Session: a.opt.Session, TurnID: a.opt.TurnID, DefaultEnvironment: defaultEnvironment, MaxSteps: a.opt.MaxSteps,
+		}
+		a.nextTaskID++
+		a.startTask(taskCtx, newGenerationTask(a.nextTaskID, a.generationOpt), &generationTaskInput{Start: &start})
+	}
+
+	// 3. 合并事件。遇到取消或首个错误后停止派发，仍处理已启动任务的请求和最终事件。
+	taskCtxDone := taskCtx.Done()
+	for len(a.tasks) != 0 {
+		if taskCtx.Err() != nil {
+			for taskID, task := range a.tasks {
+				if _, running := a.runningTaskIDs[taskID]; running {
+					continue
+				}
+				if task.GetStatus() == agentTaskWaiting || task.GetStatus() == agentTaskPending {
+					task.Cancel(taskCtx.Err())
+				}
+				delete(a.tasks, taskID)
+			}
+		}
+		if len(a.runningTaskIDs) == 0 {
+			if len(a.tasks) != 0 {
+				runErr = errors.New("agent task dependencies cannot make progress")
+			}
+			break
+		}
+		var eventErr error
+		select {
+		case <-taskCtxDone:
+			taskCtxDone = nil
+		case event := <-a.taskEvents:
+			eventErr = a.handleTaskEvent(taskCtx, event)
+		case event := <-a.executorEvents:
+			eventErr = a.handleExecutorEvent(taskCtx, event)
+		}
+		if eventErr != nil && runErr == nil && eventErr != ctx.Err() {
+			runErr = eventErr
+			cancel()
+		}
+	}
+
+	// 4. 收齐返回通知后等待任务退出，再结束未应用的摘要和本轮输出。
+	a.taskRuns.Wait()
+	a.interruptCompactionDraft()
+	if len(a.toolAgentsInstructions) != 0 {
+		if err := a.appendAgentsInstructions(a.toolAgentsInstructions, a.toolBatchModelCallID); runErr == nil {
+			runErr = err
+		}
+	}
+	if runErr == nil && (manualCompaction == nil || manualCompaction.GetStatus() != agentTaskCompleted) {
+		runErr = ctx.Err()
+	}
+	return result, runErr
+}
+
+// startTask 登记一次任务运行，并在它返回后发送通知。
+func (a *agentImpl) startTask(ctx context.Context, task agentTask, input agentTaskInput) {
+	// 1. 取消后不再启动任务；其余先登记，再启动本次 Run。
+	if err := ctx.Err(); err != nil {
+		task.Cancel(err)
+		return
+	}
+	taskID := task.GetID()
+	a.tasks[taskID] = task
+	a.runningTaskIDs[taskID] = struct{}{}
+	events := a.taskEvents
+	a.taskRuns.Go(func() {
+		result, err := task.Run(ctx, input, events)
+		events <- &agentTaskRunReturnedEvent{TaskID: taskID, Result: result, Err: err}
+	})
+}
+
+// handleTaskEvent 合并任务通知，处理任务请求并回复调用方。
+func (a *agentImpl) handleTaskEvent(ctx context.Context, event agentTaskEvent) error {
+	// 1. 合并无需回复的通知，或按事件类别处理请求并关闭回复通道。
+	switch event := event.(type) {
+	case *agentTaskRunReturnedEvent:
+		return a.handleTaskRunReturned(ctx, event)
+	case *agentTaskModelEvent:
+		a.handleTaskModelEvent(&event.Event, event.ModelCallResult)
+	case *agentTaskExecutorEvent:
+		return a.handleExecutorEvent(ctx, event.Event)
+	case *agentTaskHookRunEvent:
+		a.sendEvents([]*AgentEvent{{Type: AgentEventHookRun, HookRun: event.Run}})
+	case *agentTaskGenerationInputRequested:
+		input := a.prepareGenerationInput(telemetry.ContextWithAttrs(ctx, telemetry.TurnStep(event.Step)), event.Step, event.IsAfterCompaction, event.SkipInputRead, event.SkipEnvironmentPreparation, event.ResumeCompaction)
+		event.Reply <- input
+		close(event.Reply)
+		return input.Err
+	case *agentTaskModelCallStartedRequest:
+		err := a.saveCheckpoint(ctx, event.Checkpoint, "")
+		if err == nil {
+			a.handleModelCallStarted(event.Checkpoint.Request.ModelCallID, event.Checkpoint.Request.ModelCallThroughItemID)
+		}
+		event.Reply <- err
+		close(event.Reply)
+		return err
+	case *agentTaskSaveCheckpointRequested:
+		err := a.saveCheckpoint(ctx, event.Checkpoint, event.AfterItemID)
+		event.Reply <- err
+		close(event.Reply)
+		return err
+	case *agentTaskModelCallFinishedRequest:
+		call := a.handleModelCallFinished(telemetry.ContextWithAttrs(ctx, telemetry.TurnStep(event.Step)), event)
+		event.Reply <- call
+		close(event.Reply)
+		return call.Err
+	case *agentTaskToolResultRequested:
+		result := a.takeToolResult(event.CallID)
+		event.Reply <- result
+		close(event.Reply)
+	case *agentTaskToolCallsRejectedRequest:
+		err := a.rejectToolCalls(event.Calls)
+		event.Reply <- err
+		close(event.Reply)
+		return err
+	case *agentTaskToolsRequested:
+		result := a.startToolTasks(telemetry.ContextWithAttrs(ctx, telemetry.TurnStep(event.Step)), event.Calls)
+		event.Reply <- result
+		close(event.Reply)
+		return result.Err
+	case *agentTaskCompactionRequested:
+		result := agentTaskCreationResult{Err: ctx.Err()}
+		if result.Err == nil {
+			a.nextTaskID++
+			a.startTask(telemetry.ContextWithAttrs(ctx, telemetry.TurnStep(event.Step)), newCompactionTask(a.nextTaskID), &event.Input)
+			result.TaskIDs = []agentTaskID{a.nextTaskID}
+		}
+		event.Reply <- result
+		close(event.Reply)
+		return result.Err
+	case *agentTaskCompactionFinishedRequest:
+		err := a.handleCompactionFinished(ctx, event.Output, event.Err)
+		event.Reply <- err
+		close(event.Reply)
 		if err != nil {
-			return "", err
+			return fmt.Errorf("compact agent context: %w", err)
 		}
-		return "", nil
+	case *agentTaskStopHooksFinishedRequest:
+		events, err := a.appendCompletedItems(newHookRunItems(event.Outcome.SavedRuns, a.opt.TurnID, event.ModelCallID)...)
+		a.sendEvents(events)
+		if err != nil {
+			err = fmt.Errorf("append stop hook runs: %w", err)
+		}
+		event.Reply <- err
+		close(event.Reply)
+		return err
+	case *agentTaskToolBatchFinishedRequest:
+		err := a.handleToolBatchFinished(telemetry.ContextWithAttrs(ctx, telemetry.TurnStep(event.Step)), event.ModelCallID, event.Results)
+		event.Reply <- err
+		close(event.Reply)
+		return err
+	case *agentTaskFinalInputRequested:
+		hasInput, err := a.readInputs(telemetry.ContextWithAttrs(ctx, telemetry.TurnStep(event.Step)), true)
+		event.Reply <- agentTaskFinalInputResult{HasInput: hasInput, Err: err}
+		close(event.Reply)
+		return err
 	}
-	// 3. 预读默认环境的工作区规则，读取失败则结束本轮；再读记忆目录，读失败只记日志，不影响本轮。
-	if len(a.opt.Environments) > 0 {
-		defaultEnvironment := a.opt.Environments[0]
-		if _, err := a.getWorkspaceAgentsInstructions(ctx, defaultEnvironment); err != nil {
-			return "", fmt.Errorf("load AGENTS.md from executor %q: %w", defaultEnvironment.GetID(), err)
+	return nil
+}
+
+// handleTaskRunReturned 结算本次任务调用，启动已齐备的等待任务或下一次生成。
+func (a *agentImpl) handleTaskRunReturned(ctx context.Context, event *agentTaskRunReturnedEvent) error {
+	// 1. 只在 Run 返回后读取任务状态。失败的压缩先结束摘要草稿。
+	delete(a.runningTaskIDs, event.TaskID)
+	task := a.tasks[event.TaskID]
+	switch task.(type) {
+	case *compactionTaskImpl:
+		if event.Err != nil {
+			a.interruptCompactionDraft()
+		}
+		if a.opt.IsCompactOnly {
+			delete(a.tasks, event.TaskID)
+			return event.Err
+		}
+	case *generationTaskImpl:
+		if len(event.Result.WaitingOn) == 0 {
+			delete(a.tasks, event.TaskID)
+			if event.Err != nil {
+				return event.Err
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			output := task.GetCompletion().Output.(*generationTaskOutput)
+			if output.NextGeneration == nil {
+				a.finalModelCallID = output.FinalModelCallID
+				return nil
+			}
+			if a.opt.Model == nil || a.opt.Model.Target == nil || a.opt.Context == nil {
+				return errors.New("resume requires the recorded model to continue")
+			}
+			if resume := a.opt.Resume; resume != nil &&
+				(resume.Finish != nil && output.FinalModelCallID == resume.Finish.ModelCallID ||
+					resume.ToolBatch != nil && output.FinalModelCallID == resume.ToolBatch.ModelCallID) {
+				tools, err := a.getTools(ctx)
+				if err != nil {
+					return err
+				}
+				a.modelTools = tools
+			}
+			a.nextTaskID++
+			a.startTask(ctx, newGenerationTask(a.nextTaskID, a.generationOpt), &generationTaskInput{Start: output.NextGeneration})
+			return nil
 		}
 	}
-	a.loadMemoryIndexes(ctx)
-	// 4. 逐步循环：每步先检查取消，再读取补充输入、追加目录规则和记忆目录并按需压缩。
-	// isTurnContinuedByStopHook 本轮是否被 Stop、SubagentStop 续跑过？变成 true 后不再改回。
-	isTurnContinuedByStopHook := false
-	// stopHookContinuations 是 Stop、SubagentStop 连续续跑的次数，执行工具后清零。
-	stopHookContinuations := 0
-	for step := 1; ; step++ {
-		if err := ctx.Err(); err != nil {
-			return "", err
+
+	// 2. 登记等待和依赖返回时都检查依赖；没有齐备时保持等待。
+	if ctx.Err() != nil {
+		return nil
+	}
+	for taskID, waitingTask := range a.tasks {
+		if _, running := a.runningTaskIDs[taskID]; running || waitingTask.GetStatus() != agentTaskWaiting {
+			continue
 		}
-		// 把本步序号挂到 ctx 的遥测属性上，模型、压缩和工具调用都会带上。
-		stepCtx := telemetry.ContextWithAttrs(ctx, telemetry.TurnStep(step))
-		if _, err := a.readInputs(stepCtx, false); err != nil {
-			return "", err
+		waitingIDs := waitingTask.GetWaitingTaskIDs()
+		completions := make([]agentTaskCompletion, 0, len(waitingIDs))
+		for _, dependencyID := range waitingIDs {
+			if _, running := a.runningTaskIDs[dependencyID]; running {
+				break
+			}
+			dependency := a.tasks[dependencyID]
+			if dependency == nil {
+				break
+			}
+			switch dependency.GetStatus() {
+			case agentTaskCompleted, agentTaskFailed, agentTaskCanceled:
+				completions = append(completions, dependency.GetCompletion())
+			}
+		}
+		if len(completions) != len(waitingIDs) {
+			continue
+		}
+		// 3. 按等待次序交回完整结果；已交付的依赖不再保留。
+		for _, completion := range completions {
+			delete(a.tasks, completion.TaskID)
+		}
+		a.startTask(ctx, waitingTask, &generationTaskInput{Completions: completions})
+	}
+	return nil
+}
+
+// prepareGenerationInput 读取本步输入、补目录规则与记忆，返回摘要或普通请求。
+func (a *agentImpl) prepareGenerationInput(ctx context.Context, step int, isAfterCompaction bool, skipInputRead bool, skipEnvironmentPreparation bool, resumeCompaction *AgentResumeCompaction) agentTaskGenerationInputResult {
+	// 1. 检查取消并接续原摘要；没有已确认范围时才读取新的补充输入。
+	if err := ctx.Err(); err != nil {
+		return agentTaskGenerationInputResult{Err: err}
+	}
+	if resumeCompaction != nil {
+		compaction, err := a.prepareCompaction(false, resumeCompaction)
+		if compaction != nil || err != nil {
+			return agentTaskGenerationInputResult{Compaction: compaction, Err: err}
+		}
+		isAfterCompaction = true
+	}
+	if !isAfterCompaction && !skipInputRead {
+		if _, err := a.readInputs(ctx, false); err != nil {
+			return agentTaskGenerationInputResult{Err: err}
+		}
+	}
+	// 2. 接续原压缩步的普通请求时读取规则和记忆，再按正常顺序补回被覆盖的 Item。
+	if !skipEnvironmentPreparation {
+		if resume := a.opt.Resume; isAfterCompaction && resume != nil && resume.Compaction != nil && resume.Step == step {
+			if err := a.loadGenerationEnvironment(ctx, a.generationOpt.DefaultEnvironment); err != nil {
+				return agentTaskGenerationInputResult{Err: err}
+			}
 		}
 		var instructions []*defs.AgentsInstruction
 		for _, environment := range a.opt.Environments {
 			instructions = append(instructions, a.workspaceAgentsInstructions[environment.GetID()]...)
 		}
 		if err := a.appendAgentsInstructions(instructions, ""); err != nil {
-			return "", err
+			return agentTaskGenerationInputResult{Err: err}
 		}
 		if err := a.appendMemoryIndexes(""); err != nil {
-			return "", err
-		}
-		if _, err := a.compactContext(stepCtx, tools, false); err != nil {
-			return "", err
-		}
-		// 5. 重新追加被摘要覆盖的目录规则和记忆目录，再测量本步上下文、发送用量并组装请求。
-		if err := a.appendAgentsInstructions(instructions, ""); err != nil {
-			return "", err
-		}
-		if err := a.appendMemoryIndexes(""); err != nil {
-			return "", err
-		}
-		_, err := a.measureContext(tools)
-		if err != nil {
-			return "", err
-		}
-		req, inputThroughItemID, err := a.opt.Context.BuildModelRequest(tools)
-		if err != nil {
-			return "", fmt.Errorf("build model request: %w", err)
-		}
-		// 到达单轮上限的这一步禁用工具，并在请求末尾要求模型总结进度；提示不写进上下文。
-		isLastStep := a.opt.MaxSteps > 0 && step >= a.opt.MaxSteps
-		if isLastStep {
-			req.ToolChoice = &llmkit.ToolChoice{Type: "none"}
-			req.Messages = append(req.Messages, llmkit.Message{
-				Role: llmkit.RoleUser,
-				Content: []llmkit.ContentBlock{{
-					Type: llmkit.ContentTypeText,
-					Text: prompt.MaxStepsReachedInstructions,
-				}},
-			})
-		}
-		// 6. 调用普通模型，每次尝试都发送 ModelCallFinished；失败时把这次尝试里还没结束的草稿记为中断，临时错误按重试规则再试。
-		var modelCallID defs.ModelCallID
-		var modelOutputStart int
-		err = failsafe.With(newModelRetryPolicy()).WithContext(stepCtx).Run(func() error {
-			modelCallID = defs.NewModelCallID()
-			modelOutputStart = len(a.draftItems)
-			modelCall, err := a.callModel(stepCtx, req, inputThroughItemID, modelCallID, modelOutputStart)
-			if modelCall.ContextUsage != nil {
-				a.opt.Context.RecordRequestUsage(modelCall.ContextUsage)
-				if _, measureErr := a.measureContext(tools); measureErr != nil {
-					telemetry.GetLogger(stepCtx).Warn("context usage measurement skipped", "error", measureErr, "model_call_id", modelCallID)
-				}
-			}
-			a.sendEvents([]*AgentEvent{
-				{
-					Type:      AgentEventModelCallFinished,
-					ModelCall: modelCall,
-				},
-			})
-			if err == nil {
-				return nil
-			}
-			output := a.draftItems[modelOutputStart:]
-			a.sendEvents(a.finishDraftItemsWithInterrupted(output))
-			// 草稿里没有模型错误 Item 且 Turn 没取消时补一条；流提前关闭时错误码是 unexpected_eof。
-			if stepCtx.Err() == nil && !slices.ContainsFunc(output, func(item *defs.Item) bool {
-				return item.Kind == defs.ItemModelError
-			}) {
-				payload := &llmkit.ErrorPayload{
-					Code:    "model_call_error",
-					Message: err.Error(),
-				}
-				if err == io.ErrUnexpectedEOF {
-					payload.Code = "unexpected_eof"
-					payload.Message = "model stream closed before completion: unexpected EOF"
-				}
-				a.sendEvents(a.handleModelErrorEvent(&llmkit.Event{
-					Type:  llmkit.EventError,
-					Error: payload,
-				}, modelCallID))
-			}
-			return err
-		})
-		if err != nil {
-			// 取消后的有效输出会留在历史中，退出前将它们纳入最终测量；失败模型调用仍按历史规则排除。
-			if ctx.Err() != nil {
-				output := slices.DeleteFunc(slices.Clone(a.draftItems[modelOutputStart:]), func(item *defs.Item) bool {
-					return item.Kind == defs.ItemMessage && !hasMessageText(item)
-				})
-				retained, selectErr := defs.SelectContextHistoryItems(output)
-				if selectErr != nil {
-					return "", errors.Join(err, selectErr)
-				}
-				if appendErr := a.opt.Context.AppendItems(retained...); appendErr != nil {
-					return "", errors.Join(err, appendErr)
-				}
-			}
-			return "", err
-		}
-		// 7. 把成功调用中正常完成的输出加入上下文。
-		completedItems, toolCalls := a.collectCompletedDraftItems(a.draftItems[modelOutputStart:])
-		if err := a.opt.Context.AppendItems(completedItems...); err != nil {
-			return "", fmt.Errorf("append agent output: %w", err)
-		}
-		if _, err := a.measureContext(tools); err != nil {
-			return "", err
-		}
-		// 8. 没有工具调用时运行 Stop hook：要求结束就返回；拦下结束时在次数上限内续跑，超过上限记警告；
-		// 然后再读一次补充输入，有新输入就继续，没有就结束本轮。
-		if len(toolCalls) == 0 {
-			outcome, err := a.runStopHooks(stepCtx, modelCallID, completedItems, isTurnContinuedByStopHook)
-			if err != nil {
-				return "", err
-			}
-			if outcome.IsTurnStopped {
-				return modelCallID, nil
-			}
-			if isLastStep {
-				return modelCallID, nil
-			}
-			if outcome.IsBlocked {
-				if stopHookContinuations < maxStopHookContinuations {
-					stopHookContinuations++
-					isTurnContinuedByStopHook = true
-					continue
-				}
-				telemetry.GetLogger(stepCtx).Warn("stop hook continuation limit reached", "continuations", stopHookContinuations)
-			}
-			hasInput, err := a.readInputs(stepCtx, true)
-			if err != nil {
-				return "", err
-			}
-			if hasInput {
-				continue
-			}
-			return modelCallID, nil
-		}
-		// 9. 最后一步仍有工具调用时不执行，给每个调用补错误结果后返回错误。
-		if isLastStep {
-			return "", a.rejectToolCalls(toolCalls)
-		}
-		// 10. 有工具调用时清零续跑次数并执行工具；hook 要求结束就返回，否则进入下一步。
-		stopHookContinuations = 0
-		isTurnStopped, err := a.execTools(stepCtx, toolCalls)
-		if err != nil {
-			return "", err
-		}
-		if isTurnStopped {
-			return modelCallID, nil
+			return agentTaskGenerationInputResult{Err: err}
 		}
 	}
+	// 3. 只在首次准备时检查压缩，随后测量并组装普通请求。
+	if !isAfterCompaction && !skipEnvironmentPreparation {
+		compaction, err := a.prepareCompaction(false, nil)
+		if compaction != nil || err != nil {
+			return agentTaskGenerationInputResult{Compaction: compaction, Err: err}
+		}
+	}
+	if _, err := a.measureContext(a.modelTools); err != nil {
+		return agentTaskGenerationInputResult{Err: err}
+	}
+	req, inputThroughItemID, err := a.opt.Context.BuildModelRequest(a.modelTools)
+	if err != nil {
+		return agentTaskGenerationInputResult{Err: fmt.Errorf("build model request: %w", err)}
+	}
+	return agentTaskGenerationInputResult{Request: req, InputThroughItemID: inputThroughItemID, IsCompacted: a.opt.Context.IsCompacted()}
 }
 
 // measureContext 测量本轮请求占用并发送上下文用量事件。
@@ -340,144 +559,6 @@ func (a *agentImpl) measureContext(tools []llmkit.Tool) (*agent_context.ContextM
 		Measurement: measurement,
 	}})
 	return measurement, nil
-}
-
-// compactContext 选出待压缩的历史，调用摘要模型生成摘要 Item 并发送事件；返回是否生成了摘要。
-func (a *agentImpl) compactContext(ctx context.Context, tools []llmkit.Tool, isManual bool) (bool, error) {
-	// 1. 测量上下文并选出待压缩历史；没有可压缩历史时直接返回。
-	measurement, err := a.opt.Context.GetMeasurement(tools)
-	if err != nil {
-		return false, fmt.Errorf("measure context before compaction: %w", err)
-	}
-	source := a.opt.Context.GetCompactionSource(measurement, isManual)
-	if source == nil {
-		return false, nil
-	}
-	// 2. 创建摘要草稿并发送开始事件。
-	summary := &defs.Item{
-		ID:             defs.NewItemID(),
-		TurnID:         a.opt.TurnID,
-		Kind:           defs.ItemContextSummary,
-		ContextSummary: &defs.ContextSummary{CoveredThroughItemID: source[len(source)-1].ID},
-	}
-	a.appendDraftItem(summary)
-	a.sendEvents([]*AgentEvent{a.newItemEvent(AgentEventItemStarted, summary, nil)})
-	// 3. 调用摘要模型并重试临时错误；每次发起过的调用都累计次数和用量，并发送 ModelCallFinished。
-	err = failsafe.With(newModelRetryPolicy()).WithContext(ctx).Run(func() error {
-		compaction, err := a.opt.Context.CompactHistory(ctx, tools, source, summary)
-		if compaction != nil {
-			a.turnStats.InferenceCalls++
-			if compaction.Usage != nil {
-				a.turnStats.Usage = a.turnStats.Usage.Add(*compaction.Usage)
-			}
-			a.sendEvents([]*AgentEvent{
-				{
-					Type: AgentEventModelCallFinished,
-					ModelCall: &AgentModelCall{
-						ModelCallID: compaction.ModelCallID,
-						Purpose:     ModelCallPurposeCompaction,
-						Usage:       compaction.Usage,
-					},
-				},
-			})
-		}
-		return err
-	})
-	// 4. 失败时发送不带 Item 的中断事件，再移除摘要草稿。
-	if err != nil {
-		a.sendEvents([]*AgentEvent{{
-			Type:      AgentEventItemInterrupted,
-			ItemIndex: a.draftItemIndexes[summary],
-		}})
-		a.draftItems = a.draftItems[:len(a.draftItems)-1]
-		delete(a.draftItemIndexes, summary)
-		return false, fmt.Errorf("compact agent context: %w", err)
-	}
-	// 5. 成功时发送摘要完成事件。
-	a.sendEvents([]*AgentEvent{a.finishItemWithReason(summary, AgentEventItemCompleted)})
-	return true, nil
-}
-
-// newModelRetryPolicy 创建普通模型和摘要模型共用的重试规则。
-func newModelRetryPolicy() retrypolicy.RetryPolicy[any] {
-	// 1. 取消和超时不重试；其他可重试错误最多重试 10 次，等待从 1 秒翻倍到 30 秒，用完次数返回最后一次的错误。
-	return retrypolicy.NewBuilder[any]().
-		HandleIf(func(_ any, err error) bool { return isRetryableModelError(err) }).
-		AbortOnErrors(context.Canceled, context.DeadlineExceeded).
-		WithMaxRetries(10).
-		WithBackoff(time.Second, 30*time.Second).
-		ReturnLastFailure().
-		Build()
-}
-
-// isRetryableModelError 本次模型调用错误是否可以自动重试？
-func isRetryableModelError(err error) bool {
-	// 1. 排除空错误、取消和超时。
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	// 2. llmkit 错误按它的 Retryable 判断，其他错误只重试流提前关闭。
-	var modelError *llmkit.Error
-	if errors.As(err, &modelError) {
-		return modelError.Retryable
-	}
-	return errors.Is(err, io.ErrUnexpectedEOF)
-}
-
-// callModel 调用一次普通模型，更新草稿、遥测和本轮统计，返回带调用身份的结果。
-func (a *agentImpl) callModel(
-	ctx context.Context,
-	req *llmkit.Request,
-	inputThroughItemID defs.ItemID,
-	modelCallID defs.ModelCallID,
-	outputStart int,
-) (*AgentModelCall, error) {
-	// 1. 要求模型上报用量，开始记录这次调用的遥测；记录内容时写入请求。
-	req.StreamOptions = agent_context.GetUsageStreamOptions(req.StreamOptions, a.opt.Model.Target.Protocol)
-	serverAddress, serverPort := agent_context.GetModelServerAddress(a.opt.Model.Target)
-	chatCtx, recorder := telemetry.StartChat(ctx, telemetry.ChatStart{
-		ModelCallID:   string(modelCallID),
-		Model:         a.opt.Model.Target.Model,
-		Provider:      agent_context.GetModelProviderName(a.opt.Model.Target.Protocol),
-		Purpose:       telemetry.ChatPurposeConversation,
-		ServerAddress: serverAddress,
-		ServerPort:    serverPort,
-		Compacted:     a.opt.Context.IsCompacted(),
-		TokenModality: agent_context.GetTokenModality(req),
-	})
-	if recorder.IsContentCaptured() {
-		recorder.RecordInput(agent_context.NewTelemetryChatInput(req))
-	}
-	// 2. 累计调用次数、清空上次的结束原因，发起调用并读取事件流；发起失败时结束原因记为 error。
-	a.turnStats.Steps++
-	a.turnStats.InferenceCalls++
-	a.turnStats.FinishReason = ""
-	callCtx, cancel := context.WithCancel(chatCtx)
-	defer cancel()
-	modelEvents, err := a.opt.Client.Call(callCtx, *req, *a.opt.Model.Target,
-		llmkit.CallOptions{Conversion: llmkit.ConversionOptions{MergeMessageRoles: a.opt.Model.MergeMessageRoles}})
-	if err != nil {
-		a.turnStats.FinishReason = telemetry.FinishReasonError
-		recorder.End(err)
-		return &AgentModelCall{
-			ModelCallID: modelCallID,
-			Purpose:     ModelCallPurposeConversation,
-		}, err
-	}
-	modelCall, runErr := a.consumeEvent(callCtx, modelEvents, inputThroughItemID, modelCallID, recorder)
-	// 3. 累计用量；失败且没收到结束原因时记为 error；记录内容时写入从 outputStart 开始的草稿，再结束遥测记录。
-	if modelCall.Usage != nil {
-		a.turnStats.Usage = a.turnStats.Usage.Add(*modelCall.Usage)
-	}
-	if runErr != nil && a.turnStats.FinishReason == "" {
-		a.turnStats.FinishReason = telemetry.FinishReasonError
-	}
-	if recorder.IsContentCaptured() {
-		recorder.RecordOutput(agent_context.NewTelemetryChatOutput(a.draftItems[outputStart:]))
-	}
-	cancel()
-	recorder.End(runErr)
-	return modelCall, runErr
 }
 
 // finishDraftItemsWithInterrupted 把还没结束的草稿记为中断，返回对应的中断事件。
@@ -510,102 +591,6 @@ func (a *agentImpl) finishDraftItemsWithInterrupted(items []*defs.Item) []*Agent
 	return interruptedEvents
 }
 
-// consumeEvent 读取模型事件、更新草稿并发送输出事件，汇总用量；收到正常结束事件时生成上下文用量报告。
-func (a *agentImpl) consumeEvent(
-	ctx context.Context,
-	modelEvents <-chan llmkit.Event,
-	inputThroughItemID defs.ItemID,
-	modelCallID defs.ModelCallID,
-	recorder *telemetry.ChatRecorder,
-) (*AgentModelCall, error) {
-	// 1. 等待模型事件；取消时返回取消错误，流提前关闭时返回 io.ErrUnexpectedEOF。
-	modelCall := &AgentModelCall{
-		ModelCallID: modelCallID,
-		Purpose:     ModelCallPurposeConversation,
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return modelCall, ctx.Err()
-		case event, ok := <-modelEvents:
-			if !ok {
-				return modelCall, io.ErrUnexpectedEOF
-			}
-			// 2. 把分块、响应模型、用量和结束原因记入遥测，结束原因同时写入本轮统计。
-			if agent_context.IsOutputChunk(&event) {
-				recorder.RecordChunk()
-			}
-			if event.Model != "" {
-				recorder.RecordResponseModel(event.Model)
-			}
-			if event.Usage != nil {
-				value := agent_context.NewTokenUsage(event.Usage)
-				modelCall.Usage = &value
-				recorder.RecordUsage(value)
-			}
-			if event.Type == llmkit.EventDone {
-				modelCall.ContextUsage = &defs.TurnContextUsage{
-					ModelCallID:        modelCallID,
-					InputThroughItemID: inputThroughItemID,
-					ReasoningContext:   event.ReasoningContext,
-				}
-				if modelCall.Usage != nil {
-					modelCall.ContextUsage.Usage = *modelCall.Usage
-				}
-				a.turnStats.FinishReason = agent_context.NewTelemetryFinishReason(event.FinishReason)
-				recorder.RecordFinishReason(a.turnStats.FinishReason)
-			}
-			// 3. 更新草稿并发送事件；模型报错时返回可重试的错误，生成结束时正常返回。
-			a.sendEvents(a.applyEventToDraft(&event, modelCallID))
-			if event.Type == llmkit.EventError {
-				err := errors.New("model stream reported an error without details")
-				if event.Error != nil {
-					err = fmt.Errorf("model stream has error: %s", event.Error.Message)
-				}
-				return modelCall, &llmkit.Error{
-					Stage:     llmkit.ErrorStageStream,
-					Retryable: true,
-					Cause:     err,
-				}
-			}
-			if event.Type == llmkit.EventDone {
-				return modelCall, nil
-			}
-		}
-	}
-}
-
-// applyEventToDraft 按模型事件类别更新草稿，返回对应的 Agent 事件。
-func (a *agentImpl) applyEventToDraft(event *llmkit.Event, modelCallID defs.ModelCallID) []*AgentEvent {
-	// 1. 分发消息、推理、工具和错误事件；生成结束时完成所有未结束草稿。
-	switch event.Type {
-	case llmkit.EventDone:
-		var events []*AgentEvent
-		for _, item := range a.draftItems {
-			if _, ended := a.draftItemFinishReason[item]; !ended {
-				events = append(events, a.finishItemWithReason(item, AgentEventItemCompleted))
-			}
-		}
-		return events
-	case llmkit.EventContentDelta, llmkit.EventContentBlockStop:
-		return a.handleMessageEvent(event, modelCallID)
-	case llmkit.EventReasoningSummaryDelta,
-		llmkit.EventReasoningContentDelta,
-		llmkit.EventReasoningDone:
-		return a.handleReasoningEvent(event, modelCallID)
-	case llmkit.EventToolCallStart,
-		llmkit.EventToolCallArgumentsDelta,
-		llmkit.EventToolCallEnd,
-		llmkit.EventToolCallDelta:
-		return a.handleToolCallEvent(event, modelCallID)
-	case llmkit.EventError:
-		return a.handleModelErrorEvent(event, modelCallID)
-	case llmkit.EventThinkingDelta, llmkit.EventSignatureDelta:
-		// thinking 和签名增量不单独处理，推理内容以 Reasoning 事件为准。
-	}
-	return nil
-}
-
 // finishItemWithReason 把 Item 记为完成或中断，并创建对应事件。
 func (a *agentImpl) finishItemWithReason(item *defs.Item, eventType AgentEventType) *AgentEvent {
 	// 1. 已结束的 Item 返回 nil，否则记录结束类型并创建事件。
@@ -625,15 +610,20 @@ func (a *agentImpl) appendDraftItem(item *defs.Item) {
 
 // sendEvents 按顺序发送 Agent 事件。
 func (a *agentImpl) sendEvents(pending []*AgentEvent) {
-	// 1. 没有事件通道时直接返回，否则依次发送非空事件，取消后仍继续发送。
-	if a.agentEventChannel == nil {
-		return
-	}
+	// 1. 按草稿首次出现的顺序记下已结束、有内容可保存的末项。
 	for _, event := range pending {
 		if event == nil {
 			continue
 		}
-		a.agentEventChannel <- event
+		if a.opt.Requests != nil && event.Item != nil && event.ItemIndex >= a.checkpointAfterDraftCount &&
+			(event.Type == AgentEventItemCompleted || event.Type == AgentEventItemInterrupted) {
+			a.checkpointAfterItemID = event.Item.ID
+			a.checkpointAfterDraftCount = event.ItemIndex + 1
+		}
+		// 2. 有订阅时按顺序发送非空事件，取消后仍继续发送。
+		if a.agentEventChannel != nil {
+			a.agentEventChannel <- event
+		}
 	}
 }
 
@@ -658,15 +648,48 @@ func (a *agentImpl) getTools(ctx context.Context) ([]llmkit.Tool, error) {
 	return tools, nil
 }
 
+// saveCheckpoint 向 Turn 请求保存进度，等待写成或取消。
+func (a *agentImpl) saveCheckpoint(ctx context.Context, checkpoint defs.TurnCheckpoint, afterItemID defs.ItemID) error {
+	// 1. 独立运行直接继续；模型请求以本轮最近交付的 Item 为准，没有时使用已加载历史中的请求末项。
+	if ctx.Err() != nil || a.opt.Requests == nil {
+		return ctx.Err()
+	}
+	if afterItemID == "" {
+		afterItemID = a.checkpointAfterItemID
+		if afterItemID == "" && checkpoint.Request != nil {
+			afterItemID = checkpoint.Request.ModelCallThroughItemID
+			if compaction := checkpoint.Request.Compaction; compaction != nil {
+				afterItemID = compaction.CoveredThroughItemID
+			}
+		}
+	}
+	// 2. 发出请求并等待一次性回复。
+	reply := make(chan error, 1)
+	select {
+	case a.opt.Requests <- AgentSaveCheckpointRequest{Checkpoint: checkpoint, AfterItemID: afterItemID, Reply: reply}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-reply:
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // readInputs 向 Turn 请求补充输入并加入上下文，返回是否读到输入。
 func (a *agentImpl) readInputs(ctx context.Context, finish bool) (bool, error) {
 	// 1. 没有输入通道时直接返回；否则向 Turn 发送请求，finish 为 true 时没有输入就停止接收补充输入。
-	if a.opt.InputRequests == nil {
+	if a.opt.Requests == nil {
 		return false, nil
 	}
 	reply := make(chan AgentInputResult, 1)
 	select {
-	case a.opt.InputRequests <- AgentInputRequest{
+	case a.opt.Requests <- AgentInputRequest{
 		FinishIfEmpty: finish,
 		Reply:         reply,
 	}:
@@ -679,16 +702,32 @@ func (a *agentImpl) readInputs(ctx context.Context, finish bool) (bool, error) {
 		if result.Err != nil {
 			return false, result.Err
 		}
-		if err := a.opt.Context.AppendItems(result.Items...); err != nil {
-			return false, err
+		if len(result.Items) > 0 && a.opt.Context != nil {
+			if err := a.opt.Context.AppendItems(result.Items...); err != nil {
+				return false, err
+			}
 		}
 		if len(result.Items) > 0 {
+			a.checkpointAfterItemID = result.Items[len(result.Items)-1].ID
+			a.checkpointAfterDraftCount = len(a.draftItems)
 			telemetry.GetLogger(ctx).Info("turn input read", "openvaala.input.item_ids", getItemIDs(result.Items))
 		}
 		return len(result.Items) > 0, nil
 	case <-ctx.Done():
 		return false, ctx.Err()
 	}
+}
+
+// loadGenerationEnvironment 读取默认环境的规则和本轮的记忆目录。
+func (a *agentImpl) loadGenerationEnvironment(ctx context.Context, defaultEnvironment executor.ExecutionEnvironment) error {
+	// 1. 先读默认环境的全局和目录规则，再读用户及项目记忆。
+	if defaultEnvironment != nil {
+		if _, err := a.getWorkspaceAgentsInstructions(ctx, defaultEnvironment); err != nil {
+			return fmt.Errorf("load AGENTS.md from executor %q: %w", defaultEnvironment.GetID(), err)
+		}
+	}
+	a.loadMemoryIndexes(ctx)
+	return nil
 }
 
 // getWorkspaceAgentsInstructions 读取执行环境的全局和目录规则，并按 Executor 缓存在本轮。
@@ -805,60 +844,13 @@ func (a *agentImpl) appendMemoryIndexes(modelCallID defs.ModelCallID) error {
 	return nil
 }
 
-// runStopHooks 运行 Stop 或 SubagentStop hook，转发运行进度，把保存的运行记录追加为输出；返回 hook 的结果。
-func (a *agentImpl) runStopHooks(
-	ctx context.Context,
-	modelCallID defs.ModelCallID,
-	completedItems []*defs.Item,
-	isStopHookActive bool,
-) (*hook.HookOutcome, error) {
-	// 1. 没有 hook 或执行环境时返回空结果，否则按 Session 是否有父 Session 选择 Stop 或 SubagentStop。
-	if a.opt.Hooks == nil || len(a.opt.Environments) == 0 {
-		return &hook.HookOutcome{}, nil
-	}
-	defaultEnvironment := a.opt.Environments[0]
-	eventName := defs.HookEventStop
-	if a.opt.Session.ParentSessionID != "" {
-		eventName = defs.HookEventSubagentStop
-	}
-	// 2. 启动转发任务把运行更新发成 HookRun 事件，再把本步最后一条回复和是否续跑过交给 hook 运行。
-	runUpdates := make(chan *defs.HookRun)
-	var tasks sync.WaitGroup
-	tasks.Go(func() {
-		for run := range runUpdates {
-			a.sendEvents([]*AgentEvent{{
-				Type:    AgentEventHookRun,
-				HookRun: run,
-			}})
-		}
-	})
-	outcome := a.opt.Hooks.RunEvent(ctx, &hook.HookEventRequest{
-		Event: &hook.HookEvent{
-			Name:                 eventName,
-			Session:              a.opt.Session,
-			TurnID:               a.opt.TurnID,
-			LastAssistantMessage: getLastMessageText(completedItems),
-			IsStopHookActive:     isStopHookActive,
-		},
-		ExecutorID: defaultEnvironment.GetID(),
-		Workspace:  defaultEnvironment.GetWorkspace(),
-	}, runUpdates)
-	// 3. 关闭更新通道并等待转发结束，再将保存记录追加为本次模型调用的输出。
-	close(runUpdates)
-	tasks.Wait()
-	events, err := a.appendCompletedItems(newHookRunItems(outcome.SavedRuns, a.opt.TurnID, modelCallID)...)
-	if err != nil {
-		return nil, fmt.Errorf("append stop hook runs: %w", err)
-	}
-	a.sendEvents(events)
-	return outcome, nil
-}
-
 // appendCompletedItems 把已经完整的 Item 加入上下文和草稿，返回它们的开始、完成事件。
 func (a *agentImpl) appendCompletedItems(items ...*defs.Item) ([]*AgentEvent, error) {
 	// 1. 将本批 Item 一起追加到上下文；失败时直接返回，草稿不变。
-	if err := a.opt.Context.AppendItems(items...); err != nil {
-		return nil, err
+	if a.opt.Context != nil {
+		if err := a.opt.Context.AppendItems(items...); err != nil {
+			return nil, err
+		}
 	}
 	// 2. 按顺序加入草稿，并创建每个 Item 的开始和完成事件。
 	events := make([]*AgentEvent, 0, len(items)*2)

@@ -10,7 +10,7 @@ import (
 
 // 内置协作工具和工作区工具给模型看的用途说明。
 const (
-	SendMessageDescription = "向已知后代或直接父 Agent 发送任务、补充要求或信息。" +
+	SendMessageDescription = "向已知后代或直接父 Agent 发送任务、补充要求或信息；重开对话后，发到原 SessionID 会先续跑其未完成轮次。" +
 		"normal 安排新 Turn，忙碌时排队；steer 补充活动 Turn，在下一次模型请求前读入，无可接收 Turn 时自动按 normal 安排。" +
 		"进度汇报、提问和对当前任务的补充要求应显式设置 mode: \"steer\"；独立的后续任务用 normal。" +
 		"返回 accepted 只表示已接收；steer 不会中断正在执行的模型或工具，需要中断时使用 interrupt_agent。" +
@@ -26,7 +26,8 @@ const (
 		"返回资料省略加密推理、provider RawJSON 和图片 base64；查询不启动执行，也不影响结果通知。"
 	WaitAgentDescription = "暂停当前工作，直到收到 steer 消息（Agent 消息或用户补充输入）、子任务结果通知或超时。normal 消息排队等待新 Turn，不会唤醒本次等待。" +
 		"返回 reason：user_steer、subagent_result、agent_message 或 timeout（同时存在时按此顺序），from 为发送消息的 Agent SessionID；不返回正文。" +
-		"消息正文会在下一次模型请求中读入；超时不会取消子任务，子任务每轮结束后的结果都会自动通知。"
+		"可选 wait_for: \"subagent_result\" 优先返回已有未读补充；没有未读补充且没有运行中的后代时立即返回 no_running_subagents，可用 list_agents 查看状态。" +
+		"消息正文会在下一次模型请求中读入；省略参数默认等待 30 秒，超时不会取消子任务。"
 	BashDescription = "在工作区后台启动一条 Bash 命令（省略 cwd 时在工作区根目录运行），最多等 wait_seconds 秒后返回 command_id、status 和从头开始的第一页输出（stdout、stderr 合并）。" +
 		"wait_seconds 到期时命令不会停，status 为 running、exit_code 为 null，命令继续在后台运行；之后用 read_command_output 带上 next_cursor 续读，用 stop_command 停止。" +
 		"命令结束后 status 为 exited 并给出 exit_code，退出码非 0 不算工具出错；无法确认命令结果时 status 为 failed，原因在 error。" +

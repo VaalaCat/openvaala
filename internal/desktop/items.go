@@ -160,7 +160,7 @@ func buildMessageRows(items []viewItem) ([]messageRow, map[string]*defs.ToolResu
 	rows := []messageRow{}
 	for index, view := range items {
 		item := view.Item
-		if item.ToolResult != nil && calls[item.ToolResult.CallID] {
+		if item.Kind == defs.ItemModelCallResult || (item.ToolResult != nil && calls[item.ToolResult.CallID]) {
 			continue
 		}
 		if item.Kind == defs.ItemModelError && len(rows) > 0 {

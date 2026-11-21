@@ -338,3 +338,72 @@ func (m *conversationMetadata) getIndexRecords() (indexed map[string][]storage.R
 	}
 	return indexed, false, nil
 }
+
+// scanSessionMetadata 倒序检查删除记录，并按需读取 Session 最近的 Turn。
+func scanSessionMetadata(ctx context.Context, logs storage.LogStorage, conversationID defs.ConversationID, sessionID defs.SessionID, wantTurn bool) (*defs.Turn, error) {
+	// 1. 检查对话和 Session ID，在指定对话内按序号倒序分页。
+	if conversationID == "" || sessionID == "" {
+		return nil, errors.New("read Session metadata requires a conversation ID and Session ID")
+	}
+	var latestTurn *defs.Turn
+	request := storage.ListLogEntriesRequest{
+		Path:     storage.StreamPath(conversationID),
+		StreamID: MetadataStreamID,
+		Order:    storage.DirectionDesc,
+		Limit:    scanPageSize,
+	}
+	for {
+		page, err := logs.List(ctx, request)
+		if err != nil {
+			return nil, fmt.Errorf("list Conversation %q metadata: %w", conversationID, err)
+		}
+		// 2. 记下首个匹配 Turn；遇到对话或该 Session 的删除记录时返回对应错误。
+		for _, line := range page.Items {
+			entry, err := decodeMetadataLine(line.Payload, conversationID)
+			if err != nil {
+				return nil, fmt.Errorf("metadata ordinal %d: %w", line.Ordinal, err)
+			}
+			switch {
+			case entry.Kind == metadataConversationDeleted:
+				return nil, ErrConversationDeleted
+			case entry.Kind == metadataSessionDeleted && entry.DeletedSessionID == sessionID:
+				return nil, ErrSessionDeleted
+			case wantTurn && latestTurn == nil && entry.Kind == metadataTurnSaved && entry.Turn.SessionID == sessionID:
+				entry.Turn.UpdatedAt = line.UpdatedAt
+				latestTurn = entry.Turn
+			}
+		}
+		if page.Next == 0 {
+			return latestTurn, nil
+		}
+		request.Cursor = page.Next
+	}
+}
+
+// decodeMetadataLine 解码并检查 metadata 行的种类、身份与载荷。
+func decodeMetadataLine(payload json.RawMessage, conversationID defs.ConversationID) (metadataEntry, error) {
+	// 1. 解码一条记录，确认只有一个实体载荷或删除 ID。
+	entry, err := decodePayload[metadataEntry](payload)
+	if err != nil {
+		return metadataEntry{}, err
+	}
+	if entry.getFieldCount() != 1 {
+		return metadataEntry{}, fmt.Errorf("metadata %s must carry exactly one record", entry.Kind)
+	}
+	// 2. 检查载荷类型、实体字段和所属对话。
+	switch {
+	case entry.Kind == metadataConversationSaved && entry.Conversation != nil && entry.Conversation.ID == conversationID:
+		if entry.Conversation.RootSessionID == "" {
+			err = errors.New("conversation requires a root session ID")
+		}
+	case entry.Kind == metadataSessionSaved && entry.Session != nil && entry.Session.ConversationID == conversationID:
+		err = validateSession(*entry.Session)
+	case entry.Kind == metadataTurnSaved && entry.Turn != nil && entry.Turn.ConversationID == conversationID:
+		err = validateTurn(*entry.Turn)
+	case entry.Kind == metadataSessionDeleted && entry.DeletedSessionID != "":
+	case entry.Kind == metadataConversationDeleted && entry.DeletedConversationID == conversationID:
+	default:
+		err = fmt.Errorf("metadata %s has no matching record in Conversation %q", entry.Kind, conversationID)
+	}
+	return entry, err
+}

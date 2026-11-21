@@ -183,9 +183,21 @@ func ForkConversation(ctx context.Context, request *ForkConversationRequest, opt
 			return defs.Conversation{}, fmt.Errorf("fork Conversation %s into %s: copy Items: %w", source.ID, record.ID, err)
 		}
 	}
-	// Turn 只换 ConversationID 和 SessionID，用量等其他字段照抄。
+	// 分叉只保留已保存的历史；未完成轮的副本在截取位置结束。
 	for _, turn := range keptTurns {
 		turn.ConversationID, turn.SessionID = record.ID, root.ID
+		if turn.Status == defs.TurnStatusRunning {
+			turn.Status = defs.TurnStatusInterrupted
+			turn.Error = "unfinished turn was not continued in the fork"
+			for _, row := range items {
+				if row.Item.TurnID == turn.ID {
+					if turn.ItemsRange.FirstOrdinal == 0 {
+						turn.ItemsRange.FirstOrdinal = uint64(row.Ordinal)
+					}
+					turn.ItemsRange.LastOrdinal = uint64(row.Ordinal)
+				}
+			}
+		}
 		if err := opt.Mutation.SetTurn(ctx, turn); err != nil {
 			return defs.Conversation{}, fmt.Errorf("fork Conversation %s into %s: copy Turn %s: %w", source.ID, record.ID, turn.ID, err)
 		}

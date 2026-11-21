@@ -73,24 +73,65 @@ func (c *conversationImpl) changeDescendantModel(ctx context.Context, source, ta
 }
 
 // waitAgent 等来源 Session 的活动 Turn 收到补充输入，返回唤醒原因和 Agent 发送方。
-func (c *conversationImpl) waitAgent(ctx context.Context, source defs.Session, param *WaitAgentParam) (waitAgentResult, error) {
+func (c *conversationImpl) waitAgent(ctx context.Context, source defs.Session, param *WaitAgentParam) (result waitAgentResult, err error) {
 	// 1. 取得来源 Session 的运行实例，设置等待时限；timeout_seconds 为 0 时等 30 秒。
-	instance, _ := c.runningSessions.Load(source.ID)
+	instance, found := c.runningSessions.Load(source.ID)
+	if !found {
+		return waitAgentResult{}, errors.New("calling Session is not running")
+	}
+	if param.WaitFor != "" && param.WaitFor != waitReasonSubagentResult {
+		return waitAgentResult{}, fmt.Errorf("invalid wait_for: %q", param.WaitFor)
+	}
 	timeout := time.Duration(param.TimeoutSeconds) * time.Second
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// 2. 等未读的补充输入；等到时限返回 timeout，调用方取消等其他错误原样返回。
+	defer func() {
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			result, err = waitAgentResult{Reason: waitReasonTimeout}, nil
+		}
+	}()
+	// 2. 先读调用方的未读补充，再查正在执行的后代；返回空闲前再从调用方核对一次。
+	if param.WaitFor == waitReasonSubagentResult {
+		items, err := instance.GetUnreadSteer(waitCtx)
+		if err != nil {
+			return waitAgentResult{}, err
+		}
+		if len(items) > 0 {
+			return newWaitAgentResult(items), nil
+		}
+		hasRunningDescendant := false
+		for _, target := range c.runningSessions.Values() {
+			if !c.isDescendant(source.ID, target.GetID()) {
+				continue
+			}
+			status, err := target.GetStatus(waitCtx)
+			if err != nil {
+				return waitAgentResult{}, err
+			}
+			if status.ActiveTurnID != "" {
+				hasRunningDescendant = true
+				break
+			}
+		}
+		if !hasRunningDescendant {
+			items, err = instance.GetUnreadSteer(waitCtx)
+			if err != nil {
+				return waitAgentResult{}, err
+			}
+			if len(items) > 0 {
+				return newWaitAgentResult(items), nil
+			}
+			return waitAgentResult{Reason: waitReasonNoRunningSubagents, Hint: "使用 list_agents 查看后代的最近状态和结果。"}, nil
+		}
+	}
+	// 3. 有运行后代或省略 wait_for 时等待原来的补充输入。
 	items, err := instance.WaitSteer(waitCtx)
 	if err != nil {
-		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-			return waitAgentResult{Reason: waitReasonTimeout}, nil
-		}
 		return waitAgentResult{}, err
 	}
-	// 3. 按输入来源生成唤醒结果；Turn 已结束且没有输入时返回空的 agent_message。
 	return newWaitAgentResult(items), nil
 }
 

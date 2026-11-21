@@ -381,7 +381,7 @@ func TestConversationRun(t *testing.T) {
 		{
 			name: "session_not_blocked_by_busy_parent",
 			run: func(t *testing.T, h *conversationHarness) {
-				id := h.input(t, session.SessionInputModeNormal, "delegate")
+				h.input(t, session.SessionInputModeNormal, "delegate")
 				receiveModelRequest(t, h.model).reply <- spawnResponse("spawn", "review", "first task")
 				root, child := receiveRootAndTask(t, h.model, "review")
 				childID := decodeSpawnAgentResult(t, root, "spawn")
@@ -400,15 +400,15 @@ func TestConversationRun(t *testing.T) {
 				receiveSessionRequest(t, h.model, childID).reply <- modelResponse{text: "second done"}
 				waitCompletedTurns(t, h.store, childID, 2)
 				h.stop(t)
-				if finished, _ := h.waitTurnFinished(t, id); finished.Status != defs.TurnStatusInterrupted {
-					t.Fatalf("busy root Turn=%+v", finished)
+				if latest := latestTurn(t, h.store, h.c.GetRootSessionID()); latest.Status != defs.TurnStatusRunning {
+					t.Fatalf("busy root after shutdown = %+v", latest)
 				}
 			},
 		},
 		{
 			name: "stop_waits_all_tasks",
 			run: func(t *testing.T, h *conversationHarness) {
-				id := h.input(t, session.SessionInputModeNormal, "delegate")
+				h.input(t, session.SessionInputModeNormal, "delegate")
 				receiveModelRequest(t, h.model).reply <- spawnResponse("spawn", "review", "check A")
 				root, child := receiveRootAndTask(t, h.model, "review")
 				childID := decodeSpawnAgentResult(t, root, "spawn")
@@ -423,16 +423,15 @@ func TestConversationRun(t *testing.T) {
 				if err := h.stop(t); !errors.Is(err, context.Canceled) {
 					t.Fatalf("Run=%v", err)
 				}
-				if finished, _ := h.waitTurnFinished(t, id); finished.Status != defs.TurnStatusInterrupted {
-					t.Fatalf("root Turn=%+v", finished)
-				}
-				for event := range h.events {
-					if _, ok := event.(*session.SessionTurnFinished); ok {
-						t.Fatalf("unexpected event after root Turn: %+v", event)
+				for ev := range h.allEvents {
+					if routed, ok := ev.(*ConversationSessionEvent); ok {
+						if finished, ok := routed.Event.(*session.SessionTurnFinished); ok {
+							t.Fatalf("shutdown forwarded terminal event for %s: %+v", routed.SessionID, finished)
+						}
 					}
 				}
 				for _, sessionID := range []defs.SessionID{h.c.GetRootSessionID(), childID} {
-					if latest := latestTurn(t, h.store, sessionID); latest.Status != defs.TurnStatusInterrupted {
+					if latest := latestTurn(t, h.store, sessionID); latest.Status != defs.TurnStatusRunning {
 						t.Fatalf("Session %s latest Turn=%+v", sessionID, latest)
 					}
 				}
@@ -537,7 +536,7 @@ func TestConversationRunLifecycle(t *testing.T) {
 				}
 				// 同步调用 Run 时没有并发读取方；缓冲容纳根 Session 的启动与停止事件。
 				events := make(chan ConversationEvent, 2)
-				if err := loaded.Run(t.Context(), events); err == nil || !strings.Contains(err.Error(), "injected list turns") {
+				if err := loaded.Run(t.Context(), events); err == nil || !strings.Contains(err.Error(), "injected latest Turn metadata") {
 					t.Fatalf("Run=%v", err)
 				}
 				var received []ConversationEvent
@@ -1988,7 +1987,7 @@ func TestConversationReopenDoesNotReplay(t *testing.T) {
 			requireNoModelRequest(t, model)
 			loadedHarness := startTestConversation(t, reopened, model, loaded)
 			agents, err := loadedHarness.impl().listAgents(t.Context(), loadedHarness.record(t, loaded.GetRootSessionID()))
-			wantStatus := defs.TurnStatusInterrupted
+			var wantStatus defs.TurnStatus
 			if tt.completed {
 				wantStatus = defs.TurnStatusCompleted
 			}
@@ -2844,13 +2843,13 @@ type failingTurnQuery struct {
 	sessionID defs.SessionID
 }
 
-// ListTurns 查询指定 Session 时返回注入错误，其余照常查询。
-func (q *failingTurnQuery) ListTurns(ctx context.Context, request dao.ListTurnsRequest) (storage.Page[defs.Turn, dao.RecordCursor[defs.TurnID]], error) {
-	// 1. 是指定 Session 时返回注入错误，否则交给 DAO。
-	if request.SessionID == q.sessionID {
-		return storage.Page[defs.Turn, dao.RecordCursor[defs.TurnID]]{}, errors.New("injected list turns")
+// GetLatestLoggedTurn 读取目标 Session 的原轮时返回注入错误。
+func (q *failingTurnQuery) GetLatestLoggedTurn(ctx context.Context, cid defs.ConversationID, sid defs.SessionID) (*defs.Turn, error) {
+	// 1. 只在打开目标 Session 时拒绝读取。
+	if sid == q.sessionID {
+		return nil, errors.New("injected latest Turn metadata")
 	}
-	return q.Query.ListTurns(ctx, request)
+	return q.Query.GetLatestLoggedTurn(ctx, cid, sid)
 }
 
 // TestValidateSessionTree 检查 validateSessionTree 接受正常父子关系，拒绝父 Session 缺失和根 Session 带父级。
@@ -3837,45 +3836,6 @@ func TestValidateConversationConfigModels(t *testing.T) {
 	}
 }
 
-// conversationHooksStub 是 hook.Hooks 替身：只记下 SessionStart、SubagentStart 事件，不回任何决定。
-type conversationHooksStub struct {
-	mutex  sync.Mutex
-	starts []*hook.HookEvent
-}
-
-// RunEvent 记录 SessionStart 和 SubagentStart 事件。
-func (stub *conversationHooksStub) RunEvent(_ context.Context, request *hook.HookEventRequest, _ chan<- *defs.HookRun) *hook.HookOutcome {
-	// 1. 记下 SessionStart 和 SubagentStart 事件，返回空结果。
-	if request.Event.Name == defs.HookEventSessionStart || request.Event.Name == defs.HookEventSubagentStart {
-		stub.mutex.Lock()
-		stub.starts = append(stub.starts, request.Event)
-		stub.mutex.Unlock()
-	}
-	return &hook.HookOutcome{}
-}
-
-// GetHookInfos 返回测试 hook 信息。
-func (*conversationHooksStub) GetHookInfos() []*hook.HookInfo {
-	// 1. 返回空列表。
-	return nil
-}
-
-// getStarts 汇总已记录的 Session 启动事件。
-func (stub *conversationHooksStub) getStarts(rootSessionID defs.SessionID) []string {
-	// 1. 把记下的事件格式化成「角色:事件:来源」，根 Session 写 root，子 Session 写 child。
-	stub.mutex.Lock()
-	defer stub.mutex.Unlock()
-	var starts []string
-	for _, event := range stub.starts {
-		role := "child"
-		if event.Session.ID == rootSessionID {
-			role = "root"
-		}
-		starts = append(starts, fmt.Sprintf("%s:%s:%s", role, event.Name, event.Source))
-	}
-	return starts
-}
-
 // TestConversationHookStartSource 检查根 Session 和子 Session 首次启动、重开后各自触发的启动 hook 和来源。
 func TestConversationHookStartSource(t *testing.T) {
 	// 1. 列出新根、重开根、新子和重开子的启动 hook 预期。
@@ -3913,11 +3873,22 @@ func TestConversationHookStartSource(t *testing.T) {
 			// 2. 配置 hook，触发根或子 Session 的首轮，按场景重开后再提交一次输入。
 			store := openConversationDAO(t)
 			model := newConversationModel(t)
-			stub := &conversationHooksStub{}
+			hookDirectory := t.TempDir()
+			logPath := filepath.Join(hookDirectory, "hooks.jsonl")
 			newOpt := func() *ConversationOpt {
 				opt := conversationOpt(store, model)
-				opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
-				opt.Definitions.Hooks = stub
+				opt.Definitions.Executors = newTestExecutorProvider([]executor.Executor{executor.NewLocalExecutor(&defs.ExecutorDefinition{
+					ID: "local", Kind: defs.ExecutorKindLocal, WorkspaceDirectory: hookDirectory,
+				})})
+				for _, event := range []defs.HookEventName{defs.HookEventSessionStart, defs.HookEventSubagentStart} {
+					matcher, err := hook.NewHookMatcher("")
+					if err != nil {
+						t.Fatal(err)
+					}
+					opt.Definitions.Hooks = append(opt.Definitions.Hooks, &hook.HookDefinition{
+						Key: string(event), Event: event, Matcher: matcher, Command: "cat >> " + strconv.Quote(logPath), Timeout: 5 * time.Second,
+					})
+				}
 				return opt
 			}
 			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, newOpt())
@@ -3966,7 +3937,27 @@ func TestConversationHookStartSource(t *testing.T) {
 				}
 			}
 			// 3. 核对启动事件和 startup、resume 来源。
-			if got := stub.getStarts(rootID); !slices.Equal(got, tt.wantStarts) {
+			data, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+				var event struct {
+					Name    string `json:"hook_event_name"`
+					AgentID string `json:"agent_id"`
+					Source  string `json:"source"`
+				}
+				if err := json.Unmarshal([]byte(line), &event); err != nil {
+					t.Fatal(err)
+				}
+				role := "root"
+				if event.AgentID != "" {
+					role = "child"
+				}
+				got = append(got, fmt.Sprintf("%s:%s:%s", role, event.Name, event.Source))
+			}
+			if !slices.Equal(got, tt.wantStarts) {
 				t.Fatalf("start hooks = %v, want %v", got, tt.wantStarts)
 			}
 		})

@@ -78,25 +78,6 @@ func TestNewAgentContextValidation(t *testing.T) {
 				CompactModel: model,
 			},
 		},
-		{
-			"missing compact model",
-			&agent_context.AgentContextOpt{
-				SessionID: contextSessionID,
-				TurnID:    contextTurnID,
-				Client:    &compactClient{},
-				Model:     model,
-			},
-		},
-		{
-			"compact model without target",
-			&agent_context.AgentContextOpt{
-				SessionID:    contextSessionID,
-				TurnID:       contextTurnID,
-				Client:       &compactClient{},
-				Model:        model,
-				CompactModel: &defs.ModelDefinition{},
-			},
-		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := agent_context.NewAgentContext(tt.opt); err == nil {

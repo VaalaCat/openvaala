@@ -5,22 +5,32 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
+	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/turn"
 )
 
-// cloneItems 按组顺序复制补充输入，摊平成一个列表。
-func cloneItems(groups [][]*defs.Item) []*defs.Item {
-	// 1. 按组顺序逐条复制 Item。
-	var result []*defs.Item
-	for _, group := range groups {
-		for _, item := range group {
-			result = append(result, item.Clone())
-		}
+// cloneInputItems 复制一组原消息和 skill Item。
+func cloneInputItems(items []*defs.Item) []*defs.Item {
+	// 1. 按原顺序复制各条 Item。
+	cloned := make([]*defs.Item, len(items))
+	for index, item := range items {
+		cloned[index] = item.Clone()
 	}
-	return result
+	return cloned
+}
+
+// cloneInputGroups 按组顺序复制补充输入并展开成一个列表。
+func cloneInputGroups(groups defs.SessionInputBatch) []*defs.Item {
+	// 1. 按组顺序逐条复制 Item。
+	var items []*defs.Item
+	for _, group := range groups {
+		items = append(items, cloneInputItems(group.Items)...)
+	}
+	return items
 }
 
 // newSessionEvent 把 Turn 事件转换为带 TurnID 的 Session 事件。
@@ -48,11 +58,11 @@ func newSessionEvent(turnID defs.TurnID, event turn.TurnEvent) SessionEvent {
 }
 
 // countInboxGroups 统计排队的各批输入一共有多少条。
-func countInboxGroups(inputs []inboxInput) int {
+func countInboxGroups(inputs []defs.SessionInputBatch) int {
 	// 1. 累加每批里的组数，一组算一条输入。
 	count := 0
 	for _, input := range inputs {
-		count += len(input.groups)
+		count += len(input)
 	}
 	return count
 }
@@ -68,10 +78,10 @@ func logSessionStopped(logger *slog.Logger, err error) {
 }
 
 // isUserInputGroup 这一组是否是指定 ID 的用户消息？
-func isUserInputGroup(group []*defs.Item, itemID defs.ItemID) bool {
-	// 1. 检查组首消息 ID 与发送方。
-	item := group[0]
-	return item.ID == itemID && item.Message.From != nil && item.Message.From.Kind == defs.IdentityUser
+func isUserInputGroup(group defs.SessionInputGroup) bool {
+	// 1. 检查组首消息的发送方。
+	from := group.Items[0].Message.From
+	return from != nil && from.Kind == defs.IdentityUser
 }
 
 // newPendingInput 从用户消息生成文字预览和图片计数。
@@ -99,4 +109,82 @@ func newPendingInput(item *defs.Item, isSteer bool) PendingInput {
 	}
 	pendingInput.Preview = string(preview)
 	return pendingInput
+}
+
+// cloneSessionCheckpoint 复制待办列表和轮次归属，保留各组不变的原 Item。
+func cloneSessionCheckpoint(checkpoint *defs.SessionCheckpoint) *defs.SessionCheckpoint {
+	// 1. 复制会在变更待办时修改的切片和轮次记录。
+	cloned := *checkpoint
+	cloned.PendingUserInputs = slices.Clone(checkpoint.PendingUserInputs)
+	cloned.PendingAgentMessages = slices.Clone(checkpoint.PendingAgentMessages)
+	if inputs := checkpoint.TurnInputs; inputs != nil {
+		clonedInputs := *inputs
+		clonedInputs.SteerInputs = slices.Clone(inputs.SteerInputs)
+		cloned.TurnInputs = &clonedInputs
+	}
+	return &cloned
+}
+
+// getInputGroupIndex 查找指定组首 Item 的位置，找不到时返回 -1。
+func getInputGroupIndex(groups defs.SessionInputBatch, itemID defs.ItemID) int {
+	// 1. 比较每组首项的 ID。
+	return slices.IndexFunc(groups, func(group defs.SessionInputGroup) bool { return group.Items[0].ID == itemID })
+}
+
+// takePendingUserGroup 从待提交记录中取出指定的用户输入组和批次组首变化。
+func takePendingUserGroup(checkpoint *defs.SessionCheckpoint, itemID defs.ItemID) (group defs.SessionInputGroup, oldBatchID, newBatchID defs.ItemID) {
+	// 1. 在用户队列中找到组，复制并更新所在批次；批次变空时移除。
+	for index, batch := range checkpoint.PendingUserInputs {
+		groupIndex := getInputGroupIndex(batch, itemID)
+		if groupIndex < 0 || !isUserInputGroup(batch[groupIndex]) {
+			continue
+		}
+		group = batch[groupIndex]
+		oldBatchID = batch[0].Items[0].ID
+		remaining := slices.Delete(slices.Clone(batch), groupIndex, groupIndex+1)
+		if len(remaining) == 0 {
+			checkpoint.PendingUserInputs = slices.Delete(checkpoint.PendingUserInputs, index, index+1)
+		} else {
+			checkpoint.PendingUserInputs[index] = remaining
+			newBatchID = remaining[0].Items[0].ID
+		}
+		return group, oldBatchID, newBatchID
+	}
+	return group, "", ""
+}
+
+// getUnhandedTurnInputs 对照原轮日志保留未交接的开场和补充；全未交接时返回原归属。
+func getUnhandedTurnInputs(inputs *defs.SessionTurnInputs, rows []dao.LoggedItem) (*defs.SessionTurnInputs, error) {
+	// 1. 用原始 Item 对账，完整交接的开场不再重放。
+	items := make([]*defs.Item, len(rows))
+	for index, row := range rows {
+		items[index] = row.Item
+	}
+	remaining := &defs.SessionTurnInputs{TurnID: inputs.TurnID, OpeningInput: inputs.OpeningInput}
+	if opening := inputs.OpeningInput; opening != nil {
+		status, err := turn.CheckInputHandoff(inputs.TurnID, *opening, items)
+		if err != nil {
+			return nil, err
+		}
+		if status == turn.InputHandoffComplete {
+			remaining.OpeningInput = nil
+		}
+	}
+	// 2. 按原顺序保留剩余补充，全部交接时清除归属。
+	for _, group := range inputs.SteerInputs {
+		status, err := turn.CheckInputHandoff(inputs.TurnID, group, items)
+		if err != nil {
+			return nil, err
+		}
+		if status == turn.InputHandoffNone {
+			remaining.SteerInputs = append(remaining.SteerInputs, group)
+		}
+	}
+	if remaining.OpeningInput == nil && len(remaining.SteerInputs) == 0 {
+		return nil, nil
+	}
+	if remaining.OpeningInput == inputs.OpeningInput && len(remaining.SteerInputs) == len(inputs.SteerInputs) {
+		return inputs, nil
+	}
+	return remaining, nil
 }

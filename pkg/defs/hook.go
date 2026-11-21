@@ -43,6 +43,8 @@ type HookRun struct {
 	StartedAt   int64 `json:"started_at"`
 	CompletedAt int64 `json:"completed_at,omitempty"`
 
+	// BlockedInputItemID 是被 UserPromptSubmit 拦下的组首消息 ID；其他 hook 为空。
+	BlockedInputItemID   ItemID `json:"blocked_input_item_id,omitempty"`
 	BlockReason          string `json:"block_reason,omitempty"`
 	UpdatedToolArguments string `json:"updated_tool_arguments,omitempty"`
 	AdditionalContext    string `json:"additional_context,omitempty"`

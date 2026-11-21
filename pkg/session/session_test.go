@@ -239,10 +239,10 @@ func TestSession(t *testing.T) {
 			},
 		},
 		{
-			name: "stop_closes_events_and_drops_pending",
+			name: "shutdown_closes_events_and_preserves_pending",
 			run: func(t *testing.T, h *sessionHarness) {
 				h.start(t, nil, true)
-				a := h.submit(t, session.SessionInputModeNormal, "A")
+				h.submit(t, session.SessionInputModeNormal, "A")
 				h.waitModelStarted(t)
 				h.model.replies <- modelReply{hold: true}
 				h.waitModelStreaming(t)
@@ -254,10 +254,9 @@ func TestSession(t *testing.T) {
 						finished = append(finished, value)
 					}
 				}
-				if len(finished) != 1 {
-					t.Fatalf("finished turns = %+v, want only A", finished)
+				if len(finished) != 0 {
+					t.Fatalf("finished turns = %+v, want no terminal event", finished)
 				}
-				requireFinished(t, finished[0], []defs.ItemID{a.ID}, defs.TurnStatusInterrupted)
 				if err := h.waitRunStopped(t); !errors.Is(err, context.Canceled) {
 					t.Fatalf("Run() error = %v", err)
 				}
@@ -271,13 +270,13 @@ func TestSession(t *testing.T) {
 					t.Fatal("HandleInput() after stop error = nil")
 				}
 				status, err := h.session.GetStatus(t.Context())
-				if err != nil || status.State != session.SessionStateStopped || status.LastTurnStatus != defs.TurnStatusInterrupted {
+				if err != nil || status.State != session.SessionStateStopped || status.LastTurnStatus != "" {
 					t.Fatalf("GetStatus() = %+v, %v", status, err)
 				}
 			},
 		},
 		{
-			name: "repair_latest_running_turn",
+			name: "no_opening_or_checkpoint",
 			run: func(t *testing.T, h *sessionHarness) {
 				running := defs.Turn{
 					ID:             defs.NewTurnID(),
@@ -289,13 +288,15 @@ func TestSession(t *testing.T) {
 					t.Fatal(err)
 				}
 				h.start(t, nil, true)
-				status, err := h.session.GetStatus(t.Context())
-				if err != nil || status.State != session.SessionStateIdle || status.LastTurnID != running.ID || status.LastTurnStatus != defs.TurnStatusInterrupted {
-					t.Fatalf("GetStatus() = %+v, %v", status, err)
+				if err := h.waitRunStopped(t); !errors.Is(err, turn.ErrTurnUnsettled) {
+					t.Fatalf("missing recovery evidence: %v", err)
 				}
 				got, found, err := h.query.GetTurn(t.Context(), h.record.ID, running.ID)
-				if err != nil || !found || got.Status != defs.TurnStatusInterrupted || got.Error == "" {
-					t.Fatalf("GetTurn() = %+v, %v, %v", got, found, err)
+				if err != nil || !found || got.Status != defs.TurnStatusRunning {
+					t.Fatalf("Turn changed after rejected recovery: %+v, %v", got, err)
+				}
+				if count := h.model.count.Load(); count != 0 {
+					t.Fatalf("repair started %d model requests, want none", count)
 				}
 			},
 		},
@@ -353,15 +354,14 @@ func TestSession(t *testing.T) {
 			name: "unsettled_turn_stops_session",
 			run: func(t *testing.T, h *sessionHarness) {
 				h.start(t, &failingTerminalMutation{Mutation: h.mutation}, true)
-				a := h.submit(t, session.SessionInputModeNormal, "A")
+				h.submit(t, session.SessionInputModeNormal, "A")
 				h.waitModelStarted(t)
 				h.submit(t, session.SessionInputModeNormal, "B")
 				h.model.replies <- modelReply{text: "cannot settle"}
-				finished := h.nextTurnFinished(t)
-				if !slices.Equal(finished.InputItemIDs, []defs.ItemID{a.ID}) || finished.Status != "" || !errors.Is(finished.Err, turn.ErrTurnUnsettled) {
-					t.Fatalf("finished = %+v", finished)
-				}
-				for range h.received {
+				for event := range h.received {
+					if finished, ok := event.(*session.SessionTurnFinished); ok {
+						t.Fatalf("unsettled Turn emitted %+v", finished)
+					}
 				}
 				if err := h.waitRunStopped(t); !errors.Is(err, turn.ErrTurnUnsettled) {
 					t.Fatalf("Run() error = %v", err)
@@ -1014,9 +1014,6 @@ func TestSessionTelemetry(t *testing.T) {
 			run: func(t *testing.T, h *sessionHarness, _ context.Context, p *telemetrytest.Pipeline) {
 				h.submit(t, session.SessionInputModeNormal, "A")
 				h.model.replies <- modelReply{text: "cannot settle"}
-				if finished := h.nextTurnFinished(t); !errors.Is(finished.Err, turn.ErrTurnUnsettled) {
-					t.Fatalf("finished = %+v, want unsettled Turn", finished)
-				}
 				if err := h.waitRunStopped(t); !errors.Is(err, turn.ErrTurnUnsettled) {
 					t.Fatalf("Run() error = %v", err)
 				}
@@ -3215,12 +3212,6 @@ func (stub *sessionHooksStub) RunEvent(_ context.Context, request *hook.HookEven
 	return &hook.HookOutcome{SavedRuns: []*defs.HookRun{run}}
 }
 
-// GetHookInfos 返回测试 hook 信息。
-func (*sessionHooksStub) GetHookInfos() []*hook.HookInfo {
-	// 1. 返回空列表。
-	return nil
-}
-
 // getEvents 返回收到的全部事件的副本。
 func (stub *sessionHooksStub) getEvents() []*hook.HookEvent {
 	// 1. 加锁读取并复制已收到的事件。
@@ -3368,18 +3359,13 @@ func TestSessionRecoversTurnItemsRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			// 2. 启动 Session 触发修复，检查 interrupted 状态和恢复后的 Item 范围。
-			h.start(t, nil, true)
-			if _, err := h.session.GetStatus(t.Context()); err != nil {
+			if err := h.mutation.AppendSessionCheckpoint(t.Context(), h.record.ConversationID, h.record.ID, &defs.SessionCheckpoint{StopRequestedTurnID: running.ID, IsAgentMessagesPaused: true}); err != nil {
 				t.Fatal(err)
 			}
+			h.start(t, nil, true)
+			requireFinished(t, h.nextTurnFinished(t), nil, defs.TurnStatusInterrupted)
 			got, _, err := h.query.GetTurn(t.Context(), h.record.ID, running.ID)
-			want := defs.TurnItemRange{}
-			if tt.count > 0 {
-				want = defs.TurnItemRange{
-					FirstOrdinal: 2,
-					LastOrdinal:  uint64(tt.count + 1),
-				}
-			}
+			want := defs.TurnItemRange{FirstOrdinal: 2, LastOrdinal: uint64(tt.count + 2)}
 			if err != nil || got.Status != defs.TurnStatusInterrupted || got.ItemsRange != want {
 				t.Fatalf("recovered = %+v, %v, want %+v", got, err, want)
 			}
@@ -3388,7 +3374,7 @@ func TestSessionRecoversTurnItemsRange(t *testing.T) {
 			h.model.replies <- modelReply{text: "answer"}
 			finished := h.nextTurnFinished(t)
 			next, _, err := h.query.GetTurn(t.Context(), h.record.ID, finished.TurnID)
-			if err != nil || next.ItemsRange.FirstOrdinal != uint64(tt.count+2) {
+			if err != nil || next.ItemsRange.FirstOrdinal != uint64(tt.count+3) {
 				t.Fatalf("next = %+v, %v", next, err)
 			}
 		})
@@ -3441,6 +3427,9 @@ func TestSessionRecoveryFailureStopsBeforeNextTurn(t *testing.T) {
 			}
 			var mutation dao.Mutation
 			if tt.writeFailure {
+				if err := h.mutation.AppendSessionCheckpoint(t.Context(), h.record.ConversationID, h.record.ID, &defs.SessionCheckpoint{StopRequestedTurnID: running.ID}); err != nil {
+					t.Fatal(err)
+				}
 				mutation = &failingTerminalMutation{Mutation: h.mutation}
 			}
 			// 2. 启动 Session，检查修复报错、之后的输入被拒且没请求模型。
@@ -3675,4 +3664,706 @@ func (m *blockingInputMutation) AppendItems(ctx context.Context, conversationID 
 	}
 	// 2. 保存原输入。
 	return m.Mutation.AppendItems(ctx, conversationID, sessionID, items...)
+}
+
+// TestSessionDurableInput 检查保存失败、InputID 去重及 Skill 组顺序都由 Session checkpoint 保留。
+func TestSessionDurableInput(t *testing.T) {
+	// 1. 对照 checkpoint 写入失败和可重试输入两种场景。
+	tests := []struct {
+		name       string
+		failSave   bool
+		checkRetry bool
+	}{
+		{name: "checkpoint_save_failure", failSave: true},
+		{name: "input_id_retry_preserves_skill_group", checkRetry: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSessionHarness(t)
+			var mutation dao.Mutation
+			if tt.failSave {
+				mutation = &failingCheckpointMutation{Mutation: h.mutation}
+			}
+			var root string
+			if tt.checkRetry {
+				root = loadSessionTestSkills(t, h)
+			}
+			h.start(t, mutation, true)
+			if tt.checkRetry {
+				input := sessionInput("/review first")
+				firstID, err := h.session.HandleInput(t.Context(), &session.SessionInput{
+					Mode: session.SessionInputModeNormal, Item: input, InputID: "retry-input",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.waitModelStarted(t)
+				before := readSessionLog(t, h.query, h.record.ConversationID, h.record.ID)
+				if len(before) < 2 || before[1].Kind != defs.ItemSkillInstruction || !strings.Contains(before[1].SkillInstruction.Text, "review instructions") {
+					t.Fatalf("first input group = %+v", before)
+				}
+				if err := os.WriteFile(filepath.Join(root, "review", "SKILL.md"), []byte("---\nname: review\ndescription: changed\n---\nchanged instructions"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				retryID, err := h.session.HandleInput(t.Context(), &session.SessionInput{
+					Mode: session.SessionInputModeNormal, Item: sessionInput("/review second"), InputID: "retry-input",
+				})
+				if err != nil || retryID != firstID {
+					t.Fatalf("retry HandleInput() = %q, %v; want %q", retryID, err, firstID)
+				}
+				after := readSessionLog(t, h.query, h.record.ConversationID, h.record.ID)
+				if len(after) != len(before) || after[0].ID != before[0].ID || after[1].Kind != defs.ItemSkillInstruction || after[1].SkillInstruction.Text != before[1].SkillInstruction.Text {
+					t.Fatalf("retry changed persisted group: before=%+v after=%+v", before, after)
+				}
+				return
+			}
+			itemID, err := h.session.HandleInput(t.Context(), &session.SessionInput{Mode: session.SessionInputModeNormal, Item: sessionInput("input")})
+			if itemID != "" || err == nil {
+				t.Fatalf("HandleInput() = %q, %v; want no success", itemID, err)
+			}
+			checkpoint, err := h.query.GetSessionCheckpoint(t.Context(), h.record.ConversationID, h.record.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if checkpoint != nil {
+				t.Fatalf("checkpoint = %+v, want no durable input after save failure", checkpoint)
+			}
+		})
+	}
+}
+
+// failingCheckpointMutation 让 Session checkpoint 追加失败。
+type failingCheckpointMutation struct{ dao.Mutation }
+
+// AppendSessionCheckpoint 返回注入错误，不改变真实 DAO 的其他写入。
+func (mutation *failingCheckpointMutation) AppendSessionCheckpoint(context.Context, defs.ConversationID, defs.SessionID, *defs.SessionCheckpoint) error {
+	// 1. 拒绝待办追加。
+	return errors.New("injected Session checkpoint failure")
+}
+
+// TestCompactRunningReceipt 检查手动压缩只在 running 记录写成后返回 ID。
+func TestCompactRunningReceipt(t *testing.T) {
+	// 1. 对照 running 写入成功和失败两种回执。
+	tests := []struct {
+		name        string
+		failRunning bool
+	}{
+		{name: "running_saved"},
+		{name: "running_save_failed", failRunning: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSessionHarness(t)
+			var mutation dao.Mutation
+			if tt.failRunning {
+				mutation = &failingRunningMutation{Mutation: h.mutation}
+			}
+			h.start(t, mutation, true)
+			turnID, err := h.session.CompactContext(t.Context())
+			if tt.failRunning {
+				if turnID != "" || err == nil {
+					t.Fatalf("CompactContext() = %q, %v; want empty ID and error", turnID, err)
+				}
+				return
+			}
+			if err != nil || turnID == "" {
+				t.Fatalf("CompactContext() = %q, %v; want a durable Turn ID", turnID, err)
+			}
+		})
+	}
+}
+
+// TestCompactRunningReceiptTiming 检查首条 running 写入、调用方取消和摘要阻塞的确定时机。
+func TestCompactRunningReceiptTiming(t *testing.T) {
+	// 1. 首条 running 写入阻塞时，取消调用方不会得到 TurnID；释放后 Session 仍能收尾。
+	t.Run("cancel_while_running_write_blocked", func(t *testing.T) {
+		h := newSessionHarness(t)
+		mutation := &blockingRunningMutation{Mutation: h.mutation, started: make(chan struct{}), release: make(chan struct{})}
+		h.start(t, mutation, true)
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan compactResult, 1)
+		go func() {
+			id, err := h.session.CompactContext(ctx)
+			result <- compactResult{id: id, err: err}
+		}()
+		select {
+		case <-mutation.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("running write did not block")
+		}
+		cancel()
+		select {
+		case got := <-result:
+			if got.id != "" || !errors.Is(got.err, context.Canceled) {
+				t.Fatalf("CompactContext() = %+v", got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("CompactContext did not respect cancellation")
+		}
+		close(mutation.release)
+	})
+
+	// 2. running 写成后摘要请求阻塞，调用方已经拿到非空 ID。
+	t.Run("summary_blocked_after_running_receipt", func(t *testing.T) {
+		h := newSessionHarness(t)
+		h.start(t, nil, true)
+		first := h.submit(t, session.SessionInputModeNormal, "history")
+		h.model.replies <- modelReply{text: "history answer"}
+		requireFinished(t, h.nextTurnFinished(t), []defs.ItemID{first.ID}, defs.TurnStatusCompleted)
+		select {
+		case <-h.model.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("history request did not start")
+		}
+		result := make(chan compactResult, 1)
+		go func() {
+			id, err := h.session.CompactContext(t.Context())
+			result <- compactResult{id: id, err: err}
+		}()
+		select {
+		case <-h.model.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("summary request did not start")
+		}
+		select {
+		case got := <-result:
+			if got.err != nil || got.id == "" {
+				t.Fatalf("CompactContext() = %+v; want ID while summary is blocked", got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("CompactContext waited for summary result")
+		}
+	})
+}
+
+// compactResult 保存 CompactContext 的异步回执。
+type compactResult struct {
+	id  defs.TurnID
+	err error
+}
+
+// blockingRunningMutation 暂停首条 running Turn 写入。
+type blockingRunningMutation struct {
+	dao.Mutation
+	// turnID 是正在写首条 running 的目标，仅在 started 关闭后读取。
+	turnID           defs.TurnID
+	started, release chan struct{}
+	once             sync.Once
+}
+
+// SetTurn 在首条 running 写入前暂停，其他写入直接交给 DAO。
+func (mutation *blockingRunningMutation) SetTurn(ctx context.Context, value defs.Turn) error {
+	// 1. 暂停第一次 running 写入，释放后继续写入。
+	if value.Status == defs.TurnStatusRunning {
+		first := false
+		mutation.once.Do(func() { first = true; mutation.turnID = value.ID; close(mutation.started) })
+		if first {
+			<-mutation.release
+		}
+	}
+	return mutation.Mutation.SetTurn(ctx, value)
+}
+
+// TestTurnInputHandoff 检查首组和补充组的末项都带交接标记。
+func TestTurnInputHandoff(t *testing.T) {
+	// 1. 对照普通开场组和活动 Turn 的补充组。
+	tests := []struct {
+		name  string
+		steer bool
+	}{
+		{name: "opening"},
+		{name: "steer", steer: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSessionHarness(t)
+			h.start(t, nil, true)
+			opening := h.submit(t, session.SessionInputModeNormal, "opening")
+			var handedOff *defs.Item
+			if tt.steer {
+				h.waitModelStarted(t)
+				steer := h.submit(t, session.SessionInputModeSteer, "steer")
+				h.model.replies <- modelReply{text: "first"}
+				h.model.replies <- modelReply{text: "second"}
+				requireFinished(t, h.nextTurnFinished(t), []defs.ItemID{opening.ID, steer.ID}, defs.TurnStatusCompleted)
+				handedOff = steer
+			} else {
+				h.model.replies <- modelReply{text: "answer"}
+				requireFinished(t, h.nextTurnFinished(t), []defs.ItemID{opening.ID}, defs.TurnStatusCompleted)
+				handedOff = opening
+			}
+			for _, item := range readSessionLog(t, h.query, h.record.ConversationID, h.record.ID) {
+				if item.ID == handedOff.ID {
+					if item.HandedOffInputItemID != handedOff.ID {
+						t.Fatalf("input item = %+v, want handoff marker %q", item, handedOff.ID)
+					}
+					return
+				}
+			}
+			t.Fatalf("input item %q was not saved", handedOff.ID)
+		})
+	}
+}
+
+// failingRunningMutation 让 running Turn 记录写入失败。
+type failingRunningMutation struct {
+	dao.Mutation
+}
+
+// SetTurn 在写 running 记录时返回注入错误。
+func (mutation *failingRunningMutation) SetTurn(ctx context.Context, value defs.Turn) error {
+	// 1. 拒绝 running，其余记录交给真实 DAO。
+	if value.Status == defs.TurnStatusRunning {
+		return errors.New("injected running Turn persistence failure")
+	}
+	return mutation.Mutation.SetTurn(ctx, value)
+}
+
+// TestSessionOpenUnfinishedTurn 从开轮前后不同的落盘位置打开同一个 Session。
+func TestSessionOpenUnfinishedTurn(t *testing.T) {
+	for _, position := range []string{"queued", "allocated_after_previous", "running_before_opening", "handed_off", "terminal", "partial"} {
+		t.Run(position, func(t *testing.T) {
+			h := newSessionHarness(t)
+			ctx := t.Context()
+			opening := sessionInput("archived prompt")
+			group := defs.SessionInputGroup{InputID: "retry-key", Items: []*defs.Item{opening}}
+			record := defs.Turn{ID: "original", SessionID: h.record.ID, ConversationID: h.record.ConversationID, Model: defs.ModelSelection{Ref: testOtherModelRef, ReasoningEffort: "high"}, Status: defs.TurnStatusRunning}
+			pending := defs.SessionCheckpoint{TurnInputs: &defs.SessionTurnInputs{TurnID: record.ID, OpeningInput: &group}}
+			switch position {
+			case "queued":
+				pending = defs.SessionCheckpoint{PendingUserInputs: []defs.SessionInputBatch{{group}}}
+			case "allocated_after_previous":
+				record.ID = "previous"
+				record.Status = defs.TurnStatusCompleted
+			case "terminal":
+				record.Status = defs.TurnStatusFailed
+			}
+			if position != "queued" {
+				if err := h.mutation.SetTurn(ctx, record); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if position == "handed_off" || position == "partial" || position == "terminal" {
+				saved := opening.Clone()
+				saved.TurnID = record.ID
+				if position != "partial" {
+					saved.HandedOffInputItemID = saved.ID
+				}
+				if _, err := h.mutation.AppendItems(ctx, record.ConversationID, record.SessionID, saved); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.mutation.AppendSessionCheckpoint(ctx, record.ConversationID, record.SessionID, &pending); err != nil {
+				t.Fatal(err)
+			}
+			h.start(t, nil, true)
+			if position == "partial" {
+				if err := h.waitRunStopped(t); !errors.Is(err, turn.ErrInputHandoffIncomplete) {
+					t.Fatalf("Run = %v", err)
+				}
+				return
+			}
+			status, err := h.session.GetStatus(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if position == "terminal" {
+				if status.State != session.SessionStateIdle || status.LastTurnStatus != record.Status || h.model.count.Load() != 0 {
+					t.Fatalf("status = %+v", status)
+				}
+				return
+			}
+			if status.ActiveTurnID == "" || position != "queued" && status.ActiveTurnID != "original" {
+				t.Fatalf("opened session: %+v", status)
+			}
+			body := h.nextModelBody(t)
+			if position == "handed_off" || position == "running_before_opening" {
+				if body["model"] != "other-upstream" {
+					t.Fatalf("model = %v", body["model"])
+				}
+			}
+			if id, err := h.session.HandleInput(ctx, &session.SessionInput{Mode: session.SessionInputModeNormal, Item: sessionInput("retry"), InputID: "retry-key"}); err != nil || id != opening.ID {
+				t.Fatalf("retry = %s %v", id, err)
+			}
+			h.model.replies <- modelReply{text: "done"}
+			finished := h.nextTurnFinished(t)
+			requireFinished(t, finished, []defs.ItemID{opening.ID}, defs.TurnStatusCompleted)
+			count := 0
+			for _, item := range readSessionLog(t, h.query, record.ConversationID, record.SessionID) {
+				if item.ID == opening.ID && item.TurnID == finished.TurnID {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("opening count = %d", count)
+			}
+		})
+	}
+}
+
+// TestSessionStopAcrossRestart 对照服务退出、用户叫停及终态与回队之间退出。
+func TestSessionStopAcrossRestart(t *testing.T) {
+	for _, name := range []string{"service", "interrupt", "stop_save_error", "allocated_stop", "terminal_before_requeue"} {
+		t.Run(name, func(t *testing.T) {
+			h := newSessionHarness(t)
+			ctx := t.Context()
+			sid, cid := h.record.ID, h.record.ConversationID
+			var turnID defs.TurnID
+			var requeued defs.ItemID
+			if name == "service" || name == "interrupt" || name == "stop_save_error" {
+				var mutation dao.Mutation
+				if name == "interrupt" {
+					mutation = &failingTerminalMutation{Mutation: h.mutation}
+				}
+				saveErr := errors.New("stop checkpoint unavailable")
+				if name == "stop_save_error" {
+					mutation = &failingStopCheckpoint{Mutation: h.mutation, err: saveErr}
+				}
+				h.start(t, mutation, true)
+				h.submit(t, session.SessionInputModeNormal, "keep me")
+				h.waitModelStarted(t)
+				turnID = h.nextTurnStarted(t).TurnID
+				if name == "interrupt" {
+					if got, err := h.session.InterruptTurn(ctx); err != nil || got != turnID {
+						t.Fatalf("stop = %s %v", got, err)
+					}
+				} else if name == "stop_save_error" {
+					if got, err := h.session.InterruptTurn(ctx); got != turnID || !errors.Is(err, saveErr) {
+						t.Fatalf("failed stop receipt = %s, %v", got, err)
+					}
+				} else {
+					h.cancel()
+				}
+				h.waitRunStopped(t)
+				for event := range h.received {
+					if finished, ok := event.(*session.SessionTurnFinished); ok {
+						t.Fatalf("unsettled Turn emitted %+v", finished)
+					}
+				}
+			} else {
+				turnID = "stopped"
+				opening := defs.SessionInputGroup{Items: []*defs.Item{sessionInput("discard")}}
+				a := sessionInput("child message")
+				a.Message.From = &defs.Address{Kind: defs.IdentityAgent, ID: "child"}
+				u := sessionInput("queued user")
+				requeued = u.ID
+				logged := sessionInput("handed off")
+				steer := defs.SessionInputBatch{{Items: []*defs.Item{u}}, {Items: []*defs.Item{a}}}
+				if name == "terminal_before_requeue" {
+					if err := h.mutation.SetTurn(ctx, defs.Turn{ID: turnID, ConversationID: cid, SessionID: sid, Status: defs.TurnStatusInterrupted}); err != nil {
+						t.Fatal(err)
+					}
+					steer = append(steer, defs.SessionInputGroup{Items: []*defs.Item{logged}})
+					saved := logged.Clone()
+					saved.TurnID = turnID
+					saved.HandedOffInputItemID = logged.ID
+					if _, err := h.mutation.AppendItems(ctx, cid, sid, saved); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cp := &defs.SessionCheckpoint{StopRequestedTurnID: turnID, IsAgentMessagesPaused: true, TurnInputs: &defs.SessionTurnInputs{TurnID: turnID, OpeningInput: &opening, SteerInputs: steer}}
+				if err := h.mutation.AppendSessionCheckpoint(ctx, cid, sid, cp); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for reopen := 0; reopen < 2; reopen++ {
+				next := &sessionHarness{record: h.record, model: h.model, models: h.models, query: h.query, mutation: h.mutation}
+				next.start(t, nil, true)
+				status, err := next.session.GetStatus(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if reopen == 0 {
+					switch name {
+					case "service", "stop_save_error":
+						if status.ActiveTurnID != turnID {
+							t.Fatalf("reopened status = %+v", status)
+						}
+						next.model.replies <- modelReply{text: "restored"}
+						requireFinished(t, next.nextTurnFinished(t), nil, defs.TurnStatusCompleted)
+					case "interrupt", "allocated_stop":
+						if done := next.nextTurnFinished(t); done.TurnID != turnID || done.Status != defs.TurnStatusInterrupted {
+							t.Fatalf("stop = %+v", done)
+						}
+					}
+					if requeued != "" {
+						next.model.replies <- modelReply{text: "queued answer"}
+						requireFinished(t, next.nextTurnFinished(t), []defs.ItemID{requeued}, defs.TurnStatusCompleted)
+					}
+				} else if status.ActiveTurnID != "" {
+					t.Fatalf("second open started %+v", status)
+				}
+				if requeued != "" || name == "interrupt" {
+					cp, err := h.query.GetSessionCheckpoint(ctx, cid, sid)
+					if err != nil || cp == nil || !cp.IsAgentMessagesPaused {
+						t.Fatalf("pause = %+v %v", cp, err)
+					}
+					if requeued != "" && (len(cp.PendingAgentMessages) != 1 || len(cp.PendingAgentMessages[0]) != 1) {
+						t.Fatalf("agent queue = %+v", cp)
+					}
+				}
+				next.cancel()
+				next.waitRunStopped(t)
+				for range next.received {
+				}
+			}
+			interruptions := 0
+			for _, item := range readSessionLog(t, h.query, cid, sid) {
+				if item.Kind == defs.ItemTurnInterrupted {
+					interruptions++
+				}
+			}
+			if (name == "interrupt" || name == "allocated_stop") && interruptions != 1 || name == "service" && interruptions != 0 {
+				t.Fatalf("interrupted items = %d", interruptions)
+			}
+		})
+	}
+}
+
+// failingStopCheckpoint 在 Session 写停止请求时注入存储错误，其余待办照常保存。
+type failingStopCheckpoint struct {
+	dao.Mutation
+	// err 是写停止请求时返回给调用方的错误。
+	err error
+}
+
+// AppendSessionCheckpoint 只拒绝含有停止请求的待办记录。
+func (m *failingStopCheckpoint) AppendSessionCheckpoint(ctx context.Context, cid defs.ConversationID, sid defs.SessionID, cp *defs.SessionCheckpoint) error {
+	// 1. 停止请求写失败，其他记录交给原 DAO。
+	if cp.StopRequestedTurnID != "" {
+		return m.err
+	}
+	return m.Mutation.AppendSessionCheckpoint(ctx, cid, sid, cp)
+}
+
+// requestWaitingContext 通知测试调用方已开始等待 Session 接收请求。
+type requestWaitingContext struct {
+	context.Context
+	signalWaiting func()
+}
+
+// Done 通知测试请求已到达等待点，返回原 Context 的取消通道。
+func (ctx requestWaitingContext) Done() <-chan struct{} {
+	// 1. 通知等待点并返回取消通道。
+	ctx.signalWaiting()
+	return ctx.Context.Done()
+}
+
+// TestSessionStopWhileCompactStarts 对照手动压缩首写成功与失败，验证启动、停止与重开的先后关系。
+func TestSessionStopWhileCompactStarts(t *testing.T) {
+	for _, failWrite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail_write_%t", failWrite), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			h := newSessionHarness(t)
+			cid, sid := h.record.ConversationID, h.record.ID
+			// 1. 添加可压缩历史，暂停手动轮首写。成功分支挡住终态，留给重开结算。
+			msgs := []*defs.Item{sessionInput("history one"), sessionInput("history two")}
+			for _, msg := range msgs {
+				msg.TurnID = "history"
+			}
+			if _, err := h.mutation.AppendItems(ctx, cid, sid, msgs...); err != nil {
+				t.Fatal(err)
+			}
+			var writer dao.Mutation = &failingTerminalMutation{Mutation: h.mutation}
+			if failWrite {
+				writer = &failingRunningMutation{Mutation: h.mutation}
+			}
+			m := &blockingRunningMutation{Mutation: writer, started: make(chan struct{}), release: make(chan struct{})}
+			release := sync.OnceFunc(func() { close(m.release) })
+			defer release()
+			h.start(t, m, false)
+			compact := make(chan compactResult, 1)
+			go func() { id, err := h.session.CompactContext(ctx); compact <- compactResult{id: id, err: err} }()
+			waitClosed(t, m.started, "compact running write")
+
+			// 2. 首写期间，同一 Session 的四类请求各自等到调用方截止。压缩仍未回执。
+			replacement := sessionInput("replace")
+			for _, request := range []struct {
+				name string
+				send func(context.Context) error
+			}{
+				{"stop", func(ctx context.Context) error {
+					_, err := h.session.InterruptTurn(ctx)
+					return err
+				}},
+				{"interrupt input", func(ctx context.Context) error {
+					_, err := h.session.HandleInput(ctx, &session.SessionInput{Mode: session.SessionInputModeInterrupt, Item: replacement})
+					return err
+				}},
+				{"interrupt with queued input", func(ctx context.Context) error {
+					return h.session.InterruptTurnWithInput(ctx, m.turnID, replacement.ID)
+				}},
+				{"status", func(ctx context.Context) error {
+					_, err := h.session.GetStatus(ctx)
+					return err
+				}},
+			} {
+				requestCtx, cancelRequest := context.WithTimeout(ctx, 20*time.Millisecond)
+				err := request.send(requestCtx)
+				cancelRequest()
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("%s before compact first write = %v, want deadline exceeded", request.name, err)
+				}
+			}
+			select {
+			case receipt := <-compact:
+				t.Fatalf("compact returned before first write: %+v", receipt)
+			default:
+			}
+			if cp, err := h.query.GetSessionCheckpoint(ctx, cid, sid); err != nil || cp != nil {
+				t.Fatalf("checkpoint before first write = %+v, %v", cp, err)
+			}
+
+			// 3. 释放首写时有停止请求在等，不读事件也能收到压缩和停止回执。
+			stopWaiting := make(chan struct{})
+			stopCtx := requestWaitingContext{Context: ctx, signalWaiting: sync.OnceFunc(func() { close(stopWaiting) })}
+			stopped := make(chan compactResult, 1)
+			go func() { id, err := h.session.InterruptTurn(stopCtx); stopped <- compactResult{id: id, err: err} }()
+			waitClosed(t, stopWaiting, "stop request")
+			release()
+			receipt, stop := <-compact, <-stopped
+			if failWrite {
+				if receipt.id != "" || receipt.err == nil || !strings.Contains(receipt.err.Error(), "injected running Turn persistence failure") {
+					t.Fatalf("compact receipt = %+v", receipt)
+				}
+				if stop.id != "" || stop.err != nil {
+					t.Fatalf("stop after failed write = %+v", stop)
+				}
+			} else {
+				if receipt.id != m.turnID || receipt.err != nil || stop.id != receipt.id || stop.err != nil {
+					t.Fatalf("compact = %+v, stop = %+v", receipt, stop)
+				}
+				select {
+				case event := <-h.events:
+					if started, ok := event.(*session.SessionTurnStarted); !ok || started.TurnID != receipt.id {
+						t.Fatalf("first compact event = %+v", event)
+					}
+				case <-ctx.Done():
+					t.Fatal("timed out waiting for compact started event")
+				}
+			}
+			for event := range h.events {
+				if started, ok := event.(*session.SessionTurnStarted); ok {
+					t.Errorf("unexpected compact started event: %+v", started)
+				}
+			}
+			if err := h.waitRunStopped(t); !errors.Is(err, turn.ErrTurnUnsettled) {
+				t.Fatalf("Run = %v", err)
+			}
+			cp, err := h.query.GetSessionCheckpoint(ctx, cid, sid)
+			if err != nil || failWrite && cp != nil || !failWrite && (cp == nil || cp.StopRequestedTurnID != receipt.id) {
+				t.Fatalf("saved stop request = %+v, %v", cp, err)
+			}
+			logged, err := h.query.GetLatestLoggedTurn(ctx, cid, sid)
+			if err != nil || failWrite && logged != nil || !failWrite && (logged == nil || logged.ID != receipt.id || !logged.IsCompactOnly || logged.Status != defs.TurnStatusRunning) {
+				t.Fatalf("saved manual Turn: %+v %v", logged, err)
+			}
+
+			// 4. 用健康 DAO 重开。已确认停止的手动轮只收尾，首写失败的 Session 空闲。
+			before := h.model.count.Load()
+			next := &sessionHarness{record: h.record, model: h.model, models: h.models, query: h.query, mutation: h.mutation}
+			next.start(t, nil, true)
+			if !failWrite {
+				done := next.nextTurnFinished(t)
+				if done.TurnID != receipt.id || done.Status != defs.TurnStatusInterrupted {
+					t.Fatal(done)
+				}
+			}
+			status, err := next.session.GetStatus(ctx)
+			if err != nil || status.State == session.SessionStateStopped || failWrite && status.State != session.SessionStateIdle || next.model.count.Load() != before {
+				t.Fatalf("reopened = %+v %v requests=%d", status, err, next.model.count.Load())
+			}
+		})
+	}
+}
+
+// blockingPromptHook 在指定输入第一次审核时等到该轮取消，重新分轮后正常放行。
+type blockingPromptHook struct {
+	// prompt 是暂停审核的输入正文。
+	prompt string
+	// entered 在选中输入首次进入审核时关闭。
+	entered chan struct{}
+}
+
+// RunEvent 等选中的输入审核被取消；其他输入直接放行。
+func (h *blockingPromptHook) RunEvent(ctx context.Context, req *hook.HookEventRequest, _ chan<- *defs.HookRun) *hook.HookOutcome {
+	// 1. 只暂停选中输入的第一次审核。
+	if req.Event.Name == defs.HookEventUserPromptSubmit && req.Event.Prompt == h.prompt {
+		select {
+		case <-h.entered:
+		default:
+			close(h.entered)
+			<-ctx.Done()
+		}
+	}
+	return &hook.HookOutcome{}
+}
+
+// TestSessionInterruptDuringInputHook 中断轮报告自己的开场，未交接补充只在回队后的新轮报告。
+func TestSessionInterruptDuringInputHook(t *testing.T) {
+	for _, isOpening := range []bool{false, true} {
+		t.Run(fmt.Sprintf("opening_%t", isOpening), func(t *testing.T) {
+			h := newSessionHarness(t)
+			work, err := workspace.NewVirtualWorkspace(workspace.NewVirtualWorkspaceOpt("/workspace", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt("local", "", work))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.environments = []executor.ExecutionEnvironment{env}
+			// 1. 在开场或借出的补充审核中暂停，向 Session 提交停止。
+			gate := &blockingPromptHook{prompt: "hold input", entered: make(chan struct{})}
+			h.hooks = gate
+			h.start(t, nil, true)
+			var first, held *defs.Item
+			if isOpening {
+				held = h.submit(t, session.SessionInputModeNormal, gate.prompt)
+			} else {
+				first = h.submit(t, session.SessionInputModeNormal, "initial")
+				h.waitModelStarted(t)
+				held = h.submit(t, session.SessionInputModeSteer, gate.prompt)
+				h.model.replies <- modelReply{text: "first answer"}
+			}
+			waitClosed(t, gate.entered, "prompt hook")
+			id, err := h.session.InterruptTurn(t.Context())
+			if id == "" || err != nil {
+				t.Fatalf("stop=%s,%v", id, err)
+			}
+			done := h.nextTurnFinished(t)
+			if done.TurnID != id || done.Status != defs.TurnStatusInterrupted {
+				t.Fatalf("interrupted = %+v", done)
+			}
+			// 2. 未交接的补充回队，在新轮恰好写一次；未交接的开场不回队。
+			var expectedID defs.TurnID
+			if !isOpening {
+				h.model.replies <- modelReply{text: "second answer"}
+				next := h.nextTurnFinished(t)
+				requireFinished(t, next, []defs.ItemID{held.ID}, defs.TurnStatusCompleted)
+				expectedID = next.TurnID
+				if expectedID == id {
+					t.Fatalf("requeued input reused interrupted Turn %s", id)
+				}
+			}
+			count := 0
+			for _, item := range readSessionLog(t, h.query, h.record.ConversationID, h.record.ID) {
+				if item.ID == held.ID {
+					count++
+					if item.TurnID != expectedID || item.HandedOffInputItemID != held.ID {
+						t.Fatalf("wrong handoff: %+v", item)
+					}
+				}
+			}
+			if isOpening && count != 0 || !isOpening && count != 1 {
+				t.Fatalf("held item logged %d times", count)
+			}
+			inputs := []defs.ItemID{held.ID}
+			if first != nil {
+				inputs = []defs.ItemID{first.ID}
+			}
+			requireFinished(t, done, inputs, defs.TurnStatusInterrupted)
+		})
+	}
 }

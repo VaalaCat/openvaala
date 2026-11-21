@@ -16,7 +16,6 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/executor/tools"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/skill"
-	"github.com/VaalaCat/openvaala/pkg/storage"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/terminal"
 	"github.com/VaalaCat/openvaala/pkg/turn"
@@ -26,7 +25,7 @@ import (
 type Session interface {
 	// GetID 返回 Session ID。
 	GetID() defs.SessionID
-	// Run 修复最近的 Turn 后串行处理收件箱；停止时取消活动 Turn、丢弃排队输入，等 Turn 和后台命令结束后返回。
+	// Run 恢复本 Session 未完成的轮次后处理收件箱；停止服务时保留排队输入，等 Turn 和后台命令结束后返回。
 	// events 不能为 nil，调用方要一直读到它关闭；events 关闭时，其他方法已经按 Session 已停止处理。
 	Run(ctx context.Context, events chan<- SessionEvent) error
 	// HandleInput 接收输入并返回 ItemID，同一 InputID 在本次运行内只接收一次；哪个 Turn 处理了它，看 SessionTurnFinished.InputItemIDs。
@@ -46,10 +45,12 @@ type Session interface {
 	InterruptTurnWithInput(ctx context.Context, turnID defs.TurnID, itemID defs.ItemID) (err error)
 	// WithdrawInput 原子取走待处理的完整用户输入组。
 	WithdrawInput(ctx context.Context, itemID defs.ItemID) (items []*defs.Item, err error)
+	// GetUnreadSteer 读取未借出的补充输入副本，没有时立即返回空。
+	GetUnreadSteer(ctx context.Context) ([]*defs.Item, error)
 	// WaitSteer 等活动 Turn 的未读补充输入，返回副本，不取走；已有输入时立即返回，没有活动 Turn、Turn 结束或 Session 已停止时返回空、不报错。
 	// 调用方先取消时返回 ctx.Err()。
 	WaitSteer(ctx context.Context) ([]*defs.Item, error)
-	// CompactContext 空闲时启动只压缩的 Turn 并返回它的 ID，不等压缩完成；有活动 Turn 或排队的用户输入时返回 ErrSessionBusy，
+	// CompactContext 空闲时启动只压缩的 Turn，首条 running 写成后返回它的 ID，不等压缩完成；有活动 Turn 或排队的用户输入时返回 ErrSessionBusy，
 	// 排队的 Agent 消息不算忙；已开始停止或所选模型不在目录里时返回错误。
 	CompactContext(ctx context.Context) (defs.TurnID, error)
 	// SelectModel 接收 Conversation 已校验并保存的模型选择，从下个 Turn 起使用，不影响正在执行的 Turn；Session 已停止时返回 nil。
@@ -83,18 +84,14 @@ type sessionImpl struct {
 	// tasks 是后台命令管理任务和各 Turn 执行任务，Run 返回前等待。
 	tasks sync.WaitGroup
 
-	// pendingUserInputs 是等待开新 Turn 的用户输入，先于 Agent 消息开始；插队的放在最前。
-	pendingUserInputs []inboxInput
-	// pendingAgentMessages 是等待开新 Turn 的 Agent 消息（send_message、子任务结果通知），用户队列空了才开始。
-	pendingAgentMessages []inboxInput
-	// isAgentMessagesPaused Agent 消息是否暂停开新 Turn？用户中断主 Agent 的 Turn 后暂停，Agent 消息照常排队，收到下一条用户输入时恢复。
-	isAgentMessagesPaused bool
+	// queuedBatchSpans 保存有追踪信息的排队批次，以组首 ItemID 标识批次；未追踪时无条目。
+	queuedBatchSpans map[defs.ItemID]telemetry.SpanRef
 	// activeTurnID 是正在执行的 Turn，没有时为空。
 	activeTurnID defs.TurnID
 	// cancelActiveTurn 取消活动 Turn 的 ctx。
-	cancelActiveTurn context.CancelFunc
-	// activeSteer 是挂在活动 Turn 上、还没被取走的补充输入组。
-	activeSteer [][]*defs.Item
+	cancelActiveTurn context.CancelCauseFunc
+	// borrowedSteerIDs 标记已借出但尚未确认的补充组；没有借出的组时为空。
+	borrowedSteerIDs map[defs.ItemID]struct{}
 	// acceptingSteer 活动 Turn 是否还接收补充输入？不接收后 steer 输入改为排队。
 	acceptingSteer bool
 	// steerWaiters 是 WaitSteer 登记的回复通道（容量 1），在下次挂上补充输入或活动 Turn 结束时统一回复并清空。
@@ -102,8 +99,10 @@ type sessionImpl struct {
 	steerWaiters []chan []*defs.Item
 	// acceptedInputs 记录本次运行期已接收的 InputID 和对应的 ItemID，只增不删；只由事件循环读写。
 	acceptedInputs map[defs.InputID]defs.ItemID
+	// checkpoint 是最近一次成功写入的 Session 待办；持久化写入成功后才替换。
+	checkpoint defs.SessionCheckpoint
 
-	// lastTurnID 是最近一个 Turn，repairLatestTurn 从 Turn 记录读出，每个 Turn 结束时更新。
+	// lastTurnID 是最近一个 Turn，openLatestTurn 从 Turn 记录读出，每个 Turn 结束时更新。
 	lastTurnID defs.TurnID
 	// lastTurnStatus 是最近一个 Turn 保存的终态，终态没保存时为空。
 	lastTurnStatus defs.TurnStatus
@@ -111,9 +110,9 @@ type sessionImpl struct {
 	lastTurnContextUsage *defs.TurnContextUsage
 	// selectedModel 是下一个 Turn 使用的选择：Run 开始时取 opt.Session.Model，SelectModel 时替换；只由事件循环读写。
 	selectedModel defs.ModelSelection
-	// lastTurnModel 是上一个普通 Turn 使用的模型：repairLatestTurn 从最近的 Turn 记录读出，每次启动普通 Turn 时更新；只压缩的 Turn 不更新。
+	// lastTurnModel 是上一个普通 Turn 使用的模型：openLatestTurn 从最近的 Turn 记录读出，每次启动普通 Turn 时更新；只压缩的 Turn 不更新。
 	lastTurnModel defs.ModelRef
-	// lastTurnExecutors 是上一个普通 Turn 开始时的 Executor 列表：repairLatestTurn 从最近的 Turn 记录读出，每次启动普通 Turn 时更新；只压缩的 Turn 不更新。
+	// lastTurnExecutors 是上一个普通 Turn 开始时的 Executor 列表：openLatestTurn 从最近的 Turn 记录读出，每次启动普通 Turn 时更新；只压缩的 Turn 不更新。
 	lastTurnExecutors []defs.TurnExecutor
 	// pendingHookStartSource 是还没交给 Turn 的 SessionStart 来源：Run 开始时取 opt.HookStartSource，交给第一个非压缩 Turn 后清空；只由事件循环读写。
 	pendingHookStartSource string
@@ -204,14 +203,15 @@ func NewSession(opt *SessionOpt) (Session, error) {
 		return nil, err
 	}
 	return &sessionImpl{
-		opt:             sessionOpt,
-		toolExecutor:    toolExecutor,
-		terminalManager: terminalManager,
-		requests:        make(chan sessionRequest),
-		turnEvents:      make(chan turnFinished),
-		runStarted:      make(chan struct{}, 1),
-		stopped:         make(chan struct{}),
-		acceptedInputs:  make(map[defs.InputID]defs.ItemID),
+		opt:              sessionOpt,
+		toolExecutor:     toolExecutor,
+		terminalManager:  terminalManager,
+		requests:         make(chan sessionRequest),
+		turnEvents:       make(chan turnFinished),
+		runStarted:       make(chan struct{}, 1),
+		stopped:          make(chan struct{}),
+		acceptedInputs:   make(map[defs.InputID]defs.ItemID),
+		queuedBatchSpans: make(map[defs.ItemID]telemetry.SpanRef),
 	}, nil
 }
 
@@ -221,7 +221,7 @@ func (s *sessionImpl) GetID() defs.SessionID {
 	return s.opt.Session.ID
 }
 
-// Run 修复最近的 Turn，启动后台命令管理，运行事件循环直到停止，再等全部任务结束。
+// Run 恢复最近的 Turn，启动后台命令管理，运行事件循环直到停止，再等全部任务结束。
 func (s *sessionImpl) Run(ctx context.Context, events chan<- SessionEvent) error {
 	// 1. 检查 events 和单次启动，登记返回时先关闭 stopped、再关闭 events；调用时 ctx 已取消则直接返回。
 	if events == nil {
@@ -257,7 +257,11 @@ func (s *sessionImpl) Run(ctx context.Context, events chan<- SessionEvent) error
 	s.turnOpt = *turnOpt
 	s.selectedModel = s.opt.Session.Model
 	s.pendingHookStartSource = s.opt.HookStartSource
-	if err := s.repairLatestTurn(ctx); err != nil {
+	if err := s.loadSessionCheckpoint(ctx); err != nil {
+		logSessionStopped(logger, err)
+		return err
+	}
+	if err := s.openLatestTurn(ctx, events); err != nil {
 		logSessionStopped(logger, err)
 		return err
 	}
@@ -284,23 +288,38 @@ func (s *sessionImpl) runEventLoop(ctx context.Context, events chan<- SessionEve
 				s.handleInputRequested(ctx, events, request)
 			case steerTakeRequested:
 				s.handleSteerTakeRequested(events, request)
+			case confirmInputHandoffRequested:
+				s.handleConfirmInputHandoffRequested(ctx, request)
 			case steerInputRequested:
-				s.handleSteerInputRequested(events, request)
+				s.handleSteerInputRequested(ctx, events, request)
 			case interruptTurnWithInputRequested:
-				s.handleInterruptTurnWithInputRequested(events, request)
+				s.handleInterruptTurnWithInputRequested(ctx, events, request)
 			case withdrawInputRequested:
-				s.handleWithdrawInputRequested(events, request)
+				s.handleWithdrawInputRequested(ctx, events, request)
+			case unreadSteerRequested:
+				request.reply <- cloneInputGroups(s.getUnreadSteerInputs())
 			case steerWaitRequested:
 				s.handleSteerWaitRequested(request)
 			case statusRequested:
 				request.reply <- s.getStatus()
 			case interruptRequested:
-				turnID := s.interruptActiveTurn()
-				// 根 Session 的活动 Turn 被中断后暂停 Agent 消息开新 Turn，消息照常排队。
-				if turnID != "" && s.opt.Session.ParentSessionID == "" {
-					s.isAgentMessagesPaused = true
+				turnID := s.activeTurnID
+				if turnID == "" {
+					request.reply <- interruptAccepted{}
+					break
 				}
-				request.reply <- turnID
+				next := cloneSessionCheckpoint(&s.checkpoint)
+				next.StopRequestedTurnID = turnID
+				if s.opt.Session.ParentSessionID == "" {
+					next.IsAgentMessagesPaused = true
+				}
+				if err := s.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
+					s.stop(fmt.Errorf("save stop request: %w", err))
+					request.reply <- interruptAccepted{turnID: turnID, err: fmt.Errorf("save stop request: %w", err)}
+					break
+				}
+				s.interruptActiveTurn()
+				request.reply <- interruptAccepted{turnID: turnID}
 			case compactRequested:
 				s.handleCompactRequested(ctx, events, request)
 			case modelSelectionRequested:
@@ -377,7 +396,7 @@ func (s *sessionImpl) IsTerminalBusy() bool {
 // InterruptTurn 请求取消活动 Turn，返回它的 TurnID，不等取消完成。
 func (s *sessionImpl) InterruptTurn(ctx context.Context) (defs.TurnID, error) {
 	// 1. 向事件循环提交取消请求；Session 已停止时返回空 TurnID。
-	reply := make(chan defs.TurnID, 1)
+	reply := make(chan interruptAccepted, 1)
 	err := s.sendRequest(ctx, interruptRequested{reply: reply})
 	if errors.Is(err, errSessionStopped) {
 		return "", nil
@@ -385,7 +404,8 @@ func (s *sessionImpl) InterruptTurn(ctx context.Context) (defs.TurnID, error) {
 	if err != nil {
 		return "", err
 	}
-	return <-reply, nil
+	accepted := <-reply
+	return accepted.turnID, accepted.err
 }
 
 // SteerInput 提交排队输入转补充请求并等待结果。
@@ -434,11 +454,15 @@ func (s *sessionImpl) WithdrawInput(ctx context.Context, itemID defs.ItemID) ([]
 func (s *sessionImpl) CompactContext(ctx context.Context) (defs.TurnID, error) {
 	// 1. 提交压缩请求，等事件循环回复是否接收。
 	reply := make(chan compactAccepted, 1)
-	if err := s.sendRequest(ctx, compactRequested{reply: reply}); err != nil {
+	if err := s.sendRequest(ctx, compactRequested{ctx: ctx, reply: reply}); err != nil {
 		return "", err
 	}
-	accepted := <-reply
-	return accepted.turnID, accepted.err
+	select {
+	case accepted := <-reply:
+		return accepted.turnID, accepted.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 // SelectModel 提交下一个 Turn 使用的模型选择。
@@ -477,6 +501,19 @@ func (s *sessionImpl) AppendContextItems(ctx context.Context, items []*defs.Item
 	return <-reply
 }
 
+// GetUnreadSteer 查询活动轮已收到的未读补充，不登记等待者。
+func (s *sessionImpl) GetUnreadSteer(ctx context.Context) ([]*defs.Item, error) {
+	// 1. 在 Session 循环里读取未借出的组。
+	reply := make(chan []*defs.Item, 1)
+	if err := s.sendRequest(ctx, unreadSteerRequested{reply: reply}); err != nil {
+		if errors.Is(err, errSessionStopped) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return <-reply, nil
+}
+
 // WaitSteer 等活动 Turn 的未读补充输入，返回副本。
 func (s *sessionImpl) WaitSteer(ctx context.Context) ([]*defs.Item, error) {
 	// 1. 提交等待请求；Session 已停止时返回空、不报错。
@@ -500,18 +537,23 @@ func (s *sessionImpl) WaitSteer(ctx context.Context) ([]*defs.Item, error) {
 // TakeSteer 由活动 Turn 调用，取走挂着的全部补充输入；finish 为 true 且没有输入时，之后的 steer 输入改为排队。
 func (s *sessionImpl) TakeSteer(ctx context.Context, turnID defs.TurnID, finish bool) ([][]*defs.Item, error) {
 	// 1. 把取输入请求交给事件循环，提交前调用方取消时返回错误。
-	reply := make(chan [][]*defs.Item, 1)
-	select {
-	case s.requests <- steerTakeRequested{
-		turnID: turnID,
-		finish: finish,
-		reply:  reply,
-	}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	reply := make(chan steerTaken, 1)
+	if err := s.sendRequest(ctx, steerTakeRequested{turnID: turnID, finish: finish, reply: reply}); err != nil {
+		return nil, err
 	}
-	// 2. 等事件循环交出补充输入；请求提交后不再因调用方取消放弃回复。
-	return <-reply, nil
+	// 2. 请求已提交时等待事件循环回复借出结果。
+	result := <-reply
+	return result.groups, result.err
+}
+
+// ConfirmInputHandoff 在输入组及其 hook 记录写成后清除对应待办。
+func (s *sessionImpl) ConfirmInputHandoff(ctx context.Context, turnID defs.TurnID, inputItemIDs []defs.ItemID) error {
+	// 1. 将已写成的输入组交给事件循环，提交后等待持久化确认。
+	reply := make(chan error, 1)
+	if err := s.sendRequest(ctx, confirmInputHandoffRequested{turnID: turnID, inputItemIDs: slices.Clone(inputItemIDs), reply: reply}); err != nil {
+		return err
+	}
+	return <-reply
 }
 
 // sendRequest 向事件循环提交请求。
@@ -538,15 +580,89 @@ func (s *sessionImpl) handleAppendContextItemsRequested(request appendContextIte
 	request.reply <- nil
 }
 
-// handleInputRequested 接收一条输入，按模式挂到活动 Turn 上或排队，空闲时开始下一个 Turn。
-func (s *sessionImpl) handleInputRequested(ctx context.Context, events chan<- SessionEvent, request inputRequested) {
-	// 1. 已开始停止或所选模型不在目录里时拒收，重复 InputID 返回首次接收的 ItemID，有活动 Turn 时拒收 idle_only。
-	if s.stopReason != nil {
-		request.reply <- inputAccepted{err: fmt.Errorf("session is stopping: %w", s.stopReason)}
+// loadSessionCheckpoint 读取 Session 待办并恢复运行期队列和 InputID 去重。
+func (s *sessionImpl) loadSessionCheckpoint(ctx context.Context) error {
+	// 1. 读取最新待办；没有记录时从空 checkpoint 开始。
+	checkpoint, err := s.opt.Query.GetSessionCheckpoint(ctx, s.opt.Session.ConversationID, s.opt.Session.ID)
+	if err != nil {
+		return fmt.Errorf("load Session checkpoint: %w", err)
+	}
+	if checkpoint == nil {
+		return nil
+	}
+	s.checkpoint = *checkpoint
+	for _, batches := range [][]defs.SessionInputBatch{checkpoint.PendingUserInputs, checkpoint.PendingAgentMessages} {
+		for _, batch := range batches {
+			for _, group := range batch {
+				if group.InputID != "" && len(group.Items) > 0 {
+					s.acceptedInputs[group.InputID] = group.Items[0].ID
+				}
+			}
+		}
+	}
+	if inputs := checkpoint.TurnInputs; inputs != nil {
+		if inputs.OpeningInput != nil && inputs.OpeningInput.InputID != "" {
+			s.acceptedInputs[inputs.OpeningInput.InputID] = inputs.OpeningInput.Items[0].ID
+		}
+		for _, group := range inputs.SteerInputs {
+			if group.InputID != "" {
+				s.acceptedInputs[group.InputID] = group.Items[0].ID
+			}
+		}
+	}
+	return nil
+}
+
+// appendSessionCheckpoint 保存下一份待办并在成功后替换内存记录。
+func (s *sessionImpl) appendSessionCheckpoint(ctx context.Context, checkpoint *defs.SessionCheckpoint) error {
+	// 1. 先追加完整待办，写成功后更新 Session 的 checkpoint。
+	if err := s.opt.Mutation.AppendSessionCheckpoint(ctx, s.opt.Session.ConversationID, s.opt.Session.ID, checkpoint); err != nil {
+		return err
+	}
+	s.checkpoint = *checkpoint
+	return nil
+}
+
+// handleConfirmInputHandoffRequested 清除已完整写入的输入组并持久化新的待办。
+func (s *sessionImpl) handleConfirmInputHandoffRequested(ctx context.Context, request confirmInputHandoffRequested) {
+	// 1. 在原轮待办中匹配已交接的开场组及已借出的补充组。
+	if request.turnID == "" || request.turnID != s.activeTurnID || s.checkpoint.TurnInputs == nil || s.checkpoint.TurnInputs.TurnID != request.turnID || len(request.inputItemIDs) == 0 {
+		request.reply <- errors.New("turn input handoff is no longer pending")
 		return
 	}
-	if err := s.validateSelectedModel(); err != nil {
-		request.reply <- inputAccepted{err: err}
+	next := cloneSessionCheckpoint(&s.checkpoint)
+	inputs := next.TurnInputs
+	for _, itemID := range request.inputItemIDs {
+		if inputs.OpeningInput != nil && inputs.OpeningInput.Items[0].ID == itemID {
+			inputs.OpeningInput = nil
+			continue
+		}
+		index := getInputGroupIndex(inputs.SteerInputs, itemID)
+		if _, borrowed := s.borrowedSteerIDs[itemID]; !borrowed || index < 0 {
+			request.reply <- fmt.Errorf("input %q is not borrowed by Turn %q", itemID, request.turnID)
+			return
+		}
+		inputs.SteerInputs = slices.Delete(inputs.SteerInputs, index, index+1)
+	}
+	// 2. 写成待办后清除已确认的借出标记。
+	if inputs.OpeningInput == nil && len(inputs.SteerInputs) == 0 {
+		next.TurnInputs = nil
+	}
+	if err := s.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
+		request.reply <- fmt.Errorf("confirm input handoff: %w", err)
+		return
+	}
+	for _, itemID := range request.inputItemIDs {
+		delete(s.borrowedSteerIDs, itemID)
+	}
+	request.reply <- nil
+}
+
+// handleInputRequested 接收一条输入，按模式挂到活动 Turn 上或排队，空闲时开始下一个 Turn。
+func (s *sessionImpl) handleInputRequested(ctx context.Context, events chan<- SessionEvent, request inputRequested) {
+	// 1. 已开始停止时拒收，重复 InputID 直接返回首次接收的 ItemID。
+	if s.stopReason != nil {
+		request.reply <- inputAccepted{err: fmt.Errorf("session is stopping: %w", s.stopReason)}
 		return
 	}
 	if request.inputID != "" {
@@ -555,11 +671,15 @@ func (s *sessionImpl) handleInputRequested(ctx context.Context, events chan<- Se
 			return
 		}
 	}
+	if err := s.validateSelectedModel(); err != nil {
+		request.reply <- inputAccepted{err: err}
+		return
+	}
 	if request.mode == SessionInputModeIdleOnly && s.activeTurnID != "" {
 		request.reply <- inputAccepted{err: ErrSessionBusy}
 		return
 	}
-	// 2. 解析用户选中的 Skill，读取正文附在消息后面组成一组，读取失败时拒收输入。
+	// 2. 读取点名的 Skill，组成可持久化的输入组；读取失败时不写待办。
 	selected, err := getInputSkills(request.item, s.opt.Skills, s.opt.Agent.Name)
 	if err != nil {
 		request.reply <- inputAccepted{err: err}
@@ -584,36 +704,48 @@ func (s *sessionImpl) handleInputRequested(ctx context.Context, events chan<- Se
 			},
 		})
 	}
-	// 3. 登记 InputID 并回复接收成功；用户输入让暂停的 Agent 消息恢复开新 Turn。
+	group := defs.SessionInputGroup{InputID: request.inputID, Items: items}
+	// 3. 先写新待办，再改变内存队列、回复成功和唤醒 Turn。
+	next := cloneSessionCheckpoint(&s.checkpoint)
+	isUser := isUserInputGroup(group)
+	isAgent := request.item.Message.From != nil && request.item.Message.From.Kind == defs.IdentityAgent
+	isSteer := request.mode == SessionInputModeSteer && s.acceptingSteer
+	isInterrupt := !isAgent && request.mode == SessionInputModeInterrupt
+	if isUser {
+		next.IsAgentMessagesPaused = false
+	}
+	switch {
+	case isSteer:
+		if next.TurnInputs == nil {
+			next.TurnInputs = &defs.SessionTurnInputs{TurnID: s.activeTurnID}
+		}
+		next.TurnInputs.SteerInputs = append(next.TurnInputs.SteerInputs, group)
+	case isInterrupt:
+		next.PendingUserInputs = append([]defs.SessionInputBatch{{group}}, next.PendingUserInputs...)
+		next.StopRequestedTurnID = s.activeTurnID
+	case !isAgent:
+		next.PendingUserInputs = append(next.PendingUserInputs, defs.SessionInputBatch{group})
+	default:
+		next.PendingAgentMessages = append(next.PendingAgentMessages, defs.SessionInputBatch{group})
+	}
+	if err := s.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
+		request.reply <- inputAccepted{err: fmt.Errorf("save input checkpoint: %w", err)}
+		return
+	}
+	// 4. 登记首次接收的 ID 和批次追踪信息，再回复并安排投递。
 	if request.inputID != "" {
 		s.acceptedInputs[request.inputID] = request.item.ID
+	}
+	if !isSteer {
+		s.queuedBatchSpans[request.item.ID] = request.parentSpan
 	}
 	request.reply <- inputAccepted{itemID: request.item.ID}
 	telemetry.GetLogger(ctx).Info("input accepted",
 		"openvaala.input.item_id", request.item.ID, "openvaala.input.id", request.inputID, "mode", request.mode)
-	if request.item.Message.From != nil && request.item.Message.From.Kind == defs.IdentityUser {
-		s.isAgentMessagesPaused = false
-	}
-	// 4. steer 输入遇到还在接收补充输入的活动 Turn 时挂上去，并唤醒 WaitSteer 的等待者。
-	if request.mode == SessionInputModeSteer && s.activeTurnID != "" && s.acceptingSteer {
-		s.activeSteer = append(s.activeSteer, items)
-		s.wakeSteerWaiters(s.activeSteer)
-		s.publishPendingInputs(events)
-		return
-	}
-	// 5. 其他输入按发送方排队；用户的 interrupt 插到用户队列最前并取消活动 Turn；最后尝试开始下一个 Turn。
-	input := inboxInput{
-		groups:     [][]*defs.Item{items},
-		parentSpan: request.parentSpan,
-	}
-	switch {
-	case request.item.Message.From != nil && request.item.Message.From.Kind == defs.IdentityAgent:
-		s.pendingAgentMessages = append(s.pendingAgentMessages, input)
-	case request.mode == SessionInputModeInterrupt:
-		s.pendingUserInputs = append([]inboxInput{input}, s.pendingUserInputs...)
+	if isSteer {
+		s.wakeSteerWaiters(s.getUnreadSteerInputs())
+	} else if isInterrupt {
 		s.interruptActiveTurn()
-	default:
-		s.pendingUserInputs = append(s.pendingUserInputs, input)
 	}
 	s.publishPendingInputs(events)
 	s.startNextTurn(ctx, events)
@@ -621,7 +753,7 @@ func (s *sessionImpl) handleInputRequested(ctx context.Context, events chan<- Se
 
 // handleCompactRequested 检查 Session 状态，空闲时启动只压缩的 Turn。
 func (s *sessionImpl) handleCompactRequested(ctx context.Context, events chan<- SessionEvent, request compactRequested) {
-	// 1. 已开始停止或所选模型不在目录里时回复错误；有活动 Turn 或排队的用户输入时回复 ErrSessionBusy，排队的 Agent 消息不算。
+	// 1. 已开始停止或所选模型不在目录里时回复错误；有活动 Turn 或排队的用户输入时回复 ErrSessionBusy。
 	if s.stopReason != nil {
 		request.reply <- compactAccepted{err: fmt.Errorf("session is stopping: %w", s.stopReason)}
 		return
@@ -630,12 +762,22 @@ func (s *sessionImpl) handleCompactRequested(ctx context.Context, events chan<- 
 		request.reply <- compactAccepted{err: err}
 		return
 	}
-	if s.activeTurnID != "" || len(s.pendingUserInputs) > 0 {
+	if s.activeTurnID != "" || len(s.checkpoint.PendingUserInputs) > 0 {
 		request.reply <- compactAccepted{err: ErrSessionBusy}
 		return
 	}
-	// 2. 启动只压缩的 Turn 并回复它的 ID。
-	request.reply <- compactAccepted{turnID: s.startTurn(ctx, events, nil, true)}
+	// 2. 启动只压缩的 Turn，等首条 running 写完再回复调用方。
+	if err := request.ctx.Err(); err != nil {
+		request.reply <- compactAccepted{err: err}
+		return
+	}
+	turnOpt := s.turnOpt
+	turnOpt.TurnID, turnOpt.IsCompactOnly = defs.NewTurnID(), true
+	if err := s.startTurn(ctx, events, turnOpt, telemetry.SpanRef{}); err != nil {
+		request.reply <- compactAccepted{err: err}
+		return
+	}
+	request.reply <- compactAccepted{turnID: turnOpt.TurnID}
 }
 
 // getInputSkills 解析用户消息里用斜杠指令选中的 Skill。
@@ -685,173 +827,274 @@ func getInputSkills(item *defs.Item, skills []*skill.Skill, agentName string) ([
 
 // handleSteerTakeRequested 交出活动 Turn 挂着的补充输入，按请求停止接收。
 func (s *sessionImpl) handleSteerTakeRequested(events chan<- SessionEvent, request steerTakeRequested) {
-	// 1. 确认请求来自活动 Turn，取出并清空挂着的补充输入。
-	if request.turnID != s.activeTurnID {
-		panic(fmt.Sprintf("Turn %q took steer while %q is active", request.turnID, s.activeTurnID))
+	// 1. 借出未读补充组的副本，待办归属保持不变。
+	if request.turnID == "" || request.turnID != s.activeTurnID {
+		request.reply <- steerTaken{err: errors.New("turn is no longer running")}
+		return
 	}
-	items := s.activeSteer
-	s.activeSteer = nil
-	// 2. finish 为 true 且没有输入时停止接收，再交出取出的输入组。
+	var items [][]*defs.Item
+	if s.stopReason == nil {
+		for _, group := range s.getUnreadSteerInputs() {
+			items = append(items, cloneInputItems(group.Items))
+			s.borrowedSteerIDs[group.Items[0].ID] = struct{}{}
+		}
+	}
+	// 2. 无补充且 Turn 请求收尾时停止接收。
 	if request.finish && len(items) == 0 {
 		s.acceptingSteer = false
 	}
 	s.publishPendingInputs(events)
-	request.reply <- items
+	request.reply <- steerTaken{groups: items}
 }
 
-// handleSteerWaitRequested 有可回复的就立即回复 WaitSteer，否则登记等待者。
+// handleSteerWaitRequested 有未读补充时回复副本，否则登记等待者。
 func (s *sessionImpl) handleSteerWaitRequested(request steerWaitRequested) {
-	// 1. 没有活动 Turn 或已有未读输入时立即回复副本，否则登记回复通道。
-	if s.activeTurnID == "" || len(s.activeSteer) > 0 {
-		request.reply <- cloneItems(s.activeSteer)
+	// 1. 已停止、无活动轮或有未读补充时立即回复。
+	groups := s.getUnreadSteerInputs()
+	if s.stopReason != nil || s.activeTurnID == "" || len(groups) > 0 {
+		request.reply <- cloneInputGroups(groups)
 		return
 	}
 	s.steerWaiters = append(s.steerWaiters, request.reply)
 }
 
-// handleTurnFinished 记下结束的 Turn，把没读到的补充输入放回队首，再尝试开始下一个 Turn。
+// getUnreadSteerInputs 取尚未借出的活动轮补充组。
+func (s *sessionImpl) getUnreadSteerInputs() defs.SessionInputBatch {
+	// 1. 从已分配待办中过滤借出的组。
+	inputs := s.checkpoint.TurnInputs
+	if s.stopReason != nil || inputs == nil || inputs.TurnID != s.activeTurnID {
+		return nil
+	}
+	var groups defs.SessionInputBatch
+	for _, group := range inputs.SteerInputs {
+		if _, borrowed := s.borrowedSteerIDs[group.Items[0].ID]; !borrowed {
+			groups = append(groups, group)
+		}
+	}
+	return groups
+}
+
+// handleTurnFinished 保存未交接补充的回队结果，再安排下一轮。
 func (s *sessionImpl) handleTurnFinished(ctx context.Context, events chan<- SessionEvent, finished turnFinished) {
-	// 1. 确认结束的是活动 Turn，记下它和终态，清空活动 Turn，以空结果唤醒 WaitSteer 的等待者。
+	// 1. 登记已结束的轮，释放运行状态和等待者。
 	if finished.turnID != s.activeTurnID {
 		panic(fmt.Sprintf("Turn %q finished while %q is active", finished.turnID, s.activeTurnID))
 	}
-	unreadSteer := s.activeSteer
 	s.lastTurnID = finished.turnID
 	s.lastTurnStatus = finished.status
 	s.lastTurnContextUsage = finished.contextUsage
-	s.cancelActiveTurn()
+	s.cancelActiveTurn(nil)
 	s.activeTurnID = ""
 	s.cancelActiveTurn = nil
-	s.activeSteer = nil
+	s.borrowedSteerIDs = nil
 	s.acceptingSteer = false
 	s.wakeSteerWaiters(nil)
 
-	// 2. 终态没保存时停止 Session；已开始停止时不再安排输入。
-	if errors.Is(finished.err, turn.ErrTurnUnsettled) {
+	// 2. 终态没保存或 Session 正在停止时不改变持久待办。
+	if errors.Is(finished.err, turn.ErrTurnUnsettled) || finished.status == "" && ctx.Err() == nil && s.stopReason == nil {
 		s.stop(finished.err)
 	}
-	if s.stopReason != nil {
+	if s.stopReason != nil || ctx.Err() != nil {
 		s.publishPendingInputs(events)
 		return
 	}
-	// 3. 没读到的补充输入按用户、Agent 分开，各合成一批放回对应队列的最前面，不带提交方 span。
-	var unreadUserGroups, unreadAgentGroups [][]*defs.Item
-	for _, group := range unreadSteer {
-		if from := group[0].Message.From; from != nil && from.Kind == defs.IdentityAgent {
-			unreadAgentGroups = append(unreadAgentGroups, group)
-			continue
+	// 3. 终态写成后，将未交接的补充按发送方各合一批放回队首，清除本轮归属和停止请求。
+	if inputs := s.checkpoint.TurnInputs; inputs != nil && inputs.TurnID == finished.turnID || s.checkpoint.StopRequestedTurnID == finished.turnID {
+		if err := s.requeueTurnInputs(ctx, cloneSessionCheckpoint(&s.checkpoint), finished.turnID); err != nil {
+			s.stop(err)
+			return
 		}
-		unreadUserGroups = append(unreadUserGroups, group)
 	}
-	if len(unreadUserGroups) > 0 {
-		s.pendingUserInputs = append([]inboxInput{{groups: unreadUserGroups}}, s.pendingUserInputs...)
-	}
-	if len(unreadAgentGroups) > 0 {
-		s.pendingAgentMessages = append([]inboxInput{{groups: unreadAgentGroups}}, s.pendingAgentMessages...)
-	}
-	// 4. 尝试开始下一个 Turn。
 	s.publishPendingInputs(events)
+	cp := &s.checkpoint
+	if !cp.IsAgentMessagesPaused && cp.TurnInputs == nil && cp.StopRequestedTurnID == "" && len(cp.PendingUserInputs) == 0 && len(cp.PendingAgentMessages) == 0 {
+		if err := s.opt.Mutation.DeleteSessionCheckpoints(ctx, s.opt.Session.ConversationID, s.opt.Session.ID); err != nil {
+			s.stop(err)
+		}
+		return
+	}
 	s.startNextTurn(ctx, events)
 }
 
-// startNextTurn 没有活动 Turn 时，从输入队列取一批输入开始下一个普通 Turn。
+// requeueTurnInputs 将已终结轮的剩余补充按发送方各合一批回队，清理原轮的归属和停止请求。
+func (s *sessionImpl) requeueTurnInputs(ctx context.Context, next *defs.SessionCheckpoint, turnID defs.TurnID) error {
+	// 1. 只移动该轮尚未交接的补充，不移动开场。
+	if inputs := next.TurnInputs; inputs != nil && inputs.TurnID == turnID {
+		var users, agents defs.SessionInputBatch
+		for _, group := range inputs.SteerInputs {
+			if from := group.Items[0].Message.From; from != nil && from.Kind == defs.IdentityAgent {
+				agents = append(agents, group)
+			} else {
+				users = append(users, group)
+			}
+		}
+		if len(users) > 0 {
+			next.PendingUserInputs = append([]defs.SessionInputBatch{users}, next.PendingUserInputs...)
+		}
+		if len(agents) > 0 {
+			next.PendingAgentMessages = append([]defs.SessionInputBatch{agents}, next.PendingAgentMessages...)
+		}
+		next.TurnInputs = nil
+	}
+	// 2. 一行写成新的归属及停止请求，保留根 Session 暂停状态。
+	if next.StopRequestedTurnID == turnID {
+		next.StopRequestedTurnID = ""
+	}
+	if err := s.appendSessionCheckpoint(ctx, next); err != nil {
+		return fmt.Errorf("clear completed Turn inputs: %w", err)
+	}
+	return nil
+}
+
+// startNextTurn 从队列分配输入组并启动普通 Turn。
 func (s *sessionImpl) startNextTurn(ctx context.Context, events chan<- SessionEvent) {
-	// 1. 有活动 Turn 时直接返回；否则先取用户队列的第一批，用户队列为空且 Agent 消息没暂停时把全部 Agent 消息合成一批。
-	if s.activeTurnID != "" {
+	// 1. 空闲时先选首批用户输入，其次选未暂停的所有 Agent 消息。
+	if s.stopReason != nil || ctx.Err() != nil || s.activeTurnID != "" || s.checkpoint.TurnInputs != nil {
 		return
 	}
-	var input inboxInput
+	var batches []defs.SessionInputBatch
+	next := cloneSessionCheckpoint(&s.checkpoint)
 	switch {
-	case len(s.pendingUserInputs) > 0:
-		input, s.pendingUserInputs = s.pendingUserInputs[0], s.pendingUserInputs[1:]
-	case len(s.pendingAgentMessages) > 0 && !s.isAgentMessagesPaused:
-		input.parentSpan = s.pendingAgentMessages[0].parentSpan
-		for _, message := range s.pendingAgentMessages {
-			input.groups = append(input.groups, message.groups...)
-		}
-		s.pendingAgentMessages = nil
+	case len(next.PendingUserInputs) > 0:
+		batches = next.PendingUserInputs[:1]
+		next.PendingUserInputs = next.PendingUserInputs[1:]
+	case len(next.PendingAgentMessages) > 0 && !next.IsAgentMessagesPaused:
+		batches = next.PendingAgentMessages
+		next.PendingAgentMessages = nil
 	default:
 		return
 	}
-	// 2. 用选出的这批输入启动普通 Turn。
-	s.startTurn(ctx, events, &input, false)
-}
-
-// startTurn 创建 Turn 并启动它的执行任务，返回 TurnID。
-func (s *sessionImpl) startTurn(ctx context.Context, events chan<- SessionEvent, input *inboxInput, isCompactOnly bool) defs.TurnID {
-	// 1. 分配 TurnID，填入所选模型、压缩模型，以及上个普通 Turn 的模型和 Executor。
+	// 2. 用一条记录把选中的组移到新轮，成功后启动 Turn。
+	groups := slices.Concat(batches...)
 	turnID := defs.NewTurnID()
+	next.TurnInputs = &defs.SessionTurnInputs{TurnID: turnID, OpeningInput: &groups[0], SteerInputs: groups[1:]}
+	if err := s.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
+		s.stop(fmt.Errorf("allocate Turn %q inputs: %w", turnID, err))
+		return
+	}
+	parentSpan := s.queuedBatchSpans[groups[0].Items[0].ID]
+	for _, batch := range batches {
+		delete(s.queuedBatchSpans, batch[0].Items[0].ID)
+	}
 	turnOpt := s.turnOpt
 	turnOpt.TurnID = turnID
-	model, reasoningEffort := s.getTurnModel()
-	turnOpt.Model = model
-	turnOpt.ReasoningEffort = reasoningEffort
-	turnOpt.CompactModel = defs.GetCompactModel(s.opt.Models, s.opt.Agent.CompactModel, model)
-	turnOpt.PreviousModel = s.lastTurnModel
-	turnOpt.PreviousContextUsage = s.lastTurnContextUsage
-	turnOpt.PreviousExecutors = s.lastTurnExecutors
-	turnOpt.IsCompactOnly = isCompactOnly
-	// 2. 普通 Turn 以这批的第一组为输入，更新上个普通 Turn 的模型和 Executor，取走待交出的 SessionStart 来源和注入 Item。
-	var turnInput []*defs.Item
-	var parentSpan telemetry.SpanRef
-	if !isCompactOnly {
-		s.lastTurnModel = model.Ref
-		s.lastTurnExecutors = executor.GetTurnExecutors(s.opt.Environments)
-		turnOpt.HookStartSource, s.pendingHookStartSource = s.pendingHookStartSource, ""
-		turnOpt.ContextItems, s.pendingContextItems = s.pendingContextItems, nil
-		turnInput = input.groups[0]
-		parentSpan = input.parentSpan
+	if err := s.startTurn(ctx, events, turnOpt, parentSpan); err != nil {
+		s.stop(err)
 	}
-	// 3. 创建 Turn，登记活动 Turn 和取消函数；只压缩的 Turn 不接收补充输入，普通 Turn 把这批其余各组挂成补充输入。
-	turnSelection := defs.ModelSelection{
-		Ref:             model.Ref,
-		ReasoningEffort: reasoningEffort,
+}
+
+// startTurn 装配并启动 Turn，登记活动轮并转发该轮事件。
+func (s *sessionImpl) startTurn(ctx context.Context, events chan<- SessionEvent, turnOpt turn.TurnOpt, parentSpan telemetry.SpanRef) error {
+	// 1. 恢复已有记录时只查原模型；尚未写 running 时才按 Session 的选择开轮。
+	turnID := turnOpt.TurnID
+	var turnResume turn.TurnResume
+	if turnOpt.Resume != nil {
+		turnResume = *turnOpt.Resume
+	}
+	var turnSelection defs.ModelSelection
+	if turnResume.Record != nil {
+		turnSelection = turnResume.Record.Model
+		turnOpt.Model = s.opt.Models[turnSelection.Ref]
+	} else {
+		var found bool
+		turnOpt.Model, turnSelection.ReasoningEffort, found = defs.GetSelectedModel(s.opt.Models, s.selectedModel, s.opt.Agent.Model)
+		if !found {
+			if !turnResume.StopRequested {
+				return s.validateSelectedModel()
+			}
+			turnSelection = s.selectedModel
+			if turnSelection.Ref == (defs.ModelRef{}) {
+				turnSelection.Ref = s.opt.Agent.Model
+			}
+			turnOpt.Model = &defs.ModelDefinition{Ref: turnSelection.Ref}
+		}
+		turnSelection.Ref = turnOpt.Model.Ref
+	}
+	turnOpt.ReasoningEffort = turnSelection.ReasoningEffort
+	if turnOpt.Model != nil {
+		turnOpt.CompactModel = defs.GetCompactModel(s.opt.Models, s.opt.Agent.CompactModel, turnOpt.Model)
+	} else {
+		turnOpt.CompactModel = s.opt.Models[s.opt.Agent.CompactModel]
+	}
+	turnOpt.PreviousModel, turnOpt.PreviousContextUsage, turnOpt.PreviousExecutors = s.lastTurnModel, s.lastTurnContextUsage, s.lastTurnExecutors
+	// 2. 普通轮只接收自己的开场；恢复已写 running 的旧轮不再注入启动 hook。
+	var turnInput []*defs.Item
+	if !turnOpt.IsCompactOnly {
+		if inputs := s.checkpoint.TurnInputs; inputs != nil && inputs.TurnID == turnID && inputs.OpeningInput != nil {
+			turnInput = inputs.OpeningInput.Items
+		}
+		s.lastTurnModel = turnSelection.Ref
+		if turnResume.Record == nil {
+			s.lastTurnExecutors = executor.GetTurnExecutors(s.opt.Environments)
+			turnOpt.HookStartSource = s.pendingHookStartSource
+			turnOpt.ContextItems, s.pendingContextItems = s.pendingContextItems, nil
+		}
+		s.pendingHookStartSource = ""
+	}
+	// 3. 启动 Turn；新手动轮首写失败时等 Turn 返回并停止 Session。
+	var runningReply chan error
+	if turnOpt.IsCompactOnly && turnResume.Record == nil {
+		runningReply = make(chan error, 1)
+		turnOpt.RunningReply = runningReply
 	}
 	turnInstance, err := turn.NewTurn(&turnOpt)
 	if err != nil {
-		panic(fmt.Sprintf("create Session Turn from validated options: %v", err))
+		return err
 	}
-	turnCtx, cancel := context.WithCancel(telemetry.ContextWithParentSpan(ctx, parentSpan))
-	s.activeTurnID = turnID
-	s.cancelActiveTurn = cancel
-	s.acceptingSteer = !isCompactOnly
-	if !isCompactOnly {
-		s.activeSteer = slices.Clone(input.groups[1:])
+	turnCtx, cancel := context.WithCancelCause(telemetry.ContextWithParentSpan(ctx, parentSpan))
+	turnEvents := make(chan turn.TurnEvent)
+	var result turn.TurnResult
+	var runErr error
+	var turnRun sync.WaitGroup
+	turnRun.Go(func() {
+		result, runErr = turnInstance.Run(turnCtx, turnInput, turnEvents)
+		close(turnEvents)
+	})
+	if runningReply != nil {
+		if err := <-runningReply; err != nil {
+			turnRun.Wait()
+			cancel(nil)
+			s.stop(runErr)
+			return err
+		}
 	}
 
-	s.publishPendingInputs(events)
-	// 4. 在执行任务里发出 SessionTurnStarted，运行 Turn 并按顺序转发它的事件，转发完发出 SessionTurnFinished，再把结果交回事件循环。
+	// 4. 登记活动轮，更新已分配或恢复轮的待办列表。
+	s.activeTurnID = turnID
+	s.cancelActiveTurn = cancel
+	s.acceptingSteer = !turnOpt.IsCompactOnly && !turnResume.StopRequested
+	if !turnOpt.IsCompactOnly {
+		s.borrowedSteerIDs = make(map[defs.ItemID]struct{})
+	}
+	if runningReply == nil {
+		s.publishPendingInputs(events)
+	}
+
+	// 5. 先发布启动，再转发 Turn 事件和结束结果。
 	s.tasks.Go(func() {
-		events <- &SessionTurnStarted{
-			TurnID: turnID,
-			Model:  turnSelection,
+		events <- &SessionTurnStarted{TurnID: turnID, Model: turnSelection}
+		for event := range turnEvents {
+			events <- newSessionEvent(turnID, event)
 		}
-		turnEvents := make(chan turn.TurnEvent)
-		var forwarding sync.WaitGroup
-		forwarding.Go(func() {
-			for event := range turnEvents {
-				events <- newSessionEvent(turnID, event)
+		turnRun.Wait()
+		if result.Status != "" {
+			events <- &SessionTurnFinished{
+				TurnID:           turnID,
+				InputItemIDs:     result.InputItemIDs,
+				Status:           result.Status,
+				Outputs:          result.Outputs,
+				FinalModelCallID: result.FinalModelCallID,
+				Err:              runErr,
 			}
-		})
-		result, err := turnInstance.Run(turnCtx, turnInput, turnEvents)
-		close(turnEvents)
-		forwarding.Wait()
-		events <- &SessionTurnFinished{
-			TurnID:           turnID,
-			InputItemIDs:     result.InputItemIDs,
-			Status:           result.Status,
-			Outputs:          result.Outputs,
-			FinalModelCallID: result.FinalModelCallID,
-			Err:              err,
 		}
 		s.turnEvents <- turnFinished{
 			turnID:       turnID,
 			status:       result.Status,
 			contextUsage: result.ContextUsage,
-			err:          err,
+			err:          runErr,
 		}
 	})
-	return turnID
+	return nil
 }
 
 // validateSelectedModel 检查 Session 所选模型在目录里，不在时返回让用户重新选择的错误。
@@ -866,34 +1109,21 @@ func (s *sessionImpl) validateSelectedModel() error {
 	return fmt.Errorf("model %s is not configured; choose another model", s.selectedModel.Ref)
 }
 
-// getTurnModel 返回当前选择的模型和推理强度。
-func (s *sessionImpl) getTurnModel() (*defs.ModelDefinition, string) {
-	// 1. 读取已校验的选择对应的模型和强度，目录里没有时 panic。
-	model, reasoningEffort, found := defs.GetSelectedModel(s.opt.Models, s.selectedModel, s.opt.Agent.Model)
-	if !found {
-		panic(fmt.Sprintf("selected model %s of Session %s is not in the model catalog", s.selectedModel.Ref, s.opt.Session.ID))
-	}
-	return model, reasoningEffort
-}
-
-// stop 记下停止原因，清空排队输入并取消活动 Turn。
+// stop 记下服务或持久化错误，停止调度并取消活动 Turn。
 func (s *sessionImpl) stop(err error) {
-	// 1. 合并停止原因，丢弃还没开始的输入，取消还在执行的 Turn。
+	// 1. 合并停止原因，保留已持久化的输入归属并取消还在执行的 Turn。
 	s.stopReason = errors.Join(s.stopReason, err)
-	s.pendingUserInputs = nil
-	s.pendingAgentMessages = nil
-	s.activeSteer = nil
 	s.acceptingSteer = false
 	if s.cancelActiveTurn != nil {
-		s.cancelActiveTurn()
+		s.cancelActiveTurn(err)
 	}
 }
 
 // wakeSteerWaiters 回复全部 WaitSteer 等待者并清空登记。
-func (s *sessionImpl) wakeSteerWaiters(items [][]*defs.Item) {
+func (s *sessionImpl) wakeSteerWaiters(items defs.SessionInputBatch) {
 	// 1. 给每个等待者回复一份未读输入的副本，再清空登记；items 为 nil 表示 Turn 已结束。
 	for _, waiter := range s.steerWaiters {
-		waiter <- cloneItems(items)
+		waiter <- cloneInputGroups(items)
 	}
 	s.steerWaiters = nil
 }
@@ -904,7 +1134,7 @@ func (s *sessionImpl) getStatus() SessionStatus {
 	status := SessionStatus{
 		State:                   SessionStateIdle,
 		ActiveTurnID:            s.activeTurnID,
-		PendingInputCount:       countInboxGroups(s.pendingUserInputs) + countInboxGroups(s.pendingAgentMessages),
+		PendingInputCount:       countInboxGroups(s.checkpoint.PendingUserInputs) + countInboxGroups(s.checkpoint.PendingAgentMessages),
 		PendingContextItemCount: len(s.pendingContextItems),
 		LastTurnID:              s.lastTurnID,
 		LastTurnStatus:          s.lastTurnStatus,
@@ -918,173 +1148,225 @@ func (s *sessionImpl) getStatus() SessionStatus {
 	return status
 }
 
-// interruptActiveTurn 取消活动 Turn，返回其 ID。
-func (s *sessionImpl) interruptActiveTurn() defs.TurnID {
-	// 1. 没有活动 Turn 时返回空，否则取消它并返回 ID；结束结果仍由 Turn 执行任务交回。
-	if s.activeTurnID == "" {
-		return ""
+// interruptActiveTurn 以用户停止原因取消活动轮并停止接收补充。
+func (s *sessionImpl) interruptActiveTurn() {
+	// 1. 只取消已登记的目标轮。
+	if s.cancelActiveTurn != nil {
+		s.acceptingSteer = false
+		s.cancelActiveTurn(turn.ErrTurnInterrupted)
 	}
-	s.cancelActiveTurn()
-	return s.activeTurnID
 }
 
-// repairLatestTurn 把上次没结束的最近 Turn 保存为 interrupted，再恢复最近 Turn 的状态、模型和 Executor。
-func (s *sessionImpl) repairLatestTurn(ctx context.Context) error {
-	// 1. 读取最近一条 Turn 记录，没有记录时直接返回。
-	page, err := s.opt.Query.ListTurns(ctx, dao.ListTurnsRequest{
-		SessionID: s.opt.Session.ID,
-		Order:     storage.Order{Direction: storage.DirectionDesc},
-		Limit:     1,
-	})
+// openLatestTurn 核对本 Session 的 metadata、输入归属和进度，优先启动原轮。
+func (s *sessionImpl) openLatestTurn(ctx context.Context, events chan<- SessionEvent) error {
+	// 1. 以 metadata 日志中的最近 Turn 为准，修复索引，恢复上轮状态。
+	conversationID, sessionID := s.opt.Session.ConversationID, s.opt.Session.ID
+	latest, err := s.opt.Query.GetLatestLoggedTurn(ctx, conversationID, sessionID)
 	if err != nil {
-		return fmt.Errorf("list latest Session Turn: %w", err)
+		return fmt.Errorf("read latest Session Turn: %w", err)
 	}
-	if len(page.Items) == 0 {
-		return nil
-	}
-	latest := page.Items[0]
-	// 2. 最近 Turn 还是 running 时，用日志尾部补全它的 Item 范围：尾部不属于它而记录里已有起始序号时返回错误，
-	// 起始序号为空时从尾部往前分页找它的第一条 Item。
-	if latest.Status == defs.TurnStatusRunning {
-		request := dao.ListItemsRequest{
-			ConversationID: s.opt.Session.ConversationID,
-			SessionID:      s.opt.Session.ID,
-			Order:          storage.DirectionDesc,
-			Limit:          1,
+	next := cloneSessionCheckpoint(&s.checkpoint)
+	turnOpt := s.turnOpt
+	if latest != nil {
+		if err := s.opt.Mutation.ReindexLoggedTurn(ctx, *latest); err != nil {
+			return err
 		}
-		tail, err := s.opt.Query.ListItems(ctx, request)
-		if err != nil {
-			return fmt.Errorf("recover Turn %q items: %w", latest.ID, err)
+		s.lastTurnID = latest.ID
+		s.lastTurnContextUsage = latest.ContextUsage
+		s.lastTurnModel = latest.Model.Ref
+		s.lastTurnExecutors = latest.Executors
+		if latest.Status != defs.TurnStatusRunning {
+			s.lastTurnStatus = latest.Status
 		}
-		if len(tail.Items) == 0 || tail.Items[0].Item.TurnID != latest.ID {
-			if latest.ItemsRange.FirstOrdinal != 0 {
-				return fmt.Errorf("recover Turn %q: declared item start has no matching tail", latest.ID)
+		// 2. 只读未完成轮，或已终结但仍留有该轮待办的日志尾部。
+		inputs := next.TurnInputs
+		if latest.Status == defs.TurnStatusRunning || inputs != nil && inputs.TurnID == latest.ID {
+			rows, err := turn.GetLoggedTurnItems(ctx, s.opt.Query, *latest)
+			if err != nil {
+				return err
 			}
-		} else {
-			latest.ItemsRange.LastOrdinal = uint64(tail.Items[0].Ordinal)
-			if latest.ItemsRange.FirstOrdinal == 0 {
-				latest.ItemsRange.FirstOrdinal = latest.ItemsRange.LastOrdinal
-				request.Cursor = tail.Items[0].Ordinal
-				request.Limit = 256
-				for request.Cursor != 0 {
-					page, err := s.opt.Query.ListItems(ctx, request)
-					if err != nil {
-						return fmt.Errorf("recover Turn %q item start: %w", latest.ID, err)
+			if inputs != nil && inputs.TurnID == latest.ID {
+				next.TurnInputs, err = getUnhandedTurnInputs(inputs, rows)
+				if err != nil {
+					return err
+				}
+				if latest.Status == defs.TurnStatusRunning && next.TurnInputs != inputs {
+					if err := s.appendSessionCheckpoint(ctx, next); err != nil {
+						return err
 					}
-					for _, logged := range page.Items {
-						if logged.Item.TurnID != latest.ID {
-							request.Cursor = 0
-							break
-						}
-						latest.ItemsRange.FirstOrdinal = uint64(logged.Ordinal)
-					}
-					if request.Cursor == 0 || page.Next == 0 {
-						break
-					}
-					request.Cursor = page.Next
+				}
+			}
+			if latest.Status == defs.TurnStatusRunning {
+				if inputs != nil && inputs.TurnID != latest.ID {
+					return fmt.Errorf("running Turn %q conflicts with allocated Turn %q", latest.ID, inputs.TurnID)
+				}
+				turnOpt.TurnID, turnOpt.IsCompactOnly = latest.ID, latest.IsCompactOnly
+				checkpoint, err := s.opt.Query.GetTurnCheckpoint(ctx, conversationID, sessionID, latest.ID)
+				if err != nil {
+					return err
+				}
+				turnOpt.Resume = &turn.TurnResume{
+					Record:     latest,
+					Checkpoint: checkpoint,
+					Items:      rows,
+				}
+				if checkpoint != nil && checkpoint.Request != nil && checkpoint.Request.Compaction != nil {
+					turnOpt.Resume.CompactModel = s.opt.Models[checkpoint.Request.Compaction.CompactModelRef]
 				}
 			}
 		}
-		// 3. 把这个 Turn 保存为 interrupted，保存失败时返回错误。
-		latest.Status = defs.TurnStatusInterrupted
-		latest.Error = "turn execution was interrupted"
-		if err := s.opt.Mutation.SetTurn(ctx, latest); err != nil {
-			return fmt.Errorf("interrupt latest Session Turn: %w", err)
+		if latest.Status != defs.TurnStatusRunning && (inputs != nil && inputs.TurnID == latest.ID || next.StopRequestedTurnID == latest.ID) {
+			if err := s.requeueTurnInputs(ctx, next, latest.ID); err != nil {
+				return err
+			}
 		}
 	}
-	// 4. 恢复最近 Turn 的状态、模型和 Executor 列表。
-	s.lastTurnID = latest.ID
-	s.lastTurnStatus = latest.Status
-	s.lastTurnContextUsage = latest.ContextUsage
-	s.lastTurnModel = latest.Model.Ref
-	s.lastTurnExecutors = latest.Executors
-	return nil
+	// 3. 已分配但未写 running 时沿用原 ID；没有原轮时按原队列规则开轮。
+	if turnOpt.TurnID == "" && next.TurnInputs != nil {
+		turnOpt.TurnID = next.TurnInputs.TurnID
+		checkpoint, err := s.opt.Query.GetTurnCheckpoint(ctx, conversationID, sessionID, turnOpt.TurnID)
+		if err != nil {
+			return err
+		}
+		if checkpoint != nil {
+			return fmt.Errorf("allocated Turn %q has progress without a running record", turnOpt.TurnID)
+		}
+		if next.TurnInputs.OpeningInput == nil && next.StopRequestedTurnID != turnOpt.TurnID {
+			return fmt.Errorf("allocated Turn %q has no opening input", turnOpt.TurnID)
+		}
+	}
+	if next.StopRequestedTurnID != "" && next.StopRequestedTurnID != turnOpt.TurnID {
+		return fmt.Errorf("stop request for Turn %q has no matching allocation or running record", next.StopRequestedTurnID)
+	}
+	if turnOpt.TurnID == "" {
+		s.startNextTurn(ctx, events)
+		return s.stopReason
+	}
+	if next.StopRequestedTurnID == turnOpt.TurnID {
+		if turnOpt.Resume == nil {
+			turnOpt.Resume = &turn.TurnResume{}
+		}
+		turnOpt.Resume.StopRequested = true
+	}
+	return s.startTurn(ctx, events, turnOpt, telemetry.SpanRef{})
 }
 
 // handleSteerInputRequested 将排队用户输入移到指定轮的补充尾部。
-func (s *sessionImpl) handleSteerInputRequested(events chan<- SessionEvent, request steerInputRequested) {
-	// 1. 检查指定轮仍接收补充，再取出排队用户输入。
+func (s *sessionImpl) handleSteerInputRequested(ctx context.Context, events chan<- SessionEvent, request steerInputRequested) {
+	// 1. 检查目标轮并在新待办中把普通队列组移入补充队列。
 	if request.turnID == "" || request.turnID != s.activeTurnID || !s.acceptingSteer {
 		request.reply <- errors.New("turn is no longer accepting input")
 		return
 	}
-	group, _ := s.takePendingUserGroup(request.itemID)
-	if group == nil {
+	next := cloneSessionCheckpoint(&s.checkpoint)
+	group, oldBatchID, newBatchID := takePendingUserGroup(next, request.itemID)
+	if group.Items == nil {
 		request.reply <- errors.New("input is no longer pending")
 		return
 	}
-	// 2. 完整组追加到补充尾部，唤醒等待者并发布列表。
-	s.activeSteer = append(s.activeSteer, group)
-	s.wakeSteerWaiters(s.activeSteer)
+	if next.TurnInputs == nil {
+		next.TurnInputs = &defs.SessionTurnInputs{TurnID: request.turnID}
+	}
+	next.TurnInputs.SteerInputs = append(next.TurnInputs.SteerInputs, group)
+	// 2. 记录写成后更新批次追踪信息并通知等待者。
+	if err := s.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
+		request.reply <- fmt.Errorf("save steered input: %w", err)
+		return
+	}
+	s.moveQueuedBatchSpan(oldBatchID, newBatchID)
+	s.wakeSteerWaiters(s.getUnreadSteerInputs())
 	s.publishPendingInputs(events)
 	request.reply <- nil
 }
 
 // handleInterruptTurnWithInputRequested 将选中输入与旧未读补充同批置顶并取消旧轮。
-func (s *sessionImpl) handleInterruptTurnWithInputRequested(events chan<- SessionEvent, request interruptTurnWithInputRequested) {
-	// 1. 检查指定轮仍在运行，再取出排队用户输入。
+func (s *sessionImpl) handleInterruptTurnWithInputRequested(ctx context.Context, events chan<- SessionEvent, request interruptTurnWithInputRequested) {
+	// 1. 检查指定轮次，在新待办中将选中输入及未借出的补充组同批置顶。
 	if request.turnID == "" || request.turnID != s.activeTurnID || s.stopReason != nil {
 		request.reply <- errors.New("turn is no longer running")
 		return
 	}
-	group, parentSpan := s.takePendingUserGroup(request.itemID)
-	if group == nil {
+	next := cloneSessionCheckpoint(&s.checkpoint)
+	group, oldBatchID, newBatchID := takePendingUserGroup(next, request.itemID)
+	if group.Items == nil {
 		request.reply <- errors.New("input is no longer pending")
 		return
 	}
-	// 2. 原序搬移全部未读补充，停止旧轮接收，将整批置顶并取消旧轮。
-	groups := append([][]*defs.Item{group}, s.activeSteer...)
-	s.activeSteer = nil
-	s.acceptingSteer = false
-	s.pendingUserInputs = append([]inboxInput{{
-		groups:     groups,
-		parentSpan: parentSpan,
-	}}, s.pendingUserInputs...)
-	s.cancelActiveTurn()
+	batch := defs.SessionInputBatch{group}
+	if inputs := next.TurnInputs; inputs != nil {
+		var borrowed defs.SessionInputBatch
+		for _, steer := range inputs.SteerInputs {
+			if _, found := s.borrowedSteerIDs[steer.Items[0].ID]; found {
+				borrowed = append(borrowed, steer)
+			} else {
+				batch = append(batch, steer)
+			}
+		}
+		inputs.SteerInputs = borrowed
+		if inputs.OpeningInput == nil && len(borrowed) == 0 {
+			next.TurnInputs = nil
+		}
+	}
+	next.PendingUserInputs = append([]defs.SessionInputBatch{batch}, next.PendingUserInputs...)
+	next.StopRequestedTurnID = request.turnID
+	// 2. 保存迁移和停止请求，成功后取消旧轮。
+	if err := s.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
+		request.reply <- fmt.Errorf("save interrupted input: %w", err)
+		return
+	}
+	parentSpan := s.queuedBatchSpans[oldBatchID]
+	s.moveQueuedBatchSpan(oldBatchID, newBatchID)
+	s.queuedBatchSpans[request.itemID] = parentSpan
+	s.interruptActiveTurn()
 	s.publishPendingInputs(events)
 	request.reply <- nil
 }
 
 // handleWithdrawInputRequested 原子取走普通排队或未读补充中的用户输入组。
-func (s *sessionImpl) handleWithdrawInputRequested(events chan<- SessionEvent, request withdrawInputRequested) {
-	// 1. 优先取普通排队组，未找到时从未读用户补充中取组。
-	group, _ := s.takePendingUserGroup(request.itemID)
-	if group == nil {
-		for index, steerGroup := range s.activeSteer {
-			if isUserInputGroup(steerGroup, request.itemID) {
-				group = steerGroup
-				s.activeSteer = slices.Delete(s.activeSteer, index, index+1)
-				break
+func (s *sessionImpl) handleWithdrawInputRequested(ctx context.Context, events chan<- SessionEvent, request withdrawInputRequested) {
+	// 1. 从新待办移除普通队列或未借出的补充组。
+	if s.stopReason != nil {
+		request.reply <- inputWithdrawn{err: fmt.Errorf("session is stopping: %w", s.stopReason)}
+		return
+	}
+	next := cloneSessionCheckpoint(&s.checkpoint)
+	group, oldBatchID, newBatchID := takePendingUserGroup(next, request.itemID)
+	if inputs := next.TurnInputs; group.Items == nil && inputs != nil && inputs.TurnID == s.activeTurnID {
+		index := getInputGroupIndex(inputs.SteerInputs, request.itemID)
+		if _, borrowed := s.borrowedSteerIDs[request.itemID]; !borrowed && index >= 0 && isUserInputGroup(inputs.SteerInputs[index]) {
+			group = inputs.SteerInputs[index]
+			inputs.SteerInputs = slices.Delete(inputs.SteerInputs, index, index+1)
+			if inputs.OpeningInput == nil && len(inputs.SteerInputs) == 0 {
+				next.TurnInputs = nil
 			}
 		}
 	}
-	if group == nil {
+	if group.Items == nil {
 		request.reply <- inputWithdrawn{err: errors.New("input is no longer pending")}
 		return
 	}
-	// 2. 发布移除后的列表并交出完整组。
+	// 2. 持久移除后发布待办并交还整组 Item。
+	if err := s.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
+		request.reply <- inputWithdrawn{err: fmt.Errorf("save withdrawn input: %w", err)}
+		return
+	}
+	s.moveQueuedBatchSpan(oldBatchID, newBatchID)
 	s.publishPendingInputs(events)
-	request.reply <- inputWithdrawn{items: group}
+	request.reply <- inputWithdrawn{items: group.Items}
 }
 
-// takePendingUserGroup 从等待新轮的批次中取走一个完整用户输入组。
-func (s *sessionImpl) takePendingUserGroup(itemID defs.ItemID) ([]*defs.Item, telemetry.SpanRef) {
-	// 1. 按批次和组顺序查找用户输入，移除后清掉空批次。
-	for inputIndex := range s.pendingUserInputs {
-		input := &s.pendingUserInputs[inputIndex]
-		for groupIndex, group := range input.groups {
-			if !isUserInputGroup(group, itemID) {
-				continue
-			}
-			parentSpan := input.parentSpan
-			input.groups = slices.Delete(input.groups, groupIndex, groupIndex+1)
-			if len(input.groups) == 0 {
-				s.pendingUserInputs = slices.Delete(s.pendingUserInputs, inputIndex, inputIndex+1)
-			}
-			return group, parentSpan
+// moveQueuedBatchSpan 将排队批次的追踪信息转到新组首，批次已空时清除。
+func (s *sessionImpl) moveQueuedBatchSpan(oldBatchID, newBatchID defs.ItemID) {
+	// 1. 只更新组首有变化的批次。
+	if oldBatchID == newBatchID {
+		return
+	}
+	if span, found := s.queuedBatchSpans[oldBatchID]; found {
+		delete(s.queuedBatchSpans, oldBatchID)
+		if newBatchID != "" {
+			s.queuedBatchSpans[newBatchID] = span
 		}
 	}
-	return nil, telemetry.SpanRef{}
 }
 
 // publishPendingInputs 发布未读补充及普通队列中的轻量用户列表。
@@ -1094,15 +1376,17 @@ func (s *sessionImpl) publishPendingInputs(events chan<- SessionEvent) {
 	if s.acceptingSteer {
 		pendingInputs.SteerTurnID = s.activeTurnID
 	}
-	for _, group := range s.activeSteer {
-		if isUserInputGroup(group, group[0].ID) {
-			pendingInputs.Inputs = append(pendingInputs.Inputs, newPendingInput(group[0], true))
+	for _, group := range s.getUnreadSteerInputs() {
+		if isUserInputGroup(group) {
+			pendingInputs.Inputs = append(pendingInputs.Inputs, newPendingInput(group.Items[0], true))
 		}
 	}
-	for _, input := range s.pendingUserInputs {
-		for _, group := range input.groups {
-			if isUserInputGroup(group, group[0].ID) {
-				pendingInputs.Inputs = append(pendingInputs.Inputs, newPendingInput(group[0], false))
+	if s.stopReason == nil {
+		for _, batch := range s.checkpoint.PendingUserInputs {
+			for _, group := range batch {
+				if isUserInputGroup(group) {
+					pendingInputs.Inputs = append(pendingInputs.Inputs, newPendingInput(group.Items[0], false))
+				}
 			}
 		}
 	}

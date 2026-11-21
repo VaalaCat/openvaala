@@ -816,35 +816,60 @@ func getE2EConversationDirectory(t *testing.T, config, threadID string) string {
 // startE2EServe 启动服务并返回带 token 的连接地址。
 func startE2EServe(t *testing.T, binary, config string) string {
 	t.Helper()
-	// 1. 运行 serve，轮询它写出的地址文件和 healthz；启动失败或超时则报告失败。
+	// 1. 启动 serve 并等待它写出可用的连接地址。
 	process, _ := startE2EProcess(t, binary, config, []string{"serve"}, false)
-	path := filepath.Join(filepath.Dir(config), ".local", "state", "openvaala", "runtime-server.yaml")
-	deadline := time.Now().Add(e2eTimeout)
+	server := process.waitServeHealthy(t, getE2EServerConnectionPath(config), nil, http.DefaultClient, 50*time.Millisecond)
+	return server.URL + "?token=" + url.QueryEscape(server.Token)
+}
+
+type e2eServerConnection struct {
+	URL   string `yaml:"url"`
+	Token string `yaml:"token"`
+}
+
+func getE2EServerConnectionPath(configPath string) string {
+	return filepath.Join(filepath.Dir(configPath), ".local", "state", "openvaala", "runtime-server.yaml")
+}
+
+// getE2EServerConnection 读取服务写出的 WebSocket 地址和 token。
+func getE2EServerConnection(path string) (e2eServerConnection, error) {
+	// 1. 读取并解析连接文件。
+	var server e2eServerConnection
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return server, err
+	}
+	err = yaml.Unmarshal(payload, &server)
+	return server, err
+}
+
+// waitServeHealthy 等待服务写出连接文件并通过 healthz；重启时只接受新文件。
+func (s *e2eProcess) waitServeHealthy(t *testing.T, path string, previousFile os.FileInfo, client *http.Client, interval time.Duration) e2eServerConnection {
+	t.Helper()
+	// 1. 轮询连接文件和健康检查，进程退出或超时时报告服务日志。
+	deadline := time.After(e2eTimeout)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
-		var server struct {
-			URL   string `yaml:"url"`
-			Token string `yaml:"token"`
-		}
-		if payload, err := os.ReadFile(path); err == nil && yaml.Unmarshal(payload, &server) == nil && server.URL != "" {
-			healthz, err := url.Parse(server.URL)
-			if err != nil {
-				t.Fatal(err)
-			}
-			healthz.Scheme, healthz.Path = "http", "/api/v1/healthz"
-			if response, err := http.Get(healthz.String()); err == nil {
-				_ = response.Body.Close()
-				if response.StatusCode == http.StatusOK {
-					return server.URL + "?token=" + url.QueryEscape(server.Token)
+		if info, err := os.Stat(path); err == nil && (previousFile == nil || !os.SameFile(info, previousFile)) {
+			if server, err := getE2EServerConnection(path); err == nil && server.URL != "" {
+				if address, err := url.Parse(server.URL); err == nil {
+					address.Scheme, address.Path = "http", "/api/v1/healthz"
+					if response, err := client.Get(address.String()); err == nil {
+						_ = response.Body.Close()
+						if response.StatusCode == http.StatusOK {
+							return server
+						}
+					}
 				}
 			}
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("serve did not start\n%s", process.stderr)
-		}
 		select {
-		case <-process.exited:
-			t.Fatalf("serve exited before serving: %v\n%s", process.exitErr, process.stderr)
-		case <-time.After(50 * time.Millisecond):
+		case <-s.exited:
+			t.Fatalf("serve PID %d exited before healthz: %v\n%s", s.command.Process.Pid, s.exitErr, s.stderr)
+		case <-deadline:
+			t.Fatalf("serve PID %d did not become healthy\n%s", s.command.Process.Pid, s.stderr)
+		case <-ticker.C:
 		}
 	}
 }
@@ -4741,7 +4766,7 @@ type codexWireRequest struct {
 	Params any    `json:"params,omitempty"`
 }
 
-// e2eProcess 是测试启动的一个 openvaala 子进程：app-server 或 acp。
+// e2eProcess 保存测试启动的子进程和退出结果。
 type e2eProcess struct {
 	command *exec.Cmd
 	stderr  *e2eOutput
@@ -4788,9 +4813,7 @@ func startE2EProcess(t *testing.T, binary, config string, arguments []string, is
 	process := &e2eProcess{
 		command: command,
 		stderr:  &e2eOutput{},
-		exited:  make(chan struct{}),
 	}
-	command.Stderr = process.stderr
 	var stdout *io.PipeReader
 	var stdoutWriter *io.PipeWriter
 	// 2. 标准流模式接上输入与输出管道，再启动进程。
@@ -4802,19 +4825,29 @@ func startE2EProcess(t *testing.T, binary, config string, arguments []string, is
 		stdout, stdoutWriter = io.Pipe()
 		command.Stdout = stdoutWriter
 	}
-	if err := command.Start(); err != nil {
+	// 3. 启动进程并登记测试清理。
+	process.start(t, stdoutWriter)
+	t.Cleanup(func() { process.stop(t) })
+	return process, stdout
+}
+
+// start 启动子进程并在后台收集退出结果。
+func (s *e2eProcess) start(t *testing.T, stdoutWriter *io.PipeWriter) {
+	t.Helper()
+	// 1. 设置 stderr 并启动命令。
+	s.exited = make(chan struct{})
+	s.command.Stderr = s.stderr
+	if err := s.command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	// 3. 后台等待退出，关闭输出管道和退出信号，登记测试清理。
+	// 2. 等待进程退出、关闭输出管道并发布退出结果。
 	go func() {
-		process.exitErr = command.Wait()
+		s.exitErr = s.command.Wait()
 		if stdoutWriter != nil {
 			_ = stdoutWriter.Close()
 		}
-		close(process.exited)
+		close(s.exited)
 	}()
-	t.Cleanup(func() { process.stop(t) })
-	return process, stdout
 }
 
 // startAppServer 启动 app-server 并返回第一条连接。
@@ -4926,15 +4959,8 @@ func (c *codexConnections) open(t *testing.T) *codexWire {
 func newE2ERuntimeClient(t *testing.T, config string) (runtimeclient.Client, func()) {
 	t.Helper()
 	// 1. 读取已运行服务的地址与 token，创建客户端。
-	payload, err := os.ReadFile(filepath.Join(filepath.Dir(config), ".local", "state", "openvaala", "runtime-server.yaml"))
+	server, err := getE2EServerConnection(getE2EServerConnectionPath(config))
 	if err != nil {
-		t.Fatal(err)
-	}
-	var server struct {
-		URL   string `yaml:"url"`
-		Token string `yaml:"token"`
-	}
-	if err := yaml.Unmarshal(payload, &server); err != nil {
 		t.Fatal(err)
 	}
 	client, err := runtimeclient.NewClient(runtimeclient.NewClientOpt(server.URL, server.Token))

@@ -30,6 +30,47 @@ func TestRuntimeSessionSubscription(t *testing.T) {
 		run  func(t *testing.T, h *runtimeHarness)
 	}{
 		{
+			name: "history_and_streaming_snapshot",
+			run: func(t *testing.T, h *runtimeHarness) {
+				conv := h.create(t)
+				watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+				h.runRootTurn(t, conv, watcher, "first", runtimeModelResponse{chunks: []string{"saved"}})
+				h.submit(t, conv.ID, "second", "")
+				release := make(chan struct{})
+				h.model.receive(t).reply <- runtimeModelResponse{chunks: []string{"stream", "ed"}, release: release}
+				collectUntil(t, watcher.Events, isMessageDelta)
+				late := h.subscribeSession(t, conv.ID, conv.RootSessionID)
+				if late.LastSavedOrdinal != 3 || len(late.StreamingItems) != 1 {
+					t.Fatalf("snapshot = %+v", late)
+				}
+				history := h.listRootItems(t, conv)
+				if len(history) != 3 {
+					t.Fatalf("history length = %d", len(history))
+				}
+				text := messageText(late.StreamingItems[0].Item)
+				close(release)
+				for _, event := range collectUntil(t, late.Events, isTurnFinished) {
+					switch value := getSessionEvent(event).(type) {
+					case *session.SessionAgentEvent:
+						if value.Event.Type == agent.AgentEventItemDelta {
+							text += value.Event.Delta.Text
+						}
+					case *session.SessionItemsSaved:
+						history = append(history, value.Items...)
+					}
+				}
+				final := h.listRootItems(t, conv)
+				if text != "streamed" || len(history) != len(final) {
+					t.Fatalf("stream = %q, items = %d/%d", text, len(history), len(final))
+				}
+				for index := range final {
+					if history[index].Ordinal != final[index].Ordinal || history[index].Item.ID != final[index].Item.ID {
+						t.Fatal("history and stream differ from persisted items")
+					}
+				}
+			},
+		},
+		{
 			name: "snapshot_mid_generation",
 			run: func(t *testing.T, h *runtimeHarness) {
 				conv := h.create(t)

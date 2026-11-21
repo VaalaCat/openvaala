@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
@@ -61,7 +62,7 @@ const (
 // SessionStatus 是查询时 Session 的执行状态和最近 Turn。
 type SessionStatus struct {
 	State SessionState `json:"state"`
-	// ActiveTurnID 是活动 Turn，没有时为空。
+	// ActiveTurnID 是活动 Turn，没有活动轮次时为空。
 	ActiveTurnID defs.TurnID `json:"active_turn_id,omitempty"`
 	// PendingInputCount 是排队等新 Turn 的输入条数，用户输入和 Agent 消息都算。
 	PendingInputCount int `json:"pending_input_count"`
@@ -107,7 +108,7 @@ type SessionAgentEvent struct {
 
 func (*SessionAgentEvent) isSessionEvent() {}
 
-// SessionTurnStarted 由 Turn 执行任务在调用 Turn.Run 之前发出；同一 Turn 的其他事件都在它之后。
+// SessionTurnStarted 由 Turn 执行任务在普通轮分配后或手动压缩轮首条 running 写成后发出；同一 Turn 的其他事件都在它之后。
 type SessionTurnStarted struct {
 	TurnID defs.TurnID
 	// Model 是本 Turn 使用的模型和推理强度。
@@ -134,7 +135,7 @@ type SessionHookRunEvent struct {
 
 func (*SessionHookRunEvent) isSessionEvent() {}
 
-// SessionTurnFinished 由 Turn 执行任务在 Turn.Run 返回（终态已尽力写库）后发出；正常结束、失败、被中断都会发。
+// SessionTurnFinished 由 Turn 执行任务在 Turn 终态保存成功后发出；正常结束、失败、被中断都会发。
 type SessionTurnFinished struct {
 	TurnID defs.TurnID
 	// InputItemIDs 是本轮读入的全部输入，包括补充输入。
@@ -150,18 +151,6 @@ type SessionTurnFinished struct {
 }
 
 func (*SessionTurnFinished) isSessionEvent() {}
-
-// ── Session 收件箱 ──
-
-// inboxInput 保存等待新 Turn 的输入组和提交时的追踪信息。
-type inboxInput struct {
-	// groups 每组是一条消息及它选中的 skill 说明：第一组作为 Turn 的输入，其余各组开 Turn 时挂成补充输入，
-	// 在第一次请求模型前一起读入。例如中断后没读到的两条用户 steer 是一批，一起开一轮。
-	groups [][]*defs.Item
-	// parentSpan 是这一批第一条输入提交时 ctx 里的 span，开 Turn 时作为 invoke_agent span 的父 span。
-	// 放回队列的补充输入没有记下 span，为零值；Agent 消息合批时取队首一批的。
-	parentSpan telemetry.SpanRef
-}
 
 // ── Session 事件循环请求 ──
 
@@ -223,10 +212,38 @@ type steerTakeRequested struct {
 	turnID defs.TurnID
 	// finish 是否在没有补充输入时停止接收？停止后 steer 输入改为排队。
 	finish bool
-	reply  chan [][]*defs.Item
+	reply  chan steerTaken
 }
 
 func (steerTakeRequested) isSessionRequest() {}
+
+// steerTaken 是借出补充输入的结果。
+type steerTaken struct {
+	// groups 按原顺序保存借出的组，未借到时为空。
+	groups [][]*defs.Item
+	// err 是目标轮已不再活动时的错误，成功时为空。
+	err error
+}
+
+// confirmInputHandoffRequested 由 Turn 在输入组及其 hook 记录写成后请求清除对应待办。
+type confirmInputHandoffRequested struct {
+	// turnID 是写入输入组的轮次。
+	turnID defs.TurnID
+	// inputItemIDs 是已完整写入的组首 Item ID。
+	inputItemIDs []defs.ItemID
+	// reply 接收持久化结果，成功时为 nil。
+	reply chan error
+}
+
+func (confirmInputHandoffRequested) isSessionRequest() {}
+
+// unreadSteerRequested 由协作等待查询调用方已收到的未读补充。
+type unreadSteerRequested struct {
+	// reply 接收当前未借出的补充副本，无补充时为空。
+	reply chan []*defs.Item
+}
+
+func (unreadSteerRequested) isSessionRequest() {}
 
 // steerWaitRequested 由 WaitSteer 在等活动 Turn 挂上补充输入时交给事件循环。
 type steerWaitRequested struct{ reply chan []*defs.Item }
@@ -239,19 +256,34 @@ type statusRequested struct{ reply chan SessionStatus }
 func (statusRequested) isSessionRequest() {}
 
 // interruptRequested 由 InterruptTurn 在请求取消活动 Turn 时交给事件循环。
-type interruptRequested struct{ reply chan defs.TurnID }
+type interruptRequested struct{ reply chan interruptAccepted }
 
 func (interruptRequested) isSessionRequest() {}
 
+// interruptAccepted 是停止请求的持久化结果。
+type interruptAccepted struct {
+	// turnID 是被请求停止的轮次，没有活动轮时为空。
+	turnID defs.TurnID
+	// err 是停止请求的写入错误，成功时为空。
+	err error
+}
+
 // compactRequested 由 CompactContext 在请求手动压缩上下文时交给事件循环。
-type compactRequested struct{ reply chan compactAccepted }
+type compactRequested struct {
+	// ctx 是调用方等待接收命令的上下文。
+	ctx context.Context
+	// reply 接收事件循环安排手动压缩的结果。
+	reply chan compactAccepted
+}
 
 func (compactRequested) isSessionRequest() {}
 
 // compactAccepted 是事件循环对一次手动压缩请求的回复：turnID 是已启动的只压缩 Turn；Session 忙、已开始停止或模型不在目录里时 err 非 nil。
 type compactAccepted struct {
+	// turnID 是已写成首条 running 的手动压缩轮次；失败时为空。
 	turnID defs.TurnID
-	err    error
+	// err 是拒绝启动或首条 running 写入失败的错误；成功时为空。
+	err error
 }
 
 // modelSelectionRequested 由 SelectModel 在替换下一个 Turn 的模型时交给事件循环。

@@ -17,20 +17,23 @@ import (
 	"github.com/sourcegraph/conc/pool"
 )
 
-// ToolExecutor 是一个 Session 的工具表：列出本轮工具，按工具名和 executor 参数找到工具对象，跑完 hook 后执行。
+// ToolExecutor 是一个 Session 的工具表：列出本轮工具，整批完成路由和前置 hook 准备，再单次执行工具调用。
 type ToolExecutor interface {
 	// GetTools 建出本轮工具表并存下，返回交给模型的工具定义；多个环境提供的工具带 executor 参数。返回内容由调用方持有。
 	GetTools(ctx context.Context) ([]*defs.ToolDefinition, error)
-	// Run 并发执行本批调用，按完成顺序发送 *ExecutionProgressEvent、*ExecutionHookRunEvent 与每个调用一次 *ExecutionFinishedEvent，
-	// 全部结束后关闭 events。调用方读取 events 到关闭；调用 Item 克隆后才交给工具。
-	Run(ctx context.Context, calls []*defs.Item, events chan<- ExecutorEvent)
+	// PrepareCalls 为整批调用选择提供方并运行 PreToolUse hook，发送准备阶段的 *ExecutionHookRunEvent 与已结束调用的 *ExecutionFinishedEvent，
+	// 返回与输入同顺序、同数量的准备结果；不关闭 events。
+	PrepareCalls(ctx context.Context, calls []*defs.Item, events chan<- ExecutorEvent) []*PreparedToolCall
+	// Run 执行一次已准备的工具调用，发送 *ExecutionProgressEvent、后置 *ExecutionHookRunEvent 与 *ExecutionFinishedEvent；
+	// call.Finished 非 nil 时直接返回，不关闭 events。
+	Run(ctx context.Context, call *PreparedToolCall, events chan<- ExecutorEvent)
 }
 
 // toolExecutorImpl 一个 Session 一个实例；执行环境由 Conversation 持有，各 Session 共用。
 type toolExecutorImpl struct {
 	opt *ToolExecutorOpt
-	// turnToolRoutes 是最近一次 GetTools 建出的工具表，Run 直接按它分发；
-	// 没调过 GetTools 时为 nil，Run 现建一次并存下。
+	// turnToolRoutes 是最近一次 GetTools 建出的工具表，PrepareCalls 直接按它分发；
+	// 没调过 GetTools 时为 nil，PrepareCalls 现建一次并存下。
 	turnToolRoutes atomic.Pointer[toolRoutes]
 }
 
@@ -112,39 +115,54 @@ func (e *toolExecutorImpl) GetTools(ctx context.Context) ([]*defs.ToolDefinition
 	return routes.getDefinitions()
 }
 
-// Run 分配本批调用，运行前置 hook，再并发执行放行的工具。
-func (e *toolExecutorImpl) Run(ctx context.Context, calls []*defs.Item, events chan<- ExecutorEvent) {
-	// 1. 取得本轮工具表，失败时给每个调用发送错误结果，返回时关闭 events。
-	defer close(events)
+// PrepareCalls 为整批调用选择提供方并运行前置 hook，返回与输入同顺序的准备结果。
+func (e *toolExecutorImpl) PrepareCalls(ctx context.Context, calls []*defs.Item, events chan<- ExecutorEvent) []*PreparedToolCall {
+	// 1. 取得本轮工具表，失败时给每个调用发送错误结果并记入准备项。
+	preparedCalls := make([]*PreparedToolCall, len(calls))
 	routes, err := e.getTurnToolRoutes(ctx)
 	if err != nil {
-		for _, call := range calls {
+		for index, call := range calls {
 			logUndispatchedCall(ctx, call, "executor_unavailable", "error", err)
-			events <- &ExecutionFinishedEvent{Result: newToolErrorResult(call.ToolCall.CallID, "executor_unavailable", err)}
+			finished := &ExecutionFinishedEvent{Result: newToolErrorResult(call.ToolCall.CallID, "executor_unavailable", err)}
+			events <- finished
+			preparedCalls[index] = &PreparedToolCall{
+				Call:     call.Clone(),
+				Finished: finished,
+			}
 		}
-		return
+		return preparedCalls
 	}
-	// 2. 为调用选择提供方，无法分发的调用直接发送错误结果。
-	var routedCalls []*routedToolCall
-	for _, call := range calls {
+	// 2. 为调用选择提供方，无法分发的调用直接发送错误结果并记入准备项。
+	for index, call := range calls {
 		provider, routedCall, failedResult := routes.routeCall(call)
 		if failedResult != nil {
 			logUndispatchedCall(ctx, call, failedResult.Error.Code)
-			events <- &ExecutionFinishedEvent{Result: failedResult}
+			finished := &ExecutionFinishedEvent{Result: failedResult}
+			events <- finished
+			preparedCalls[index] = &PreparedToolCall{
+				Call:     call.Clone(),
+				Finished: finished,
+			}
 			continue
 		}
-		routedCalls = append(routedCalls, &routedToolCall{
-			call:     routedCall,
+		preparedCalls[index] = &PreparedToolCall{
+			Call:     routedCall,
 			provider: provider,
-		})
+		}
 	}
-	// 3. 等前置 hook 全部结束，再并发执行放行的调用并等待完成。
-	e.runPreToolUseHooks(ctx, routedCalls, events)
-	tasks := pool.New()
-	for _, routed := range e.applyPreToolUseOutcomes(ctx, routedCalls, events) {
-		tasks.Go(func() { e.executeCall(ctx, routed, events) })
+	// 3. 等前置 hook 全部结束，应用拦截、停止和改写参数后返回准备结果。
+	preOutcomes := e.runPreToolUseHooks(ctx, preparedCalls, events)
+	e.applyPreToolUseOutcomes(ctx, preparedCalls, preOutcomes, events)
+	return preparedCalls
+}
+
+// Run 执行一次已准备的工具调用。
+func (e *toolExecutorImpl) Run(ctx context.Context, call *PreparedToolCall, events chan<- ExecutorEvent) {
+	// 1. 准备阶段已结束的调用直接返回，其余调用执行工具并发送结果。
+	if call == nil || call.Finished != nil {
+		return
 	}
-	tasks.Wait()
+	e.executeCall(ctx, call, events)
 }
 
 // buildToolRoutes 汇总协作工具、环境工具、环境 MCP 工具和客户端 MCP 工具，建立本轮工具表。
@@ -315,7 +333,7 @@ func (r *toolRoutes) routeCall(call *defs.Item) (toolProvider, *defs.Item, *defs
 		return toolProvider{}, nil, newToolErrorResult(callID, "tool_not_found", fmt.Errorf("tool %q is not available", call.ToolCall.Name))
 	}
 	if route.providers[0].environment == nil {
-		return route.providers[0], call, nil
+		return route.providers[0], call.Clone(), nil
 	}
 	// 2. 取出 executor，省略时用第一个提供方；环境没配置或不提供这个工具时返回 invalid_arguments。
 	executorID, arguments, err := takeExecutorArgument(call.ToolCall.Arguments)
@@ -354,77 +372,83 @@ func (e *toolExecutorImpl) getHookEnvironment(provider toolProvider) ExecutionEn
 }
 
 // isHooked 这次调用是否配置了 hook，且有环境运行 hook？
-func (e *toolExecutorImpl) isHooked(routed *routedToolCall) bool {
+func (e *toolExecutorImpl) isHooked(prepared *PreparedToolCall) bool {
 	// 1. 检查 Hooks 和运行 hook 的环境。
-	return e.opt.Hooks != nil && e.getHookEnvironment(routed.provider) != nil
+	return e.opt.Hooks != nil && e.getHookEnvironment(prepared.provider) != nil
 }
 
-// runPreToolUseHooks 并发运行前置 hook，并保存各调用的合并结果。
-func (e *toolExecutorImpl) runPreToolUseHooks(ctx context.Context, routedCalls []*routedToolCall, events chan<- ExecutorEvent) {
-	// 1. 为有 hook 的调用并发触发 PreToolUse，等待全部结束。
+// runPreToolUseHooks 并发运行前置 hook，并返回与 preparedCalls 位置对应的合并结果。
+func (e *toolExecutorImpl) runPreToolUseHooks(ctx context.Context, preparedCalls []*PreparedToolCall, events chan<- ExecutorEvent) []*hook.HookOutcome {
+	// 1. 为未提前结束且配置了 hook 的调用并发触发 PreToolUse，等待全部结束。
+	preOutcomes := make([]*hook.HookOutcome, len(preparedCalls))
 	tasks := pool.New()
-	for _, routed := range routedCalls {
-		if !e.isHooked(routed) {
+	for index, prepared := range preparedCalls {
+		if prepared.Finished != nil || !e.isHooked(prepared) {
 			continue
 		}
 		tasks.Go(func() {
-			routed.preOutcome = e.runToolHookEvent(ctx, e.getHookEnvironment(routed.provider), &hook.HookEvent{
+			preOutcomes[index] = e.runToolHookEvent(ctx, e.getHookEnvironment(prepared.provider), &hook.HookEvent{
 				Name:     defs.HookEventPreToolUse,
 				Session:  e.opt.Session,
-				TurnID:   routed.call.TurnID,
-				ToolCall: routed.call.ToolCall,
+				TurnID:   prepared.Call.TurnID,
+				ToolCall: prepared.Call.ToolCall,
 			}, events)
 		})
 	}
 	tasks.Wait()
+	return preOutcomes
 }
 
-// applyPreToolUseOutcomes 处理前置 hook 的结果，返回放行的调用。
-func (e *toolExecutorImpl) applyPreToolUseOutcomes(ctx context.Context, routedCalls []*routedToolCall, events chan<- ExecutorEvent) []*routedToolCall {
-	// 1. 逐个处理调用：拦截或停止时发送错误结果，放行时应用改写参数。
-	var dispatchedCalls []*routedToolCall
-	for _, routed := range routedCalls {
-		if !e.isHooked(routed) {
-			dispatchedCalls = append(dispatchedCalls, routed)
+// applyPreToolUseOutcomes 处理前置 hook 的结果，写回已结束结果或改写后的调用参数。
+func (e *toolExecutorImpl) applyPreToolUseOutcomes(
+	ctx context.Context,
+	preparedCalls []*PreparedToolCall,
+	preOutcomes []*hook.HookOutcome,
+	events chan<- ExecutorEvent,
+) {
+	// 1. 逐个处理调用：拦截或停止时记录并发送错误结果，放行时应用改写参数与前置运行记录。
+	for index, prepared := range preparedCalls {
+		if prepared.Finished != nil || !e.isHooked(prepared) {
 			continue
 		}
-		outcome := routed.preOutcome
+		outcome := preOutcomes[index]
 		var errorCode, message string
 		switch {
 		case outcome.IsBlocked:
 			errorCode, message = "hook_blocked", "blocked by PreToolUse hook: "+outcome.BlockReason
 		case outcome.IsTurnStopped && outcome.StopReason == "":
-			errorCode, message = "hook_stopped", "turn stopped by hook"
+			errorCode, message = defs.ToolErrorHookStopped, "turn stopped by hook"
 		case outcome.IsTurnStopped:
-			errorCode, message = "hook_stopped", "turn stopped by hook: "+outcome.StopReason
+			errorCode, message = defs.ToolErrorHookStopped, "turn stopped by hook: "+outcome.StopReason
 		default:
 			if outcome.UpdatedToolArguments != "" {
-				routed.call = routed.call.Clone()
-				routed.call.ToolCall.Arguments = outcome.UpdatedToolArguments
+				prepared.Call = prepared.Call.Clone()
+				prepared.Call.ToolCall.Arguments = outcome.UpdatedToolArguments
 			}
-			dispatchedCalls = append(dispatchedCalls, routed)
+			prepared.preRuns = outcome.SavedRuns
 			continue
 		}
-		logUndispatchedCall(ctx, routed.call, errorCode)
-		events <- &ExecutionFinishedEvent{
-			Result:   newToolErrorResult(routed.call.ToolCall.CallID, errorCode, errors.New(message)),
+		logUndispatchedCall(ctx, prepared.Call, errorCode)
+		finished := &ExecutionFinishedEvent{
+			Result:   newToolErrorResult(prepared.Call.ToolCall.CallID, errorCode, errors.New(message)),
 			HookRuns: outcome.SavedRuns,
 		}
+		prepared.Finished = finished
+		events <- finished
 	}
-	return dispatchedCalls
 }
 
 // executeCall 执行放行的工具，汇集进度、规则和 hook 记录后发送最终结果。
-func (e *toolExecutorImpl) executeCall(ctx context.Context, routed *routedToolCall, events chan<- ExecutorEvent) {
+func (e *toolExecutorImpl) executeCall(ctx context.Context, prepared *PreparedToolCall, events chan<- ExecutorEvent) {
 	// 1. 补充提供方的 executor ID，启动工具遥测并按配置记录参数。
-	call := routed.call
-	if executorID := routed.provider.executorID; executorID != "" {
+	call := prepared.Call
+	if executorID := prepared.provider.executorID; executorID != "" {
 		ctx = telemetry.ContextWithAttrs(ctx, telemetry.ExecutorID(executorID))
 	}
 	toolCtx, recorder := telemetry.StartExecuteTool(ctx, telemetry.ExecuteToolStart{
 		Name:        call.ToolCall.Name,
 		CallID:      call.ToolCall.CallID,
-		Description: routed.provider.tool.GetDefinition().Description,
+		Description: prepared.provider.tool.GetDefinition().Description,
 	})
 	if recorder.IsContentCaptured() {
 		recorder.RecordArguments(telemetry.DecodeJSONContent([]byte(call.ToolCall.Arguments)))
@@ -437,7 +461,7 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, routed *routedToolCa
 			events <- event
 		}
 	})
-	result := routed.provider.tool.Execute(toolCtx, call.Clone(), progress)
+	result := prepared.provider.tool.Execute(toolCtx, call.Clone(), progress)
 	close(progress)
 	forwarding.Wait()
 	if recorder.IsContentCaptured() {
@@ -447,8 +471,8 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, routed *routedToolCa
 
 	// 3. 给结果和目录规则填入实际环境 ID，协作工具和客户端工具留空；没有 hook 时直接发送完成事件。
 	environmentID := ""
-	if routed.provider.environment != nil {
-		environmentID = routed.provider.environment.GetID()
+	if prepared.provider.environment != nil {
+		environmentID = prepared.provider.environment.GetID()
 	}
 	result.Result.Executor = environmentID
 	for _, instruction := range result.AgentsInstructions {
@@ -458,14 +482,14 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, routed *routedToolCa
 		Result:             result.Result,
 		AgentsInstructions: result.AgentsInstructions,
 	}
-	if !e.isHooked(routed) {
+	if !e.isHooked(prepared) {
 		events <- finished
 		return
 	}
 	// 4. 加入前置 hook 记录；成功时运行后置 hook，最后发送完成事件。
-	finished.HookRuns = routed.preOutcome.SavedRuns
+	finished.HookRuns = prepared.preRuns
 	if finished.Result.Error == nil {
-		postOutcome := e.runToolHookEvent(ctx, e.getHookEnvironment(routed.provider), &hook.HookEvent{
+		postOutcome := e.runToolHookEvent(ctx, e.getHookEnvironment(prepared.provider), &hook.HookEvent{
 			Name:       defs.HookEventPostToolUse,
 			Session:    e.opt.Session,
 			TurnID:     call.TurnID,

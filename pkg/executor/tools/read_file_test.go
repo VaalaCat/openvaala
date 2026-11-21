@@ -758,10 +758,13 @@ func runExecutorCall(t *testing.T, instance executor.ToolExecutor, call *defs.To
 	events := make(chan executor.ExecutorEvent)
 	var tasks sync.WaitGroup
 	tasks.Go(func() {
-		instance.Run(ctx, []*defs.Item{{
+		defer close(events)
+		for _, prepared := range instance.PrepareCalls(ctx, []*defs.Item{{
 			Kind:     defs.ItemToolCall,
 			ToolCall: call,
-		}}, events)
+		}}, events) {
+			instance.Run(ctx, prepared, events)
+		}
 	})
 	// 2. 收集完成事件，等待执行结束并核对调用 ID。
 	var result *defs.ToolResult

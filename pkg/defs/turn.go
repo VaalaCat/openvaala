@@ -65,6 +65,8 @@ type Turn struct {
 	ConversationID ConversationID `json:"conversation_id"`
 	SessionID      SessionID      `json:"session_id"`
 	Status         TurnStatus     `json:"status"`
+	// IsCompactOnly 是否只运行手动压缩？普通 Turn 触发自动压缩时仍为 false。
+	IsCompactOnly bool `json:"is_compact_only,omitempty"`
 	// FinalModelCallID 是本轮最后一次成功的普通模型调用；只在 completed 时填写。
 	FinalModelCallID ModelCallID `json:"final_model_call_id,omitempty"`
 	// Error 是 Turn 失败或被中断时的错误说明。
@@ -78,4 +80,68 @@ type Turn struct {
 	Model ModelSelection `json:"model,omitzero"`
 	// Executors 是本 Turn 开始时对话可用的 Executor，按顺序，第一个是默认；创建 running 记录时写入。
 	Executors []TurnExecutor `json:"executors,omitempty"`
+}
+
+// ModelCallPurpose 是一次模型调用的用途。
+type ModelCallPurpose string
+
+const (
+	// ModelCallPurposeConversation 是产生对话输出的普通模型调用。
+	ModelCallPurposeConversation ModelCallPurpose = "conversation"
+	// ModelCallPurposeCompaction 是生成上下文摘要的摘要模型调用。
+	ModelCallPurposeCompaction ModelCallPurpose = "compaction"
+)
+
+// TurnCheckpointPhase 是进度所记录的模型请求或已放行工具批。
+type TurnCheckpointPhase string
+
+const (
+	TurnCheckpointPhaseRequest TurnCheckpointPhase = "request"
+	TurnCheckpointPhaseTools   TurnCheckpointPhase = "tools"
+)
+
+// TurnCheckpoint 保存原 Turn 当时的模型请求或工具批进度。
+type TurnCheckpoint struct {
+	// TurnID 是本条进度所属的原轮次。
+	TurnID TurnID `json:"turn_id"`
+	// Step 是本轮普通生成的步号，从 1 开始；重试和步内摘要不消耗新步。
+	Step int `json:"step"`
+	// Phase 只取 request（即将发普通或摘要请求）或 tools（这批工具已放行）。
+	Phase TurnCheckpointPhase `json:"phase"`
+	// StopHookContinuations 是连续被停止 hook 拦截并续跑的次数，进入 tools 时清零。
+	StopHookContinuations int `json:"stop_hook_continuations"`
+	// IsContinuedByStopHook 本轮是否曾因停止 hook 续跑？进入工具阶段也不清除。
+	IsContinuedByStopHook bool `json:"is_continued_by_stop_hook"`
+	// Request 只在 request 阶段填写，tools 时为 nil。
+	Request *TurnRequestCheckpoint `json:"request,omitempty"`
+	// Tools 只在 tools 阶段填写，request 时为 nil。
+	Tools *TurnToolsCheckpoint `json:"tools,omitempty"`
+}
+
+// TurnRequestCheckpoint 保存发起模型请求前选定的范围和本次尝试 ID。
+type TurnRequestCheckpoint struct {
+	// Purpose 区分普通回复 conversation 和摘要 compaction。
+	Purpose ModelCallPurpose `json:"purpose"`
+	// ModelCallID 是这次模型尝试的身份，重试用新 ID。
+	ModelCallID ModelCallID `json:"model_call_id"`
+	// ModelCallThroughItemID 是普通请求的最后一个输入 Item（含本条，不含本次输出）；摘要请求时为空。
+	ModelCallThroughItemID ItemID `json:"model_call_through_item_id,omitempty"`
+	// Compaction 只在摘要请求时填写，普通请求为 nil。
+	Compaction *TurnCompactionCheckpoint `json:"compaction,omitempty"`
+}
+
+// TurnCompactionCheckpoint 保存原摘要选择和范围。
+type TurnCompactionCheckpoint struct {
+	// SummaryItemID 是要生成的摘要 Item 的身份，重启仍用它查找是否已经写入。
+	SummaryItemID ItemID `json:"summary_item_id"`
+	// CoveredThroughItemID 是这份摘要覆盖到的最后一个原始 Item，包含它本身。
+	CoveredThroughItemID ItemID `json:"covered_through_item_id"`
+	// CompactModelRef 是此次实际选用的摘要模型（含提供方）。
+	CompactModelRef ModelRef `json:"compact_model_ref"`
+}
+
+// TurnToolsCheckpoint 标记普通模型生成的一批工具调用已放行。
+type TurnToolsCheckpoint struct {
+	// ModelCallID 指生成这批 ToolCall 的普通模型调用；逐个 CallID 从已存的本批 Item 读取。
+	ModelCallID ModelCallID `json:"model_call_id"`
 }

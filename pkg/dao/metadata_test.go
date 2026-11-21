@@ -848,3 +848,94 @@ func (s *failingTurnIndexStorage) Set(ctx context.Context, namespace string, rec
 	}
 	return s.RecordStorage.Set(ctx, namespace, record)
 }
+
+// TestLatestLoggedTurn 检查漏写索引时仍读取原终态，且修复和重建索引都不改变 checkpoint。
+func TestLatestLoggedTurn(t *testing.T) {
+	for _, status := range []defs.TurnStatus{defs.TurnStatusCompleted, defs.TurnStatusInterrupted} {
+		t.Run(string(status), func(t *testing.T) {
+			ctx := t.Context()
+			records, logs := openStorage(t)
+			opt := dao.NewDAOOpt(records, logs)
+			query, mutation, err := dao.NewDAO(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conversation, otherSessionID := writeConversation(t, mutation)
+			sessionID := conversation.RootSessionID
+			turn := defs.Turn{
+				ID:             defs.NewTurnID(),
+				ConversationID: conversation.ID,
+				SessionID:      sessionID,
+				Status:         defs.TurnStatusRunning,
+				IsCompactOnly:  true,
+			}
+			if err := mutation.SetTurn(ctx, turn); err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := &defs.TurnCheckpoint{
+				TurnID: turn.ID,
+				Step:   1,
+				Phase:  defs.TurnCheckpointPhaseRequest,
+				Request: &defs.TurnRequestCheckpoint{
+					Purpose:     defs.ModelCallPurposeCompaction,
+					ModelCallID: "compact-call",
+					Compaction: &defs.TurnCompactionCheckpoint{
+						SummaryItemID:        "summary",
+						CoveredThroughItemID: "prefix-end",
+						CompactModelRef: defs.ModelRef{
+							ProviderID: "local",
+							ModelID:    "compact",
+						},
+					},
+				},
+			}
+			if err := mutation.AppendTurnCheckpoint(ctx, conversation.ID, sessionID, checkpoint); err != nil {
+				t.Fatal(err)
+			}
+			// 1. 终态写入日志但索引失败，再写一个其他 Session 的 Turn。
+			_, failing, err := dao.NewDAO(dao.NewDAOOpt(&failingTurnIndexStorage{RecordStorage: records}, logs))
+			if err != nil {
+				t.Fatal(err)
+			}
+			turn.Status = status
+			if err := failing.SetTurn(ctx, turn); err == nil || !strings.Contains(err.Error(), "index not updated") {
+				t.Fatalf("SetTurn() error = %v, want index failure", err)
+			}
+			lines := readMetadata(t, logs, conversation.ID)
+			turn.UpdatedAt = lines[len(lines)-1].UpdatedAt
+			if err := mutation.SetTurn(ctx, defs.Turn{
+				ID:             defs.NewTurnID(),
+				ConversationID: conversation.ID,
+				SessionID:      otherSessionID,
+				Status:         defs.TurnStatusCompleted,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			lines = readMetadata(t, logs, conversation.ID)
+			// 2. 倒查读到原终态，但只读调用没有修改索引；显式回写索引不增加日志。
+			loggedTurn, err := query.GetLatestLoggedTurn(ctx, conversation.ID, sessionID)
+			if err != nil || !reflect.DeepEqual(loggedTurn, &turn) {
+				t.Fatalf("GetLatestLoggedTurn() = %+v, %v; want %+v", loggedTurn, err, turn)
+			}
+			if indexed, found, err := query.GetTurn(ctx, sessionID, turn.ID); err != nil || !found || indexed.Status != defs.TurnStatusRunning {
+				t.Fatalf("GetTurn() before repair = %+v, %v, %v; want running", indexed, found, err)
+			}
+			if err := mutation.ReindexLoggedTurn(ctx, *loggedTurn); err != nil {
+				t.Fatal(err)
+			}
+			if indexed, found, err := query.GetTurn(ctx, sessionID, turn.ID); err != nil || !found || !reflect.DeepEqual(indexed, turn) {
+				t.Fatalf("GetTurn() after repair = %+v, %v, %v; want %+v", indexed, found, err, turn)
+			}
+			if got := readMetadata(t, logs, conversation.ID); !reflect.DeepEqual(got, lines) {
+				t.Fatal("index repair changed metadata log")
+			}
+			// 3. 全量重建索引后仍读到相同的 checkpoint。
+			if result, err := dao.RebuildMetadataIndex(ctx, opt); err != nil || result.RebuiltConversations != 1 {
+				t.Fatalf("RebuildMetadataIndex() = %+v, %v", result, err)
+			}
+			if got, err := query.GetTurnCheckpoint(ctx, conversation.ID, sessionID, turn.ID); err != nil || !reflect.DeepEqual(got, checkpoint) {
+				t.Fatalf("GetTurnCheckpoint() after index rebuild = %+v, %v; want %+v", got, err, checkpoint)
+			}
+		})
+	}
+}

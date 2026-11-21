@@ -10,6 +10,92 @@ import {
   test,
 } from "./fixture"
 
+for (const list of [
+  { name: "unordered", first: "-", second: "-", last: "-", indent: "  " },
+  { name: "ordered", first: "1.", second: "2.", last: "3.", indent: "   " },
+]) {
+  test(`streaming_${list.name}_list_keeps_height_with_pending_emphasis`, async ({
+    page,
+    fixture,
+  }) => {
+    // 1. 正文逐字经过半截强调标记、完整强调和真实子列表，最后留下字面量标记。
+    const chunkDelayMs = 300
+    const text = `${list.first} 第一项\n${list.second} **第二项**\n${list.indent}- 子项\n${list.last} **`
+    await fixture.replies({ text, chunkDelayMs })
+    await fixture.openApp(page)
+    const recorder = await page.evaluateHandle(() => {
+      const samples: { at: number; height: number; text: string }[] = []
+      const record = () => {
+        const turn = [...document.querySelectorAll("[data-turn-id]")].at(-1)
+        const markdown = turn?.querySelector(".markdown-view")
+        if (markdown)
+          samples.push({
+            at: performance.now(),
+            height: markdown.getBoundingClientRect().height,
+            text: markdown.textContent ?? "",
+          })
+      }
+      const observer = new MutationObserver(record)
+      observer.observe(document, {
+        childList: true,
+        characterData: true,
+        subtree: true,
+      })
+      return {
+        stop: () => {
+          record()
+          observer.disconnect()
+          return samples
+        },
+      }
+    })
+    await startConversation(page, "逐字生成列表")
+    const turn = getMessages(page).locator("[data-turn-id]").last()
+    await expect(turn.locator('[data-turn-status="completed"]')).toBeAttached({
+      timeout: 30_000,
+    })
+    const samples = (await recorder.evaluate((value) => value.stop())).filter(
+      (sample) => sample.text.includes("第一项")
+    )
+    await recorder.dispose()
+    await test.info().attach("streaming-list-height-samples", {
+      body: JSON.stringify(samples),
+      contentType: "application/json",
+    })
+
+    // 2. 每次 DOM 更新采集高度，覆盖逐字增长，正文高度没有先增后缩。
+    expect(samples.length).toBeGreaterThan(1)
+    expect(samples.some((sample) => !sample.text.includes("第二项"))).toBe(true)
+    expect(
+      samples.some(
+        (sample) =>
+          sample.text.includes("第二项") && !sample.text.includes("子项")
+      )
+    ).toBe(true)
+    expect(samples.at(-1)!.text).toContain("子项")
+    expect(
+      Math.max(
+        ...samples
+          .slice(1)
+          .map((sample, index) => samples[index].height - sample.height)
+      )
+    ).toBeLessThanOrEqual(2)
+
+    // 3. 结束后保留完整正文、子项缩进和未闭合标记的字面量。
+    const markdown = turn.locator(".markdown-view")
+    await expect(markdown.getByText("第一项", { exact: true })).toBeVisible()
+    const second = markdown.getByText("第二项", { exact: true })
+    const nested = markdown.getByText("子项", { exact: true })
+    await expect(second).toBeVisible()
+    await expect(nested).toBeVisible()
+    await expect(markdown.getByText("**", { exact: true })).toBeVisible()
+    const secondBox = (await second.boundingBox())!
+    const nestedBox = (await nested.boundingBox())!
+    expect(nestedBox.x).toBeGreaterThan(secondBox.x)
+    expect(nestedBox.y).toBeGreaterThan(secondBox.y)
+  })
+}
+
 test("highlight_worker_load_failure_keeps_streaming_plain_text", async ({
   page,
   fixture,

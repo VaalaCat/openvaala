@@ -413,7 +413,12 @@ func (h *commandToolsHarness) run(t *testing.T, ctx context.Context, name string
 	// 2. 后台执行调用，收集进度和结果；收到进度时调用 onProgress。
 	events := make(chan executor.ExecutorEvent)
 	var tasks sync.WaitGroup
-	tasks.Go(func() { h.toolExecutor.Run(ctx, []*defs.Item{call}, events) })
+	tasks.Go(func() {
+		defer close(events)
+		for _, prepared := range h.toolExecutor.PrepareCalls(ctx, []*defs.Item{call}, events) {
+			h.toolExecutor.Run(ctx, prepared, events)
+		}
+	})
 	var result *defs.ToolResult
 	var progress []*executor.ExecutionProgressEvent
 	for event := range events {

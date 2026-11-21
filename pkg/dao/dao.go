@@ -10,6 +10,12 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/storage"
 )
 
+// ErrSessionDeleted 表示 metadata 已记录该 Session 删除，checkpoint 不可恢复。
+var ErrSessionDeleted = errors.New("session deleted")
+
+// ErrConversationDeleted 表示 metadata 已记录该对话删除，checkpoint 不可恢复。
+var ErrConversationDeleted = errors.New("conversation deleted")
+
 // Query 读取对话、Session、Turn 和 Item。
 type Query interface {
 	ConversationQuery
@@ -30,6 +36,8 @@ type Mutation interface {
 
 // SessionQuery 读取 Session 记录。
 type SessionQuery interface {
+	// GetSessionCheckpoint 读取最新待办；没有记录时返回 nil，已清空的待办返回空结构体。已记下删除时返回 ErrSessionDeleted 或 ErrConversationDeleted。
+	GetSessionCheckpoint(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) (checkpoint *defs.SessionCheckpoint, err error)
 	// GetSession 读取对话内指定 Session，返回记录及是否找到。
 	GetSession(context.Context, defs.ConversationID, defs.SessionID) (defs.Session, bool, error)
 	// GetSessionByID 只凭 Session ID 读取记录；Session 还没写过 Item 时返回未找到。
@@ -42,14 +50,24 @@ type SessionQuery interface {
 
 // SessionMutation 保存和删除 Session。
 type SessionMutation interface {
+	// AppendSessionCheckpoint 追加一份完整待办，空结构体表示清空待办。
+	AppendSessionCheckpoint(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID, checkpoint *defs.SessionCheckpoint) error
+	// DeleteSessionCheckpoints 删除 Session 的待办和所有 Turn 进度记录。
+	DeleteSessionCheckpoints(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) error
 	// SetSession 保存 Session 的日志和索引。
 	SetSession(context.Context, defs.Session) error
-	// DeleteSession 先在 metadata 日志里记下删除，再删除 Session 的 Turn 索引、Item 日志和 Session 索引；Session 不存在时直接返回。
+	// DeleteSession 先在 metadata 日志里记下删除，再删除 Session 的 Turn 索引、Item 日志、checkpoint 日志和 Session 索引；Session 不存在时直接返回。
 	DeleteSession(context.Context, defs.ConversationID, defs.SessionID) error
 }
 
 // TurnQuery 读取 Turn 记录。
 type TurnQuery interface {
+	// GetModelRequestHistory 按这次普通请求之前生效的摘要及逻辑末项重建模型历史。
+	GetModelRequestHistory(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID, checkpoint *defs.TurnCheckpoint) (items []*defs.Item, err error)
+	// GetTurnCheckpoint 读取指定 Turn 最新的进度，没有记录时返回 nil。已记下删除时返回 ErrSessionDeleted 或 ErrConversationDeleted。
+	GetTurnCheckpoint(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID, turnID defs.TurnID) (checkpoint *defs.TurnCheckpoint, err error)
+	// GetLatestLoggedTurn 从对话 metadata 日志读取这个 Session 最近的 Turn，没有记录时返回 nil。已记下删除时返回 ErrSessionDeleted 或 ErrConversationDeleted。
+	GetLatestLoggedTurn(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) (turn *defs.Turn, err error)
 	// GetTurn 读取 Session 内指定 Turn，返回记录及是否找到。
 	GetTurn(context.Context, defs.SessionID, defs.TurnID) (defs.Turn, bool, error)
 	// GetTurns 按输入 ID 顺序返回 Session 中找到的 Turn，跳过不存在的记录。
@@ -60,6 +78,10 @@ type TurnQuery interface {
 
 // TurnMutation 保存 Turn 记录。
 type TurnMutation interface {
+	// AppendTurnCheckpoint 追加指定 Turn 的一次模型请求或已放行工具批进度。
+	AppendTurnCheckpoint(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID, checkpoint *defs.TurnCheckpoint) error
+	// ReindexLoggedTurn 以 GetLatestLoggedTurn 返回的原记录更新索引，不追加日志。
+	ReindexLoggedTurn(ctx context.Context, turn defs.Turn) error
 	// SetTurn 保存 Turn 的日志和索引。
 	SetTurn(context.Context, defs.Turn) error
 }

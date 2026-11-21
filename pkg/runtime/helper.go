@@ -12,7 +12,6 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
-	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 )
 
@@ -40,13 +39,13 @@ func newRuntimeDefinitions(source *Definitions) *runtimeDefinitions {
 	if executors == nil {
 		executors = executor.NewConfigExecutorProvider(nil)
 	}
-	// 2. 复制各类定义，用这份 hook 定义新建 Hooks，并创建空的模型索引。
+	// 2. 复制各类定义，并创建空的模型索引。
 	definitions := &runtimeDefinitions{
 		conversationDefinitions: &conversation.ConversationDefinitions{
 			Agents:     slices.Clone(source.Agents),
 			Models:     slices.Clone(source.Models),
 			MCPServers: slices.Clone(source.MCPServers),
-			Hooks:      hook.NewHooks(hook.NewHooksOpt(slices.Clone(source.Hooks))),
+			Hooks:      slices.Clone(source.Hooks),
 			Executors:  executors,
 			Skills:     slices.Clone(source.Skills),
 		},

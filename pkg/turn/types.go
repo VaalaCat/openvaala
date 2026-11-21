@@ -10,14 +10,34 @@ import (
 
 // ── Turn 执行错误 ──
 
+// ErrTurnInterrupted 是用户明确叫停活动轮时传给取消上下文的原因。
+var ErrTurnInterrupted = errors.New("turn interrupted by caller")
+
 // ErrTurnUnsettled 由 Turn 在本轮记录或 Item 没能保存时返回，本轮留在 running；Session 收到后停止，按已保存的记录恢复。
 var ErrTurnUnsettled = errors.New("turn terminal status was not persisted")
+
+// ── Turn 恢复入参 ──
+
+// TurnResume 是 Session 已读取的原轮资料，交给 Turn 继续执行或收尾。
+type TurnResume struct {
+	// Record 是原轮的 running 记录；已分配输入但还没写 running 时为空。
+	Record *defs.Turn
+	// Checkpoint 是原轮最新的请求或工具批次进度；没有进度时为空。
+	Checkpoint *defs.TurnCheckpoint
+	// CompactModel 是按原摘要请求的完整模型引用找到的模型；没有原摘要请求或找不到模型时为空。
+	CompactModel *defs.ModelDefinition
+	// Items 是已读取的原轮 Item 及其日志流水号；原轮没有 Item 时为空。
+	Items []dao.LoggedItem
+	// StopRequested 表示 Session 已保存对原轮的停止请求；没有请求时为 false。
+	StopRequested bool
+}
 
 // ── Turn 执行结果 ──
 
 // TurnResult 是 Turn 一次 Run 的结果。
 type TurnResult struct {
-	// InputItemIDs 按读入顺序保存首批输入和每组补充输入的首个 Item ID；被 UserPromptSubmit 拦下、没有保存的输入也算。
+	// InputItemIDs 在终态中包含本轮的开场（含停止时丢弃的开场）及已交接补充的组首 ID，拦截记录也算交接。
+	// 写入失败而未结算时也包含已尝试写入的补充；未结算结果不作为终态发布。
 	InputItemIDs []defs.ItemID
 	// Outputs 是 Agent 返回的全部草稿；Agent 没运行时为空。
 	Outputs []*defs.Item

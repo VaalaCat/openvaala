@@ -69,6 +69,7 @@ func itemsToLLMKitMessages(items []*defs.Item, isImageInputSupported bool) ([]*l
 	messages := make([]*llmkit.Message, 0, len(items))
 	itemMessages := make([][]*llmkit.Message, len(items))
 	toolCallIndexes := make(map[string]int)
+	var recoveredResults map[string]*llmkit.Message
 	// heldMessages 暂存带 CallID 的 hook 和工具图片消息，在连续工具结果之后按原顺序发送。
 	var heldMessages []*llmkit.Message
 	// appendMessage 在非工具结果消息之前，先追加暂存的 hook 和图片消息。
@@ -305,6 +306,12 @@ func itemsToLLMKitMessages(items []*defs.Item, isImageInputSupported bool) ([]*l
 			}
 		}
 		appendMessage(message, index)
+		if item.Kind == defs.ItemToolResult && item.ToolResult.IsOutcomeUnknown() {
+			if recoveredResults == nil {
+				recoveredResults = make(map[string]*llmkit.Message)
+			}
+			recoveredResults[item.ToolResult.CallID] = message
+		}
 		if item.Kind == defs.ItemToolResult && len(item.ToolResult.Images) > 0 {
 			imageMessage, err := toolResultImagesToMessage(item.ToolResult, sentImages, isImageInputSupported)
 			if err != nil {
@@ -314,10 +321,10 @@ func itemsToLLMKitMessages(items []*defs.Item, isImageInputSupported bool) ([]*l
 			itemMessages[index] = append(itemMessages[index], imageMessage)
 		}
 	}
-	// 7. 追加末尾助手消息和暂存消息，再补齐缺失工具结果。
+	// 7. 追加末尾消息；将落在后续消息之后的未知结果发回原批，最后补齐仍缺失的结果。
 	flushAssistant()
 	messages = append(messages, heldMessages...)
-	completed, missingResults, err := completeToolResults(messages)
+	completed, missingResults, err := completeToolResults(messages, recoveredResults)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -443,6 +450,8 @@ func IsSentToModel(item *defs.Item) bool {
 	case item.Kind == defs.ItemToolCall && item.ToolCall != nil && item.ToolCall.Status == defs.ToolCallInterrupted &&
 		(item.ToolCall.CallID == "" || item.ToolCall.Name == "" || !json.Valid([]byte(item.ToolCall.Arguments))):
 		return false
+	case item.Kind == defs.ItemModelCallResult:
+		return false
 	}
 	return true
 }
@@ -494,10 +503,13 @@ func validateContextItem(item *defs.Item) error {
 	}
 	// 2. 检查推理、工具调用、工具结果和模型错误带有模型调用 ID。
 	switch item.Kind {
-	case defs.ItemReasoning, defs.ItemToolCall, defs.ItemToolResult, defs.ItemModelError:
+	case defs.ItemReasoning, defs.ItemToolCall, defs.ItemToolResult, defs.ItemModelError, defs.ItemModelCallResult:
 		if item.ModelCallID == "" {
 			return errors.New("item has no model call ID")
 		}
+	}
+	if item.ModelCallResult != "" && item.ModelCallResult != defs.ModelCallResultReply && item.ModelCallResult != defs.ModelCallResultToolsRejected {
+		return errors.New("item has an invalid model call result")
 	}
 	return nil
 }
@@ -649,16 +661,25 @@ func executorsChangeToMessage(change *defs.ExecutorsChange) *llmkit.Message {
 	}
 }
 
-// completeToolResults 按调用顺序补齐缺失工具结果，同时返回新补齐的消息。
-func completeToolResults(messages []*llmkit.Message) ([]*llmkit.Message, []*llmkit.Message, error) {
+// completeToolResults 将恢复补写的结果配回原批，返回所有消息及新生成的缺失结果。
+func completeToolResults(messages []*llmkit.Message, recoveredResults map[string]*llmkit.Message) ([]*llmkit.Message, []*llmkit.Message, error) {
 	// 1. 记录待补结果的调用顺序，并准备追加缺失结果的操作。
 	completed := make([]*llmkit.Message, 0, len(messages))
 	var missingResults []*llmkit.Message
 	pendingOrder := make([]string, 0)
 	pending := make(map[string]bool)
+	var movedResults map[*llmkit.Message]bool
 	appendMissingResults := func() error {
 		for _, callID := range pendingOrder {
 			if !pending[callID] {
+				continue
+			}
+			if recovered := recoveredResults[callID]; recovered != nil {
+				completed = append(completed, recovered)
+				if movedResults == nil {
+					movedResults = make(map[*llmkit.Message]bool)
+				}
+				movedResults[recovered] = true
 				continue
 			}
 			message, err := missingToolResultMessage(callID)
@@ -673,8 +694,11 @@ func completeToolResults(messages []*llmkit.Message) ([]*llmkit.Message, []*llmk
 		return nil
 	}
 
-	// 2. 非工具消息前补齐上一批调用结果，工具消息没有匹配的待处理 CallID 时返回错误；再登记本条消息里的工具调用。
+	// 2. 跳过已移回原批的结果，在非工具消息前配齐上一批；其余工具结果必须对应待处理的 CallID。
 	for _, message := range messages {
+		if movedResults[message] {
+			continue
+		}
 		if message.Role != llmkit.RoleTool {
 			if err := appendMissingResults(); err != nil {
 				return nil, nil, err

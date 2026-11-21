@@ -346,6 +346,20 @@ func validateItem(item *defs.Item) error {
 	if item == nil || item.ID == "" {
 		return errors.New("item requires an ID")
 	}
+	if item.ModelCallResult != "" {
+		if item.TurnID == "" || item.ModelCallID == "" || (item.ModelCallResult != defs.ModelCallResultReply && item.ModelCallResult != defs.ModelCallResultToolsRejected) {
+			return fmt.Errorf("item %q: invalid model call result", item.ID)
+		}
+		if item.Kind != defs.ItemMessage && item.Kind != defs.ItemToolCall && item.Kind != defs.ItemModelCallResult {
+			return fmt.Errorf("item %q: model call result is attached to an invalid item", item.ID)
+		}
+	}
+	if report := item.ModelCallUsage; report != nil && (report.ModelCallID == "" || report.ModelCallID != item.ModelCallID || report.InputThroughItemID == "") {
+		return fmt.Errorf("item %q: invalid model call usage", item.ID)
+	}
+	if item.Kind == defs.ItemModelCallResult && item.ModelCallResult == "" {
+		return fmt.Errorf("item %q: model call result requires a result", item.ID)
+	}
 	if err := item.ValidateContextSummary(); err != nil {
 		return fmt.Errorf("item %q: %w", item.ID, err)
 	}

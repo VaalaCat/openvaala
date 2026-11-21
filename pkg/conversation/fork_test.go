@@ -316,7 +316,14 @@ func TestForkConversation(t *testing.T) {
 				if turn.ConversationID != forked.ID || turn.SessionID != forked.RootSessionID {
 					t.Fatalf("forked Turn %d = %+v, want Conversation %s Session %s", index, turn, forked.ID, forked.RootSessionID)
 				}
-				if got, want := withoutTurnOwner(turn), withoutTurnOwner(sourceTurns[index]); !reflect.DeepEqual(got, want) {
+				got, want := withoutTurnOwner(turn), withoutTurnOwner(sourceTurns[index])
+				if want.Status == defs.TurnStatusRunning {
+					if got.Status != defs.TurnStatusInterrupted || got.ItemsRange.FirstOrdinal != want.ItemsRange.FirstOrdinal || got.ItemsRange.LastOrdinal != uint64(source.itemCount) || got.Error == "" {
+						t.Fatalf("unfinished history = %+v", got)
+					}
+					want.Status, want.ItemsRange, want.Error = got.Status, got.ItemsRange, got.Error
+				}
+				if !reflect.DeepEqual(got, want) {
 					t.Fatalf("forked Turn %d = %+v, want %+v", index, got, want)
 				}
 			}

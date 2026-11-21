@@ -52,8 +52,8 @@ type ConversationDefinitions struct {
 	Models []*defs.ModelDefinition
 	// MCPServers 是全部 MCP server 定义；对话只给本对话 Agent 会用到的建连接。
 	MCPServers []*mcpclient.ServerDefinition
-	// Hooks 是本对话使用的 hook，nil 表示没有 hook。
-	Hooks hook.Hooks
+	// Hooks 是只读共享的 hook 定义；每套对话配置创建自己的运行实例。
+	Hooks []*hook.HookDefinition
 	// Executors 决定本对话能用哪些 Executor，不能为 nil，由 Runtime 保证；对话按自己的 Executor 设置从中选出可用的建执行环境。
 	Executors executor.ExecutorProvider
 	// Skills 是所有对话共用的 skill；和项目目录、主目录里的 skill 同名时，项目目录的优先，其次是这里的，主目录的最后。
@@ -131,6 +131,8 @@ func (*ConversationReconfigured) isConversationEvent() {}
 // conversationConfig 保存一套对话设置、定义、执行环境和 Skill，替换配置时整份换掉。
 // Run 在启动这套配置的 Session 前填写 sessionsCtx、stopSessions，之后由 Run 和 Session 任务读取。
 type conversationConfig struct {
+	// hooks 保存本套配置使用的 hook 及工作区脚本拷贝记录。
+	hooks hook.Hooks
 	// settings 是这套配置的 Executor 设置，已补上 local 目录；换定义时沿用。
 	settings defs.ExecutorSettings
 	// definitions 是这套配置的定义；改设置时沿用。
@@ -212,7 +214,9 @@ type SendMessageParam struct {
 
 // WaitAgentParam 是 wait_agent 的模型参数，等待当前 Turn 收到新的补充输入。
 type WaitAgentParam struct {
-	TimeoutSeconds int `json:"timeout_seconds,omitempty" jsonschema:"description=等待秒数；省略或 0 为 30，有效范围 1–600。被 steer 消息或子任务结果通知唤醒，超时也会返回；normal 消息不会唤醒本次等待，不会取消子任务,minimum=0,maximum=600,default=30"`
+	// WaitFor 为 subagent_result 时先检查运行后代；省略时沿用普通等待。
+	WaitFor        string `json:"wait_for,omitempty" jsonschema:"description=设为 subagent_result 时若无未读补充且无后代正在运行则立即返回,enum=subagent_result"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"description=等待秒数；省略或 0 为 30，有效范围 1–600。被 steer 消息或子任务结果通知唤醒，超时也会返回；normal 消息不会唤醒本次等待，不会取消子任务,minimum=0,maximum=600,default=30"`
 }
 
 // interruptAgentParam 是 interrupt_agent 的模型参数，指定要取消哪个后代 Session 的活动 Turn。
@@ -235,10 +239,11 @@ type SessionHistoryParam struct {
 // wait_agent 的唤醒原因：同时收到几种消息时按 user_steer、subagent_result、agent_message 的顺序取第一个；
 // 等到超时也没有消息时为 timeout。
 const (
-	waitReasonUserSteer      = "user_steer"
-	waitReasonSubagentResult = "subagent_result"
-	waitReasonAgentMessage   = "agent_message"
-	waitReasonTimeout        = "timeout"
+	waitReasonUserSteer          = "user_steer"
+	waitReasonSubagentResult     = "subagent_result"
+	waitReasonAgentMessage       = "agent_message"
+	waitReasonTimeout            = "timeout"
+	waitReasonNoRunningSubagents = "no_running_subagents"
 )
 
 // ── 协作工具结果 ──
@@ -260,6 +265,8 @@ type sendMessageResult struct {
 
 // waitAgentResult 只说明唤醒原因与 Agent 发送方；消息正文在下一次模型请求前经收件箱读入。
 type waitAgentResult struct {
+	// Hint 在没有运行后代时提示如何查阅现状；其他原因时为空。
+	Hint   string           `json:"hint,omitempty"`
 	Reason string           `json:"reason"`
 	From   []defs.SessionID `json:"from,omitempty"`
 }

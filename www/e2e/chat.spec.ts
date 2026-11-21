@@ -471,7 +471,8 @@ test("turn_divider_lines_and_item_actions_align", async ({ page, fixture }) => {
       expect(Math.abs(iconBounds.x - headerBounds.x)).toBeLessThanOrEqual(1)
     }
     const bubbleBounds = (await turn
-      .getByText(input, { exact: true })
+      .locator("p")
+      .filter({ hasText: input })
       .locator("..")
       .boundingBox())!
     const turnBounds = (await turn.boundingBox())!

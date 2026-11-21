@@ -19,6 +19,74 @@ func TestConversationWaitAgent(t *testing.T) {
 		name string
 		run  func(t *testing.T, h *conversationHarness)
 	}{
+		{name: "unread_before_no_descendants", run: func(t *testing.T, h *conversationHarness) {
+			id := h.input(t, session.SessionInputModeNormal, "wait")
+			request := receiveModelRequest(t, h.model)
+			steer := h.input(t, session.SessionInputModeSteer, "check tests")
+			request.reply <- waitResponse("peek", `{"wait_for":"subagent_result","timeout_seconds":1}`)
+			next := receiveModelRequest(t, h.model)
+			var result waitAgentResult
+			decodeRequestToolResult(t, next, "peek", &result)
+			if result.Reason != "user_steer" {
+				t.Fatal(result)
+			}
+			next.reply <- modelResponse{text: "ok"}
+			if done, _ := h.waitTurnFinished(t, id); !slices.Contains(done.InputItemIDs, steer) {
+				t.Fatal(done)
+			}
+		}},
+		{name: "no_running_descendants_ignores_normal", run: func(t *testing.T, h *conversationHarness) {
+			h.input(t, session.SessionInputModeNormal, "wait")
+			request := receiveModelRequest(t, h.model)
+			h.input(t, session.SessionInputModeNormal, "later")
+			request.reply <- waitResponse("idle", `{"wait_for":"subagent_result","timeout_seconds":1}`)
+			next := receiveModelRequest(t, h.model)
+			var result map[string]any
+			decodeRequestToolResult(t, next, "idle", &result)
+			if result["reason"] != "no_running_subagents" || !strings.Contains(fmt.Sprint(result), "list_agents") {
+				t.Fatal(result)
+			}
+		}},
+		{name: "only_grandchild_running", run: func(t *testing.T, h *conversationHarness) {
+			root := h.record(t, h.c.GetRootSessionID())
+			h.input(t, session.SessionInputModeNormal, "wait")
+			request := receiveModelRequest(t, h.model)
+			child, err := h.impl().spawnAgent(t.Context(), root, spawnCall("root-turn", "child"), &SpawnAgentParam{TaskName: "child", Message: "task"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			childRequest := receiveSessionRequest(t, h.model, child)
+			grandchild, err := h.impl().spawnAgent(t.Context(), h.record(t, child), spawnCall("child-turn", "grandchild"), &SpawnAgentParam{TaskName: "grandchild", Message: "long task"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			receiveSessionRequest(t, h.model, grandchild)
+			childRequest.reply <- modelResponse{text: "child done"}
+			instance, _ := h.impl().runningSessions.Load(root.ID)
+			if _, err := instance.WaitSteer(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			request.reply <- modelResponse{text: "noted"}
+			next := receiveSessionRequest(t, h.model, root.ID)
+			next.reply <- waitResponse("grand", `{"wait_for":"subagent_result","timeout_seconds":1}`)
+			next = receiveSessionRequest(t, h.model, root.ID)
+			var result waitAgentResult
+			decodeRequestToolResult(t, next, "grand", &result)
+			if result.Reason != "timeout" {
+				t.Fatal(result)
+			}
+		}},
+		{name: "no_parameters_still_waits", run: func(t *testing.T, h *conversationHarness) {
+			h.input(t, session.SessionInputModeNormal, "wait")
+			receiveModelRequest(t, h.model).reply <- waitResponse("default", `{}`)
+			h.input(t, session.SessionInputModeSteer, "wake")
+			next := receiveModelRequest(t, h.model)
+			var result waitAgentResult
+			decodeRequestToolResult(t, next, "default", &result)
+			if result.Reason != "user_steer" {
+				t.Fatal(result)
+			}
+		}},
 		{
 			name: "wait_agent_woken_by_subagent_result",
 			run: func(t *testing.T, h *conversationHarness) {

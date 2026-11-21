@@ -392,6 +392,7 @@ export function getMessageRows(
       rows.push(turnRow)
     }
     if (turnRow?.kind === "turn" && view.turnID) turnRow.items.push(view)
+    if (view.item.kind === "model_call_result") continue
     const resultCallID = view.item.tool_result?.call_id
     if (resultCallID && callIDs.has(resultCallID)) continue
     const callID = view.item.tool_call?.call_id

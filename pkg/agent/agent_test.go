@@ -970,8 +970,8 @@ func TestAgentInputRequests(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &textAgentClient{}
 			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, newTestContext(t, "", []*defs.Item{userMessage("开始。")}))
-			inputRequests := make(chan agent.AgentInputRequest)
-			opt.InputRequests = inputRequests
+			inputRequests := make(chan agent.AgentRequest)
+			opt.Requests = inputRequests
 			instance, err := agent.NewAgent(opt)
 			if err != nil {
 				t.Fatal(err)
@@ -992,7 +992,7 @@ func TestAgentInputRequests(t *testing.T) {
 			}()
 			var gotRequests []bool
 			for _, reply := range tt.replies {
-				request := <-inputRequests
+				request := readAgentInputRequest(t, inputRequests)
 				gotRequests = append(gotRequests, request.FinishIfEmpty)
 				request.Reply <- reply
 			}
@@ -1542,13 +1542,19 @@ func TestAgentCompactsContext(t *testing.T) {
 				}
 			}
 			compactRequests := 0
-			for _, req := range client.requests {
+			for callIndex, req := range client.requests {
 				if req.Extras["prompt_cache_key"] != string(testSessionID) {
 					t.Fatal("cache key changed")
 				}
 				if req.ToolChoice != nil && req.ToolChoice.Type == "none" {
+					if client.targets[callIndex].Model != "compact-model" || !slices.Equal(client.options[callIndex].Conversion.MergeMessageRoles, []llmkit.Role{llmkit.RoleUser}) {
+						t.Fatalf("compaction call target = %+v, options = %+v", client.targets[callIndex], client.options[callIndex])
+					}
 					compactRequests++
 					continue
+				}
+				if client.targets[callIndex].Model != "model" || len(client.options[callIndex].Conversion.MergeMessageRoles) != 0 {
+					t.Fatalf("normal call target = %+v, options = %+v", client.targets[callIndex], client.options[callIndex])
 				}
 				if compactRequests == 0 {
 					continue
@@ -1641,12 +1647,12 @@ func TestAgentUsesRequestUsageForNextStepCompaction(t *testing.T) {
 				t.Fatalf("measurement after output = %+v, want corrected and raw estimates on opposite sides of threshold (compact=%v)", appended, tt.wantCompaction)
 			}
 			// 3. 检查下一步是否先压缩、后续请求内容，以及第二次用量替换第一次基准。
-			wantPurposes := []agent.ModelCallPurpose{agent.ModelCallPurposeConversation, agent.ModelCallPurposeConversation}
+			wantPurposes := []defs.ModelCallPurpose{defs.ModelCallPurposeConversation, defs.ModelCallPurposeConversation}
 			if tt.wantCompaction {
-				wantPurposes = slices.Insert(wantPurposes, 1, agent.ModelCallPurposeCompaction)
+				wantPurposes = slices.Insert(wantPurposes, 1, defs.ModelCallPurposeCompaction)
 			}
 			calls := getAgentEventsOfType(received, agent.AgentEventModelCallFinished)
-			var purposes []agent.ModelCallPurpose
+			var purposes []defs.ModelCallPurpose
 			for _, event := range calls {
 				purposes = append(purposes, event.ModelCall.Purpose)
 			}
@@ -1674,6 +1680,8 @@ func TestAgentUsesRequestUsageForNextStepCompaction(t *testing.T) {
 // compactingAgentClient 是压缩测试用的模型客户端，按 ToolChoice 区分摘要请求和普通请求。
 type compactingAgentClient struct {
 	requests    []llmkit.Request
+	targets     []llmkit.Target
+	options     []llmkit.CallOptions
 	toolLoop    bool
 	normalCalls int
 	// summaryUsage、normalUsage 非 nil 时，摘要调用和普通调用在结束前上报这份用量。
@@ -1681,9 +1689,11 @@ type compactingAgentClient struct {
 }
 
 // Call 生成压缩测试的模型回复。
-func (c *compactingAgentClient) Call(_ context.Context, req llmkit.Request, _ llmkit.Target, _ llmkit.CallOptions) (<-chan llmkit.Event, error) {
-	// 1. 记录请求。
+func (c *compactingAgentClient) Call(_ context.Context, req llmkit.Request, target llmkit.Target, options llmkit.CallOptions) (<-chan llmkit.Event, error) {
+	// 1. 记录请求、目标和调用选项。
 	c.requests = append(c.requests, req)
+	c.targets = append(c.targets, target)
+	c.options = append(c.options, options)
 	// 2. 禁用工具的摘要请求返回固定摘要文本，普通请求按配置返回文本、工具调用和用量。
 	events := make(chan llmkit.Event, 8)
 	if req.ToolChoice != nil && req.ToolChoice.Type == "none" {
@@ -1754,7 +1764,13 @@ func newCompactionTestAgent(t *testing.T, client llmkit.Client, window int, larg
 	recent := userMessage(strings.Repeat("recent ", 220))
 	recent.ID = "recent"
 	model := newTestModel(&llmkit.Target{Model: "model"}, window)
-	history, err := agent_context.NewAgentContext(agent_context.NewAgentContextOpt(testSessionID, testTurnID, client, model, model))
+	compactModel := newTestModel(&llmkit.Target{Model: "compact-model"}, window)
+	compactModel.Ref = defs.ModelRef{
+		ProviderID: "test",
+		ModelID:    "compact-model",
+	}
+	compactModel.MergeMessageRoles = []llmkit.Role{llmkit.RoleUser}
+	history, err := agent_context.NewAgentContext(agent_context.NewAgentContextOpt(testSessionID, testTurnID, client, model, compactModel))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1817,7 +1833,7 @@ func TestAgentCompactionFailure(t *testing.T) {
 				case event.Type == agent.AgentEventItemInterrupted:
 					interrupted = event
 					got = append(got, "interrupted")
-				case event.Type == agent.AgentEventModelCallFinished && event.ModelCall.Purpose == agent.ModelCallPurposeCompaction:
+				case event.Type == agent.AgentEventModelCallFinished && event.ModelCall.Purpose == defs.ModelCallPurposeCompaction:
 					got = append(got, "model_call_finished(compaction)")
 				}
 			}
@@ -2581,8 +2597,8 @@ func TestAgentLogsSupplementaryInput(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p := telemetrytest.NewPipeline(t)
 			opt := agent.NewAgentOpt(testTurnID, testSessionID, &textAgentClient{}, testModel, newTestContext(t, "", []*defs.Item{userMessage("开始。")}))
-			inputRequests := make(chan agent.AgentInputRequest)
-			opt.InputRequests = inputRequests
+			inputRequests := make(chan agent.AgentRequest)
+			opt.Requests = inputRequests
 			instance, err := agent.NewAgent(opt)
 			if err != nil {
 				t.Fatal(err)
@@ -2595,7 +2611,7 @@ func TestAgentLogsSupplementaryInput(t *testing.T) {
 				done <- err
 			}()
 			for _, reply := range tt.replies {
-				request := <-inputRequests
+				request := readAgentInputRequest(t, inputRequests)
 				request.Reply <- reply
 			}
 			if err := <-done; err != nil {
@@ -2623,7 +2639,7 @@ func TestAgentLogsSupplementaryInput(t *testing.T) {
 func TestAgentStepEvents(t *testing.T) {
 	// 1. 准备普通回复、重试、补充输入、压缩和工具循环的预期事件。
 	type wantModelCall struct {
-		purpose agent.ModelCallPurpose
+		purpose defs.ModelCallPurpose
 		usage   *defs.TokenUsage
 	}
 	usage := defs.TokenUsage{
@@ -2668,7 +2684,7 @@ func TestAgentStepEvents(t *testing.T) {
 				"context_measured", "context_measured",
 			},
 			wantModelCalls: []wantModelCall{{
-				purpose: agent.ModelCallPurposeConversation,
+				purpose: defs.ModelCallPurposeConversation,
 				usage:   &usage,
 			}},
 			wantStatsUsage: usage,
@@ -2682,7 +2698,7 @@ func TestAgentStepEvents(t *testing.T) {
 				"context_measured", "item_started:message", "item_completed:message", "context_measured", "model_call_finished(conversation)",
 				"context_measured", "context_measured",
 			},
-			wantModelCalls: []wantModelCall{{purpose: agent.ModelCallPurposeConversation}},
+			wantModelCalls: []wantModelCall{{purpose: defs.ModelCallPurposeConversation}},
 		},
 		{
 			name: "stream_error_after_reported_usage_finishes_call_before_interruption",
@@ -2717,11 +2733,11 @@ func TestAgentStepEvents(t *testing.T) {
 			},
 			wantModelCalls: []wantModelCall{
 				{
-					purpose: agent.ModelCallPurposeConversation,
+					purpose: defs.ModelCallPurposeConversation,
 					usage:   &usage,
 				},
 				{
-					purpose: agent.ModelCallPurposeConversation,
+					purpose: defs.ModelCallPurposeConversation,
 					usage: &defs.TokenUsage{
 						Input:  200,
 						Output: 20,
@@ -2744,7 +2760,7 @@ func TestAgentStepEvents(t *testing.T) {
 				"context_measured", "item_started:message", "item_completed:message", "context_measured", "model_call_finished(conversation)",
 				"context_measured", "context_measured",
 			},
-			wantModelCalls: []wantModelCall{{purpose: agent.ModelCallPurposeConversation}},
+			wantModelCalls: []wantModelCall{{purpose: defs.ModelCallPurposeConversation}},
 			verify: func(t *testing.T, events []*agent.AgentEvent) {
 				measured := getAgentEventsOfType(events, agent.AgentEventContextMeasured)[0].Measurement
 				if !slices.ContainsFunc(measured.Items, func(item agent_context.ItemTokens) bool { return item.ItemID == steer.ID }) {
@@ -2786,14 +2802,14 @@ func TestAgentStepEvents(t *testing.T) {
 			},
 			wantModelCalls: []wantModelCall{
 				{
-					purpose: agent.ModelCallPurposeCompaction,
+					purpose: defs.ModelCallPurposeCompaction,
 					usage: &defs.TokenUsage{
 						Input:  50,
 						Output: 5,
 					},
 				},
 				{
-					purpose: agent.ModelCallPurposeConversation,
+					purpose: defs.ModelCallPurposeConversation,
 					usage: &defs.TokenUsage{
 						Input:  100,
 						Output: 10,
@@ -2837,14 +2853,14 @@ func TestAgentStepEvents(t *testing.T) {
 			},
 			wantModelCalls: []wantModelCall{
 				{
-					purpose: agent.ModelCallPurposeConversation,
+					purpose: defs.ModelCallPurposeConversation,
 					usage: &defs.TokenUsage{
 						Input:  100,
 						Output: 10,
 					},
 				},
 				{
-					purpose: agent.ModelCallPurposeConversation,
+					purpose: defs.ModelCallPurposeConversation,
 					usage: &defs.TokenUsage{
 						Input:  200,
 						Output: 20,
@@ -2971,12 +2987,6 @@ func (h *stubHooks) RunEvent(_ context.Context, request *hook.HookEventRequest, 
 		return h.outcomes[index]
 	}
 	return &hook.HookOutcome{}
-}
-
-// GetHookInfos 返回空的 hook 说明列表。
-func (h *stubHooks) GetHookInfos() []*hook.HookInfo {
-	// 1. 返回空列表。
-	return nil
 }
 
 // newStopHookRun 创建指定状态的 Stop hook 运行记录。
@@ -3293,25 +3303,41 @@ func getAgentEventsOfType(events []*agent.AgentEvent, eventType agent.AgentEvent
 	return matched
 }
 
-// serveAgentInputs 为 Agent 提供测试输入。
-func serveAgentInputs(t *testing.T, opt *agent.AgentOpt, replies ...agent.AgentInputResult) {
-	// 1. 设置输入请求通道，按顺序回复预设输入，之后回复空输入，测试结束时退出。
+// readAgentInputRequest 确认途中收到的 checkpoint，再返回下一次输入请求。
+func readAgentInputRequest(t *testing.T, requests <-chan agent.AgentRequest) agent.AgentInputRequest {
+	// 1. 不读输入的 checkpoint 直接确认，其余交给测试回复。
 	t.Helper()
-	requests := make(chan agent.AgentInputRequest)
-	opt.InputRequests = requests
-	go func() {
-		for _, reply := range replies {
-			select {
-			case request := <-requests:
-				request.Reply <- reply
-			case <-t.Context().Done():
-				return
-			}
+	for {
+		switch request := (<-requests).(type) {
+		case agent.AgentInputRequest:
+			return request
+		case agent.AgentSaveCheckpointRequest:
+			close(request.Reply)
 		}
+	}
+}
+
+// serveAgentInputs 为 Agent 提供测试输入并确认 checkpoint。
+func serveAgentInputs(t *testing.T, opt *agent.AgentOpt, replies ...agent.AgentInputResult) {
+	// 1. 按顺序回复预设输入，之后回复空输入，测试结束时退出。
+	t.Helper()
+	requests := make(chan agent.AgentRequest)
+	opt.Requests = requests
+	go func() {
 		for {
 			select {
 			case request := <-requests:
-				request.Reply <- agent.AgentInputResult{}
+				switch request := request.(type) {
+				case agent.AgentInputRequest:
+					var reply agent.AgentInputResult
+					if len(replies) != 0 {
+						reply, replies = replies[0], replies[1:]
+					}
+					request.Reply <- reply
+					close(request.Reply)
+				case agent.AgentSaveCheckpointRequest:
+					close(request.Reply)
+				}
 			case <-t.Context().Done():
 				return
 			}
@@ -4566,10 +4592,34 @@ func TestAgentRunKeepsCompletedOutputOnFailure(t *testing.T) {
 					opt := agent.NewAgentOpt(testTurnID, testSessionID, client, model, history)
 					toolExecutor := &testToolExecutor{}
 					opt.ToolExecutor = toolExecutor
+					opt.MaxSteps = 3
+					inputRequests := make(chan agent.AgentRequest)
+					opt.Requests = inputRequests
 					instance, err := agent.NewAgent(opt)
 					if err != nil {
 						t.Fatal(err)
 					}
+					inputChecks := make(chan []bool, 1)
+					runFinished := make(chan struct{})
+					go func() {
+						var finishFlags []bool
+						for {
+							select {
+							case requestValue := <-inputRequests:
+								request, ok := requestValue.(agent.AgentInputRequest)
+								if !ok {
+									close(requestValue.(agent.AgentSaveCheckpointRequest).Reply)
+									continue
+								}
+								finishFlags = append(finishFlags, request.FinishIfEmpty)
+								request.Reply <- agent.AgentInputResult{}
+								close(request.Reply)
+							case <-runFinished:
+								inputChecks <- finishFlags
+								return
+							}
+						}
+					}()
 					events := make(chan *agent.AgentEvent)
 					collected := make(chan []*agent.AgentEvent, 1)
 					go func() {
@@ -4580,6 +4630,8 @@ func TestAgentRunKeepsCompletedOutputOnFailure(t *testing.T) {
 						collected <- received
 					}()
 					result, err := instance.Run(telemetry.ContextWithTelemetry(t.Context(), pipeline.Telemetry), events)
+					close(runFinished)
+					finishFlags := <-inputChecks
 					received := <-collected
 					if err != nil {
 						t.Fatal(err)
@@ -4592,6 +4644,15 @@ func TestAgentRunKeepsCompletedOutputOnFailure(t *testing.T) {
 						Output: 35,
 					}) {
 						t.Fatalf("stats = %+v", result.Stats)
+					}
+					if !slices.Equal(finishFlags, []bool{false, false, false}) {
+						t.Fatalf("input checks = %v, want one non-final check per generation step", finishFlags)
+					}
+					for attempt, request := range client.requests {
+						isToolChoiceDisabled := request.ToolChoice != nil && request.ToolChoice.Type == "none"
+						if isToolChoiceDisabled != (attempt == 3) {
+							t.Fatalf("attempt %d tool choice = %+v, want tool disabling only on the third generation step", attempt+1, request.ToolChoice)
+						}
 					}
 					if !reflect.DeepEqual(client.requests[1].Messages, client.requests[2].Messages) {
 						t.Fatal("retry did not reuse original input")
@@ -4717,6 +4778,7 @@ type measuredRequestContext struct {
 	reports                []*defs.TurnContextUsage
 	failRequestMeasurement bool
 	requestMeasurementErr  error
+	onRequestUsage         func()
 }
 
 // RecordRequestUsage 保存收到的报告并更新真实上下文。
@@ -4724,6 +4786,9 @@ func (c *measuredRequestContext) RecordRequestUsage(contextUsage *defs.TurnConte
 	// 1. 记录收到的报告，交给真实上下文，并安排本次测量错误。
 	c.reports = append(c.reports, contextUsage)
 	c.AgentContext.RecordRequestUsage(contextUsage)
+	if c.onRequestUsage != nil {
+		c.onRequestUsage()
+	}
 	if c.failRequestMeasurement {
 		c.requestMeasurementErr = io.ErrUnexpectedEOF
 	}
@@ -4788,7 +4853,7 @@ func TestAgentModelCallReports(t *testing.T) {
 				t.Fatalf("requests=%d, steps=%d, calls=%d; want one attempt", len(client.requests), result.Stats.Steps, len(calls))
 			}
 			call := calls[0].ModelCall
-			if call.ModelCallID == "" || call.Purpose != agent.ModelCallPurposeConversation || (call.ContextUsage != nil) != (tt.callError == nil) {
+			if call.ModelCallID == "" || call.Purpose != defs.ModelCallPurposeConversation || (call.ContextUsage != nil) != (tt.callError == nil) {
 				t.Fatalf("call = %+v", call)
 			}
 			if tt.callError != nil {
@@ -4805,8 +4870,8 @@ func TestAgentModelCallReports(t *testing.T) {
 			if tt.hasUsage {
 				wantReport.Usage = defs.TokenUsage{Input: 9000, Output: 5000, Reasoning: 4000}
 			}
-			if history.reports[0] != call.ContextUsage || !reflect.DeepEqual(call.ContextUsage, wantReport) || (call.Usage != nil) != tt.hasUsage {
-				t.Fatalf("report=%+v, event report=%+v, want one shared report %+v; usage=%+v", history.reports[0], call.ContextUsage, wantReport, call.Usage)
+			if !reflect.DeepEqual(history.reports[0], wantReport) || !reflect.DeepEqual(call.ContextUsage, wantReport) || (call.Usage != nil) != tt.hasUsage {
+				t.Fatalf("report=%+v, event report=%+v, want both to match %+v; usage=%+v", history.reports[0], call.ContextUsage, wantReport, call.Usage)
 			}
 			if tt.hasUsage && (result.Stats.Usage != (defs.TokenUsage{Input: 9000, Output: 5000, Reasoning: 4000}) || *call.Usage != result.Stats.Usage) {
 				t.Fatalf("call usage=%+v, stats=%+v", call.Usage, result.Stats.Usage)
@@ -5108,7 +5173,7 @@ func TestAgentRetriesContextCompaction(t *testing.T) {
 						t.Fatalf("model call = %+v", call)
 					}
 					identities[call.ModelCallID] = true
-					wantPurpose := agent.ModelCallPurposeCompaction
+					wantPurpose := defs.ModelCallPurposeCompaction
 					wantCallUsage := defs.TokenUsage{
 						Input:  7,
 						Output: 3,
@@ -5120,7 +5185,7 @@ func TestAgentRetriesContextCompaction(t *testing.T) {
 						}
 					}
 					if index >= tt.wantAttempts {
-						wantPurpose = agent.ModelCallPurposeConversation
+						wantPurpose = defs.ModelCallPurposeConversation
 						wantCallUsage = defs.TokenUsage{
 							Input:  200,
 							Output: 20,
@@ -5367,4 +5432,328 @@ func TestAgentMaxSteps(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAgentTaskScheduling 检查两项工具结果都收到后才继续生成，且输出位置跨任务连续。
+func TestAgentTaskScheduling(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		preparedCall string
+		wantFailures int
+	}{
+		{name: "waits_for_both_running_tools"},
+		{name: "keeps_result_finished_during_prepare", preparedCall: "call-a", wantFailures: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// 1. 第二个工具等待放行，第一个从执行器或准备阶段返回。
+				responses := newToolLoopResponses()
+				responses[0][0].ToolCall.CallID = "call-a"
+				secondCall := llmkit.Event{Type: llmkit.EventToolCallEnd, ToolCall: &llmkit.StreamingToolCall{
+					CallID: "call-b", Name: "lookup", Arguments: `{}`,
+				}}
+				responses[0] = slices.Insert(responses[0], 1, secondCall)
+				client := &sequenceAgentClient{responses: responses}
+				release := make(chan struct{})
+				toolExecutor := &testToolExecutor{blockedCallID: "call-b", releaseCall: release, preparedCallID: tt.preparedCall}
+				history := &measuredRequestContext{AgentContext: newTestContext(t, "", []*defs.Item{userMessage("查两份资料")})}
+				opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, history)
+				opt.ToolExecutor = toolExecutor
+				serveAgentInputs(t, opt)
+				instance, err := agent.NewAgent(opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				events := make(chan *agent.AgentEvent, 64)
+				done := make(chan struct{})
+				var result agent.AgentResult
+				var runErr error
+				go func() { defer close(done); result, runErr = instance.Run(t.Context(), events) }()
+				// 2. 等待所有未放行工作停在通道，再确认只有第一个结果和一次模型调用。
+				synctest.Wait()
+				var received []*agent.AgentEvent
+				for range len(events) {
+					received = append(received, <-events)
+				}
+				var toolResultIDs []string
+				for _, event := range received {
+					if event.Type == agent.AgentEventItemCompleted && event.Item.ToolResult != nil {
+						toolResultIDs = append(toolResultIDs, event.Item.ToolResult.CallID)
+					}
+				}
+				if !slices.Equal(toolResultIDs, []string{"call-a"}) || len(client.requests) != 1 {
+					t.Errorf("before second result: tool results=%v, model calls=%d", toolResultIDs, len(client.requests))
+				}
+				close(release)
+				<-done
+				// 3. 完整批次放行后只继续一次，输出索引没有空洞或重复。
+				if runErr != nil || len(client.requests) != 2 || len(result.Items) != 5 || result.Stats.ToolCalls != 2 || result.Stats.FailedToolCalls != tt.wantFailures {
+					t.Fatalf("Run() error=%v, calls=%d, items=%v, stats=%+v", runErr, len(client.requests), result.Items, result.Stats)
+				}
+				for event := range events {
+					received = append(received, event)
+				}
+				assertAgentEvents(t, slices.DeleteFunc(received, func(event *agent.AgentEvent) bool {
+					return event.Type == agent.AgentEventToolProgress
+				}), result.Items)
+			})
+		})
+	}
+}
+
+// TestAgentTaskRequestCancellation 检查 Agent 在任务交接处取消后仍结算已发出的事件。
+func TestAgentTaskRequestCancellation(t *testing.T) {
+	for _, handoff := range []string{"model_finished", "create_tools", "compaction_finished", "final_input"} {
+		t.Run(handoff, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// 1. 为每种交接准备可控模型、上下文和取消点。
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				responses := newToolLoopResponses()
+				client := &sequenceAgentClient{responses: responses[:1]}
+				agentContext, err := agent_context.NewAgentContext(agent_context.NewAgentContextOpt(testSessionID, testTurnID, client, testModel, testModel))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := agentContext.Load(&agent_context.ContextLoadParam{Items: []*defs.Item{userMessage("保留原历史")}}); err != nil {
+					t.Fatal(err)
+				}
+				history := &measuredRequestContext{AgentContext: agentContext}
+				opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, history)
+				toolExecutor := &testToolExecutor{exitedCalls: make(chan string, 2)}
+				opt.ToolExecutor = toolExecutor
+				inputRequests := make(chan agent.AgentRequest)
+				events := make(chan *agent.AgentEvent, 32)
+				switch handoff {
+				case "model_finished":
+					history.onRequestUsage = cancel
+				case "create_tools":
+					toolExecutor.beforePreparedCallsReturned = cancel
+				case "compaction_finished":
+					opt.IsCompactOnly = true
+					client.responses = responses[1:]
+					events = make(chan *agent.AgentEvent)
+				case "final_input":
+					client.responses = responses[1:]
+					opt.Requests = inputRequests
+				}
+				instance, err := agent.NewAgent(opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan struct{})
+				var result agent.AgentResult
+				var runErr error
+				go func() { defer close(done); result, runErr = instance.Run(ctx, events) }()
+				// 2. 在摘要的调用通知出口或最终输入请求处取消，普通模型和工具使用上面的回调。
+				var received []*agent.AgentEvent
+				switch handoff {
+				case "compaction_finished":
+					started := <-events
+					if started.Type != agent.AgentEventItemStarted || started.Item.ContextSummary == nil {
+						t.Errorf("first event = %+v, want summary start", started)
+					}
+					received = append(received, started)
+					synctest.Wait()
+					cancel()
+				case "final_input":
+					request := readAgentInputRequest(t, inputRequests)
+					request.Reply <- agent.AgentInputResult{}
+					finalRequest := readAgentInputRequest(t, inputRequests)
+					if !finalRequest.FinishIfEmpty {
+						t.Error("last request cannot finish input")
+					}
+					cancel()
+				}
+				for event := range events {
+					received = append(received, event)
+				}
+				<-done
+				// 3. 已开始的模型调用有最终报告；未派发的工具不会运行，未应用的摘要不裁剪历史。
+				if !errors.Is(runErr, context.Canceled) || result.FinalModelCallID != "" || len(client.requests) != 1 || len(toolExecutor.exitedCalls) != 0 {
+					t.Fatalf("Run() error=%v, final=%q, calls=%d, dispatched tools=%d", runErr, result.FinalModelCallID, len(client.requests), len(toolExecutor.exitedCalls))
+				}
+				if calls := getAgentEventsOfType(received, agent.AgentEventModelCallFinished); len(calls) != 1 || result.Stats.InferenceCalls != 1 || result.Stats.Usage.Input == 0 {
+					t.Fatalf("model reports=%v, stats=%+v", calls, result.Stats)
+				}
+				if handoff == "compaction_finished" {
+					messages := contextMessages(t, history)
+					if len(result.Items) != 0 || len(messages) != 1 || messages[0].Content[0].Text != "保留原历史" {
+						t.Fatalf("canceled summary changed history: items=%+v, messages=%+v", result.Items, messages)
+					}
+				}
+			})
+		})
+	}
+}
+
+// taskFailingContext 在指定的 Context 操作返回主错误，其他操作仍使用真实 Context。
+type taskFailingContext struct {
+	agent_context.AgentContext
+	buildErr  error
+	appendErr error
+	onFailure func()
+}
+
+func (c *taskFailingContext) BuildModelRequest(tools []llmkit.Tool) (*llmkit.Request, defs.ItemID, error) {
+	if c.buildErr != nil {
+		c.onFailure()
+		return nil, "", c.buildErr
+	}
+	return c.AgentContext.BuildModelRequest(tools)
+}
+
+func (c *taskFailingContext) AppendItems(items ...*defs.Item) error {
+	if c.appendErr != nil && len(items) != 0 && items[0].Kind == defs.ItemMessage {
+		c.onFailure()
+		return c.appendErr
+	}
+	return c.AgentContext.AppendItems(items...)
+}
+
+// TestAgentTaskFailureOwnership 检查 Context 的首错不会被任务收尾时的取消覆盖。
+func TestAgentTaskFailureOwnership(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		wantCalls int
+		wantError string
+	}{
+		{name: "build", wantError: "build model request: unexpected EOF"},
+		{name: "append", wantCalls: 1, wantError: "append agent output: unexpected EOF"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. Context 返回带模型重试分类的 sentinel，并同时取消。
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			history := &taskFailingContext{AgentContext: newTestContext(t, "", []*defs.Item{userMessage("初始输入")}), onFailure: cancel}
+			if tt.name == "build" {
+				history.buildErr = io.ErrUnexpectedEOF
+			} else {
+				history.appendErr = io.ErrUnexpectedEOF
+			}
+			client := &sequenceAgentClient{responses: newToolLoopResponses()[1:]}
+			instance, err := agent.NewAgent(agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, history))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 2. 返回首个错误，并且 Context 错误不触发模型重试。
+			events := make(chan *agent.AgentEvent, 32)
+			result, err := instance.Run(ctx, events)
+			if !errors.Is(err, io.ErrUnexpectedEOF) || err.Error() != tt.wantError || len(client.requests) != tt.wantCalls || result.FinalModelCallID != "" {
+				t.Fatalf("Run() error=%v, calls=%d, final=%q", err, len(client.requests), result.FinalModelCallID)
+			}
+			callReports := 0
+			for event := range events {
+				if event.Type == agent.AgentEventModelCallFinished {
+					callReports++
+				}
+			}
+			if callReports != tt.wantCalls {
+				t.Fatalf("call reports=%d, want %d", callReports, tt.wantCalls)
+			}
+		})
+	}
+}
+
+// TestAgentCancellationWhileReportingModelFailure 检查取消期间只把未标为失败的尝试留在历史中。
+func TestAgentCancellationWhileReportingModelFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name              string
+		cancelOnErrorItem bool
+	}{
+		{name: "before_error_item"},
+		{name: "after_error_item_started", cancelOnErrorItem: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// 1. 模型发送文本后关闭流。Agent 会发布调用结果、消息中断和合成错误 Item。
+				history := newTestContext(t, "", []*defs.Item{userMessage("原始输入")})
+				client := &scriptedAgentClient{events: []llmkit.Event{{
+					Type: llmkit.EventContentDelta, Delta: &llmkit.DeltaPayload{Text: "partial answer"},
+				}}}
+				instance, err := agent.NewAgent(agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, history))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				events := make(chan *agent.AgentEvent)
+				done := make(chan struct{})
+				var result agent.AgentResult
+				var runErr error
+				go func() { defer close(done); result, runErr = instance.Run(ctx, events) }()
+				// 2. Agent 发出指定事件后停在下一次发送，取消再继续消费事件。
+				reachedCancelPoint := false
+				for event := range events {
+					if !tt.cancelOnErrorItem && event.Type == agent.AgentEventModelCallFinished ||
+						tt.cancelOnErrorItem && event.Type == agent.AgentEventItemStarted && event.Item.ModelError != nil {
+						synctest.Wait()
+						cancel()
+						reachedCancelPoint = true
+					}
+				}
+				<-done
+				// 3. 草稿保留文本；历史只保留未写入失败标记的尝试。
+				if !reachedCancelPoint || runErr == nil || result.FinalModelCallID != "" || client.calls != 1 || len(result.Items) == 0 || result.Items[0].Message == nil {
+					t.Fatalf("cancel point=%v, Run() error=%v, calls=%d, result=%+v", reachedCancelPoint, runErr, client.calls, result)
+				}
+				messages := contextMessages(t, history)
+				wantMessages := 2
+				if tt.cancelOnErrorItem {
+					wantMessages = 1
+				}
+				if len(messages) != wantMessages {
+					t.Fatalf("context messages = %+v, want %d", messages, wantMessages)
+				}
+			})
+		})
+	}
+}
+
+// TestAgentFinalContextMeasurementError 检查结束测量报错时是否已经有成功生成的 ID。
+func TestAgentFinalContextMeasurementError(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		failAt     int
+		wantCallID bool
+	}{
+		{name: "model_output_measurement", failAt: 4},
+		{name: "final_measurement", failAt: 5, wantCallID: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. 前两次测量用于准备，随后测量模型请求用量、已追加的输出和最终上下文。
+			measureErr := errors.New("measurement failed")
+			history := &indexedMeasurementContext{
+				AgentContext: newTestContext(t, "", []*defs.Item{userMessage("原始输入")}),
+				failAt:       tt.failAt, measureErr: measureErr,
+			}
+			client := &sequenceAgentClient{responses: newToolLoopResponses()[1:]}
+			instance, err := agent.NewAgent(agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, history))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 2. 只有生成成功后发生的最终测量错误保留最后一次模型调用 ID。
+			result, err := instance.Run(t.Context(), nil)
+			if !errors.Is(err, measureErr) || len(result.Items) != 1 || (result.FinalModelCallID != "") != tt.wantCallID ||
+				tt.wantCallID && result.FinalModelCallID != result.Items[0].ModelCallID {
+				t.Fatalf("Run() error=%v, final call=%q, items=%v; want measurement error, call ID=%v", err, result.FinalModelCallID, result.Items, tt.wantCallID)
+			}
+		})
+	}
+}
+
+// indexedMeasurementContext 只让指定的一次上下文测量失败。
+type indexedMeasurementContext struct {
+	agent_context.AgentContext
+	measurements int
+	failAt       int
+	measureErr   error
+}
+
+func (c *indexedMeasurementContext) GetMeasurement(tools []llmkit.Tool) (*agent_context.ContextMeasurement, error) {
+	c.measurements++
+	if c.measurements == c.failAt {
+		return nil, c.measureErr
+	}
+	return c.AgentContext.GetMeasurement(tools)
 }

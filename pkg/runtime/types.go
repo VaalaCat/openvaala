@@ -75,6 +75,11 @@ type OpenConversationRequest struct {
 	Environment []string
 }
 
+// CloseConversationRequest 指定要关闭运行实例并保留已保存历史的对话。
+type CloseConversationRequest struct {
+	ConversationID defs.ConversationID
+}
+
 // SetConversationExecutorSettingsRequest 是对话新的完整 Executor 设置。
 type SetConversationExecutorSettingsRequest struct {
 	ConversationID   defs.ConversationID
@@ -356,7 +361,15 @@ type conversationArchiveChangeRequested struct {
 
 func (*conversationArchiveChangeRequested) isRuntimeRequest() {}
 
-// conversationDeleteRequested 由 DeleteConversation 触发：事件循环确认对话已保存，有 Session 在执行 Turn 时回复 session.ErrSessionBusy；
+// conversationCloseRequested 由 CloseConversation 触发，事件循环确认空闲后停止实例并保留已保存历史。
+type conversationCloseRequested struct {
+	request *CloseConversationRequest
+	reply   chan error
+}
+
+func (*conversationCloseRequested) isRuntimeRequest() {}
+
+// conversationDeleteRequested 由 DeleteConversation 触发：事件循环确认对话已保存，有活动 Turn 或后台命令时回复 session.ErrSessionBusy；
 // 否则停掉运行实例，再删除它的全部记录和日志，回复删除结果。
 type conversationDeleteRequested struct {
 	request *DeleteConversationRequest
@@ -442,7 +455,7 @@ func (*terminalsUnsubscribeRequested) isRuntimeRequest() {}
 // runtimeDefinitions 是 Runtime 当前的定义和两个索引，构造后只读，reload 时整份替换。
 type runtimeDefinitions struct {
 	// conversationDefinitions 是交给对话的整份定义（Agent、模型目录、MCP server、hook、Executor、共用 skill），建一次、各对话共用；
-	// 对话只给其中至少一个 Agent 会用到的 MCP server 建连接；没有 hook 定义时 Hooks 也不为 nil。
+	// 对话只给其中至少一个 Agent 会用到的 MCP server 建连接；各套对话配置自行创建 Hooks。
 	conversationDefinitions *conversation.ConversationDefinitions
 	// modelsByRef 是按引用索引的模型目录；runtimeConversation 用它算 Session 下一次请求的上下文窗口。
 	modelsByRef map[defs.ModelRef]*defs.ModelDefinition

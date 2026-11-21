@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
@@ -290,4 +291,30 @@ func getPluginCommandLine(root string, definition *HookDefinition) string {
 	}
 	// 2. 在命令前导出 OPENVAALA_PLUGIN_ROOT。
 	return "export OPENVAALA_PLUGIN_ROOT=" + workspace.QuoteShellWord(root) + "; " + commandLine
+}
+
+// GetHookInfos 返回按展示顺序排列的 hook 信息。
+func GetHookInfos(definitions []*HookDefinition) []*HookInfo {
+	// 1. 提取事件、matcher、显示命令、超时、来源、定义哈希和插件名。
+	infos := make([]*HookInfo, 0, len(definitions))
+	for _, definition := range definitions {
+		pluginName := ""
+		if definition.Plugin != nil {
+			pluginName = definition.Plugin.Name
+		}
+		infos = append(infos, &HookInfo{
+			Key:            definition.Key,
+			Event:          definition.Event,
+			Matcher:        definition.Matcher.String(),
+			Handler:        getHandler(definition),
+			TimeoutSeconds: int(definition.Timeout / time.Second),
+			SourcePath:     definition.SourcePath,
+			DisplayOrder:   definition.DisplayOrder,
+			CurrentHash:    getDefinitionHash(definition),
+			PluginName:     pluginName,
+		})
+	}
+	// 2. 按 DisplayOrder 稳定排序。
+	slices.SortStableFunc(infos, func(a, b *HookInfo) int { return a.DisplayOrder - b.DisplayOrder })
+	return infos
 }

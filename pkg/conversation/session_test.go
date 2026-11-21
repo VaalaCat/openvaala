@@ -733,11 +733,11 @@ type spawnStartupQuery struct {
 	root defs.SessionID
 }
 
-// ListTurns 查询非根 Session 时返回注入错误，根 Session 照常查询。
-func (q *spawnStartupQuery) ListTurns(ctx context.Context, request dao.ListTurnsRequest) (storage.Page[defs.Turn, dao.RecordCursor[defs.TurnID]], error) {
+// GetLatestLoggedTurn 查询非根 Session 时返回注入错误，根 Session 照常查询。
+func (q *spawnStartupQuery) GetLatestLoggedTurn(ctx context.Context, cid defs.ConversationID, sid defs.SessionID) (*defs.Turn, error) {
 	// 1. 不是根 Session 时返回注入错误，否则交给 DAO。
-	if request.SessionID != q.root {
-		return storage.Page[defs.Turn, dao.RecordCursor[defs.TurnID]]{}, errors.New("injected startup")
+	if sid != q.root {
+		return nil, errors.New("injected startup")
 	}
-	return q.Query.ListTurns(ctx, request)
+	return q.Query.GetLatestLoggedTurn(ctx, cid, sid)
 }

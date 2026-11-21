@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
-	"github.com/VaalaCat/openvaala/pkg/hook"
 )
 
 // ── Execution 输出流 ──
@@ -27,7 +26,7 @@ type ToolExecutionResult struct {
 
 // ── ToolExecutor 事件 ──
 
-// ExecutorEvent 是 ToolExecutor.Run 发给调用方的事件：工具执行进度、hook 运行记录和调用结果；发出后归调用方所有。
+// ExecutorEvent 是 ToolExecutor.PrepareCalls 和 ToolExecutor.Run 发给调用方的事件：工具执行进度、hook 运行记录和调用结果；发出后归调用方所有。
 type ExecutorEvent interface {
 	executorEvent()
 }
@@ -93,11 +92,14 @@ type toolProvider struct {
 	executorID string
 }
 
-// routedToolCall 是已经选好提供方的一次调用和它的 PreToolUse 结果。
-type routedToolCall struct {
-	// call 是去掉 executor 参数的调用；PreToolUse 改写参数后换成带新参数的副本。
-	call     *defs.Item
+// PreparedToolCall 表示 PrepareCalls 返回的单条已准备工具调用，包含已选定提供方并完成前置 hook 处理的调用，或准备失败、被拦截时已发送结果的调用。
+type PreparedToolCall struct {
+	// Call 保存该工具调用的副本：路由成功时已去掉 executor 并应用可能的 hook 参数改写，路由失败时为原调用副本。
+	Call *defs.Item
+	// Finished 是准备阶段已经发出的最终结果；为 nil 时由 Run 执行工具并发送最终结果。
+	Finished *ExecutionFinishedEvent
+	// provider 为 PrepareCalls 路由时选定的工具提供方，供 Run 实际使用其工具和环境。
 	provider toolProvider
-	// preOutcome 是 PreToolUse 的合并结果；没有触发 PreToolUse 时为 nil。
-	preOutcome *hook.HookOutcome
+	// preRuns 是 PreToolUse 要保存的运行记录；没有触发或没有命中时为空。
+	preRuns []*defs.HookRun
 }

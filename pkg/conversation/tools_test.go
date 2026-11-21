@@ -29,7 +29,7 @@ func TestCollaborationToolDefinitions(t *testing.T) {
 			"message 应提供目标、必要材料和预期交付物；默认不继承历史，需要时明确设置 fork_turns。" +
 			"返回 session_id、task_name 和 accepted 表示首个任务已接收，不表示已经完成；子任务每个 Turn 结束后，结果以通知消息自动进入你的收件箱，在下一次模型请求前读入。" +
 			"需要暂停等待时使用 wait_agent，它只在新消息到达时唤醒、不返回正文。" + "可选 agent_name（省略时与当前 Agent 相同）：\n- assistant：主 Agent\n- worker：只读调查\n可选 model（省略时同一 Agent 继承你当前的模型，不同 Agent 使用它的默认模型）：\n- test/other（）：窗口 64000，reasoning_effort 可选 low|high，默认 low\n- test/test（）：窗口 0\n- test/third（）：窗口 0，reasoning_effort 可选 high|medium，默认 medium\n- test/worker-model（）：窗口 0",
-		"send_message": "向已知后代或直接父 Agent 发送任务、补充要求或信息。" +
+		"send_message": "向已知后代或直接父 Agent 发送任务、补充要求或信息；重开对话后，发到原 SessionID 会先续跑其未完成轮次。" +
 			"normal 安排新 Turn，忙碌时排队；steer 补充活动 Turn，在下一次模型请求前读入，无可接收 Turn 时自动按 normal 安排。" +
 			"进度汇报、提问和对当前任务的补充要求应显式设置 mode: \"steer\"；独立的后续任务用 normal。" +
 			"返回 accepted 只表示已接收；steer 不会中断正在执行的模型或工具，需要中断时使用 interrupt_agent。" +
@@ -45,7 +45,8 @@ func TestCollaborationToolDefinitions(t *testing.T) {
 			"返回资料省略加密推理、provider RawJSON 和图片 base64；查询不启动执行，也不影响结果通知。",
 		"wait_agent": "暂停当前工作，直到收到 steer 消息（Agent 消息或用户补充输入）、子任务结果通知或超时。normal 消息排队等待新 Turn，不会唤醒本次等待。" +
 			"返回 reason：user_steer、subagent_result、agent_message 或 timeout（同时存在时按此顺序），from 为发送消息的 Agent SessionID；不返回正文。" +
-			"消息正文会在下一次模型请求中读入；超时不会取消子任务，子任务每轮结束后的结果都会自动通知。",
+			"可选 wait_for: \"subagent_result\" 优先返回已有未读补充；没有未读补充且没有运行中的后代时立即返回 no_running_subagents，可用 list_agents 查看状态。" +
+			"消息正文会在下一次模型请求中读入；省略参数默认等待 30 秒，超时不会取消子任务。",
 	}
 	for _, tt := range []struct {
 		name   string
@@ -61,7 +62,7 @@ func TestCollaborationToolDefinitions(t *testing.T) {
 		},
 		{
 			name:   "wait_agent",
-			fields: []string{"timeout_seconds"},
+			fields: []string{"timeout_seconds", "wait_for"},
 		},
 		{
 			name:   "interrupt_agent",
@@ -187,6 +188,7 @@ func TestCollaborationToolParameters(t *testing.T) {
 			args:     `{"session_id":"unknown"}`,
 			wantCode: "collaboration_error",
 		},
+		{name: "invalid_wait_for", tool: "wait_agent", args: `{"wait_for":"steer"}`, wantCode: "invalid_arguments"},
 		{
 			name:     "wait_negative",
 			tool:     "wait_agent",

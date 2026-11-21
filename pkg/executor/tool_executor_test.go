@@ -193,16 +193,22 @@ func (t *identityTool) Execute(_ context.Context, call *defs.Item, _ chan<- *exe
 
 // toolProbe 记录各 probeTool 实际收到的参数；没有记录说明工具没被调用。
 type toolProbe struct {
-	mu        sync.Mutex
-	arguments []string
+	mu                sync.Mutex
+	arguments         []string
+	argumentsByCallID map[string][]string
+	onExecute         func()
 }
 
-// record 记录工具收到的参数。
-func (p *toolProbe) record(arguments string) {
-	// 1. 加锁追加参数。
+// record 记录工具收到的调用 ID 和参数。
+func (p *toolProbe) record(callID string, arguments string) {
+	// 1. 加锁追加参数列表及按调用 ID 分组的参数。
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.arguments = append(p.arguments, arguments)
+	if p.argumentsByCallID == nil {
+		p.argumentsByCallID = make(map[string][]string)
+	}
+	p.argumentsByCallID[callID] = append(p.argumentsByCallID[callID], arguments)
 }
 
 // getArguments 返回已记录参数的副本。
@@ -211,6 +217,14 @@ func (p *toolProbe) getArguments() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.arguments)
+}
+
+// getCallArguments 返回指定调用收到的参数；多次调用用逗号连接。
+func (p *toolProbe) getCallArguments(callID string) string {
+	// 1. 加锁读取指定调用的参数列表并拼接。
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return strings.Join(p.argumentsByCallID[callID], ",")
 }
 
 // probeTool 把收到的参数记进 probe；failureCode 非空时返回带该错误码的失败结果。
@@ -232,8 +246,11 @@ func (t *probeTool) GetDefinition() *defs.ToolDefinition {
 
 // Execute 记录参数并生成探测工具的测试结果。
 func (t *probeTool) Execute(_ context.Context, call *defs.Item, _ chan<- *executor.ExecutionProgressEvent) *executor.ToolExecutionResult {
-	// 1. 保存收到的参数，有预设错误码时返回错误，否则返回参数正文。
-	t.probe.record(call.ToolCall.Arguments)
+	// 1. 在执行入口通知测试并保存参数；有预设错误码时返回错误，否则返回参数正文。
+	if t.probe.onExecute != nil {
+		t.probe.onExecute()
+	}
+	t.probe.record(call.ToolCall.CallID, call.ToolCall.Arguments)
 	if t.failureCode != "" {
 		return &executor.ToolExecutionResult{Result: &defs.ToolResult{
 			CallID:  call.ToolCall.CallID,
@@ -251,9 +268,16 @@ func (t *probeTool) Execute(_ context.Context, call *defs.Item, _ chan<- *execut
 	}}
 }
 
-// stubHooks 按事件名返回预设的 HookOutcome、记录收到的请求；每个请求先后往 runUpdates 发 running 和 completed 两条运行记录。
+// hookOutcomeKey 按事件名和调用 ID 定位预设的 HookOutcome。
+type hookOutcomeKey struct {
+	event  defs.HookEventName
+	callID string
+}
+
+// stubHooks 按事件名或调用 ID 返回预设的 HookOutcome、记录收到的请求；每个请求先后往 runUpdates 发 running 和 completed 两条运行记录。
 type stubHooks struct {
-	outcomes map[defs.HookEventName]*hook.HookOutcome
+	outcomes     map[defs.HookEventName]*hook.HookOutcome
+	callOutcomes map[hookOutcomeKey]*hook.HookOutcome
 	// gatedCallIDs 里的调用，PreToolUse 要等 release 关闭才返回。
 	gatedCallIDs []string
 	release      chan struct{}
@@ -289,16 +313,16 @@ func (s *stubHooks) RunEvent(_ context.Context, request *hook.HookEventRequest, 
 	}
 	run.Status = defs.HookRunCompleted
 	runUpdates <- run.Clone()
+	if outcome := s.callOutcomes[hookOutcomeKey{
+		event:  request.Event.Name,
+		callID: callID,
+	}]; outcome != nil {
+		return outcome
+	}
 	if outcome := s.outcomes[request.Event.Name]; outcome != nil {
 		return outcome
 	}
 	return &hook.HookOutcome{}
-}
-
-// GetHookInfos 返回空的 hook 信息列表。
-func (s *stubHooks) GetHookInfos() []*hook.HookInfo {
-	// 1. 返回 nil。
-	return nil
 }
 
 // getRequests 返回收到的 hook 请求列表副本。
@@ -460,6 +484,21 @@ func newHookToolCallItem(call *defs.ToolCall) *defs.Item {
 	}
 }
 
+// executeToolBatch 准备并并发执行一批调用，全部完成后关闭 events。
+func executeToolBatch(ctx context.Context, toolExecutor executor.ToolExecutor, calls []*defs.Item, events chan<- executor.ExecutorEvent) {
+	// 1. 准备整批调用，并发执行未提前结束的项，等待完成后关闭事件通道。
+	defer close(events)
+	preparedCalls := toolExecutor.PrepareCalls(ctx, calls, events)
+	var tasks sync.WaitGroup
+	for _, prepared := range preparedCalls {
+		if prepared.Finished != nil {
+			continue
+		}
+		tasks.Go(func() { toolExecutor.Run(ctx, prepared, events) })
+	}
+	tasks.Wait()
+}
+
 // runToolCalls 执行一批调用，返回各调用的结果和完成次数。
 func runToolCalls(t *testing.T, toolExecutor executor.ToolExecutor, calls []*defs.ToolCall) (map[string]*defs.ToolResult, map[string]int) {
 	// 1. 使用测试上下文执行本批调用。
@@ -475,7 +514,7 @@ func runToolCallsWithContext(t *testing.T, ctx context.Context, toolExecutor exe
 	defer cancel()
 	events := make(chan executor.ExecutorEvent)
 	var tasks sync.WaitGroup
-	tasks.Go(func() { toolExecutor.Run(ctx, executorCallItems(calls), events) })
+	tasks.Go(func() { executeToolBatch(ctx, toolExecutor, executorCallItems(calls), events) })
 	// 2. 按调用 ID 收集结果和完成次数，等待本批执行结束。
 	results := make(map[string]*defs.ToolResult)
 	finishedCounts := make(map[string]int)
@@ -497,7 +536,7 @@ func collectToolEvents(t *testing.T, toolExecutor executor.ToolExecutor, items [
 	defer cancel()
 	events := make(chan executor.ExecutorEvent)
 	var tasks sync.WaitGroup
-	tasks.Go(func() { toolExecutor.Run(ctx, items, events) })
+	tasks.Go(func() { executeToolBatch(ctx, toolExecutor, items, events) })
 	var collected []executor.ExecutorEvent
 	for event := range events {
 		collected = append(collected, event)
@@ -654,7 +693,7 @@ func TestToolExecutorRunResults(t *testing.T) {
 			defer cancel()
 			events := make(chan executor.ExecutorEvent)
 			var tasks sync.WaitGroup
-			tasks.Go(func() { toolExecutor.Run(ctx, executorCallItems(tt.calls), events) })
+			tasks.Go(func() { executeToolBatch(ctx, toolExecutor, executorCallItems(tt.calls), events) })
 			progress := make(map[string][]string)
 			// 按调用 ID 收集进度和结果，同一调用收到第二个结果时直接失败。
 			results := make(map[string]*defs.ToolResult)
@@ -931,7 +970,9 @@ func TestToolExecutorCallItemIdentity(t *testing.T) {
 				})
 			}
 			events := make(chan executor.ExecutorEvent, 10)
-			toolExecutor.Run(t.Context(), calls, events)
+			for _, prepared := range toolExecutor.PrepareCalls(t.Context(), calls, events) {
+				toolExecutor.Run(t.Context(), prepared, events)
+			}
 			for range count {
 				got := <-received
 				found := false
@@ -2568,7 +2609,7 @@ func TestToolExecutorPreToolUseBeforeDispatch(t *testing.T) {
 			events := make(chan executor.ExecutorEvent)
 			var tasks sync.WaitGroup
 			tasks.Go(func() {
-				toolExecutor.Run(ctx, []*defs.Item{newHookToolCallItem(tt.slowCall), newHookToolCallItem(tt.otherCall)}, events)
+				executeToolBatch(ctx, toolExecutor, []*defs.Item{newHookToolCallItem(tt.slowCall), newHookToolCallItem(tt.otherCall)}, events)
 			})
 			finishedCallIDs := make(chan []string, 1)
 			tasks.Go(func() {
@@ -2602,6 +2643,385 @@ func TestToolExecutorPreToolUseBeforeDispatch(t *testing.T) {
 			}
 			if got := probe.getArguments(); len(got) != 2 {
 				t.Fatalf("tool runs = %v, want both calls after PreToolUse finished", got)
+			}
+		})
+	}
+}
+
+// TestToolExecutorPreparedCalls 验证批准备与单次执行的参数改写、事件时序、拒绝调用结果和通道所有权。
+func TestToolExecutorPreparedCalls(t *testing.T) {
+	// 1. 准备正常双调用、hook 改参、路由失败、前置拦截、前置停止和后置停止用例。
+	preBlockedSaved := &defs.HookRun{
+		ID:     "pre-blocked",
+		Event:  defs.HookEventPreToolUse,
+		CallID: "call-a",
+		Status: defs.HookRunBlocked,
+	}
+	preStoppedSaved := &defs.HookRun{
+		ID:     "pre-stopped",
+		Event:  defs.HookEventPreToolUse,
+		CallID: "call-a",
+		Status: defs.HookRunStopped,
+	}
+	postStoppedSaved := &defs.HookRun{
+		ID:     "post-stopped",
+		Event:  defs.HookEventPostToolUse,
+		CallID: "call-a",
+		Status: defs.HookRunStopped,
+	}
+	tests := []struct {
+		name                       string
+		calls                      []*defs.ToolCall
+		callOutcomes               map[hookOutcomeKey]*hook.HookOutcome
+		wantPreparedFinished       map[string]bool
+		wantCodes                  map[string]string
+		wantArguments              map[string]string
+		checkRouteBeforePreHook    bool
+		checkBlockedBeforeToolBody bool
+		wantStoppedCallID          string
+	}{
+		{
+			name: "two_calls_succeed",
+			calls: []*defs.ToolCall{
+				{
+					CallID:    "call-a",
+					Name:      "probe",
+					Arguments: `{"path":"a","executor":"first"}`,
+				},
+				{
+					CallID:    "call-b",
+					Name:      "agent_probe",
+					Arguments: `{"path":"b"}`,
+				},
+			},
+			wantPreparedFinished: map[string]bool{
+				"call-a": false,
+				"call-b": false,
+			},
+			wantCodes: map[string]string{
+				"call-a": "",
+				"call-b": "",
+			},
+			wantArguments: map[string]string{
+				"call-a": `{"path":"a"}`,
+				"call-b": `{"path":"b"}`,
+			},
+		},
+		{
+			name: "hook_rewrites_arguments",
+			calls: []*defs.ToolCall{
+				{
+					CallID:    "call-a",
+					Name:      "probe",
+					Arguments: `{"path":"old","executor":"first"}`,
+				},
+				{
+					CallID:    "call-b",
+					Name:      "agent_probe",
+					Arguments: `{"path":"keep"}`,
+				},
+			},
+			callOutcomes: map[hookOutcomeKey]*hook.HookOutcome{
+				{
+					event:  defs.HookEventPreToolUse,
+					callID: "call-a",
+				}: {UpdatedToolArguments: `{"path":"new"}`},
+			},
+			wantPreparedFinished: map[string]bool{
+				"call-a": false,
+				"call-b": false,
+			},
+			wantCodes: map[string]string{
+				"call-a": "",
+				"call-b": "",
+			},
+			wantArguments: map[string]string{
+				"call-a": `{"path":"new"}`,
+				"call-b": `{"path":"keep"}`,
+			},
+		},
+		{
+			name: "route_failure",
+			calls: []*defs.ToolCall{
+				{
+					CallID:    "call-a",
+					Name:      "missing_tool",
+					Arguments: `{"path":"a"}`,
+				},
+				{
+					CallID:    "call-b",
+					Name:      "probe",
+					Arguments: `{"path":"b"}`,
+				},
+			},
+			wantPreparedFinished: map[string]bool{
+				"call-a": true,
+				"call-b": false,
+			},
+			wantCodes: map[string]string{
+				"call-a": "tool_not_found",
+				"call-b": "",
+			},
+			wantArguments: map[string]string{
+				"call-b": `{"path":"b"}`,
+			},
+			checkRouteBeforePreHook: true,
+		},
+		{
+			name: "pre_blocked",
+			calls: []*defs.ToolCall{
+				{
+					CallID:    "call-a",
+					Name:      "probe",
+					Arguments: `{"path":"a"}`,
+				},
+				{
+					CallID:    "call-b",
+					Name:      "agent_probe",
+					Arguments: `{"path":"b"}`,
+				},
+			},
+			callOutcomes: map[hookOutcomeKey]*hook.HookOutcome{
+				{
+					event:  defs.HookEventPreToolUse,
+					callID: "call-a",
+				}: {
+					IsBlocked:   true,
+					BlockReason: "denied",
+					SavedRuns:   []*defs.HookRun{preBlockedSaved},
+				},
+			},
+			wantPreparedFinished: map[string]bool{
+				"call-a": true,
+				"call-b": false,
+			},
+			wantCodes: map[string]string{
+				"call-a": "hook_blocked",
+				"call-b": "",
+			},
+			wantArguments: map[string]string{
+				"call-b": `{"path":"b"}`,
+			},
+			checkBlockedBeforeToolBody: true,
+		},
+		{
+			name: "pre_stopped",
+			calls: []*defs.ToolCall{
+				{
+					CallID:    "call-a",
+					Name:      "probe",
+					Arguments: `{"path":"a"}`,
+				},
+				{
+					CallID:    "call-b",
+					Name:      "agent_probe",
+					Arguments: `{"path":"b"}`,
+				},
+			},
+			callOutcomes: map[hookOutcomeKey]*hook.HookOutcome{
+				{
+					event:  defs.HookEventPreToolUse,
+					callID: "call-a",
+				}: {
+					IsTurnStopped: true,
+					StopReason:    "halt",
+					SavedRuns:     []*defs.HookRun{preStoppedSaved},
+				},
+			},
+			wantPreparedFinished: map[string]bool{
+				"call-a": true,
+				"call-b": false,
+			},
+			wantCodes: map[string]string{
+				"call-a": "hook_stopped",
+				"call-b": "",
+			},
+			wantArguments: map[string]string{
+				"call-b": `{"path":"b"}`,
+			},
+			checkBlockedBeforeToolBody: true,
+		},
+		{
+			name: "post_stopped",
+			calls: []*defs.ToolCall{
+				{
+					CallID:    "call-a",
+					Name:      "probe",
+					Arguments: `{"path":"a"}`,
+				},
+				{
+					CallID:    "call-b",
+					Name:      "agent_probe",
+					Arguments: `{"path":"b"}`,
+				},
+			},
+			callOutcomes: map[hookOutcomeKey]*hook.HookOutcome{
+				{
+					event:  defs.HookEventPostToolUse,
+					callID: "call-a",
+				}: {
+					IsTurnStopped: true,
+					StopReason:    "after-a",
+					SavedRuns:     []*defs.HookRun{postStoppedSaved},
+				},
+			},
+			wantPreparedFinished: map[string]bool{
+				"call-a": false,
+				"call-b": false,
+			},
+			wantCodes: map[string]string{
+				"call-a": "",
+				"call-b": "",
+			},
+			wantArguments: map[string]string{
+				"call-a": `{"path":"a"}`,
+				"call-b": `{"path":"b"}`,
+			},
+			wantStoppedCallID: "call-a",
+		},
+	}
+	// 2. 逐项运行 PrepareCalls 与单次 Run，核对结果计数、事件顺序和实际参数。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. 创建探测工具、替身 hook 与工具执行器，启动事件收集。
+			probe := &toolProbe{}
+			blockedResultReceived := make(chan struct{})
+			if tt.checkBlockedBeforeToolBody {
+				probe.onExecute = func() {
+					select {
+					case <-blockedResultReceived:
+					default:
+						t.Error("tool body entered before the rejected call result was received")
+					}
+				}
+			}
+			hooks := &stubHooks{callOutcomes: tt.callOutcomes}
+			opt := newHookToolExecutorOpt(t, probe, "", true)
+			opt.Hooks = hooks
+			toolExecutor, err := executor.NewToolExecutor(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := make([]*defs.Item, 0, len(tt.calls))
+			for _, call := range tt.calls {
+				calls = append(calls, newHookToolCallItem(call.Clone()))
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			events := make(chan executor.ExecutorEvent)
+			var collected []executor.ExecutorEvent
+			var collector sync.WaitGroup
+			collector.Go(func() {
+				for event := range events {
+					collected = append(collected, event)
+					if finished, ok := event.(*executor.ExecutionFinishedEvent); ok && tt.checkBlockedBeforeToolBody && finished.Result.CallID == "call-a" && finished.Result.Error != nil && finished.Result.Error.Code == tt.wantCodes["call-a"] {
+						select {
+						case <-blockedResultReceived:
+						default:
+							close(blockedResultReceived)
+						}
+					}
+				}
+			})
+
+			// 2. 每个 case 使用真实 PrepareCalls，再并行执行 Finished == nil 的项；测试自己关闭事件通道。
+			preparedCalls := toolExecutor.PrepareCalls(ctx, calls, events)
+			if len(preparedCalls) != len(calls) {
+				t.Fatalf("prepared count mismatch")
+			}
+			for index, prepared := range preparedCalls {
+				callID := tt.calls[index].CallID
+				if prepared == nil || prepared.Call == nil || prepared.Call.ToolCall == nil || prepared.Call.ToolCall.CallID != callID {
+					t.Fatalf("prepared[%d] = %+v, want call %s", index, prepared, callID)
+				}
+				if (prepared.Finished != nil) != tt.wantPreparedFinished[callID] {
+					t.Fatalf("prepared[%d] finished = %+v, want finished=%v", index, prepared.Finished, tt.wantPreparedFinished[callID])
+				}
+				if calls[index].ToolCall.Arguments != tt.calls[index].Arguments {
+					t.Fatalf("source call %s arguments mutated to %s", callID, calls[index].ToolCall.Arguments)
+				}
+			}
+			if tt.checkBlockedBeforeToolBody {
+				// 等收集器记下 PrepareCalls 已送达的事件，再由测试派发执行。
+				select {
+				case <-blockedResultReceived:
+				case <-ctx.Done():
+					t.Error("PrepareCalls returned without delivering the rejected call result")
+				}
+			}
+			var tasks sync.WaitGroup
+			for _, prepared := range preparedCalls {
+				if prepared.Finished == nil {
+					tasks.Go(func() {
+						toolExecutor.Run(ctx, prepared, events)
+					})
+				}
+			}
+			tasks.Wait()
+			for _, prepared := range preparedCalls {
+				if prepared.Finished != nil {
+					toolExecutor.Run(ctx, prepared, events)
+				}
+			}
+			close(events)
+			collector.Wait()
+
+			// 3. 统计各调用完成次数、错误码与关键事件位置。
+			finishedCount := make(map[string]int, len(tt.calls))
+			finishedEvents := make(map[string]*executor.ExecutionFinishedEvent, len(tt.calls))
+			routeFailureIndex := -1
+			firstPreHookIndex := -1
+			for index, event := range collected {
+				switch event := event.(type) {
+				case *executor.ExecutionHookRunEvent:
+					if event.Run.Event == defs.HookEventPreToolUse && firstPreHookIndex < 0 {
+						firstPreHookIndex = index
+					}
+				case *executor.ExecutionFinishedEvent:
+					callID := event.Result.CallID
+					finishedCount[callID]++
+					finishedEvents[callID] = event
+					if event.Result.Error == nil {
+						continue
+					}
+					switch event.Result.Error.Code {
+					case "tool_not_found", "invalid_arguments":
+						if routeFailureIndex < 0 {
+							routeFailureIndex = index
+						}
+					}
+				}
+			}
+			for _, call := range tt.calls {
+				callID := call.CallID
+				if finishedCount[callID] != 1 {
+					t.Fatalf("expected exactly one final result")
+				}
+				gotCode := ""
+				if finishedEvents[callID].Result.Error != nil {
+					gotCode = finishedEvents[callID].Result.Error.Code
+				}
+				if gotCode != tt.wantCodes[callID] {
+					t.Fatalf("%s error code = %q, want %q", callID, gotCode, tt.wantCodes[callID])
+				}
+				gotArguments := probe.getCallArguments(callID)
+				wantArguments := tt.wantArguments[callID]
+				if gotArguments != wantArguments {
+					t.Fatalf("hook arguments changed or applied twice")
+				}
+			}
+			if tt.checkRouteBeforePreHook {
+				if routeFailureIndex < 0 || firstPreHookIndex < 0 || routeFailureIndex >= firstPreHookIndex {
+					t.Fatalf("route failure reported too late")
+				}
+			}
+			if tt.wantStoppedCallID != "" {
+				stoppedEvent := finishedEvents[tt.wantStoppedCallID]
+				if !slices.ContainsFunc(stoppedEvent.HookRuns, func(run *defs.HookRun) bool {
+					return run.Status == defs.HookRunStopped
+				}) {
+					t.Fatalf("%s hook runs = %+v, want a stopped hook run", tt.wantStoppedCallID, stoppedEvent.HookRuns)
+				}
 			}
 		})
 	}

@@ -386,7 +386,7 @@ func TestSessionQueryScanSessions(t *testing.T) {
 
 // TestSessionMutationDeleteSession 检查删除 Session 的日志和各级索引。
 func TestSessionMutationDeleteSession(t *testing.T) {
-	// 1. 分别删除匹配对话、不匹配对话和重复删除，检查 Session、Turn、Item 与最后一条 metadata。
+	// 1. 分别删除匹配对话、不匹配对话和重复删除，检查 Session、Turn、Item、checkpoint 与最后一条 metadata。
 	for _, tt := range []struct {
 		name    string
 		scope   defs.ConversationID
@@ -457,6 +457,10 @@ func TestSessionMutationDeleteSession(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			if err := mutation.AppendSessionCheckpoint(t.Context(), session.ConversationID, session.ID, &defs.SessionCheckpoint{StopRequestedTurnID: turnRecord.ID}); err != nil {
+				t.Fatal(err)
+			}
+
 			for range tt.repeats {
 				if err := mutation.DeleteSession(t.Context(), tt.scope, session.ID); err != nil {
 					t.Fatal(err)
@@ -489,6 +493,14 @@ func TestSessionMutationDeleteSession(t *testing.T) {
 			}
 			if sessionFound != tt.remains || len(turnPage.Items) != wantTurns || len(itemPage.Items) != wantItems {
 				t.Fatalf("DeleteSession() left Session=%v Turns=%+v Items=%+v", sessionFound, turnPage.Items, itemPage.Items)
+			}
+			got, err := query.GetSessionCheckpoint(t.Context(), session.ConversationID, session.ID)
+			if tt.remains {
+				if err != nil || got == nil || got.StopRequestedTurnID != turnRecord.ID {
+					t.Fatalf("GetSessionCheckpoint() after unrelated delete = %+v, %v", got, err)
+				}
+			} else if got != nil || !errors.Is(err, dao.ErrSessionDeleted) {
+				t.Fatalf("GetSessionCheckpoint() after delete = %+v, %v; want ErrSessionDeleted", got, err)
 			}
 			lines := readMetadata(t, logs, session.ConversationID)
 			if len(lines) == 0 {

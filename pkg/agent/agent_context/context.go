@@ -33,10 +33,8 @@ type AgentContext interface {
 	// 自动压缩要求窗口已知且用量达到阈值；手动压缩不检查阈值。两者都按窗口的 20% 保留最近历史，
 	// 保留范围覆盖全部原文时，自动压缩返回 nil，手动压缩返回全部历史。
 	GetCompactionSource(measurement *ContextMeasurement, isManual bool) []*defs.Item
-	// CompactHistory 调用摘要模型，填写 summary 并用它替换已覆盖的历史；失败时保留原上下文。
-	// summary 由调用方创建，ContextSummary.CoveredThroughItemID 填 source 最后一条的 ID。
-	// 发起过模型调用就返回 CompactionCall，调用失败也返回；组装请求失败、没有发起调用时返回 nil。
-	CompactHistory(ctx context.Context, tools []llmkit.Tool, source []*defs.Item, summary *defs.Item) (*CompactionCall, error)
+	// BuildCompactionRequest 为给定模型组装禁用工具的摘要请求；新压缩传 nil 使用配置的摘要模型。
+	BuildCompactionRequest(tools []llmkit.Tool, source []*defs.Item, compactModel *defs.ModelDefinition) (request *llmkit.Request, model *defs.ModelDefinition, client llmkit.Client, err error)
 	// IsCompacted 当前历史是否以摘要开头？
 	IsCompacted() bool
 	// IsAgentsInstructionLoaded 当前历史里是否已有这个 Executor 下这个路径的目录规则？
@@ -73,12 +71,13 @@ type AgentContextOpt struct {
 	SessionID defs.SessionID
 	// TurnID 是摘要 Item 所属的 Turn。
 	TurnID defs.TurnID
+	// Client 发起摘要请求。
 	Client llmkit.Client
 	// Model 提供普通请求参数和窗口；自动压缩预留最大输出，窗口为 0 时不自动压缩。
 	Model *defs.ModelDefinition
 	// ReasoningEffort 是普通请求的推理强度，可以为空。
 	ReasoningEffort string
-	// CompactModel 提供摘要模型和它的默认推理强度。
+	// CompactModel 是新压缩的模型及其默认推理强度；不准备新压缩时可为空。
 	CompactModel *defs.ModelDefinition
 }
 
@@ -97,8 +96,8 @@ func NewAgentContextOpt(sessionID defs.SessionID, turnID defs.TurnID, client llm
 // NewAgentContext 检查配置并创建空上下文。
 func NewAgentContext(opt *AgentContextOpt) (AgentContext, error) {
 	// 1. 检查本轮身份、客户端、模型和窗口大小。
-	if opt == nil || opt.SessionID == "" || opt.TurnID == "" || opt.Client == nil || opt.Model == nil || opt.CompactModel == nil || opt.CompactModel.Target == nil {
-		return nil, errors.New("agent context requires a session ID, turn ID, model client, model and compact model with target")
+	if opt == nil || opt.SessionID == "" || opt.TurnID == "" || opt.Client == nil || opt.Model == nil {
+		return nil, errors.New("agent context requires a session ID, turn ID, model client and model")
 	}
 	if opt.Model.ContextWindow < 0 {
 		return nil, errors.New("context window must not be negative")

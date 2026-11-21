@@ -28,15 +28,31 @@ const (
 	ItemHookRun           ItemKind = "hook_run"
 	// ItemTurnInterrupted 由 Turn 在以 interrupted 结束时写在本轮最后；没有载荷，TurnID 说明是哪一轮。
 	ItemTurnInterrupted ItemKind = "turn_interrupted"
+	// ItemModelCallResult 由 Turn 在无可挂载输出时写入，仅供日志判断调用是否完整结束。
+	ItemModelCallResult ItemKind = "model_call_result"
+)
+
+// ModelCallResult 是一次普通模型调用完整结束时写入的调用级结果事实。
+type ModelCallResult string
+
+const (
+	// ModelCallResultReply 表示本次调用完整结束并产生普通回复。
+	ModelCallResultReply ModelCallResult = "reply"
+	// ModelCallResultToolsRejected 表示本次调用完整结束但最后一步拒绝整批工具调用。
+	ModelCallResultToolsRejected ModelCallResult = "tools_rejected"
 )
 
 // Item 保存一条消息、模型输出或历史记录，Kind 指定使用的载荷。
 type Item struct {
 	ID ItemID `json:"id"`
 	// UpdatedAt 是保存时的 Unix 毫秒，由存储分配；Item 保存后不再修改。
-	UpdatedAt         int64              `json:"updated_at,omitempty"`
-	TurnID            TurnID             `json:"turn_id"`
-	ModelCallID       ModelCallID        `json:"model_call_id,omitempty"`
+	UpdatedAt   int64       `json:"updated_at,omitempty"`
+	TurnID      TurnID      `json:"turn_id"`
+	ModelCallID ModelCallID `json:"model_call_id,omitempty"`
+	// ModelCallResult 是本次模型调用的完整结束事实；非末项或未完整结束时为空。
+	ModelCallResult ModelCallResult `json:"model_call_result,omitempty"`
+	// ModelCallUsage 是这次完整普通请求的用量和输入位置；只有保存调用报告的末项非空。
+	ModelCallUsage    *TurnContextUsage  `json:"model_call_usage,omitempty"`
 	Kind              ItemKind           `json:"kind"`
 	Message           *Message           `json:"message,omitempty"`
 	Reasoning         *Reasoning         `json:"reasoning,omitempty"`
@@ -52,6 +68,8 @@ type Item struct {
 	MemoryIndex       *MemoryIndex       `json:"memory_index,omitempty"`
 	ClientInstruction *ClientInstruction `json:"client_instruction,omitempty"`
 	HookRun           *HookRun           `json:"hook_run,omitempty"`
+	// HandedOffInputItemID 是此项写成后才算完整交接的组首消息 ID；其他 Item 为空。
+	HandedOffInputItemID ItemID `json:"handed_off_input_item_id,omitempty"`
 }
 
 // SkillInstruction 是用户在一条输入里点名的一个 Skill：名字、所在 Executor、文件路径和正文。
@@ -115,7 +133,13 @@ func (item *Item) ValidateKindPayload() error {
 
 // ValidateContextItem 检查客户端注入的 Item：没有 TurnID 和 ModelCallID 时也能写入日志、转成模型消息。
 func (item *Item) ValidateContextItem() error {
-	// 1. 先检查指令类 Item 的种类与载荷。
+	// 1. 拒绝客户端附带的模型调用记录和输入交接标记，再检查指令载荷。
+	if item.ModelCallResult != "" || item.ModelCallUsage != nil {
+		return fmt.Errorf("context item cannot carry model call result or usage")
+	}
+	if item.HandedOffInputItemID != "" || (item.HookRun != nil && item.HookRun.BlockedInputItemID != "") {
+		return fmt.Errorf("context item carries a runtime input handoff marker")
+	}
 	if err := item.ValidateKindPayload(); err != nil {
 		return err
 	}
@@ -166,7 +190,10 @@ func (item *Item) ValidateContextSummary() error {
 
 // ValidateInputMessage 检查提交给 Session 的输入消息。
 func (item *Item) ValidateInputMessage() error {
-	// 1. 要求消息类型和载荷存在；只有子 Agent 通知允许正文为空。
+	// 1. 检查运行时写入的输入交接标记、消息类型和载荷；只有子 Agent 通知允许正文为空。
+	if item.HandedOffInputItemID != "" || (item.HookRun != nil && item.HookRun.BlockedInputItemID != "") {
+		return fmt.Errorf("input message carries a runtime input handoff marker")
+	}
 	if item.Kind != ItemMessage || item.Message == nil {
 		return fmt.Errorf("input item must be a message")
 	}

@@ -193,3 +193,32 @@ func validateTurn(value defs.Turn) error {
 	}
 	return nil
 }
+
+// GetLatestLoggedTurn 从对话 metadata 日志读取 Session 最近一条 Turn 记录。
+func (d *turnDAOImpl) GetLatestLoggedTurn(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) (*defs.Turn, error) {
+	// 1. 在本对话的 metadata 中查找该 Session 最近的 Turn。
+	return scanSessionMetadata(ctx, d.logs, conversationID, sessionID, true)
+}
+
+// ReindexLoggedTurn 用 metadata 日志中的 Turn 事实更新索引，不追加 metadata。
+func (d *turnDAOImpl) ReindexLoggedTurn(ctx context.Context, turn defs.Turn) error {
+	// 1. 校验 Turn 并编码索引载荷，保留原 metadata 日志时间。
+	if err := validateTurn(turn); err != nil {
+		return err
+	}
+	updatedAt := turn.UpdatedAt
+	turn.UpdatedAt = 0
+	_, index, err := (metadataEntry{
+		Kind: metadataTurnSaved,
+		Turn: &turn,
+	}).getIndexRecord()
+	if err != nil {
+		return err
+	}
+	// 2. 以原日志时间直接写入索引。
+	index.record.UpdatedAt = updatedAt
+	if err := d.records.Set(ctx, index.namespace, index.record); err != nil {
+		return fmt.Errorf("reindex Turn %q: %w", turn.ID, err)
+	}
+	return nil
+}

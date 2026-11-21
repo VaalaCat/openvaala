@@ -1967,7 +1967,7 @@ func TestHooksGetHookInfos(t *testing.T) {
 		return definition
 	}
 	getHash := func(definition *hook.HookDefinition) string {
-		return hook.NewHooks(hook.NewHooksOpt([]*hook.HookDefinition{definition})).GetHookInfos()[0].CurrentHash
+		return hook.GetHookInfos([]*hook.HookDefinition{definition})[0].CurrentHash
 	}
 
 	// 2. 核对各字段和顺序，哈希是 64 位十六进制。
@@ -2067,7 +2067,7 @@ func TestHooksGetHookInfos(t *testing.T) {
 		// 1. 取 hook 信息，去掉哈希后比较。
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				infos := hook.NewHooks(hook.NewHooksOpt(tt.definitions)).GetHookInfos()
+				infos := hook.GetHookInfos(tt.definitions)
 				got := make([]hook.HookInfo, 0, len(infos))
 				for _, info := range infos {
 					if len(info.CurrentHash) != 64 {

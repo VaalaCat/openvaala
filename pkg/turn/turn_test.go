@@ -8,11 +8,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -34,6 +36,250 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
+
+// TestTurnCheckpointBeforeIO 检查模型、整批工具准备和前置 hook 都在 checkpoint 写成后才运行。
+func TestTurnCheckpointBeforeIO(t *testing.T) {
+	checkpointWriteErr := errors.New("checkpoint write failed")
+	checkpointMixedErr := errors.Join(context.Canceled, fmt.Errorf("checkpoint rollback: %w", checkpointWriteErr))
+	for _, tt := range []struct {
+		name               string
+		blockCall          int32
+		wantModelCall      int32
+		toolBatch          bool
+		checkpointErr      error
+		checkpointErrCall  int32
+		cancelErr          error
+		cancelWhileBlocked bool
+		wantErr            error
+		wantUnsettled      bool
+	}{
+		{name: "conversation_request", blockCall: 1, wantModelCall: 0},
+		{name: "tool_batch", blockCall: 2, wantModelCall: 1, toolBatch: true},
+		{name: "checkpoint_write_error", blockCall: 1, wantModelCall: 0, checkpointErr: checkpointWriteErr, checkpointErrCall: 1, wantErr: checkpointWriteErr, wantUnsettled: true},
+		{name: "checkpoint_tool_write_error", blockCall: 2, wantModelCall: 1, toolBatch: true, checkpointErr: checkpointWriteErr, checkpointErrCall: 2, wantErr: checkpointWriteErr, wantUnsettled: true},
+		{name: "checkpoint_canceled", blockCall: 1, wantModelCall: 0, cancelErr: fmt.Errorf("checkpoint canceled: %w", context.Canceled), cancelWhileBlocked: true, wantErr: context.Canceled},
+		{name: "checkpoint_canceled_after_write_error", blockCall: 1, wantModelCall: 0, cancelErr: checkpointMixedErr, cancelWhileBlocked: true, wantErr: checkpointWriteErr, wantUnsettled: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stores := openTurnStorage(t)
+			gate := &checkpointTestMutation{
+				Mutation: stores.mutation, blockCall: tt.blockCall, checkpointErr: tt.checkpointErr, checkpointErrCall: tt.checkpointErrCall, cancelErr: tt.cancelErr,
+				checkpointStarted: make(chan struct{}), checkpointRelease: make(chan struct{}),
+			}
+			client := &checkpointTestClient{toolBatch: tt.toolBatch}
+			opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"}, stores.query, gate, client)
+			opt.Model = newTestModel(&llmkit.Target{Model: "checkpoint-model"}, 0)
+			if tt.toolBatch {
+				hooks := &checkpointTestHooks{}
+				environment := newTurnEnvironments(t, []defs.TurnExecutor{{ID: "local", WorkspaceDirectory: "/checkpoint"}})[0]
+				baseExecutor, err := executor.NewToolExecutor(&executor.ToolExecutorOpt{
+					Environments: []executor.ExecutionEnvironment{environment},
+					AgentTools:   []executor.Tool{&checkpointTestTool{}},
+					Hooks:        hooks,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				opt.ToolExecutor = &checkpointCountingExecutor{ToolExecutor: baseExecutor}
+				opt.Environments = []executor.ExecutionEnvironment{environment}
+				opt.Hooks = hooks
+				gate.preToolUseCalls = &hooks.preToolUseCalls
+			}
+			instance, err := newTestTurn(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, runErr := instance.Run(ctx, []*defs.Item{turnUserMessage("checkpoint")}, nil)
+				done <- runErr
+			}()
+			select {
+			case <-gate.checkpointStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("checkpoint write did not reach the blocking point")
+			}
+			if got := client.calls.Load(); got != tt.wantModelCall {
+				t.Fatalf("model calls while checkpoint is blocked = %d, want %d", got, tt.wantModelCall)
+			}
+			if tt.toolBatch {
+				if got := opt.ToolExecutor.(*checkpointCountingExecutor).prepareCalls.Load(); got != 0 {
+					t.Fatalf("tool preparation while checkpoint is blocked = %d", got)
+				}
+				if got := opt.ToolExecutor.(*checkpointCountingExecutor).runCalls.Load(); got != 0 {
+					t.Fatalf("tool runs while checkpoint is blocked = %d", got)
+				}
+				if got := gate.preToolUseCalls.Load(); got != 0 {
+					t.Fatalf("pre-tool hooks while checkpoint is blocked = %d", got)
+				}
+			}
+			if tt.cancelWhileBlocked {
+				cancel()
+			} else {
+				close(gate.checkpointRelease)
+			}
+			runErr := <-done
+			if tt.wantErr != nil {
+				if !errors.Is(runErr, tt.wantErr) || errors.Is(runErr, turn.ErrTurnUnsettled) != tt.wantUnsettled {
+					t.Fatalf("Run() error = %v, want %v, unsettled=%v", runErr, tt.wantErr, tt.wantUnsettled)
+				}
+				return
+			}
+			if runErr != nil {
+				t.Fatal(runErr)
+			}
+			wantCallsAfterRelease := int32(1)
+			if tt.toolBatch {
+				wantCallsAfterRelease = 2
+			}
+			if got := client.calls.Load(); got != wantCallsAfterRelease {
+				t.Fatalf("model calls after checkpoint = %d, want %d", got, wantCallsAfterRelease)
+			}
+			if tt.toolBatch {
+				counting := opt.ToolExecutor.(*checkpointCountingExecutor)
+				if counting.prepareCalls.Load() != 1 || counting.runCalls.Load() != 1 || gate.preToolUseCalls.Load() != 1 {
+					t.Fatalf("tool counts after checkpoint: prepare=%d hook=%d run=%d", counting.prepareCalls.Load(), gate.preToolUseCalls.Load(), counting.runCalls.Load())
+				}
+			}
+		})
+	}
+}
+
+type checkpointTestMutation struct {
+	dao.Mutation
+	blockCall         int32
+	checkpointCalls   atomic.Int32
+	checkpointStarted chan struct{}
+	checkpointRelease chan struct{}
+	checkpointErr     error
+	checkpointErrCall int32
+	cancelErr         error
+	preToolUseCalls   *atomic.Int32
+}
+
+func (m *checkpointTestMutation) AppendTurnCheckpoint(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID, checkpoint *defs.TurnCheckpoint) error {
+	call := m.checkpointCalls.Add(1)
+	if call == m.blockCall {
+		close(m.checkpointStarted)
+		select {
+		case <-m.checkpointRelease:
+		case <-ctx.Done():
+			if m.cancelErr != nil {
+				return m.cancelErr
+			}
+			return ctx.Err()
+		}
+	}
+	if m.checkpointErr != nil && (m.checkpointErrCall == 0 || call == m.checkpointErrCall) {
+		return m.checkpointErr
+	}
+	return m.Mutation.AppendTurnCheckpoint(ctx, conversationID, sessionID, checkpoint)
+}
+
+type checkpointTestClient struct {
+	toolBatch bool
+	calls     atomic.Int32
+}
+
+func (c *checkpointTestClient) Call(context.Context, llmkit.Request, llmkit.Target, llmkit.CallOptions) (<-chan llmkit.Event, error) {
+	call := c.calls.Add(1)
+	stream := make(chan llmkit.Event, 3)
+	if c.toolBatch && call == 1 {
+		stream <- llmkit.Event{Type: llmkit.EventToolCallEnd, ToolCall: &llmkit.StreamingToolCall{CallID: "checkpoint-call", Name: "checkpoint", Arguments: `{}`}}
+		stream <- llmkit.Event{Type: llmkit.EventDone, FinishReason: "tool_calls"}
+	} else {
+		stream <- llmkit.Event{Type: llmkit.EventContentDelta, Delta: &llmkit.DeltaPayload{Text: "done"}}
+		stream <- llmkit.Event{Type: llmkit.EventDone, FinishReason: "stop"}
+	}
+	close(stream)
+	return stream, nil
+}
+
+type checkpointTestHooks struct {
+	preToolUseCalls atomic.Int32
+}
+
+func (h *checkpointTestHooks) RunEvent(_ context.Context, request *hook.HookEventRequest, _ chan<- *defs.HookRun) *hook.HookOutcome {
+	if request.Event.Name == defs.HookEventPreToolUse {
+		h.preToolUseCalls.Add(1)
+	}
+	return &hook.HookOutcome{}
+}
+
+type checkpointCountingExecutor struct {
+	executor.ToolExecutor
+	prepareCalls atomic.Int32
+	runCalls     atomic.Int32
+}
+
+func (e *checkpointCountingExecutor) PrepareCalls(ctx context.Context, calls []*defs.Item, events chan<- executor.ExecutorEvent) []*executor.PreparedToolCall {
+	e.prepareCalls.Add(1)
+	return e.ToolExecutor.PrepareCalls(ctx, calls, events)
+}
+
+func (e *checkpointCountingExecutor) Run(ctx context.Context, call *executor.PreparedToolCall, events chan<- executor.ExecutorEvent) {
+	e.runCalls.Add(1)
+	e.ToolExecutor.Run(ctx, call, events)
+}
+
+type checkpointTestTool struct{}
+
+func (*checkpointTestTool) GetDefinition() *defs.ToolDefinition {
+	return &defs.ToolDefinition{Name: "checkpoint", Description: "checkpoint", InputSchema: json.RawMessage(`{"type":"object"}`)}
+}
+
+func (*checkpointTestTool) Execute(_ context.Context, call *defs.Item, _ chan<- *executor.ExecutionProgressEvent) *executor.ToolExecutionResult {
+	return &executor.ToolExecutionResult{Result: &defs.ToolResult{CallID: call.ToolCall.CallID, Content: json.RawMessage(`{"ok":true}`)}}
+}
+
+// TestTurnSummaryCheckpointBeforeIO 检查摘要模型也要等 checkpoint 写成后才发请求。
+func TestTurnSummaryCheckpointBeforeIO(t *testing.T) {
+	stores := openTurnStorage(t)
+	conversationID, sessionID := defs.NewConversationID(), defs.NewSessionID()
+	seedTurnSummaryHistory(t, stores.mutation, conversationID, sessionID)
+	gate := &checkpointTestMutation{
+		Mutation: stores.mutation, blockCall: 1,
+		checkpointStarted: make(chan struct{}), checkpointRelease: make(chan struct{}),
+	}
+	client := &summaryTurnClient{}
+	opt := turn.NewTurnOpt(conversationID, sessionID, &agent.AgentDefinition{Name: "assistant"}, stores.query, gate, client)
+	opt.Model = newTestModel(&llmkit.Target{Model: "summary-main"}, 1000)
+	opt.IsCompactOnly = true
+	instance, err := newTestTurn(opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := instance.Run(t.Context(), nil, nil)
+		done <- runErr
+	}()
+	select {
+	case <-gate.checkpointStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("summary checkpoint write did not reach the blocking point")
+	}
+	if client.summaryAttempts != 0 || len(client.requests) != 0 {
+		t.Fatalf("summary request started before checkpoint: attempts=%d requests=%d", client.summaryAttempts, len(client.requests))
+	}
+	items := readTurnLog(t, stores.query, conversationID, sessionID)
+	if slices.ContainsFunc(items, func(item *defs.Item) bool { return item.Kind == defs.ItemContextSummary }) {
+		t.Fatal("summary item persisted before summary request")
+	}
+	close(gate.checkpointRelease)
+	if runErr := <-done; runErr != nil {
+		t.Fatal(runErr)
+	}
+	if client.summaryAttempts != 1 {
+		t.Fatalf("summary attempts after checkpoint = %d, want 1", client.summaryAttempts)
+	}
+	items = readTurnLog(t, stores.query, conversationID, sessionID)
+	if !slices.ContainsFunc(items, func(item *defs.Item) bool { return item.Kind == defs.ItemContextSummary }) {
+		t.Fatal("summary item missing after acknowledged request")
+	}
+}
 
 // TestTurnRun 检查输入、输出、运行状态和保存失败后的记录。
 func TestTurnRun(t *testing.T) {
@@ -88,6 +334,7 @@ data: [DONE]
 			wantStatus:   defs.TurnStatusRunning,
 			wantLogKinds: []defs.ItemKind{defs.ItemMessage},
 			wantErr:      "append agent item",
+			wantEvents:   1,
 		},
 		{
 			name:     "later_log_failure_keeps_earlier_item",
@@ -106,7 +353,7 @@ data: [DONE]
 			wantStatus:   defs.TurnStatusRunning,
 			wantLogKinds: []defs.ItemKind{defs.ItemMessage, defs.ItemReasoning},
 			wantErr:      "append agent item",
-			wantEvents:   1,
+			wantEvents:   2,
 		},
 	}
 	// 2. 运行模型及日志故障样例，比较输入、输出、Turn 状态、日志范围和事件数量。
@@ -709,10 +956,10 @@ func TestTurnModelRetryTermination(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				ctx, cancel := context.WithCancel(t.Context())
-				defer cancel()
+				ctx, cancel := context.WithCancelCause(t.Context())
+				defer cancel(nil)
 				if tt.cancelAfter != 0 {
-					defer time.AfterFunc(tt.cancelAfter, cancel).Stop()
+					defer time.AfterFunc(tt.cancelAfter, func() { cancel(turn.ErrTurnInterrupted) }).Stop()
 				}
 				started := time.Now()
 				result, runErr := instance.Run(ctx, []*defs.Item{turnUserMessage("retry input")}, nil)
@@ -892,8 +1139,8 @@ func TestTurnTerminalStatus(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
 			completed := make(chan error, 1)
 			var turnResult turn.TurnResult
 			go func() {
@@ -903,7 +1150,7 @@ func TestTurnTerminalStatus(t *testing.T) {
 			}()
 			if tt.cancelRun {
 				<-blocking.started
-				cancel()
+				cancel(turn.ErrTurnInterrupted)
 			}
 			runErr := <-completed
 			if tt.wantStatus == defs.TurnStatusCompleted && runErr != nil {
@@ -1117,8 +1364,8 @@ func TestTurnPersistsUsage(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
 			completed := make(chan error, 1)
 			events := make(chan turn.TurnEvent, 128)
 			var result turn.TurnResult
@@ -1130,7 +1377,7 @@ func TestTurnPersistsUsage(t *testing.T) {
 			}()
 			if tt.cancelRun {
 				<-client.blocked
-				cancel()
+				cancel(turn.ErrTurnInterrupted)
 			}
 			runErr := <-completed
 			if (runErr != nil) != (tt.wantStatus != defs.TurnStatusCompleted) {
@@ -1248,6 +1495,32 @@ func TestTurnLatestContextUsage(t *testing.T) {
 			if err != nil || len(page.Items) != wantWrites {
 				t.Fatalf("metadata writes = %d, want %d, err %v", len(page.Items), wantWrites, err)
 			}
+			// 4. 终态未写成时，从普通调用的原始报告恢复两步的用量，已结束回复不再请求。
+			if tt.failTerminal {
+				checkpoint, err := stores.query.GetTurnCheckpoint(t.Context(), conversationID, sessionID, opt.TurnID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				opt.Resume = &turn.TurnResume{
+					Record:     &record,
+					Checkpoint: checkpoint,
+					Items:      readResumeLog(t, opt),
+				}
+				opt.Mutation = stores.mutation
+				opt.Model = nil
+				resumed, err := newTestTurn(opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := resumed.Run(t.Context(), nil, nil)
+				if err != nil || got.Status != defs.TurnStatusCompleted || len(client.requests) != 2 || got.ContextUsage == nil || got.ContextUsage.ModelCallID != got.FinalModelCallID {
+					t.Fatalf("finish original calls: %+v, %v", got, err)
+				}
+				record, _, err = stores.query.GetTurn(t.Context(), sessionID, opt.TurnID)
+				if err != nil || record.Usage != (defs.TokenUsage{Input: 240, Output: 50}) {
+					t.Fatalf("resumed aggregate=%+v err=%v", record.Usage, err)
+				}
+			}
 		})
 	}
 }
@@ -1259,6 +1532,7 @@ func TestTurnUnsettled(t *testing.T) {
 		name           string
 		failRunning    bool
 		failTerminal   bool
+		failHandoff    bool
 		wantUnsettled  bool
 		wantPersistent bool
 	}{
@@ -1270,6 +1544,12 @@ func TestTurnUnsettled(t *testing.T) {
 		{
 			name:           "terminal_write",
 			failTerminal:   true,
+			wantUnsettled:  true,
+			wantPersistent: true,
+		},
+		{
+			name:           "input_handoff_confirmation",
+			failHandoff:    true,
 			wantUnsettled:  true,
 			wantPersistent: true,
 		},
@@ -1297,6 +1577,9 @@ func TestTurnUnsettled(t *testing.T) {
 				Protocol: llmkit.ProtocolOpenAIChat,
 				Model:    "turn-test",
 			}, 0)
+			if tt.failHandoff {
+				turnOpt.Inbox = &testTurnInbox{confirmErr: errors.New("injected input handoff failure")}
+			}
 			turnInstance, err := newTestTurn(turnOpt)
 			if err != nil {
 				t.Fatal(err)
@@ -1316,6 +1599,70 @@ func TestTurnUnsettled(t *testing.T) {
 				t.Fatalf("GetTurn() = %+v, want running without final model call", record)
 			}
 		})
+	}
+}
+
+// TestTurnHandoffErrorSurvivesCancellation 检查取消轮次不会覆盖补充组的交接确认错误。
+func TestTurnHandoffErrorSurvivesCancellation(t *testing.T) {
+	// 1. 开场确认成功；指定补充组的 Item 写成后，暂停其确认。
+	stores := openTurnStorage(t)
+	opening, steer := turnUserMessage("opening"), turnUserMessage("steer")
+	injected := errors.New("injected steer handoff confirmation failure")
+	inbox := &testTurnInbox{
+		pending: []*defs.Item{steer}, confirmErr: injected, confirmItemID: steer.ID,
+		confirmStarted: make(chan struct{}), confirmRelease: make(chan struct{}),
+	}
+	opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"},
+		stores.query, stores.mutation, &scriptedTurnClient{events: []llmkit.Event{{Type: llmkit.EventDone}}})
+	opt.Model = newTestModel(&llmkit.Target{Protocol: llmkit.ProtocolOpenAIChat, Model: "turn-test"}, 0)
+	opt.Inbox = inbox
+	instance, err := newTestTurn(opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	release := sync.OnceFunc(func() { close(inbox.confirmRelease) })
+	defer release()
+	completed := make(chan error, 1)
+	go func() {
+		result, err := instance.Run(ctx, []*defs.Item{opening}, nil)
+		if result.Status != "" {
+			t.Errorf("Run reported terminal status %s", result.Status)
+		}
+		completed <- err
+	}()
+	select {
+	case <-inbox.confirmStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("steer handoff confirmation did not start")
+	}
+	// 2. 先取消，再让确认返回错误；原轮保持 running，输入各写一次且不加中断项。
+	cancel()
+	release()
+	select {
+	case err := <-completed:
+		if !errors.Is(err, turn.ErrTurnUnsettled) || !errors.Is(err, injected) {
+			t.Fatalf("Run error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Turn did not finish")
+	}
+	record, err := stores.query.GetLatestLoggedTurn(t.Context(), opt.ConversationID, opt.SessionID)
+	if err != nil || record == nil || record.ID != opt.TurnID || record.Status != defs.TurnStatusRunning {
+		t.Fatalf("latest Turn = %+v, %v", record, err)
+	}
+	var inputs []defs.ItemID
+	for _, item := range readTurnLog(t, stores.query, opt.ConversationID, opt.SessionID) {
+		if item.Kind == defs.ItemTurnInterrupted {
+			t.Fatal("unsettled Turn wrote interruption Item")
+		}
+		if item.HandedOffInputItemID != "" {
+			inputs = append(inputs, item.HandedOffInputItemID)
+		}
+	}
+	if !slices.Equal(inputs, []defs.ItemID{opening.ID, steer.ID}) {
+		t.Fatalf("handoff log order = %v", inputs)
 	}
 }
 
@@ -1385,6 +1732,44 @@ func TestTurnPersistsAgentItemsByFirstAppearance(t *testing.T) {
 	}
 	if items[1].ToolCall.CallID != "call-a" || items[2].ToolCall.CallID != "call-b" {
 		t.Fatalf("persisted call order = %q, %q, want call-a, call-b", items[1].ToolCall.CallID, items[2].ToolCall.CallID)
+	}
+}
+
+// TestTurnToolsRejectedFactOrder 检查逆序完成的工具块在最终步按草稿顺序写入调用事实。
+func TestTurnToolsRejectedFactOrder(t *testing.T) {
+	for _, ends := range [][]string{{"a", "b"}, {"b", "a"}} {
+		t.Run(strings.Join(ends, "_"), func(t *testing.T) {
+			store := openTurnStorage(t)
+			client := &scriptedTurnClient{}
+			for _, id := range []string{"a", "b"} {
+				client.events = append(client.events, llmkit.Event{Type: llmkit.EventToolCallStart, ToolCall: &llmkit.StreamingToolCall{CallID: id, Name: "lookup"}})
+			}
+			for _, id := range ends {
+				client.events = append(client.events, llmkit.Event{Type: llmkit.EventToolCallEnd, ToolCall: &llmkit.StreamingToolCall{CallID: id, Name: "lookup", Arguments: "{}"}})
+			}
+			client.events = append(client.events, llmkit.Event{Type: llmkit.EventDone})
+			opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"}, store.query, store.mutation, client)
+			opt.Model = newTestModel(&llmkit.Target{}, 0)
+			opt.MaxSteps = 1
+			instance, err := newTestTurn(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := instance.Run(t.Context(), []*defs.Item{turnUserMessage("last step")}, nil)
+			if err == nil || result.Status != defs.TurnStatusFailed {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			rows := readTurnLog(t, store.query, opt.ConversationID, opt.SessionID)
+			if len(rows) != 5 || rows[1].ToolCall.CallID != "a" || rows[1].ModelCallResult != "" || rows[2].ToolCall.CallID != "b" || rows[2].ModelCallResult != defs.ModelCallResultToolsRejected {
+				t.Fatalf("wrong ordered calls or rejection marker: %+v", rows)
+			}
+			for index, id := range []string{"a", "b"} {
+				r := rows[3+index].ToolResult
+				if r == nil || r.CallID != id || r.Error == nil || r.Error.Code != "max_steps_reached" {
+					t.Fatalf("wrong rejection result for %s: %+v", id, r)
+				}
+			}
+		})
 	}
 }
 
@@ -1586,14 +1971,14 @@ func TestTurnCancellationRecordsInterrupted(t *testing.T) {
 			stores := openTurnStorage(t)
 			conversationID := defs.NewConversationID()
 			sessionID := defs.NewSessionID()
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
 			mutation := &interruptTestMutation{
 				Mutation:             stores.mutation,
 				failInterruptedWrite: tt.failInterruptedWrite,
 			}
 			if tt.cancelAfterInput {
-				mutation.cancelAfterInput = cancel
+				mutation.cancelAfterInput = func() { cancel(turn.ErrTurnInterrupted) }
 			}
 			turnOpt := turn.NewTurnOpt(
 				conversationID,
@@ -1643,7 +2028,7 @@ func TestTurnCancellationRecordsInterrupted(t *testing.T) {
 				case <-time.After(5 * time.Second):
 					t.Fatal("model request did not start")
 				}
-				cancel()
+				cancel(turn.ErrTurnInterrupted)
 			}
 			select {
 			case err := <-completed:
@@ -1729,6 +2114,8 @@ type failingLogStorage struct {
 	storage.LogStorage
 	successfulLimit int
 	appendCount     int
+	// failKind 是要拒绝的本轮输出种类，未指定时按 successfulLimit 注入错误。
+	failKind defs.ItemKind
 }
 
 // failingTurnMutation 按配置让 running 或终态的 Turn 记录保存失败。
@@ -1906,7 +2293,10 @@ func (client *usageTurnClient) Call(
 
 // reverseTurnExecutor 并行执行 call-a、call-b 两个 lookup 调用，按 call-b、call-a 的顺序返回结果。
 type reverseTurnExecutor struct {
-	stopTurn bool
+	stopTurn      bool
+	callAStarted  chan struct{}
+	callBStarted  chan struct{}
+	callBFinished chan struct{}
 }
 
 // GetTools 返回测试 lookup 工具定义。
@@ -1921,62 +2311,67 @@ func (*reverseTurnExecutor) GetTools(context.Context) ([]*defs.ToolDefinition, e
 	}, nil
 }
 
-// Run 并行执行两个调用，按 call-b、call-a 的顺序返回结果。
-func (e *reverseTurnExecutor) Run(ctx context.Context, calls []*defs.Item, events chan<- executor.ExecutorEvent) {
-	// 1. 检查收到两个预期调用，创建并行启动、释放和结束通知。
-	defer close(events)
+// PrepareCalls 校验两个预期调用，初始化受控同步通道并返回调用副本。
+func (e *reverseTurnExecutor) PrepareCalls(_ context.Context, calls []*defs.Item, _ chan<- executor.ExecutorEvent) []*executor.PreparedToolCall {
+	// 1. 检查收到 call-a 和 call-b，创建并行启动与完成通知通道。
 	if len(calls) != 2 || calls[0].ToolCall.CallID != "call-a" || calls[1].ToolCall.CallID != "call-b" {
 		panic(fmt.Sprintf("unexpected calls: %+v", calls))
 	}
-	started := make(chan struct{}, len(calls))
-	release := make(chan struct{})
-	callBFinished := make(chan struct{})
-	// 2. 并行启动两个调用，call-a 等 call-b 结果交付后再完成。
-	var tasks sync.WaitGroup
-	for _, call := range calls {
-		tasks.Go(func() {
-			started <- struct{}{}
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return
-			}
-			if call.ToolCall.CallID == "call-a" {
-				select {
-				case <-callBFinished:
-				case <-ctx.Done():
-					return
-				}
-			}
-			finishedEvent := &executor.ExecutionFinishedEvent{
-				Result: &defs.ToolResult{
-					CallID:  call.ToolCall.CallID,
-					Content: json.RawMessage(`{"ok":true}`),
-				},
-			}
-			if e.stopTurn {
-				finishedEvent.HookRuns = []*defs.HookRun{{
-					ID:     defs.NewHookRunID(),
-					Event:  defs.HookEventPostToolUse,
-					CallID: call.ToolCall.CallID,
-					Status: defs.HookRunStopped,
-				}}
-			}
-			select {
-			case events <- finishedEvent:
-				if call.ToolCall.CallID == "call-b" {
-					close(callBFinished)
-				}
-			case <-ctx.Done():
-			}
-		})
+	e.callAStarted = make(chan struct{})
+	e.callBStarted = make(chan struct{})
+	e.callBFinished = make(chan struct{})
+	return []*executor.PreparedToolCall{
+		{Call: calls[0].Clone()},
+		{Call: calls[1].Clone()},
 	}
-	// 3. 等待两个调用均已启动，释放执行并等待全部任务结束。
-	for range calls {
-		<-started
+}
+
+// Run 并行执行单个调用，通过受控通道按 call-b、call-a 的顺序返回结果。
+func (e *reverseTurnExecutor) Run(ctx context.Context, call *executor.PreparedToolCall, events chan<- executor.ExecutorEvent) {
+	// 1. 标记当前调用已启动并等待两个调用同时在跑；call-a 再等 call-b 先发送结果。
+	callID := call.Call.ToolCall.CallID
+	if callID == "call-a" {
+		close(e.callAStarted)
+		select {
+		case <-e.callBStarted:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-e.callBFinished:
+		case <-ctx.Done():
+			return
+		}
+	} else {
+		close(e.callBStarted)
+		select {
+		case <-e.callAStarted:
+		case <-ctx.Done():
+			return
+		}
 	}
-	close(release)
-	tasks.Wait()
+	// 2. 构造完成事件并发送，call-b 发送后通知 call-a 继续。
+	finishedEvent := &executor.ExecutionFinishedEvent{
+		Result: &defs.ToolResult{
+			CallID:  callID,
+			Content: json.RawMessage(`{"ok":true}`),
+		},
+	}
+	if e.stopTurn {
+		finishedEvent.HookRuns = []*defs.HookRun{{
+			ID:     defs.NewHookRunID(),
+			Event:  defs.HookEventPostToolUse,
+			CallID: callID,
+			Status: defs.HookRunStopped,
+		}}
+	}
+	select {
+	case events <- finishedEvent:
+		if callID == "call-b" {
+			close(e.callBFinished)
+		}
+	case <-ctx.Done():
+	}
 }
 
 // Call 发送预设模型事件后关闭事件流。
@@ -2002,8 +2397,24 @@ func (logs *failingLogStorage) Append(
 	streamID storage.StreamID,
 	payloads ...json.RawMessage,
 ) ([]storage.LogEntryInfo, error) {
-	// 1. metadata 日志直接追加；Item 日志达到次数上限后返回错误，其他追加累计次数。
-	if streamID == metadataTestStreamID {
+	// 1. 只统计 Item 日志；metadata 和 checkpoint 日志直接追加。
+	if streamID == metadataTestStreamID || strings.HasPrefix(string(streamID), "checkpoint-") {
+		return logs.LogStorage.Append(ctx, path, streamID, payloads...)
+	}
+	if logs.failKind != "" {
+		for _, payload := range payloads {
+			var item defs.Item
+			if err := json.Unmarshal(payload, &item); err != nil {
+				return nil, err
+			}
+			if item.Kind != logs.failKind {
+				continue
+			}
+			if item.Kind == defs.ItemToolResult && item.ToolResult.CallID != "call-a" || item.Kind == defs.ItemMessage && item.ModelCallResult != defs.ModelCallResultReply {
+				continue
+			}
+			return nil, errors.New("injected log failure")
+		}
 		return logs.LogStorage.Append(ctx, path, streamID, payloads...)
 	}
 	if logs.appendCount >= logs.successfulLimit {
@@ -2268,34 +2679,32 @@ func TestTurnPersistsContextSummary(t *testing.T) {
 	// 1. 准备原文、摘要和后续输出保存失败的样例。
 	for _, tt := range []struct {
 		name        string
-		limit       int
+		wantNewRows int
+		failKind    defs.ItemKind
 		wantSummary bool
 	}{
 		{
-			"source_write_failure",
-			5,
+			"source_write_failure", 5, defs.ItemToolResult,
 			false,
 		},
 		{
-			"summary_write_failure",
-			6,
+			"summary_write_failure", 6, defs.ItemContextSummary,
 			false,
 		},
 		{
-			"later_output_failure",
-			7,
+			"later_output_failure", 7, defs.ItemMessage,
 			true,
 		},
 	} {
-		// 2. 在指定追加次数失败后重新打开存储，检查已保存摘要和原文组成的后续请求。
+		// 2. 在指定工具结果、摘要或回复行失败后重新打开存储，检查已保存摘要和原文组成的后续请求。
 		t.Run(tt.name, func(t *testing.T) {
 			store := openTurnStorage(t)
 			conversationID := defs.NewConversationID()
 			sid := defs.NewSessionID()
 			seedTurnSummaryHistory(t, store.mutation, conversationID, sid)
 			logs := &failingLogStorage{
-				LogStorage:      store.logs,
-				successfulLimit: tt.limit,
+				LogStorage: store.logs,
+				failKind:   tt.failKind,
 			}
 			query, mutation, err := dao.NewDAO(dao.NewDAOOpt(store.records, logs))
 			if err != nil {
@@ -2323,8 +2732,8 @@ func TestTurnPersistsContextSummary(t *testing.T) {
 				}
 			}
 			items := readTurnLog(t, store.query, conversationID, sid)
-			if len(items) != tt.limit+1 {
-				t.Fatalf("saved %d items, want %d", len(items), tt.limit+1)
+			if len(items) != tt.wantNewRows+1 {
+				t.Fatalf("saved %d items, want %d", len(items), tt.wantNewRows+1)
 			}
 			summaries := 0
 			for _, item := range items {
@@ -2462,7 +2871,7 @@ func TestTurnCompactionRetry(t *testing.T) {
 				var started, completed int
 				for event := range events {
 					if event, ok := event.(*turn.TurnAgentEvent); ok {
-						if event.Event.Type == agent.AgentEventModelCallFinished && event.Event.ModelCall.Purpose == agent.ModelCallPurposeCompaction {
+						if event.Event.Type == agent.AgentEventModelCallFinished && event.Event.ModelCall.Purpose == defs.ModelCallPurposeCompaction {
 							compactCalls = append(compactCalls, event.Event.ModelCall.ModelCallID)
 						}
 						if event.Event.Item != nil && event.Event.Item.Kind == defs.ItemContextSummary {
@@ -2756,26 +3165,28 @@ func (c *summaryTurnClient) Call(ctx context.Context, req llmkit.Request, target
 	return stream, nil
 }
 
-// blockedSummaryLog 在第 6 次 Item 追加时暂停，等测试放行后再写入。
+// blockedSummaryLog 在本批最后一个工具结果写入时暂停。
 type blockedSummaryLog struct {
 	storage.LogStorage
-	count            int
 	started, release chan struct{}
 }
 
 // Append 暂停指定批次的日志追加。
 func (l *blockedSummaryLog) Append(ctx context.Context, path storage.StreamPath, sid storage.StreamID, payloads ...json.RawMessage) ([]storage.LogEntryInfo, error) {
-	// 1. metadata 直接追加；第 6 次 Item 追加时通知测试并等待放行或取消，再追加日志。
-	if sid == metadataTestStreamID {
-		return l.LogStorage.Append(ctx, path, sid, payloads...)
-	}
-	l.count++
-	if l.count == 6 {
-		close(l.started)
-		select {
-		case <-l.release:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+	// 1. 找到 call-a 的结果后通知测试并等待放行，再保存原批次。
+	for _, payload := range payloads {
+		var item defs.Item
+		if err := json.Unmarshal(payload, &item); err != nil {
+			return nil, err
+		}
+		if item.ToolResult != nil && item.ToolResult.CallID == "call-a" {
+			close(l.started)
+			select {
+			case <-l.release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			break
 		}
 	}
 	return l.LogStorage.Append(ctx, path, sid, payloads...)
@@ -3147,8 +3558,19 @@ func TestTurnSteerFinishBoundary(t *testing.T) {
 				}
 			}
 			logged := readTurnLog(t, store.query, opt.ConversationID, opt.SessionID)
-			if !tt.wantErr && (len(logged) != 2 || logged[1].ID != steer.ID || logged[1].TurnID != opt.TurnID) {
-				t.Fatalf("log = %+v, want steer persisted in Turn", logged)
+			if !tt.wantErr {
+				if len(logged) != 4 || logged[0].ID != first.ID || logged[2].ID != steer.ID || logged[2].HandedOffInputItemID != steer.ID || logged[2].TurnID != opt.TurnID {
+					t.Fatalf("log = %+v, want input, empty reply, steer, empty reply", logged)
+				}
+				for _, index := range []int{1, 3} {
+					item := logged[index]
+					if item.Kind != defs.ItemModelCallResult || item.ModelCallResult != defs.ModelCallResultReply || item.Message != nil || item.ModelCallID == "" {
+						t.Fatalf("empty result %d = %+v", index, item)
+					}
+				}
+				if logged[1].ModelCallID == logged[3].ModelCallID || logged[3].ModelCallID != got.result.FinalModelCallID {
+					t.Fatalf("empty call IDs: %s / %s, final %s", logged[1].ModelCallID, logged[3].ModelCallID, got.result.FinalModelCallID)
+				}
 			}
 		})
 	}
@@ -3301,10 +3723,14 @@ func newTestTurn(opt *turn.TurnOpt) (turn.Turn, error) {
 // newTestModel 创建指定连接参数和窗口的测试模型。
 func newTestModel(target *llmkit.Target, window int) *defs.ModelDefinition {
 	// 1. 填写模型身份、请求目标和窗口。
+	modelID := target.Model
+	if modelID == "" {
+		modelID = "test-model"
+	}
 	return &defs.ModelDefinition{
 		Ref: defs.ModelRef{
 			ProviderID: "test",
-			ModelID:    target.Model,
+			ModelID:    modelID,
 		},
 		Target:        target,
 		ContextWindow: window,
@@ -3317,9 +3743,30 @@ type testTurnInbox struct {
 	pending  []*defs.Item
 	finished bool
 	turnIDs  []defs.TurnID
+	// confirmErr 是测试收件箱写入确认时返回的错误，成功时为 nil。
+	confirmErr error
+	// confirmItemID 限定注入错误的组；为空时所有组使用 confirmErr。
+	confirmItemID defs.ItemID
+	// confirmStarted 在目标组到达确认步骤时关闭，不阻塞时为 nil。
+	confirmStarted chan struct{}
+	// confirmRelease 放行目标组的确认，不阻塞时为 nil。
+	confirmRelease chan struct{}
 }
 
 // TakeSteer 取走测试补充输入并更新接收状态。
+// ConfirmInputHandoff 确认测试输入已写入，不保留持久化待办。
+func (inbox *testTurnInbox) ConfirmInputHandoff(_ context.Context, _ defs.TurnID, inputItemIDs []defs.ItemID) error {
+	// 1. 非目标组立即确认；目标组暂停后返回注入错误。
+	if inbox.confirmItemID != "" && !slices.Contains(inputItemIDs, inbox.confirmItemID) {
+		return nil
+	}
+	if inbox.confirmStarted != nil {
+		close(inbox.confirmStarted)
+		<-inbox.confirmRelease
+	}
+	return inbox.confirmErr
+}
+
 func (inbox *testTurnInbox) TakeSteer(_ context.Context, turnID defs.TurnID, finish bool) ([][]*defs.Item, error) {
 	// 1. 加锁取出并清空待处理输入，记录 TurnID 和结束标记，再将每条输入组成一组。
 	inbox.mutex.Lock()
@@ -3556,12 +4003,6 @@ func (stub *turnHooksStub) RunEvent(_ context.Context, request *hook.HookEventRe
 		runUpdates <- run
 	}
 	return outcome
-}
-
-// GetHookInfos 返回空的 hook 说明列表。
-func (*turnHooksStub) GetHookInfos() []*hook.HookInfo {
-	// 1. 返回空列表。
-	return nil
 }
 
 // newTurnHookOutcome 创建带一条运行记录的 hook 结果。
@@ -4117,4 +4558,974 @@ func TestTurnItemsRangeWrites(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCheckInputHandoff 根据实际 Turn 日志核对完整组、拦截及截断和乱序记录。
+func TestCheckInputHandoff(t *testing.T) {
+	// 1. 用真实 Turn 生成正文、技能与 hook 日志，再按用例保留或重排原记录。
+	for _, tt := range []struct {
+		name       string
+		skill      bool
+		hookStatus defs.HookRunStatus
+		logIndexes []int
+		want       turn.InputHandoffStatus
+	}{
+		{name: "no_hook_message_tail", logIndexes: []int{0}, want: turn.InputHandoffComplete},
+		{name: "no_hook_skill_tail", skill: true, logIndexes: []int{0, 1}, want: turn.InputHandoffComplete},
+		{name: "complete_hook_tail", skill: true, hookStatus: defs.HookRunCompleted, logIndexes: []int{0, 1, 2}, want: turn.InputHandoffComplete},
+		{name: "blocked", skill: true, hookStatus: defs.HookRunBlocked, logIndexes: []int{0}, want: turn.InputHandoffComplete},
+		{name: "none", skill: true, want: turn.InputHandoffNone},
+		{name: "missing_last_hook", skill: true, hookStatus: defs.HookRunCompleted, logIndexes: []int{0, 1}, want: turn.InputHandoffPartial},
+		{name: "missing_opening", skill: true, logIndexes: []int{1}, want: turn.InputHandoffPartial},
+		{name: "out_of_order", skill: true, hookStatus: defs.HookRunCompleted, logIndexes: []int{1, 0, 1, 2}, want: turn.InputHandoffPartial},
+		{name: "duplicate_member", skill: true, hookStatus: defs.HookRunCompleted, logIndexes: []int{0, 0, 1, 2}, want: turn.InputHandoffPartial},
+		{name: "early_marker", skill: true, hookStatus: defs.HookRunCompleted, logIndexes: []int{0, 2, 1}, want: turn.InputHandoffPartial},
+		{name: "duplicate_marker", skill: true, hookStatus: defs.HookRunCompleted, logIndexes: []int{0, 1, 2, 2}, want: turn.InputHandoffPartial},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stores := openTurnStorage(t)
+			input := turnUserMessage("用 /review 审 PR")
+			group := defs.SessionInputGroup{Items: []*defs.Item{input}}
+			if tt.skill {
+				group.Items = append(group.Items, &defs.Item{ID: defs.NewItemID(), Kind: defs.ItemSkillInstruction,
+					SkillInstruction: &defs.SkillInstruction{InputItemID: input.ID, Name: "review", Path: "/review/SKILL.md", Executor: "local", Text: "Review instructions"}})
+			}
+			opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"},
+				stores.query, stores.mutation, &scriptedTurnClient{events: []llmkit.Event{{Type: llmkit.EventDone}}})
+			opt.Model = newTestModel(&llmkit.Target{Protocol: llmkit.ProtocolOpenAIChat, Model: "turn-test"}, 0)
+			if tt.hookStatus != "" {
+				const event = defs.HookEventUserPromptSubmit
+				opt.Environments = newTurnEnvironments(t, []defs.TurnExecutor{{ID: "local", WorkspaceDirectory: "/workspace"}})
+				opt.Hooks = &turnHooksStub{outcomes: map[turnHookKey]*hook.HookOutcome{
+					{name: event, prompt: "用 /review 审 PR"}: newTurnHookOutcome(event, tt.hookStatus),
+				}}
+			}
+			instance, err := newTestTurn(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := instance.Run(t.Context(), group.Items, nil); err != nil {
+				t.Fatal(err)
+			}
+			fullLog := readTurnLog(t, stores.query, opt.ConversationID, opt.SessionID)
+			var log []*defs.Item
+			for _, index := range tt.logIndexes {
+				log = append(log, fullLog[index])
+			}
+			state, err := turn.CheckInputHandoff(opt.TurnID, group, log)
+			if state != tt.want {
+				t.Fatalf("CheckInputHandoff() = %q, %v; want %q", state, err, tt.want)
+			}
+			if tt.want == turn.InputHandoffPartial {
+				if !errors.Is(err, turn.ErrInputHandoffIncomplete) || !strings.Contains(err.Error(), string(opt.TurnID)) || !strings.Contains(err.Error(), string(input.ID)) {
+					t.Fatalf("incomplete input error = %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if tt.hookStatus == defs.HookRunBlocked {
+				// 2. 同组同时拥有拦截与正文时不准清待办。
+				body := input.Clone()
+				body.TurnID = opt.TurnID
+				if got, err := turn.CheckInputHandoff(opt.TurnID, group, append(log, body)); got != turn.InputHandoffPartial || !errors.Is(err, turn.ErrInputHandoffIncomplete) {
+					t.Fatalf("contradictory log = %q, %v", got, err)
+				}
+			}
+		})
+	}
+}
+
+// TestTurnResumeConversation 以同一轮的日志和进度重新创建 Turn，核对请求、收尾和原始历史。
+func TestTurnResumeConversation(t *testing.T) {
+	for _, tt := range []struct {
+		name                                         string
+		empty, missingModel, retry, blockHook, steer bool
+	}{
+		{name: "finish_reply"}, {name: "finish_empty", empty: true}, {name: "removed_model_only_finishes", missingModel: true},
+		{name: "retry_after_interrupted_reasoning", retry: true}, {name: "stop_hook_and_persisted_steer", blockHook: true, steer: true}, {name: "persisted_steer", steer: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. 保存第 3 步即将请求时的进度；写入旧调用的输出，但不结算本轮。
+			store := openTurnStorage(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			client := &usageTurnClient{calls: []usageTurnCall{{events: []llmkit.Event{{Type: llmkit.EventContentDelta, Delta: &llmkit.DeltaPayload{Text: "new answer"}}, {Type: llmkit.EventDone}}}}}
+			opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"}, store.query, store.mutation, client)
+			opt.TurnID = defs.NewTurnID()
+			model := newTestModel(&llmkit.Target{Model: "original"}, 0)
+			opt.Model = model
+			opening := turnUserMessage("opening")
+			opening.TurnID = opt.TurnID
+			opening.HandedOffInputItemID = opening.ID
+			cp := &defs.TurnCheckpoint{TurnID: opt.TurnID, Step: 3, Phase: defs.TurnCheckpointPhaseRequest, StopHookContinuations: 7, IsContinuedByStopHook: true, Request: &defs.TurnRequestCheckpoint{Purpose: defs.ModelCallPurposeConversation, ModelCallID: "original-call", ModelCallThroughItemID: opening.ID}}
+			rec := defs.Turn{ID: opt.TurnID, ConversationID: opt.ConversationID, SessionID: opt.SessionID, Model: defs.ModelSelection{Ref: model.Ref}, Status: defs.TurnStatusRunning, ItemsRange: defs.TurnItemRange{FirstOrdinal: 1}}
+			if err := store.mutation.SetTurn(ctx, rec); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.mutation.AppendTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, cp); err != nil {
+				t.Fatal(err)
+			}
+			history := []*defs.Item{opening}
+			assistant := func(text string) *defs.Item {
+				item := turnUserMessage(text)
+				item.TurnID = opt.TurnID
+				item.ModelCallID = cp.Request.ModelCallID
+				item.Message.From = &defs.Address{Kind: defs.IdentityAgent, ID: string(opt.SessionID)}
+				return item
+			}
+			switch {
+			case tt.retry:
+				history = append(history, &defs.Item{ID: "partial", TurnID: opt.TurnID, ModelCallID: cp.Request.ModelCallID, Kind: defs.ItemReasoning, Reasoning: &defs.Reasoning{Status: defs.ReasoningCompleted, Summary: []string{"failed reasoning"}}})
+			case tt.empty:
+				history = append(history, &defs.Item{ID: "empty", TurnID: opt.TurnID, ModelCallID: cp.Request.ModelCallID, Kind: defs.ItemModelCallResult, ModelCallResult: defs.ModelCallResultReply})
+			default:
+				last := assistant("last reply")
+				last.ModelCallResult = defs.ModelCallResultReply
+				history = append(history, assistant("first block"), last)
+			}
+			if !tt.retry {
+				history[len(history)-1].ModelCallUsage = &defs.TurnContextUsage{ModelCallID: cp.Request.ModelCallID, InputThroughItemID: opening.ID, Usage: defs.TokenUsage{Output: 9}}
+			}
+			wantInputIDs := []defs.ItemID{opening.ID}
+			if tt.steer {
+				s := turnUserMessage("already handed off")
+				s.TurnID = opt.TurnID
+				s.HandedOffInputItemID = s.ID
+				history = append(history, s)
+				wantInputIDs = append(wantInputIDs, s.ID)
+			}
+			if _, err := store.mutation.AppendItems(ctx, opt.ConversationID, opt.SessionID, history...); err != nil {
+				t.Fatal(err)
+			}
+			opt.Resume = &turn.TurnResume{
+				Record:     &rec,
+				Checkpoint: cp,
+				Items:      readResumeLog(t, opt),
+			}
+			hooks := &turnHooksStub{}
+			if tt.blockHook {
+				opt.MaxSteps = 4
+				hooks.outcomes = map[turnHookKey]*hook.HookOutcome{{name: defs.HookEventStop}: withTurnHookContext(newTurnHookOutcome(defs.HookEventStop, defs.HookRunBlocked), "hook asks to continue")}
+				opt.Hooks = hooks
+				opt.Environments = newTurnEnvironments(t, []defs.TurnExecutor{{ID: "local", WorkspaceDirectory: "/work"}})
+			}
+			if tt.missingModel {
+				opt.Model = nil
+			}
+			if tt.retry {
+				// 2. 模拟补写失败调用后、新请求进度写成前再次退出。
+				opt.Mutation = &checkpointTestMutation{Mutation: store.mutation, checkpointErr: errors.New("stop before next checkpoint")}
+				instance, err := newTestTurn(opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = instance.Run(ctx, nil, nil); !errors.Is(err, turn.ErrTurnUnsettled) || len(client.requests) != 0 {
+					t.Fatalf("first retry: %v, requests=%d", err, len(client.requests))
+				}
+				opt.Mutation = store.mutation
+				opt.Resume = &turn.TurnResume{
+					Record:     &rec,
+					Checkpoint: cp,
+					Items:      readResumeLog(t, opt),
+				}
+			}
+			// 3. 接续执行；旧输出不再发布，末序号及本轮输入身份完整。
+			events := make(chan turn.TurnEvent, 128)
+			instance, err := newTestTurn(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := instance.Run(ctx, nil, events)
+			close(events)
+			if err != nil || result.Status != defs.TurnStatusCompleted || !slices.Equal(result.InputItemIDs, wantInputIDs) {
+				t.Fatalf("resume result=%+v, err=%v", result, err)
+			}
+			for event := range events {
+				if ev, ok := event.(*turn.TurnAgentEvent); ok && ev.Event.Item != nil && slices.ContainsFunc(opt.Resume.Items, func(old dao.LoggedItem) bool { return old.Item.ID == ev.Event.Item.ID }) {
+					t.Fatalf("republished %s", ev.Event.Item.ID)
+				}
+			}
+			log := readTurnLog(t, store.query, opt.ConversationID, opt.SessionID)
+			saved, _, err := store.query.GetTurn(ctx, opt.SessionID, opt.TurnID)
+			if err != nil || saved.ItemsRange != (defs.TurnItemRange{FirstOrdinal: 1, LastOrdinal: uint64(len(log))}) {
+				t.Errorf("saved range=%+v, rows=%d, err=%v", saved.ItemsRange, len(log), err)
+			}
+			if !tt.retry && saved.Usage.Output != 9 {
+				t.Errorf("restored usage=%+v, want 9 tokens once", saved.Usage)
+			}
+			if !tt.retry && !tt.steer {
+				if result.ContextUsage == nil || result.ContextUsage.ModelCallID != cp.Request.ModelCallID || result.ContextUsage.Usage.Output != 9 {
+					t.Errorf("missing usage report: %+v", result.ContextUsage)
+				}
+				if len(client.requests) != 0 || result.FinalModelCallID != cp.Request.ModelCallID || len(log) != len(history) {
+					t.Fatalf("finish re-generated: requests=%d final=%q log=%v", len(client.requests), result.FinalModelCallID, log)
+				}
+				if !tt.empty && (len(result.Outputs) != 2 || describeTurnLogItem(result.Outputs[1]) != "last reply") {
+					t.Fatalf("lost saved output: %+v", result.Outputs)
+				}
+				return
+			}
+			if len(client.requests) != 1 || result.FinalModelCallID == cp.Request.ModelCallID {
+				t.Fatalf("requests=%d, final=%q", len(client.requests), result.FinalModelCallID)
+			}
+			request, _ := json.Marshal(client.requests[0].Messages)
+			latest, err := store.query.GetTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, opt.TurnID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if latest.Request.ModelCallID != result.FinalModelCallID {
+				t.Fatalf("checkpoint=%+v, final=%q", latest.Request, result.FinalModelCallID)
+			}
+			if tt.retry {
+				if latest.Step != 3 || latest.Request.ModelCallThroughItemID != opening.ID || strings.Contains(string(request), "failed reasoning") || !strings.Contains(string(request), "opening") {
+					t.Errorf("retry checkpoint=%+v, request=%s", latest, request)
+				}
+				if len(log) != 4 || log[2].Kind != defs.ItemModelError || log[2].ModelCallID != cp.Request.ModelCallID || log[3].ModelCallResult != defs.ModelCallResultReply {
+					t.Errorf("retry history=%+v", log)
+				}
+				return
+			}
+			if latest.Step != 4 || !strings.Contains(string(request), "already handed off") || !strings.Contains(string(request), "last reply") {
+				t.Errorf("next step=%d, messages=%s", latest.Step, request)
+			}
+			if tt.blockHook && (latest.StopHookContinuations != 8 || !latest.IsContinuedByStopHook || hooks.requests[0].Event.LastAssistantMessage != "last reply" || !hooks.requests[0].Event.IsStopHookActive || !strings.Contains(string(request), "hook asks to continue")) {
+				t.Errorf("next checkpoint=%+v, first stop=%+v, request=%s", latest, hooks.requests[0].Event, request)
+			}
+		})
+	}
+}
+
+// TestTurnResumeToolBatch 从已保存日志恢复原轮，检查工具不重放以及调用与结果的配对。
+func TestTurnResumeToolBatch(t *testing.T) {
+	for _, tt := range []struct {
+		name                                                         string
+		phase                                                        defs.TurnCheckpointPhase
+		wantStatus                                                   defs.TurnStatus
+		wantRequests                                                 int
+		firstReopenFailure                                           string
+		stop, hookStopped, missingCalls, conflictingFact             bool
+		stoppedResult, unconfirmedResult, earlyRejection, savedRules bool
+	}{
+		{name: "released_twice", phase: defs.TurnCheckpointPhaseTools, wantStatus: defs.TurnStatusCompleted, wantRequests: 1, firstReopenFailure: "next_checkpoint"},
+		{name: "released_hook_stopped", phase: defs.TurnCheckpointPhaseTools, wantStatus: defs.TurnStatusCompleted, hookStopped: true},
+		{name: "released_hook_stop_result_before_hook_run", phase: defs.TurnCheckpointPhaseTools, wantStatus: defs.TurnStatusCompleted, stoppedResult: true},
+		{name: "released_rules_before_missing_result", phase: defs.TurnCheckpointPhaseTools, wantStatus: defs.TurnStatusCompleted, wantRequests: 1, firstReopenFailure: "next_checkpoint", savedRules: true},
+		{name: "interrupt_during_reopen", phase: defs.TurnCheckpointPhaseTools, wantStatus: defs.TurnStatusInterrupted, stop: true},
+		{name: "released_user_stopped", phase: defs.TurnCheckpointPhaseTools, wantStatus: defs.TurnStatusInterrupted, stop: true, firstReopenFailure: "terminal"},
+		{name: "released_stop_before_unknown_is_saved", phase: defs.TurnCheckpointPhaseTools, wantStatus: defs.TurnStatusInterrupted, stop: true, firstReopenFailure: "tool_result"},
+		{name: "released_without_calls", phase: defs.TurnCheckpointPhaseTools, missingCalls: true},
+		{name: "released_conflicts_with_rejection", phase: defs.TurnCheckpointPhaseTools, conflictingFact: true},
+		{name: "unconfirmed_batch_with_result", phase: defs.TurnCheckpointPhaseRequest, unconfirmedResult: true},
+		{name: "rejection_fact_before_last_call", phase: defs.TurnCheckpointPhaseRequest, earlyRejection: true},
+		{name: "before_rejected_fact", phase: defs.TurnCheckpointPhaseRequest, wantStatus: defs.TurnStatusCompleted, wantRequests: 1},
+		{name: "after_rejected_fact", phase: defs.TurnCheckpointPhaseRequest, wantStatus: defs.TurnStatusFailed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. 保存退出时已经写成的请求、调用和结果；未写成的结果不放入日志。
+			store := openTurnStorage(t)
+			ctx := t.Context()
+			client := &usageTurnClient{calls: []usageTurnCall{{events: []llmkit.Event{{Type: llmkit.EventContentDelta, Delta: &llmkit.DeltaPayload{Text: "checked"}}, {Type: llmkit.EventDone}}}}}
+			opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"}, store.query, store.mutation, client)
+			opt.TurnID = defs.NewTurnID()
+			opt.Model = newTestModel(&llmkit.Target{Protocol: llmkit.ProtocolOpenAIChat, Model: "original"}, 0)
+			opt.Environments = newTurnEnvironments(t, []defs.TurnExecutor{{ID: "local", WorkspaceDirectory: "/work"}})
+			hooks := &turnHooksStub{}
+			opt.Hooks = hooks
+			baseExecutor, err := executor.NewToolExecutor(&executor.ToolExecutorOpt{Environments: opt.Environments, AgentTools: []executor.Tool{&checkpointTestTool{}}, Hooks: hooks})
+			if err != nil {
+				t.Fatal(err)
+			}
+			counting := &checkpointCountingExecutor{ToolExecutor: baseExecutor}
+			opt.ToolExecutor = counting
+			opening := turnUserMessage("check the site")
+			opening.TurnID, opening.HandedOffInputItemID = opt.TurnID, opening.ID
+			callID := defs.ModelCallID("original-call")
+			newItem := func(kind defs.ItemKind) *defs.Item {
+				return &defs.Item{ID: defs.NewItemID(), Kind: kind, TurnID: opt.TurnID, ModelCallID: callID}
+			}
+			request := &defs.TurnCheckpoint{TurnID: opt.TurnID, Step: 3, Phase: defs.TurnCheckpointPhaseRequest, StopHookContinuations: 7, IsContinuedByStopHook: true,
+				Request: &defs.TurnRequestCheckpoint{Purpose: defs.ModelCallPurposeConversation, ModelCallID: callID, ModelCallThroughItemID: opening.ID}}
+			record := defs.Turn{ID: opt.TurnID, ConversationID: opt.ConversationID, SessionID: opt.SessionID, Model: defs.ModelSelection{Ref: opt.Model.Ref}, Status: defs.TurnStatusRunning, ItemsRange: defs.TurnItemRange{FirstOrdinal: 1}}
+			if err := store.mutation.SetTurn(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.mutation.AppendTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, request); err != nil {
+				t.Fatal(err)
+			}
+			released := tt.phase == defs.TurnCheckpointPhaseTools
+			if released {
+				checkpoint := &defs.TurnCheckpoint{TurnID: opt.TurnID, Step: 3, Phase: tt.phase, IsContinuedByStopHook: true, Tools: &defs.TurnToolsCheckpoint{ModelCallID: callID}}
+				if err := store.mutation.AppendTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, checkpoint); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				opt.MaxSteps = 3
+			}
+			history := []*defs.Item{opening}
+			var existingResults []*defs.Item
+			var callIDs []string
+			switch {
+			case tt.missingCalls:
+			case released:
+				callIDs = []string{"success", "failure", "missing"}
+			case tt.unconfirmedResult || tt.wantRequests != 0:
+				callIDs = []string{"partial"}
+			default:
+				callIDs = []string{"rejected-a", "rejected-b"}
+			}
+			for _, id := range callIDs {
+				item := newItem(defs.ItemToolCall)
+				item.ToolCall = &defs.ToolCall{CallID: id, Name: "checkpoint_tool", Arguments: "{}", Status: defs.ToolCallReady}
+				history = append(history, item)
+			}
+			switch {
+			case tt.earlyRejection:
+				history[1].ModelCallResult = defs.ModelCallResultToolsRejected
+			case tt.conflictingFact || !released && tt.wantRequests == 0 && !tt.unconfirmedResult:
+				history[len(history)-1].ModelCallResult = defs.ModelCallResultToolsRejected
+			}
+			if released && !tt.missingCalls && !tt.conflictingFact {
+				failed, succeeded := newItem(defs.ItemToolResult), newItem(defs.ItemToolResult)
+				failed.ToolResult = &defs.ToolResult{CallID: "failure", Executor: "local", Error: &defs.ToolError{Code: "tool_failed", Message: "original error"}}
+				if tt.hookStopped {
+					failed.ToolResult.Executor = ""
+					failed.ToolResult.Error = &defs.ToolError{Code: "hook_blocked", Message: "blocked by PreToolUse hook"}
+				}
+				if tt.stoppedResult {
+					failed.ToolResult.Executor = ""
+					failed.ToolResult.Error = &defs.ToolError{Code: "hook_stopped", Message: "turn stopped by hook"}
+				}
+				succeeded.ToolResult = &defs.ToolResult{CallID: "success", Executor: "local", Content: json.RawMessage(`{"saved":"original success"}`)}
+				existingResults = append(existingResults, failed, succeeded)
+			} else if tt.unconfirmedResult {
+				item := newItem(defs.ItemToolResult)
+				item.ToolResult = &defs.ToolResult{CallID: "partial", Content: json.RawMessage(`{"saved":"unconfirmed result"}`)}
+				existingResults = append(existingResults, item)
+			} else if !released && tt.wantRequests == 0 && !tt.earlyRejection {
+				item := newItem(defs.ItemToolResult)
+				item.ToolResult = &defs.ToolResult{CallID: "rejected-a", Error: &defs.ToolError{Code: "max_steps_reached", Message: "agent reached max steps but model still requested tools"}}
+				existingResults = append(existingResults, item)
+			}
+			history = append(history, existingResults...)
+			if tt.hookStopped {
+				item := newItem(defs.ItemHookRun)
+				item.HookRun = newTurnHookOutcome(defs.HookEventPostToolUse, defs.HookRunStopped).SavedRuns[0]
+				history = append(history, item)
+			}
+			if tt.savedRules {
+				for _, name := range []string{"first saved rule", "second saved rule"} {
+					item := newItem(defs.ItemAgentsInstruction)
+					item.AgentsInstruction = &defs.AgentsInstruction{Executor: "local", Path: "/work/" + name + "/AGENTS.md", Text: name}
+					history = append(history, item)
+				}
+			}
+			if _, err := store.mutation.AppendItems(ctx, opt.ConversationID, opt.SessionID, history...); err != nil {
+				t.Fatal(err)
+			}
+			originalLog := readTurnLog(t, store.query, opt.ConversationID, opt.SessionID)
+			existingResults = slices.DeleteFunc(slices.Clone(originalLog), func(item *defs.Item) bool {
+				return item.Kind != defs.ItemToolResult
+			})
+
+			// 2. 在不同保存步骤注入一次故障，用同一目录重开并继续处理。
+			var lastUnknown *defs.Item
+			reopens := 1
+			if tt.firstReopenFailure != "" {
+				reopens = 2
+			}
+			for reopen := 0; reopen < reopens; reopen++ {
+				if err := store.database.Close(); err != nil {
+					t.Fatal(err)
+				}
+				store = openTurnStorageAt(t, store.root)
+				opt.Query, opt.Mutation = store.query, store.mutation
+				record, _, err := store.query.GetTurn(ctx, opt.SessionID, opt.TurnID)
+				if err != nil || record.Status != defs.TurnStatusRunning {
+					t.Fatalf("before reopen: record=%+v error=%v", record, err)
+				}
+				checkpoint, err := store.query.GetTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, opt.TurnID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				opt.Resume = &turn.TurnResume{
+					Record:        &record,
+					Checkpoint:    checkpoint,
+					Items:         readResumeLog(t, opt),
+					StopRequested: tt.stop && tt.name != "interrupt_during_reopen",
+				}
+				var failure string
+				if reopen == 0 {
+					failure = tt.firstReopenFailure
+				}
+				var wantWriteError string
+				switch failure {
+				case "next_checkpoint":
+					wantWriteError = "stop before next checkpoint"
+					opt.Mutation = &checkpointTestMutation{Mutation: store.mutation, checkpointErr: errors.New(wantWriteError)}
+				case "terminal":
+					wantWriteError = "injected turn persistence failure"
+					opt.Mutation = &failingTurnMutation{Mutation: store.mutation, failTerminal: true}
+				case "tool_result":
+					wantWriteError = "injected log failure"
+					_, opt.Mutation, err = dao.NewDAO(dao.NewDAOOpt(store.records, &failingLogStorage{LogStorage: store.logs}))
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				instance, err := newTestTurn(opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runCtx := ctx
+				if tt.name == "interrupt_during_reopen" {
+					var cancel context.CancelCauseFunc
+					runCtx, cancel = context.WithCancelCause(ctx)
+					cancel(turn.ErrTurnInterrupted)
+				}
+				result, runErr := instance.Run(runCtx, nil, nil)
+				if tt.wantStatus == "" {
+					if !errors.Is(runErr, turn.ErrTurnUnsettled) || !strings.Contains(runErr.Error(), "corrupt") || len(client.requests) != 0 {
+						t.Fatalf("invalid batch: result=%+v err=%v requests=%d", result, runErr, len(client.requests))
+					}
+					loaded, _, err := store.query.GetTurn(ctx, opt.SessionID, opt.TurnID)
+					if err != nil || !reflect.DeepEqual(loaded, record) || !reflect.DeepEqual(readTurnLog(t, store.query, opt.ConversationID, opt.SessionID), originalLog) {
+						t.Fatalf("corruption changed the original log or Turn: %+v, %v", loaded, err)
+					}
+					return
+				}
+				if failure != "" {
+					if !errors.Is(runErr, turn.ErrTurnUnsettled) || !strings.Contains(runErr.Error(), wantWriteError) || len(client.requests) != 0 {
+						t.Fatalf("first reopen: result=%+v err=%v requests=%d", result, runErr, len(client.requests))
+					}
+				} else if result.Status != tt.wantStatus || (runErr == nil) != (tt.wantStatus == defs.TurnStatusCompleted) || len(client.requests) != tt.wantRequests {
+					t.Fatalf("reopen: status=%s want=%s err=%v requests=%d want=%d", result.Status, tt.wantStatus, runErr, len(client.requests), tt.wantRequests)
+				}
+
+				// 3. 核对原结果逐条不变；仅补缺项，双次重开也不改未知结果的 ItemID。
+				log := readTurnLog(t, store.query, opt.ConversationID, opt.SessionID)
+				results := slices.DeleteFunc(slices.Clone(log), func(item *defs.Item) bool { return item.Kind != defs.ItemToolResult })
+				if failure == "tool_result" {
+					if !reflect.DeepEqual(results, existingResults) || log[len(log)-1].Kind == defs.ItemTurnInterrupted {
+						t.Fatal("settled the stopped turn despite a failed result write")
+					}
+					continue
+				}
+				if released || tt.wantRequests == 0 {
+					if len(results) != len(existingResults)+1 || !reflect.DeepEqual(results[:len(existingResults)], existingResults) {
+						t.Fatalf("saved tool results changed: %+v", results)
+					}
+					last := results[len(results)-1]
+					if last.TurnID != opt.TurnID || last.ModelCallID != callID {
+						t.Fatalf("wrong recovered result identity: %+v", last)
+					}
+					if released {
+						var body map[string]string
+						if got := last.ToolResult; got.CallID != "missing" || got.Error != nil || json.Unmarshal(got.Content, &body) != nil || body["code"] != "outcome_unknown" || !strings.Contains(body["message"], "检查现场") {
+							t.Fatalf("unknown result=%+v body=%v", got, body)
+						}
+						if lastUnknown != nil && !reflect.DeepEqual(lastUnknown, last) {
+							t.Fatalf("unknown result replaced on reopen: %s → %s", lastUnknown.ID, last.ID)
+						}
+						lastUnknown = last
+					} else if got := last.ToolResult; got.CallID != "rejected-b" || got.Error == nil || got.Error.Code != "max_steps_reached" || runErr.Error() != got.Error.Message {
+						t.Fatalf("missing rejection=%+v, run error=%v", got, runErr)
+					}
+				} else if len(results) != 0 || !slices.ContainsFunc(log, func(item *defs.Item) bool { return item.Kind == defs.ItemModelError && item.ModelCallID == callID }) {
+					t.Fatalf("unconfirmed calls were not superseded: %v", results)
+				}
+				if tt.stop {
+					interruptedMarkers := slices.DeleteFunc(slices.Clone(log), func(item *defs.Item) bool { return item.Kind != defs.ItemTurnInterrupted })
+					if len(interruptedMarkers) != 1 || log[len(log)-1] != interruptedMarkers[0] || log[len(log)-2] != lastUnknown {
+						t.Fatal("exactly one interruption must follow the saved missing result")
+					}
+				}
+				if (tt.hookStopped || tt.stoppedResult) && result.FinalModelCallID != callID {
+					t.Fatalf("final call = %s, want %s", result.FinalModelCallID, callID)
+				}
+			}
+			// 4. 检查新模型请求的配对、步号及工具侧没有新增调用。
+			if counting.prepareCalls.Load() != 0 || counting.runCalls.Load() != 0 || slices.ContainsFunc(hooks.requests, func(request *hook.HookEventRequest) bool {
+				return request.Event.Name == defs.HookEventPreToolUse || request.Event.Name == defs.HookEventPostToolUse
+			}) {
+				t.Fatal("tool preparation, execution or tool hooks ran during recovery")
+			}
+			if tt.wantRequests == 0 {
+				return
+			}
+			latest, err := store.query.GetTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, opt.TurnID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages := client.requests[0].Messages
+			if !released {
+				if latest.Step != 3 || latest.Request.ModelCallID == callID || !latest.IsContinuedByStopHook || latest.StopHookContinuations != 7 || slices.ContainsFunc(messages, func(msg llmkit.Message) bool { return len(msg.ToolCalls) != 0 || msg.Role == llmkit.RoleTool }) {
+					t.Fatalf("retry checkpoint=%+v messages=%+v", latest, messages)
+				}
+				return
+			}
+			if latest.Step != 4 || !latest.IsContinuedByStopHook || latest.StopHookContinuations != 0 {
+				t.Fatalf("next step checkpoint=%+v", latest)
+			}
+			wantMessageCount := 5
+			if tt.savedRules {
+				wantMessageCount += 2
+			}
+			if len(messages) != wantMessageCount || messages[1].Role != llmkit.RoleAssistant {
+				t.Fatalf("next request messages=%+v", messages)
+			}
+			var modelCalls []string
+			for _, call := range messages[1].ToolCalls {
+				modelCalls = append(modelCalls, call.ID)
+			}
+			if !slices.Equal(modelCalls, callIDs) {
+				t.Fatalf("next request calls=%v, want %v", modelCalls, callIDs)
+			}
+			for i, want := range []struct{ id, content string }{{"failure", "original error"}, {"success", "original success"}, {"missing", "outcome_unknown"}} {
+				message := messages[i+2]
+				if message.Role != llmkit.RoleTool || message.ToolCallID != want.id || len(message.Content) != 1 || !strings.Contains(message.Content[0].Text, want.content) {
+					t.Fatalf("tool message=%+v, want %+v", message, want)
+				}
+			}
+			if tt.savedRules {
+				for i, want := range []string{"first saved rule", "second saved rule"} {
+					message := messages[i+5]
+					if message.Role != llmkit.RoleUser || len(message.Content) != 1 || !strings.Contains(message.Content[0].Text, want) {
+						t.Fatalf("rule message=%+v, want %q after the tool results", message, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestRecoveryHistoryAfterSummary 检查重试模型实际收到请求时有效的摘要和保留段。
+func TestRecoveryHistoryAfterSummary(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		compact, missing bool
+	}{{"inherited_summary", false, false}, {"compacted_this_turn", true, false}, {"missing_expected_summary", true, true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. 分叉只继承已选历史；在保留段之后写入两个摘要，只有原请求前确认的摘要可用。
+			store := openTurnStorage(t)
+			ctx := t.Context()
+			client := &summaryTurnClient{}
+			opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"}, store.query, store.mutation, client)
+			opt.TurnID = defs.NewTurnID()
+			opt.Model = newTestModel(&llmkit.Target{}, 0)
+			inherited := turnSummary("inherited", "omitted", "inherited summary")
+			source := turnUserMessage("from fork source")
+			source.TurnID = "source"
+			input := turnUserMessage("kept input")
+			input.TurnID = opt.TurnID
+			input.HandedOffInputItemID = input.ID
+			history := []*defs.Item{inherited, source, {ID: "fork", Kind: defs.ItemSessionFork, SessionFork: &defs.SessionFork{SourceSessionID: "source"}}, input}
+			compact := func(id, call, text string) *defs.Item {
+				s := turnSummary(defs.ItemID(id), source.ID, text)
+				s.TurnID = opt.TurnID
+				s.ModelCallID = defs.ModelCallID(call)
+				if err := store.mutation.AppendTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, &defs.TurnCheckpoint{TurnID: opt.TurnID, Step: 2, Phase: defs.TurnCheckpointPhaseRequest, Request: &defs.TurnRequestCheckpoint{Purpose: defs.ModelCallPurposeCompaction, ModelCallID: s.ModelCallID, Compaction: &defs.TurnCompactionCheckpoint{SummaryItemID: s.ID, CoveredThroughItemID: source.ID, CompactModelRef: opt.Model.Ref}}}); err != nil {
+					t.Fatal(err)
+				}
+				return s
+			}
+			if tt.compact {
+				s := compact("effective", "z-before", "effective summary")
+				if !tt.missing {
+					history = append(history, s)
+				}
+			}
+			cp := &defs.TurnCheckpoint{TurnID: opt.TurnID, Step: 2, Phase: defs.TurnCheckpointPhaseRequest, Request: &defs.TurnRequestCheckpoint{Purpose: defs.ModelCallPurposeConversation, ModelCallID: "original", ModelCallThroughItemID: input.ID}}
+			if err := store.mutation.AppendTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, cp); err != nil {
+				t.Fatal(err)
+			}
+			late := turnUserMessage("later input")
+			late.TurnID = opt.TurnID
+			history = append(history, late, compact("later", "a-after", "later summary"))
+			if _, err := store.mutation.AppendItems(ctx, opt.ConversationID, opt.SessionID, history...); err != nil {
+				t.Fatal(err)
+			}
+			// 2. 直接重试原请求，检查完整、有序的模型消息。
+			opt.Resume = &turn.TurnResume{
+				Record: &defs.Turn{
+					ID:             opt.TurnID,
+					SessionID:      opt.SessionID,
+					ConversationID: opt.ConversationID,
+					Status:         defs.TurnStatusRunning,
+					Model:          defs.ModelSelection{Ref: opt.Model.Ref},
+					ItemsRange:     defs.TurnItemRange{FirstOrdinal: 4},
+				},
+				Checkpoint: cp,
+				Items:      readResumeLog(t, opt),
+			}
+			instance, err := newTestTurn(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = instance.Run(ctx, nil, nil)
+			if tt.missing {
+				if err == nil || len(client.requests) != 0 {
+					t.Fatalf("missing summary reached model: %v, requests=%d", err, len(client.requests))
+				}
+				return
+			}
+			if err != nil || len(client.requests) != 1 {
+				t.Fatalf("requests=%d, err=%v", len(client.requests), err)
+			}
+			want := []string{"inherited summary", "from fork source", "kept input"}
+			if tt.compact {
+				want = []string{"effective summary", "kept input"}
+			}
+			messages := client.requests[0].Messages
+			if len(messages) != len(want) {
+				t.Fatalf("messages=%+v, want %v", messages, want)
+			}
+			for i, text := range want {
+				if len(messages[i].Content) != 1 || !strings.Contains(messages[i].Content[0].Text, text) {
+					t.Fatalf("message[%d]=%+v, want %q", i, messages[i], text)
+				}
+			}
+		})
+	}
+}
+
+// TestTurnStreamPersistence 检查流还未结束时，较早的块已经落盘，末条文字仍在等待调用完成。
+func TestTurnStreamPersistence(t *testing.T) {
+	for _, reasoningOnly := range []bool{true, false} {
+		t.Run(fmt.Sprintf("reasoning_only_%t", reasoningOnly), func(t *testing.T) {
+			store := openTurnStorage(t)
+			client := &inputBoundaryClient{calls: make(chan chan llmkit.Event, 1)}
+			opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"}, store.query, store.mutation, client)
+			opt.Model = newTestModel(&llmkit.Target{}, 0)
+			instance, err := newTestTurn(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			events := make(chan turn.TurnEvent, 128)
+			done := make(chan error, 1)
+			go func() { _, err := instance.Run(ctx, []*defs.Item{turnUserMessage("input")}, events); done <- err }()
+			defer func() { cancel(); <-done }()
+			stream := <-client.calls
+			stream <- llmkit.Event{Type: llmkit.EventReasoningDone, Reasoning: &llmkit.ReasoningContent{Summary: []string{"in progress"}}, ReasoningStatus: llmkit.ReasoningCompleted}
+			if !reasoningOnly {
+				for _, text := range []string{"first block", "final block"} {
+					stream <- llmkit.Event{Type: llmkit.EventContentDelta, Delta: &llmkit.DeltaPayload{Text: text}}
+					stream <- llmkit.Event{Type: llmkit.EventContentBlockStop}
+				}
+			}
+			for ev := range events {
+				if saved, ok := ev.(*turn.TurnItemsSaved); ok && slices.ContainsFunc(saved.Items, func(item dao.LoggedItem) bool {
+					return (reasoningOnly && item.Item.Kind == defs.ItemReasoning) || (!reasoningOnly && describeTurnLogItem(item.Item) == "first block")
+				}) {
+					break
+				}
+			}
+			rows := readTurnLog(t, store.query, opt.ConversationID, opt.SessionID)
+			if len(rows) < 2 || rows[1].Kind != defs.ItemReasoning || rows[1].ModelCallResult != "" {
+				t.Fatalf("unfinished stream reasoning is not durable: %+v", rows)
+			}
+			if !reasoningOnly && (len(rows) != 3 || describeTurnLogItem(rows[2]) != "first block" || rows[2].ModelCallResult != "") {
+				t.Fatalf("expected only earlier block persisted: %+v", rows)
+			}
+			stream <- llmkit.Event{Type: llmkit.EventDone}
+			for ev := range events {
+				if s, ok := ev.(*turn.TurnItemsSaved); ok && s.Items[len(s.Items)-1].Item.ModelCallResult == defs.ModelCallResultReply {
+					item := s.Items[len(s.Items)-1].Item
+					if reasoningOnly && item.Kind != defs.ItemModelCallResult || !reasoningOnly && describeTurnLogItem(item) != "final block" {
+						t.Fatalf("wrong completion fact: %+v", item)
+					}
+					break
+				}
+			}
+		})
+	}
+}
+
+// readResumeLog 读取测试 Session 的原始日志和对外序号。
+func readResumeLog(t *testing.T, opt *turn.TurnOpt) []dao.LoggedItem {
+	t.Helper()
+	page, err := opt.Query.ListItems(t.Context(), dao.ListItemsRequest{ConversationID: opt.ConversationID, SessionID: opt.SessionID, Limit: 100, Order: storage.DirectionAsc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return page.Items
+}
+
+// TestTurnResumeCompaction 从摘要正文落盘前后的日志继续同一轮，核对模型实际收到的请求和落盘结果。
+func TestTurnResumeCompaction(t *testing.T) {
+	for _, tt := range []struct {
+		name                        string
+		manual, saved, removedModel bool
+		noCheckpoint, emptyHistory  bool
+		removedConversationModel    bool
+		differentProvider           bool
+		withEnvironment             bool
+		wantTargets                 []string
+		wantSummary                 bool
+		wantStatus                  defs.TurnStatus
+	}{
+		{name: "manual_before_summary", manual: true, wantTargets: []string{"original-summary"}, wantSummary: true, wantStatus: defs.TurnStatusCompleted},
+		{name: "manual_before_summary_with_removed_conversation_model", manual: true, removedConversationModel: true, wantTargets: []string{"original-summary"}, wantSummary: true, wantStatus: defs.TurnStatusCompleted},
+		{name: "manual_after_summary", manual: true, saved: true, wantSummary: true, wantStatus: defs.TurnStatusCompleted},
+		{name: "automatic_before_summary", withEnvironment: true, wantTargets: []string{"original-summary", "conversation"}, wantSummary: true, wantStatus: defs.TurnStatusCompleted},
+		{name: "automatic_after_summary", saved: true, withEnvironment: true, wantTargets: []string{"conversation"}, wantSummary: true, wantStatus: defs.TurnStatusCompleted},
+		{name: "manual_after_summary_with_removed_models", manual: true, saved: true, removedModel: true, removedConversationModel: true, wantSummary: true, wantStatus: defs.TurnStatusCompleted},
+		{name: "automatic_after_summary_with_removed_summary_model", saved: true, removedModel: true, wantTargets: []string{"conversation"}, wantSummary: true, wantStatus: defs.TurnStatusCompleted},
+		{name: "automatic_before_summary_with_removed_summary_model", removedModel: true, wantStatus: defs.TurnStatusFailed},
+		{name: "retry_refuses_another_provider_for_same_model_id", differentProvider: true, wantStatus: defs.TurnStatusFailed},
+		{name: "manual_before_checkpoint", manual: true, noCheckpoint: true, wantTargets: []string{"original-summary"}, wantSummary: true, wantStatus: defs.TurnStatusCompleted},
+		{name: "manual_before_checkpoint_without_history", manual: true, noCheckpoint: true, emptyHistory: true, wantStatus: defs.TurnStatusCompleted},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. 还原退出时的有序日志；上一摘要虽然写在覆盖末项之后，仍属于这次摘要的原请求。
+			store := openTurnStorage(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			client := &compactionResumeTurnClient{}
+			for _, target := range tt.wantTargets {
+				text := "retried summary"
+				if target == "conversation" {
+					text = "ordinary answer"
+				}
+				client.calls = append(client.calls, usageTurnCall{events: []llmkit.Event{
+					{Type: llmkit.EventContentDelta, Delta: &llmkit.DeltaPayload{Text: text}},
+					{Type: llmkit.EventDone, FinishReason: "stop"},
+				}})
+			}
+			opt := turn.NewTurnOpt(defs.NewConversationID(), defs.NewSessionID(), &agent.AgentDefinition{Name: "assistant"}, store.query, store.mutation, client)
+			opt.TurnID = defs.NewTurnID()
+			opt.Inbox = &testTurnInbox{}
+			opt.Model = newTestModel(&llmkit.Target{Model: "conversation"}, 0)
+			originalModel := newTestModel(&llmkit.Target{Model: "original-summary"}, 0)
+			if tt.noCheckpoint {
+				opt.CompactModel = originalModel
+			} else if !tt.saved {
+				opt.CompactModel = newTestModel(&llmkit.Target{Model: "backup-summary"}, 0)
+			}
+			if tt.withEnvironment {
+				work, err := workspace.NewVirtualWorkspace(workspace.NewVirtualWorkspaceOpt("/workspace", map[string]*workspace.VirtualFile{
+					"/workspace/.git":      {Content: []byte("git")},
+					"/workspace/AGENTS.md": {Content: []byte("fresh rule")},
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				environment, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt("local", "", work))
+				if err != nil {
+					t.Fatal(err)
+				}
+				memoryRoot := t.TempDir()
+				if err := os.Mkdir(filepath.Join(memoryRoot, "user"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				memory, err := workspace.NewMemoryWorkspace(workspace.NewMemoryWorkspaceOpt(memoryRoot, "test-project"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := memory.WriteFile(ctx, "/user/MEMORY.md", []byte("fresh memory index"), 0o600, true); err != nil {
+					t.Fatal(err)
+				}
+				memoryEnvironment, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt(defs.MemoryExecutorID, "", memory))
+				if err != nil {
+					t.Fatal(err)
+				}
+				opt.Environments = []executor.ExecutionEnvironment{environment, memoryEnvironment}
+			}
+			previousTurnID := defs.NewTurnID()
+			old, covered, retained := turnUserMessage("already summarized"), turnUserMessage("original coverage end"), turnUserMessage("uncovered history")
+			uncovered := turnUserMessage("uncovered middle")
+			rule := &defs.Item{ID: defs.NewItemID(), Kind: defs.ItemAgentsInstruction,
+				AgentsInstruction: &defs.AgentsInstruction{Executor: "local", Path: "/workspace/AGENTS.md", Text: "old rule"}}
+			memoryIndex := &defs.Item{ID: defs.NewItemID(), Kind: defs.ItemMemoryIndex,
+				MemoryIndex: &defs.MemoryIndex{Path: "user/MEMORY.md", Text: "old memory index"}}
+			for _, item := range []*defs.Item{old, rule, memoryIndex, covered, uncovered, retained} {
+				item.TurnID = previousTurnID
+			}
+			previousSummary := &defs.Item{ID: "previous-summary", TurnID: previousTurnID, ModelCallID: "previous-compact-call", Kind: defs.ItemContextSummary,
+				ContextSummary: &defs.ContextSummary{CoveredThroughItemID: old.ID, Text: "previous summary text"}}
+			items := []*defs.Item{old, rule, memoryIndex, covered, previousSummary, uncovered, retained}
+			if !tt.manual {
+				retained.TurnID, retained.HandedOffInputItemID = opt.TurnID, retained.ID
+			}
+			step, stopContinuations := 3, 7
+			if tt.manual {
+				step, stopContinuations = 1, 0
+			}
+			record := defs.Turn{ID: opt.TurnID, ConversationID: opt.ConversationID, SessionID: opt.SessionID, Model: defs.ModelSelection{Ref: opt.Model.Ref}, Status: defs.TurnStatusRunning, IsCompactOnly: tt.manual}
+			if err := store.mutation.SetTurn(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+			originalCheckpoint := &defs.TurnCheckpoint{TurnID: opt.TurnID, Step: step, Phase: defs.TurnCheckpointPhaseRequest, StopHookContinuations: stopContinuations, IsContinuedByStopHook: !tt.manual,
+				Request: &defs.TurnRequestCheckpoint{Purpose: defs.ModelCallPurposeCompaction, ModelCallID: "original-compact-call", Compaction: &defs.TurnCompactionCheckpoint{
+					SummaryItemID: "original-summary-item", CoveredThroughItemID: covered.ID, CompactModelRef: originalModel.Ref,
+				}}}
+			if !tt.emptyHistory {
+				if _, err := store.mutation.AppendItems(ctx, opt.ConversationID, opt.SessionID, items...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !tt.noCheckpoint {
+				if err := store.mutation.AppendTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, originalCheckpoint); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.saved {
+				summary := &defs.Item{ID: originalCheckpoint.Request.Compaction.SummaryItemID, TurnID: opt.TurnID, ModelCallID: originalCheckpoint.Request.ModelCallID, Kind: defs.ItemContextSummary,
+					ContextSummary: &defs.ContextSummary{CoveredThroughItemID: covered.ID, Text: "saved summary text"}}
+				if _, err := store.mutation.AppendItems(ctx, opt.ConversationID, opt.SessionID, summary); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// 2. 重开存储，用新的 Turn 实例和模型目录继续原轮。
+			if err := store.database.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store = openTurnStorageAt(t, store.root)
+			opt.Query, opt.Mutation = store.query, store.mutation
+			savedTurn, found, err := store.query.GetTurn(ctx, opt.SessionID, opt.TurnID)
+			if err != nil || !found || savedTurn.Status != defs.TurnStatusRunning {
+				t.Fatalf("running Turn: %+v, %v", savedTurn, err)
+			}
+			checkpoint, err := store.query.GetTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, opt.TurnID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opt.Resume = &turn.TurnResume{
+				Record:     &savedTurn,
+				Checkpoint: checkpoint,
+				Items:      readResumeLog(t, opt),
+			}
+			if checkpoint != nil && !tt.removedModel {
+				opt.Resume.CompactModel = originalModel
+			}
+			if tt.differentProvider {
+				differentModel := newTestModel(&llmkit.Target{Model: "original-summary"}, 0)
+				differentModel.Ref.ProviderID = "backup-provider"
+				opt.Resume.CompactModel = differentModel
+			}
+			if tt.removedConversationModel {
+				opt.Model = nil
+			}
+			instance, err := turn.NewTurn(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := instance.Run(ctx, nil, nil)
+			if result.Status != tt.wantStatus || (err != nil) != (tt.wantStatus == defs.TurnStatusFailed) {
+				t.Fatalf("reopened Turn status=%q, error=%v; want %q", result.Status, err, tt.wantStatus)
+			}
+			if tt.wantStatus == defs.TurnStatusFailed && !strings.Contains(err.Error(), originalModel.Ref.String()) {
+				t.Errorf("missing original model error = %v", err)
+			}
+			if !slices.Equal(client.targets, tt.wantTargets) {
+				t.Fatalf("actual model calls=%v, want %v", client.targets, tt.wantTargets)
+			}
+
+			// 3. 只允许一条原摘要，并核对摘要输入和恢复后的同一步普通请求。
+			var summaries []*defs.Item
+			var environmentItems []*defs.Item
+			for _, item := range readTurnLog(t, store.query, opt.ConversationID, opt.SessionID) {
+				if item.TurnID != opt.TurnID {
+					continue
+				}
+				switch item.Kind {
+				case defs.ItemContextSummary:
+					summaries = append(summaries, item)
+				case defs.ItemAgentsInstruction, defs.ItemMemoryIndex:
+					environmentItems = append(environmentItems, item)
+				}
+			}
+			if !tt.wantSummary {
+				if len(summaries) != 0 {
+					t.Fatalf("unexpected summaries: %+v", summaries)
+				}
+				return
+			}
+			if len(summaries) != 1 {
+				t.Fatalf("saved %d summaries, want 1", len(summaries))
+			}
+			summary := summaries[0]
+			wantText := "retried summary"
+			if tt.saved {
+				wantText = "saved summary text"
+			}
+			if summary.ContextSummary.Text != wantText {
+				t.Errorf("summary text = %q, want %q", summary.ContextSummary.Text, wantText)
+			}
+			if tt.noCheckpoint && summary.ContextSummary.CoveredThroughItemID != uncovered.ID {
+				t.Errorf("new manual summary covers through %q, want %q", summary.ContextSummary.CoveredThroughItemID, uncovered.ID)
+			}
+			if !tt.noCheckpoint && (summary.ID != originalCheckpoint.Request.Compaction.SummaryItemID || summary.ContextSummary.CoveredThroughItemID != covered.ID ||
+				(summary.ModelCallID == originalCheckpoint.Request.ModelCallID) != tt.saved) {
+				t.Errorf("summary identity/coverage changed: id=%q through=%q attempt=%q", summary.ID, summary.ContextSummary.CoveredThroughItemID, summary.ModelCallID)
+			}
+			for i, target := range client.targets {
+				messages, err := json.Marshal(client.requests[i].Messages)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var want, omit []string
+				if target == "conversation" {
+					want = []string{wantText, "uncovered middle", "uncovered history"}
+					omit = []string{"previous summary text", "old rule", "old memory index", "original coverage end"}
+					if tt.withEnvironment {
+						want = append(want, "fresh rule", "fresh memory index")
+					}
+				} else {
+					want = []string{"previous summary text", "old rule", "old memory index", "original coverage end"}
+					omit = []string{"fresh rule", "fresh memory index", "uncovered history", wantText}
+					if tt.noCheckpoint {
+						want = append(want, "uncovered middle")
+					} else {
+						omit = append(omit, "uncovered middle")
+					}
+				}
+				for _, text := range omit {
+					if strings.Contains(string(messages), text) {
+						t.Errorf("%s request unexpectedly contains %q", target, text)
+					}
+				}
+				remaining := string(messages)
+				for _, text := range want {
+					_, after, found := strings.Cut(remaining, text)
+					if !found {
+						t.Errorf("%s request lacks %q in order", target, text)
+						continue
+					}
+					remaining = after
+				}
+			}
+			wantConversationThrough := retained.ID
+			if tt.withEnvironment {
+				if len(environmentItems) != 2 || environmentItems[0].Kind != defs.ItemAgentsInstruction || environmentItems[1].Kind != defs.ItemMemoryIndex {
+					t.Errorf("saved environment items = %v, want one rule followed by one memory index", environmentItems)
+				} else {
+					wantConversationThrough = environmentItems[1].ID
+				}
+			}
+			latest, err := store.query.GetTurnCheckpoint(ctx, opt.ConversationID, opt.SessionID, opt.TurnID)
+			if err != nil || latest == nil || latest.Step != step || latest.StopHookContinuations != stopContinuations || latest.IsContinuedByStopHook != !tt.manual {
+				t.Fatalf("final checkpoint=%+v, error=%v", latest, err)
+			}
+			if tt.manual {
+				if latest.Request.Purpose != defs.ModelCallPurposeCompaction || latest.Request.ModelCallID != summary.ModelCallID || latest.Request.Compaction.CompactModelRef != originalModel.Ref || result.FinalModelCallID != "" {
+					t.Errorf("manual checkpoint=%+v, final ordinary call=%q", latest.Request, result.FinalModelCallID)
+				}
+			} else if latest.Request.Purpose != defs.ModelCallPurposeConversation || latest.Request.ModelCallThroughItemID != wantConversationThrough || latest.Request.ModelCallID != result.FinalModelCallID {
+				t.Errorf("ordinary checkpoint=%+v, final ordinary call=%q", latest.Request, result.FinalModelCallID)
+			}
+		})
+	}
+}
+
+// compactionResumeTurnClient 记录测试模型实际收到的目标，按预设顺序返回流。
+type compactionResumeTurnClient struct {
+	usageTurnClient
+	targets []string
+}
+
+func (c *compactionResumeTurnClient) Call(ctx context.Context, req llmkit.Request, target llmkit.Target, opt llmkit.CallOptions) (<-chan llmkit.Event, error) {
+	c.targets = append(c.targets, target.Model)
+	return c.usageTurnClient.Call(ctx, req, target, opt)
 }

@@ -1,10 +1,16 @@
 package agent
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"slices"
 
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/openvaala/pkg/agent/agent_context"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/telemetry"
 )
 
 // handleMessageEvent 将文本和拒绝回复写入消息草稿，返回消息开始、增量或完成事件。
@@ -201,4 +207,169 @@ func (a *agentImpl) handleModelErrorEvent(event *llmkit.Event, modelCallID defs.
 		a.newItemEvent(AgentEventItemStarted, item, nil),
 		a.finishItemWithReason(item, AgentEventItemCompleted),
 	}
+}
+
+// applyEventToDraft 按模型事件类别更新草稿，返回对应的 Agent 事件。
+func (a *agentImpl) applyEventToDraft(event *llmkit.Event, modelCallID defs.ModelCallID) []*AgentEvent {
+	// 1. 分发消息、推理、工具和错误事件；生成结束时完成所有未结束草稿。
+	switch event.Type {
+	case llmkit.EventDone:
+		var events []*AgentEvent
+		for _, item := range a.draftItems {
+			if _, ended := a.draftItemFinishReason[item]; !ended {
+				events = append(events, a.finishItemWithReason(item, AgentEventItemCompleted))
+			}
+		}
+		return events
+	case llmkit.EventContentDelta, llmkit.EventContentBlockStop:
+		return a.handleMessageEvent(event, modelCallID)
+	case llmkit.EventReasoningSummaryDelta,
+		llmkit.EventReasoningContentDelta,
+		llmkit.EventReasoningDone:
+		return a.handleReasoningEvent(event, modelCallID)
+	case llmkit.EventToolCallStart,
+		llmkit.EventToolCallArgumentsDelta,
+		llmkit.EventToolCallEnd,
+		llmkit.EventToolCallDelta:
+		return a.handleToolCallEvent(event, modelCallID)
+	case llmkit.EventError:
+		return a.handleModelErrorEvent(event, modelCallID)
+	case llmkit.EventThinkingDelta, llmkit.EventSignatureDelta:
+		// thinking 和签名增量不单独处理，推理内容以 Reasoning 事件为准。
+	}
+	return nil
+}
+
+// handleModelCallStarted 登记本次模型流的身份、输入位置和输出起点。
+func (a *agentImpl) handleModelCallStarted(modelCallID defs.ModelCallID, inputThroughItemID defs.ItemID) {
+	// 1. 登记流并累计一次普通模型尝试。
+	a.modelStream = &agentModelStream{
+		inputThroughItemID: inputThroughItemID,
+		outputStart:        len(a.draftItems),
+		call: AgentModelCall{
+			ModelCallID: modelCallID,
+			Purpose:     defs.ModelCallPurposeConversation,
+		},
+	}
+	a.turnStats.Steps++
+	a.turnStats.InferenceCalls++
+	a.turnStats.FinishReason = ""
+}
+
+// handleTaskModelEvent 合并当前模型流的用量、结束原因和输出事件。
+func (a *agentImpl) handleTaskModelEvent(event *llmkit.Event, modelCallResult defs.ModelCallResult) {
+	// 1. 记录本次调用上报的用量和结束原因。
+	stream := a.modelStream
+	if event.Usage != nil {
+		usage := agent_context.NewTokenUsage(event.Usage)
+		stream.call.Usage = &usage
+	}
+	if event.Type == llmkit.EventDone {
+		report := &defs.TurnContextUsage{
+			ModelCallID:        stream.call.ModelCallID,
+			InputThroughItemID: stream.inputThroughItemID,
+			ReasoningContext:   event.ReasoningContext,
+		}
+		if stream.call.Usage != nil {
+			report.Usage = *stream.call.Usage
+		}
+		stream.call.ContextUsage = report
+		a.turnStats.FinishReason = agent_context.NewTelemetryFinishReason(event.FinishReason)
+	}
+	// 2. 发送输出事件；调用完成事实随 ModelCallFinished 交给 Turn 收尾写入。
+	if event.Type == llmkit.EventDone {
+		stream.call.Result = modelCallResult
+	}
+	a.sendEvents(a.applyEventToDraft(event, stream.call.ModelCallID))
+}
+
+// handleModelCallFinished 结算一次模型尝试，发布调用报告并把可用输出交给生成任务。
+func (a *agentImpl) handleModelCallFinished(ctx context.Context, request *agentTaskModelCallFinishedRequest) agentTaskModelCallResult {
+	// 1. 取出已合并的调用，结束遥测，发送原输入测量和调用报告。
+	stream := a.modelStream
+	a.modelStream = nil
+	call := &stream.call
+	modelCallID := call.ModelCallID
+	output := a.draftItems[stream.outputStart:]
+	if call.Usage != nil {
+		a.turnStats.Usage = a.turnStats.Usage.Add(*call.Usage)
+	}
+	if request.CallErr != nil && a.turnStats.FinishReason == "" {
+		a.turnStats.FinishReason = telemetry.FinishReasonError
+	}
+	if request.Recorder.IsContentCaptured() {
+		request.Recorder.RecordOutput(agent_context.NewTelemetryChatOutput(output))
+	}
+	request.Recorder.End(request.CallErr)
+	if call.ContextUsage != nil {
+		contextUsage := *call.ContextUsage
+		a.opt.Context.RecordRequestUsage(&contextUsage)
+		if _, err := a.measureContext(a.modelTools); err != nil {
+			telemetry.GetLogger(ctx).Warn("context usage measurement skipped", "error", err, "model_call_id", modelCallID)
+		}
+	}
+	a.sendEvents([]*AgentEvent{{Type: AgentEventModelCallFinished, ModelCall: call}})
+	result := agentTaskModelCallResult{ModelCallID: modelCallID}
+
+	// 2. 失败时收尾未结束的草稿；本轮未取消且没有流错误 Item 时补一条错误记录。
+	if callErr := request.CallErr; callErr != nil {
+		a.sendEvents(a.finishDraftItemsWithInterrupted(output))
+		if ctx.Err() == nil && !slices.ContainsFunc(output, func(item *defs.Item) bool { return item.Kind == defs.ItemModelError }) {
+			payload := &llmkit.ErrorPayload{Code: "model_call_error", Message: callErr.Error()}
+			if callErr == io.ErrUnexpectedEOF {
+				payload.Code = "unexpected_eof"
+				payload.Message = "model stream closed before completion: unexpected EOF"
+			}
+			a.sendEvents(a.handleModelErrorEvent(&llmkit.Event{Type: llmkit.EventError, Error: payload}, modelCallID))
+		}
+	}
+	// 3. 取消时只保留可进入历史的输出，不派发工具；非取消的失败尝试不写入上下文。
+	if err := ctx.Err(); err != nil {
+		output = slices.DeleteFunc(slices.Clone(a.draftItems[stream.outputStart:]), func(item *defs.Item) bool {
+			return item.Kind == defs.ItemMessage && !hasMessageText(item)
+		})
+		retained, selectErr := defs.SelectContextHistoryItems(output)
+		if selectErr != nil {
+			result.Err = errors.Join(err, selectErr)
+			return result
+		}
+		if appendErr := a.opt.Context.AppendItems(retained...); appendErr != nil {
+			result.Err = errors.Join(err, appendErr)
+			return result
+		}
+		result.Err = err
+		return result
+	}
+	if request.CallErr != nil {
+		return result
+	}
+	// 4. 追加已完成的模型输出、发送用量，再把完整调用的独立副本交给生成任务。
+	completed, toolCalls := a.collectCompletedDraftItems(output)
+	if err := a.opt.Context.AppendItems(completed...); err != nil {
+		result.Err = fmt.Errorf("append agent output: %w", err)
+		return result
+	}
+	if _, err := a.measureContext(a.modelTools); err != nil {
+		result.Err = err
+		return result
+	}
+	if len(toolCalls) == 0 {
+		result.LastAssistantMessage = getLastMessageText(completed)
+		return result
+	}
+	a.toolCallsByCallID = make(map[string]agentToolCall, len(toolCalls))
+	for _, item := range toolCalls {
+		callID := item.ToolCall.CallID
+		if callID == "" {
+			result.Err = errors.New("tool execution requires complete tool call items")
+			return result
+		}
+		if _, exists := a.toolCallsByCallID[callID]; exists {
+			result.Err = fmt.Errorf("duplicate tool call ID %q", callID)
+			return result
+		}
+		a.toolCallsByCallID[callID] = agentToolCall{item: item}
+		result.ToolCalls = append(result.ToolCalls, item.Clone())
+	}
+	return result
 }

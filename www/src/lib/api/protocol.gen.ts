@@ -577,6 +577,10 @@ export interface HookRun {
      */
     started_at: number;
     completed_at?: number;
+    /**
+     * BlockedInputItemID 是被 UserPromptSubmit 拦下的组首消息 ID；其他 hook 为空。
+     */
+    blocked_input_item_id?: ItemID;
     block_reason?: string;
     updated_tool_arguments?: string;
     additional_context?: string;
@@ -689,6 +693,14 @@ export interface Item {
     updated_at?: number;
     turn_id: TurnID;
     model_call_id?: ModelCallID;
+    /**
+     * ModelCallResult 是本次模型调用的完整结束事实；非末项或未完整结束时为空。
+     */
+    model_call_result?: ModelCallResult;
+    /**
+     * ModelCallUsage 是这次完整普通请求的用量和输入位置；只有保存调用报告的末项非空。
+     */
+    model_call_usage?: TurnContextUsage;
     kind: ItemKind;
     message?: Message;
     reasoning?: Reasoning;
@@ -704,6 +716,10 @@ export interface Item {
     memory_index?: MemoryIndex;
     client_instruction?: ClientInstruction;
     hook_run?: HookRun;
+    /**
+     * HandedOffInputItemID 是此项写成后才算完整交接的组首消息 ID；其他 Item 为空。
+     */
+    handed_off_input_item_id?: ItemID;
 }
 
 // From runtimeprotocol/types.go
@@ -728,7 +744,7 @@ export type ItemID = string;
 /**
  * ItemKind 区分消息、模型输出和历史记录的种类。
  */
-export type ItemKind = "agents_instruction" | "client_instruction" | "context_summary" | "executors_change" | "hook_run" | "memory_index" | "message" | "model_change" | "model_error" | "reasoning" | "session_fork" | "skill_instruction" | "tool_call" | "tool_result" | "turn_interrupted";
+export type ItemKind = "agents_instruction" | "client_instruction" | "context_summary" | "executors_change" | "hook_run" | "memory_index" | "message" | "model_call_result" | "model_change" | "model_error" | "reasoning" | "session_fork" | "skill_instruction" | "tool_call" | "tool_result" | "turn_interrupted";
 
 // From runtimeprotocol/types.go
 /**
@@ -1019,6 +1035,12 @@ export interface Message {
  * ModelCallID 唯一标识一次模型调用，并按创建时间排序。
  */
 export type ModelCallID = string;
+
+// From defs/item.go
+/**
+ * ModelCallResult 是一次普通模型调用完整结束时写入的调用级结果事实。
+ */
+export type ModelCallResult = "reply" | "tools_rejected";
 
 // From defs/model.go
 /**
@@ -2048,6 +2070,10 @@ export interface Turn {
     conversation_id: ConversationID;
     session_id: SessionID;
     status: TurnStatus;
+    /**
+     * IsCompactOnly 是否只运行手动压缩？普通 Turn 触发自动压缩时仍为 false。
+     */
+    is_compact_only?: boolean;
     /**
      * FinalModelCallID 是本轮最后一次成功的普通模型调用；只在 completed 时填写。
      */

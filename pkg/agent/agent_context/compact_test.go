@@ -607,6 +607,32 @@ func TestAgentContextCompactFailure(t *testing.T) {
 	}
 }
 
+// TestBuildCompactionRequestRequiresModel 检查没有可用摘要模型时仅拒绝摘要请求。
+func TestBuildCompactionRequestRequiresModel(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		compactModel *defs.ModelDefinition
+	}{
+		{name: "missing compact model"},
+		{name: "compact model without target", compactModel: &defs.ModelDefinition{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			model := newTestModel(&llmkit.Target{}, 0)
+			opt := agent_context.NewAgentContextOpt(contextSessionID, contextTurnID, &compactClient{}, model, tt.compactModel)
+			agentContext, err := agent_context.NewAgentContext(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := agentContext.BuildModelRequest(nil); err != nil {
+				t.Fatalf("ordinary request: %v", err)
+			}
+			if _, _, _, err := agentContext.BuildCompactionRequest(nil, nil, nil); err == nil {
+				t.Fatal("built a compaction request without a usable model")
+			}
+		})
+	}
+}
+
 // TestGetCompactionSource 检查手动、自动压缩选择的历史及返回副本。
 func TestGetCompactionSource(t *testing.T) {
 	// 1. 准备长历史、短历史和已有摘要样例。
@@ -728,15 +754,30 @@ func compactHistory(ctx context.Context, history agent_context.AgentContext, too
 	if source == nil {
 		return nil, nil, nil
 	}
-	// 2. 创建摘要 Item，调用摘要模型并返回调用结果；失败时返回空摘要。
-	summary := &defs.Item{
-		ID:             defs.NewItemID(),
-		TurnID:         contextTurnID,
-		Kind:           defs.ItemContextSummary,
-		ContextSummary: &defs.ContextSummary{CoveredThroughItemID: source[len(source)-1].ID},
-	}
-	call, err := history.CompactHistory(ctx, tools, source, summary)
+	// 2. 构建摘要请求并调用摘要模型；失败时返回空摘要和已发起的调用记录。
+	request, model, client, err := history.BuildCompactionRequest(tools, source, nil)
 	if err != nil {
+		return nil, nil, err
+	}
+	text, call, err := agent_context.GenerateSummary(ctx, defs.NewModelCallID(), client, model, request, history.IsCompacted())
+	if err != nil {
+		return nil, call, err
+	}
+	// 3. 创建摘要 Item，检查取消后追加到上下文。
+	summary := &defs.Item{
+		ID:          defs.NewItemID(),
+		TurnID:      contextTurnID,
+		ModelCallID: call.ModelCallID,
+		Kind:        defs.ItemContextSummary,
+		ContextSummary: &defs.ContextSummary{
+			CoveredThroughItemID: source[len(source)-1].ID,
+			Text:                 text,
+		},
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, call, err
+	}
+	if err := history.AppendItems(summary); err != nil {
 		return nil, call, err
 	}
 	return summary, call, nil
@@ -1443,6 +1484,279 @@ func TestContextMeasurementReservesModelOutput(t *testing.T) {
 			}
 			if got.ThresholdTokens != tt.want || got.Model != model.Ref || req.MaxTokens != tt.maxOutput {
 				t.Fatalf("measurement = %+v, request max output = %d, want threshold %d and max output %d", got, req.MaxTokens, tt.want, tt.maxOutput)
+			}
+		})
+	}
+}
+
+// TestAgentContextCompactionExecution 检查构建摘要请求、生成摘要和显式追加摘要互不耦合。
+func TestAgentContextCompactionExecution(t *testing.T) {
+	// 1. 准备支持图片的本轮主模型、仅支持文本的独立摘要模型，以及包含图片、推理和保留后缀的历史。
+	turnModel := &defs.ModelDefinition{
+		Ref: defs.ModelRef{
+			ProviderID: "p",
+			ModelID:    "main",
+		},
+		Target: &llmkit.Target{
+			Protocol: llmkit.ProtocolOpenAIChat,
+			Model:    "main",
+		},
+		Capabilities: defs.ModelCapabilities{
+			Input: []defs.ModelInput{
+				defs.ModelInputText,
+				defs.ModelInputImage,
+			},
+		},
+		ContextWindow:    1000,
+		MaxOutputTokens:  32000,
+		ThinkingEnabled:  true,
+		ReasoningEfforts: []string{"high"},
+	}
+	otherCompactModel := &defs.ModelDefinition{
+		Ref: defs.ModelRef{
+			ProviderID: "p",
+			ModelID:    "summary",
+		},
+		Target: &llmkit.Target{
+			Protocol: llmkit.ProtocolOpenAIChat,
+			Model:    "summary",
+		},
+		Capabilities: defs.ModelCapabilities{
+			Input: []defs.ModelInput{defs.ModelInputText},
+		},
+		ContextWindow:          1000,
+		MaxOutputTokens:        2000,
+		ThinkingEnabled:        false,
+		ReasoningEfforts:       []string{"low"},
+		DefaultReasoningEffort: "low",
+		MergeMessageRoles:      []llmkit.Role{llmkit.RoleUser},
+	}
+	withImage := contextUserImageMessage(strings.Repeat("历史资料", 100), "shot.png")
+	withImage.ID = "A"
+	reasoning := &defs.Item{
+		ID:          "R",
+		TurnID:      contextTurnID,
+		ModelCallID: "m1",
+		Kind:        defs.ItemReasoning,
+		Reasoning: &defs.Reasoning{
+			Status:  defs.ReasoningCompleted,
+			Summary: []string{"PRIOR-REASONING"},
+		},
+	}
+	reply := &defs.Item{
+		ID:          "M",
+		TurnID:      contextTurnID,
+		ModelCallID: "m1",
+		Kind:        defs.ItemMessage,
+		Message: &defs.Message{
+			From: &defs.Address{
+				Kind: defs.IdentityAgent,
+				ID:   string(contextSessionID),
+			},
+			Content: []*defs.Content{{
+				Kind: defs.ContentText,
+				Text: &defs.TextContent{Text: strings.Repeat("回答", 100)},
+			}},
+		},
+	}
+	covered := contextSource("B", strings.Repeat("recent ", 220))
+	retainedText := strings.Repeat(" steer", 600)
+	retained := contextSource("C", retainedText)
+	tools := []llmkit.Tool{{
+		Name:        "read",
+		InputSchema: map[string]any{"type": "object"},
+	}}
+	usageEvent := llmkit.Event{
+		Type: llmkit.EventUsage,
+		Usage: &llmkit.Usage{
+			PromptTokens:     900,
+			CompletionTokens: 40,
+		},
+	}
+	successEvents := append(compactTextEvents("short summary")[:2], usageEvent, compactTextEvents("short summary")[2])
+
+	tests := []struct {
+		name          string
+		compactModel  *defs.ModelDefinition
+		client        *compactClient
+		wantMaxTokens int
+		wantEffort    string
+		wantRoles     []llmkit.Role
+		wantImages    int
+		wantReasoning bool
+		wantUsage     *defs.TokenUsage
+		wantErrText   string
+	}{
+		{
+			name:          "same_model",
+			compactModel:  turnModel,
+			client:        &compactClient{events: successEvents},
+			wantMaxTokens: 32000,
+			wantImages:    1,
+			wantReasoning: true,
+			wantUsage: &defs.TokenUsage{
+				Input:  900,
+				Output: 40,
+			},
+		},
+		{
+			name:          "different_model",
+			compactModel:  otherCompactModel,
+			client:        &compactClient{events: successEvents},
+			wantMaxTokens: 2000,
+			wantEffort:    "low",
+			wantRoles:     []llmkit.Role{llmkit.RoleUser},
+			wantImages:    0,
+			wantReasoning: false,
+			wantUsage: &defs.TokenUsage{
+				Input:  900,
+				Output: 40,
+			},
+		},
+		{
+			name:          "model_call_error",
+			compactModel:  otherCompactModel,
+			client:        &compactClient{err: errors.New("offline")},
+			wantMaxTokens: 2000,
+			wantEffort:    "low",
+			wantRoles:     []llmkit.Role{llmkit.RoleUser},
+			wantErrText:   "offline",
+		},
+		{
+			name:          "empty_summary",
+			compactModel:  otherCompactModel,
+			client:        &compactClient{events: compactTextEvents(" \n")},
+			wantMaxTokens: 2000,
+			wantEffort:    "low",
+			wantRoles:     []llmkit.Role{llmkit.RoleUser},
+			wantErrText:   "compaction returned an empty summary",
+		},
+		{
+			name:          "tool_call_attempted",
+			compactModel:  otherCompactModel,
+			client:        &compactClient{events: []llmkit.Event{{Type: llmkit.EventToolCallStart}}},
+			wantMaxTokens: 2000,
+			wantEffort:    "low",
+			wantRoles:     []llmkit.Role{llmkit.RoleUser},
+			wantErrText:   "compaction model attempted a tool call",
+		},
+	}
+
+	// 2. 逐例构建请求、调用 GenerateSummary，检查在显式 AppendItems 前上下文不变，并在成功后追加摘要。
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 1. 创建上下文并记录摘要生成前的普通模型请求。
+			opt := agent_context.NewAgentContextOpt(contextSessionID, contextTurnID, tt.client, turnModel, tt.compactModel)
+			opt.ReasoningEffort = "high"
+			ctx, err := agent_context.NewAgentContext(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ctx.Load(&agent_context.ContextLoadParam{
+				System: "original system",
+				Items:  []*defs.Item{withImage, reasoning, reply, covered, retained},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			historyBefore, inputBefore, err := ctx.BuildModelRequest(tools)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// 2. 选择压缩源并组装摘要请求，检查返回的模型配置、推理、图片和用量流选项。
+			measurement := getContextMeasurement(t, ctx, tools)
+			source := ctx.GetCompactionSource(measurement, false)
+			if len(source) == 0 || source[len(source)-1].ID != "B" {
+				t.Fatalf("compaction source = %+v, want covered through B", source)
+			}
+			request, selectedModel, client, err := ctx.BuildCompactionRequest(tools, source, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selectedModel == nil || selectedModel.Ref != tt.compactModel.Ref {
+				t.Fatalf("wrong compaction model: got %+v, want %+v", selectedModel, tt.compactModel)
+			}
+			if request.MaxTokens != tt.wantMaxTokens || request.ReasoningEffort != tt.wantEffort || request.ToolChoice == nil || request.ToolChoice.Type != "none" || !reflect.DeepEqual(request.Tools, tools) {
+				t.Fatalf("compaction request = %+v", request)
+			}
+			if wantStreamOpts := map[string]any{"include_usage": true}; !reflect.DeepEqual(request.StreamOptions, wantStreamOpts) {
+				t.Fatalf("compaction stream options = %v, want %v", request.StreamOptions, wantStreamOpts)
+			}
+			images := 0
+			var messageText strings.Builder
+			for _, message := range request.Messages {
+				for _, block := range message.Content {
+					if block.Type == llmkit.ContentTypeImage {
+						images++
+					}
+					messageText.WriteString(block.Text)
+				}
+			}
+			if images != tt.wantImages {
+				t.Fatalf("compaction request image blocks = %d, want %d", images, tt.wantImages)
+			}
+			if (tt.wantImages == 0) != strings.Contains(messageText.String(), "[图片已省略：当前模型不能接收图片]") {
+				t.Fatalf("compaction request text = %q, want omitted image placeholder %v", messageText.String(), tt.wantImages == 0)
+			}
+			payload, err := json.Marshal(request.Messages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(payload), "PRIOR-REASONING") != tt.wantReasoning {
+				t.Fatalf("compaction request reasoning present = %v, want %v", !tt.wantReasoning, tt.wantReasoning)
+			}
+
+			// 3. 调用 GenerateSummary，确认发起调用即返回记录且未修改上下文。
+			text, call, err := agent_context.GenerateSummary(t.Context(), defs.NewModelCallID(), client, selectedModel, request, ctx.IsCompacted())
+			if call == nil || call.ModelCallID == "" {
+				t.Fatalf("missing attempted call record: %+v", call)
+			}
+			historyAfterGenerate, inputAfterGenerate, buildErr := ctx.BuildModelRequest(tools)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			if inputAfterGenerate != inputBefore || !reflect.DeepEqual(historyBefore, historyAfterGenerate) || ctx.IsCompacted() {
+				t.Fatalf("generation mutated context")
+			}
+			if len(tt.client.targets) != 1 || !reflect.DeepEqual(tt.client.targets[0], *tt.compactModel.Target) || !slices.Equal(tt.client.options[0].Conversion.MergeMessageRoles, tt.wantRoles) {
+				t.Fatalf("compaction call targets = %+v, options = %+v", tt.client.targets, tt.client.options)
+			}
+			if !reflect.DeepEqual(call.Usage, tt.wantUsage) {
+				t.Fatalf("compaction call usage = %+v, want %+v", call.Usage, tt.wantUsage)
+			}
+
+			// 4. 错误场景保留原文；成功场景显式追加摘要并检查覆盖范围。
+			if tt.wantErrText != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrText) {
+					t.Fatalf("GenerateSummary() error = %v, want containing %q", err, tt.wantErrText)
+				}
+				return
+			}
+			if err != nil || text != "short summary" {
+				t.Fatalf("GenerateSummary() = %q, %v; want short summary", text, err)
+			}
+			summary := &defs.Item{
+				ID:          defs.NewItemID(),
+				TurnID:      contextTurnID,
+				ModelCallID: call.ModelCallID,
+				Kind:        defs.ItemContextSummary,
+				ContextSummary: &defs.ContextSummary{
+					CoveredThroughItemID: source[len(source)-1].ID,
+					Text:                 text,
+				},
+			}
+			if err := ctx.AppendItems(summary); err != nil {
+				t.Fatal(err)
+			}
+			if !ctx.IsCompacted() {
+				t.Fatal("IsCompacted() = false after appending summary")
+			}
+			afterAppend, inputAfterAppend, err := ctx.BuildModelRequest(tools)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inputAfterAppend != "C" || len(afterAppend.Messages) != 3 || !strings.Contains(afterAppend.Messages[1].Content[0].Text, "short summary") || afterAppend.Messages[2].Content[0].Text != retainedText {
+				t.Fatalf("context after explicit AppendItems = %+v (inputThrough=%q)", afterAppend.Messages, inputAfterAppend)
 			}
 		})
 	}
