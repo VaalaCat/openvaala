@@ -586,6 +586,16 @@ func TestGetItemPreview(t *testing.T) {
 			item: executorsChange,
 			want: "Executor 已变更：默认 gpu:/data · 移除 openvaala",
 		},
+		{
+			name: "executors_change_with_multiline_description",
+			item: &defs.Item{
+				Kind: defs.ItemExecutorsChange,
+				ExecutorsChange: &defs.ExecutorsChange{Executors: []defs.TurnExecutor{{
+					ID: "laptop", IsDynamic: true, Description: "\x1b[31m编辑器\x1b[0m\n第二行",
+				}}},
+			},
+			want: "Executor 已变更：新增 laptop: 编辑器",
+		},
 		// 只显示第一行：先截到前 512 字节（不切断字符）再清理，超长正文不在每一帧整段处理。
 		{
 			name: "long_text_cut_before_first_line",

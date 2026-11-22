@@ -397,7 +397,7 @@ func getToolStatus(result *defs.Item, isInterrupted bool) string {
 func isAgentTool(name string) bool {
 	// 1. 按名称比对子 Agent 协作工具。
 	switch name {
-	case "spawn_agent", "send_message", "interrupt_agent", "wait_agent", "list_agents", "read_session_history":
+	case "spawn_agent", "send_message", "interrupt_agent", "wait_agent", "list_agents", "list_executors", "read_session_history":
 		return true
 	}
 	return false

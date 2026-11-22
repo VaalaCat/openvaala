@@ -425,7 +425,7 @@ export interface ExecutorDetails {
 /**
  * ExecutorKind 是 Executor 的种类；自定义 Executor 可以用自己的种类。
  */
-export type ExecutorKind = "local" | "memory" | "ssh" | "virtual";
+export type ExecutorKind = "client" | "local" | "memory" | "ssh" | "virtual";
 
 // From defs/conversation.go
 /**
@@ -450,8 +450,7 @@ export interface ExecutorSettings {
 
 // From defs/item.go
 /**
- * ExecutorsChange 由 Turn 在本轮 Executor 列表和上一轮不同时写在本轮输入之前：默认换了、目录换了、增加或减少都在这一条里，
- * 作为提示发给模型。
+ * ExecutorsChange 由 Turn 在本轮输入之前写入，通知模型首轮接入的动态 Executor 或与上一轮相比的环境变化。
  */
 export interface ExecutorsChange {
     previous_executors: TurnExecutor[];
@@ -983,7 +982,7 @@ export interface LoggedItem {
 
 // From conversation/types.go
 /**
- * MCPServerInfo 是对话里一个执行环境上的一个 MCP 连接；客户端登记的 ExecutorID 为 defs.ClientExecutorID。
+ * MCPServerInfo 是对话里一个执行环境上的一个 MCP 连接。
  */
 export interface MCPServerInfo extends ConnectionInfo {
     executor_id: string;
@@ -1622,12 +1621,14 @@ export interface SessionStoppedParams extends NotificationTarget {
 
 // From runtimeprotocol/types.go
 /**
- * SetClientMCPServersParams 是 conversation/setClientMCPServers 的参数：server_ids 是本连接为这个对话登记的全部客户端 MCP server，
- * 换掉本连接之前为这个对话登记的；空列表表示全部移除。server 在客户端机器上运行，serve 只经过本连接转发它的 MCP 消息。
+ * SetClientExecutorParams 登记本连接为对话提供的执行环境，mcp_server_ids 为空时注销登记。
+ * 登记时省略 executor_id 使用连接 ID，注销时省略则使用已登记的 ID。
  */
-export interface SetClientMCPServersParams {
+export interface SetClientExecutorParams {
     conversation_id: ConversationID;
-    server_ids: string[];
+    executor_id?: string;
+    description?: string;
+    mcp_server_ids: string[];
 }
 
 // From runtimeprotocol/types.go
@@ -2121,11 +2122,19 @@ export interface TurnContextUsage {
 
 // From defs/turn.go
 /**
- * TurnExecutor 是一个 Executor 和它在对话里的根目录。
+ * TurnExecutor 是一个 Executor 和它在对话里的根目录与说明。
  */
 export interface TurnExecutor {
     id: string;
-    workspace_directory: string;
+    workspace_directory?: string;
+    /**
+     * Description 是执行环境的说明，动态环境接入时由变更通知展示。
+     */
+    description?: string;
+    /**
+     * IsDynamic 这个 Executor 是否可以在对话运行期间接入或移除？
+     */
+    is_dynamic?: boolean;
 }
 
 // From runtimeprotocol/types.go
@@ -2241,7 +2250,7 @@ export interface MethodParams {
     "skill/list": ListSkillsParams;
     "hook/list": EmptyParams;
     "mcpServer/list": ConversationParams;
-    "conversation/setClientMCPServers": SetClientMCPServersParams;
+    "conversation/setClientExecutor": SetClientExecutorParams;
     "conversation/subscribe": ConversationParams;
     "conversation/unsubscribe": ConversationParams;
     "conversation/running/subscribe": EmptyParams;
@@ -2301,7 +2310,7 @@ export interface MethodResult {
     "skill/list": SkillInfo[];
     "hook/list": ListHooksResult;
     "mcpServer/list": ListMCPServersResult;
-    "conversation/setClientMCPServers": EmptyResult;
+    "conversation/setClientExecutor": EmptyResult;
     "conversation/subscribe": SubscribeConversationResult;
     "conversation/unsubscribe": EmptyResult;
     "conversation/running/subscribe": RunningConversations;

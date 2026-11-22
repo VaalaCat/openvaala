@@ -101,11 +101,13 @@ type SetExecutorSettingsParams struct {
 	ExecutorSettings defs.ExecutorSettings `json:"executor_settings"`
 }
 
-// SetClientMCPServersParams 是 conversation/setClientMCPServers 的参数：server_ids 是本连接为这个对话登记的全部客户端 MCP server，
-// 换掉本连接之前为这个对话登记的；空列表表示全部移除。server 在客户端机器上运行，serve 只经过本连接转发它的 MCP 消息。
-type SetClientMCPServersParams struct {
+// SetClientExecutorParams 登记本连接为对话提供的执行环境，mcp_server_ids 为空时注销登记。
+// 登记时省略 executor_id 使用连接 ID，注销时省略则使用已登记的 ID。
+type SetClientExecutorParams struct {
 	ConversationID defs.ConversationID `json:"conversation_id"`
-	ServerIDs      []string            `json:"server_ids"`
+	ExecutorID     string              `json:"executor_id,omitempty"`
+	Description    string              `json:"description,omitempty"`
+	MCPServerIDs   []string            `json:"mcp_server_ids"`
 }
 
 // ListSkillsParams 是 skill/list 的参数；没有 conversation_id 时按 agent_name 和 executor_settings 查草稿 Skills。

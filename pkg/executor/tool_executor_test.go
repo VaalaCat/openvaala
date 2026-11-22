@@ -1,10 +1,12 @@
 package executor_test
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,9 +19,11 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
+	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 )
@@ -401,11 +405,10 @@ func newEchoEnvironment(t *testing.T, id string, toolNames ...string) executor.E
 func newEchoToolExecutorOpt(t *testing.T) *executor.ToolExecutorOpt {
 	// 1. 创建各环境的回显工具，保存为执行器配置。
 	t.Helper()
-	return executor.NewToolExecutorOpt(
-		[]executor.ExecutionEnvironment{
-			newEchoEnvironment(t, "local", "bash", "read_file", "apply_patch"),
-			newEchoEnvironment(t, "sandbox", "bash", "read_file"),
-		},
+	return executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t,
+		newEchoEnvironment(t, "local", "bash", "read_file", "apply_patch"),
+		newEchoEnvironment(t, "sandbox", "bash", "read_file"),
+	),
 		&echoTool{
 			executorID: "agent",
 			name:       "list_agents",
@@ -450,7 +453,7 @@ func newHookToolExecutorOpt(t *testing.T, probe *toolProbe, failureCode string, 
 			environments = append(environments, environment)
 		}
 	}
-	opt := executor.NewToolExecutorOpt(environments, &probeTool{
+	opt := executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, environments...), &probeTool{
 		name:        "agent_probe",
 		failureCode: failureCode,
 		probe:       probe,
@@ -1053,7 +1056,7 @@ func TestToolExecutorRouteCalls(t *testing.T) {
 				Arguments: `{"executor":"sandbox"}`,
 			},
 			wantCode:    "invalid_arguments",
-			wantMessage: "does not provide",
+			wantMessage: `does not provide tool "apply_patch"; available: local (local 环境)`,
 		},
 		{
 			name: "unknown_executor",
@@ -1062,7 +1065,7 @@ func TestToolExecutorRouteCalls(t *testing.T) {
 				Arguments: `{"executor":"missing"}`,
 			},
 			wantCode:    "invalid_arguments",
-			wantMessage: "not configured",
+			wantMessage: `is not configured; available: local (local 环境), sandbox (sandbox 环境)`,
 		},
 		{
 			name: "non_string_executor",
@@ -1137,6 +1140,43 @@ func TestToolExecutorRouteCalls(t *testing.T) {
 	}
 }
 
+// TestToolExecutorSingleProviderExecutorArgument 检查单来源工具声明的 executor 参数原样转发。
+func TestToolExecutorSingleProviderExecutorArgument(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		schema string
+	}{
+		{name: "properties", schema: `{"type":"object","properties":{"executor":{"type":"string"}}}`},
+		{name: "required_only", schema: `{"type":"object","required":["executor"]}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const arguments = `{"executor":"business-value"}`
+			environment, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt("local", "", nil, &echoTool{
+				executorID: "local", name: "echo", schema: tt.schema,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, environment)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			results, _ := runToolCalls(t, toolExecutor, []*defs.ToolCall{{CallID: "call", Name: "echo", Arguments: arguments}})
+			result := results["call"]
+			if result.Error != nil || result.Executor != "local" {
+				t.Fatalf("result = %+v, want success on local", result)
+			}
+			var echoed map[string]string
+			if err := json.Unmarshal(result.Content, &echoed); err != nil {
+				t.Fatal(err)
+			}
+			if got := echoed["arguments"]; got != arguments {
+				t.Fatalf("forwarded arguments = %q, want %q", got, arguments)
+			}
+		})
+	}
+}
+
 // TestToolExecutorConcurrentCalls 验证混合工具批次中的调用均返回一次结果。
 func TestToolExecutorConcurrentCalls(t *testing.T) {
 	// 1. 创建不同环境、协作工具和无效环境的调用。
@@ -1183,8 +1223,9 @@ func TestToolExecutorDefinitionsExecutorParameter(t *testing.T) {
 		name         string
 		environments func(t *testing.T) []executor.ExecutionEnvironment
 		// wantEnums 是工具名 → executor 参数 enum（逗号连接）；空串表示这个工具没有 executor 参数。
-		wantEnums   map[string]string
-		wantDefault map[string]string
+		wantEnums    map[string]string
+		wantDefault  map[string]string
+		wantRequired string
 	}{
 		{
 			name: "single_executor_unchanged",
@@ -1213,12 +1254,12 @@ func TestToolExecutorDefinitionsExecutorParameter(t *testing.T) {
 					newEchoEnvironment(t, "gpu", "bash"),
 				}
 			},
-			wantEnums:   map[string]string{"read_file": "", "bash": "sandbox,gpu", "list_agents": ""},
-			wantDefault: map[string]string{"bash": "sandbox"},
+			wantEnums:    map[string]string{"read_file": "", "bash": "sandbox,gpu", "list_agents": ""},
+			wantRequired: "bash",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(tt.environments(t),
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, tt.environments(t)...),
 				&echoTool{
 					executorID: "agent",
 					name:       "list_agents",
@@ -1240,6 +1281,7 @@ func TestToolExecutorDefinitionsExecutorParameter(t *testing.T) {
 			}
 			for _, definition := range definitions {
 				var schema struct {
+					Required   []string `json:"required"`
 					Properties map[string]struct {
 						Enum        []string `json:"enum"`
 						Description string   `json:"description"`
@@ -1247,6 +1289,9 @@ func TestToolExecutorDefinitionsExecutorParameter(t *testing.T) {
 				}
 				if err := json.Unmarshal(definition.InputSchema, &schema); err != nil {
 					t.Fatal(err)
+				}
+				if required := slices.Contains(schema.Required, "executor"); required != (definition.Name == tt.wantRequired) {
+					t.Fatalf("tool %s executor required = %t, want required for %q", definition.Name, required, tt.wantRequired)
 				}
 				parameter, found := schema.Properties["executor"]
 				wantEnum, known := tt.wantEnums[definition.Name]
@@ -1262,57 +1307,18 @@ func TestToolExecutorDefinitionsExecutorParameter(t *testing.T) {
 	}
 }
 
-// TestToolExecutorInvalid 验证缺失环境、重复 ID 和协作工具重名错误。
-func TestToolExecutorInvalid(t *testing.T) {
-	// 1. 逐项构造无效环境配置，核对构造或读取工具时的错误。
-	for _, tt := range []struct {
-		name         string
-		environments func(t *testing.T) []executor.ExecutionEnvironment
-		wantBuildErr string
-		wantToolsErr string
-	}{
-		{
-			name: "agent_tool_conflict",
-			environments: func(t *testing.T) []executor.ExecutionEnvironment {
-				return []executor.ExecutionEnvironment{newEchoEnvironment(t, "local", "list_agents")}
-			},
-			wantToolsErr: "conflicts with an agent tool",
-		},
-		{
-			name: "duplicate_executor_id",
-			environments: func(t *testing.T) []executor.ExecutionEnvironment {
-				return []executor.ExecutionEnvironment{newEchoEnvironment(t, "local", "bash"), newEchoEnvironment(t, "local", "read_file")}
-			},
-			wantBuildErr: "more than once",
-		},
-		{
-			name: "missing_executor",
-			environments: func(t *testing.T) []executor.ExecutionEnvironment {
-				return []executor.ExecutionEnvironment{nil}
-			},
-			wantBuildErr: "execution environment is missing",
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(tt.environments(t),
-				&echoTool{
-					executorID: "agent",
-					name:       "list_agents",
-					schema:     echoSchema,
-				}))
-			if tt.wantBuildErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantBuildErr) {
-					t.Fatalf("NewToolExecutor error = %v, want %q", err, tt.wantBuildErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := toolExecutor.GetTools(t.Context()); err == nil || !strings.Contains(err.Error(), tt.wantToolsErr) {
-				t.Fatalf("GetTools error = %v, want %q", err, tt.wantToolsErr)
-			}
-		})
+// TestToolExecutorAgentToolConflict 验证协作工具重名会使建表失败。
+func TestToolExecutorAgentToolConflict(t *testing.T) {
+	manager := newStaticEnvironmentsManager(t, newEchoEnvironment(t, "local", "list_agents"))
+	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager, &echoTool{
+		name:   "list_agents",
+		schema: echoSchema,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := toolExecutor.GetTools(t.Context()); err == nil || !strings.Contains(err.Error(), "conflicts with an agent tool") {
+		t.Fatalf("GetTools() error = %v, want an agent tool conflict", err)
 	}
 }
 
@@ -1320,10 +1326,8 @@ func TestToolExecutorInvalid(t *testing.T) {
 func TestToolExecutorTelemetry(t *testing.T) {
 	// 1. 创建双环境及客户端 MCP 工具，在父 span 下执行混合调用。
 	p := telemetrytest.NewPipeline(t)
-	client := newClientMCPServersFixture(t)
-	client.register(t, "c1", clientServer{id: "remote"})
 	opt := newEchoToolExecutorOpt(t)
-	opt.ClientMCPServers = client.client
+	registerDynamicEnvironment(t, opt.EnvironmentsManager, "c1", "connection-1", clientServer{id: "remote"})
 	toolExecutor, err := executor.NewToolExecutor(opt)
 	if err != nil {
 		t.Fatal(err)
@@ -1360,8 +1364,8 @@ func TestToolExecutorTelemetry(t *testing.T) {
 	if results["call-missing"].Error == nil || results["call-missing"].Error.Code != "invalid_arguments" {
 		t.Fatalf("call-missing result = %+v", results["call-missing"])
 	}
-	if result := results["call-client"]; result.Error != nil || result.Executor != "" {
-		t.Fatalf("call-client result = %+v, want success without a result executor", result)
+	if result := results["call-client"]; result.Error != nil || result.Executor != "c1" {
+		t.Fatalf("call-client result = %+v, want success on c1", result)
 	}
 
 	tests := []struct {
@@ -1392,7 +1396,7 @@ func TestToolExecutorTelemetry(t *testing.T) {
 			name:       "client_mcp_tool_on_client",
 			spanName:   "execute_tool mcp__remote__echo",
 			callID:     "call-client",
-			executorID: defs.ClientExecutorID,
+			executorID: "c1",
 		},
 	}
 	// 2. 逐项读取遥测，核对环境身份、父 span、日志和指标。
@@ -1431,7 +1435,7 @@ func TestToolExecutorTelemetry(t *testing.T) {
 		}
 	})
 	t.Run("client_mcp_tool_metric_and_log_on_client", func(t *testing.T) {
-		if got := p.GetHistogramCount(t, "gen_ai.execute_tool.duration", attribute.String("openvaala.executor.id", defs.ClientExecutorID)); got != 1 {
+		if got := p.GetHistogramCount(t, "gen_ai.execute_tool.duration", attribute.String("openvaala.executor.id", "c1")); got != 1 {
 			t.Errorf("client tool duration records = %d, want 1", got)
 		}
 		var clientRecords []map[string]any
@@ -1440,8 +1444,8 @@ func TestToolExecutorTelemetry(t *testing.T) {
 				clientRecords = append(clientRecords, record)
 			}
 		}
-		if len(clientRecords) != 1 || clientRecords[0]["openvaala.executor.id"] != defs.ClientExecutorID {
-			t.Errorf("tool call finished records for call-client = %v, want one with executor %s", clientRecords, defs.ClientExecutorID)
+		if len(clientRecords) != 1 || clientRecords[0]["openvaala.executor.id"] != "c1" {
+			t.Errorf("tool call finished records for call-client = %v, want one with executor c1", clientRecords)
 		}
 	})
 }
@@ -1479,7 +1483,7 @@ func TestToolExecutorToolFailureTelemetry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{environment}))
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, environment)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1509,9 +1513,9 @@ func TestToolExecutorRoutesUnavailable(t *testing.T) {
 	p := telemetrytest.NewPipeline(t)
 	strong := newFakeServerDefinition("strong", "/nonexistent/openvaala-mcp-strong", []string{"local"})
 	strong.Required = true
-	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{
+	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t,
 		newEnvironmentFixture(t, "local", newLocalWorkspace(t), []*mcpclient.ServerDefinition{strong}, "bash", "read_file").environment,
-	}))
+	)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1644,10 +1648,10 @@ func TestToolExecutorMCPTools(t *testing.T) {
 				strong.Required = true
 				servers = append(servers, strong)
 			}
-			opt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{
+			opt := executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t,
 				newEnvironmentFixture(t, "a", newLocalWorkspace(t), servers, "bash", "read_file").environment,
 				newEnvironmentFixture(t, "b", newLocalWorkspace(t), servers, "bash", "read_file").environment,
-			})
+			))
 			opt.ToolNames = tt.toolNames
 			opt.MCPServerIDs = tt.mcpServerIDs
 			toolExecutor, err := executor.NewToolExecutor(opt)
@@ -1722,7 +1726,7 @@ func TestToolExecutorRunUsesTurnRoutes(t *testing.T) {
 			servers := []*mcpclient.ServerDefinition{newFakeServerDefinition("fake", binary, bothEnvironments)}
 			a := newEnvironmentFixture(t, "a", &singleStartWorkspace{Workspace: newLocalWorkspace(t)}, servers, "bash", "read_file").environment
 			b := newEnvironmentFixture(t, "b", newLocalWorkspace(t), servers, "bash", "read_file").environment
-			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{a, b}))
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, a, b)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1805,7 +1809,7 @@ func TestToolExecutorReadsEnvironmentsInParallel(t *testing.T) {
 	// 2. 逐项读取工具表，核对耗时、工具顺序和环境枚举。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(tt.environments(t)))
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, tt.environments(t)...)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1848,10 +1852,10 @@ func TestToolExecutorSchemaMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{
+	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t,
 		newEchoEnvironment(t, "a", "bash", "read_file"),
 		otherEnvironment,
-	}))
+	)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1928,6 +1932,73 @@ func TestToolExecutorSchemaMismatch(t *testing.T) {
 	}
 }
 
+// commandTransport 保存命令及参数，每次连接使用新的命令进程。
+type commandTransport struct {
+	command   string
+	arguments []string
+}
+
+// Connect 启动新的命令进程并连接 MCP。
+func (t *commandTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	// 1. 创建本次使用的命令传输并连接。
+	return (&mcp.CommandTransport{Command: exec.Command(t.command, t.arguments...)}).Connect(ctx)
+}
+
+// clientServer 是测试里客户端登记的一个 MCP server，用 command 加 arguments 起进程。
+type clientServer struct {
+	id string
+	// command 为空时用假 MCP server。
+	command   string
+	arguments []string
+	// startupTimeout 为 0 时取 5 秒。
+	startupTimeout time.Duration
+}
+
+// newClientMCPConnection 创建客户端提供的 MCP 连接；由测试环境运行。
+func newClientMCPConnection(t *testing.T, server clientServer) mcpclient.Connection {
+	t.Helper()
+	command := server.command
+	if command == "" {
+		command = buildFakeMCPServer(t)
+	}
+	definition := &mcpclient.ServerDefinition{
+		ID:             server.id,
+		StartupTimeout: cmp.Or(server.startupTimeout, 5*time.Second),
+		ToolTimeout:    30 * time.Second,
+	}
+	connection, err := mcpclient.NewConnection(mcpclient.NewConnectionOpt(definition, nil).
+		WithTransport(&commandTransport{
+			command:   command,
+			arguments: server.arguments,
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return connection
+}
+
+// registerDynamicEnvironment 登记客户端环境并运行连接，返回停止函数。
+func registerDynamicEnvironment(t *testing.T, manager executor.ExecutionEnvironmentsManager, id, connectionID string, servers ...clientServer) func() {
+	t.Helper()
+	connections := make([]mcpclient.Connection, 0, len(servers))
+	for _, server := range servers {
+		connections = append(connections, newClientMCPConnection(t, server))
+	}
+	environment := newDynamicEnvironment(t, id, connections...)
+	if err := manager.SetDynamic(environment, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	var tasks sync.WaitGroup
+	tasks.Go(func() { _ = environment.Run(ctx) })
+	stop := func() {
+		cancel()
+		tasks.Wait()
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
 // TestToolExecutorClientTools 验证客户端 MCP 工具的筛选、参数和实际调用。
 func TestToolExecutorClientTools(t *testing.T) {
 	// 1. 准备省略、指定和空 MCP server 名单的用例。
@@ -1965,7 +2036,6 @@ func TestToolExecutorClientTools(t *testing.T) {
 	// 2. 逐项创建工具执行器，运行调用并核对期望结果。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := newClientMCPServersFixture(t)
 			servers := []clientServer{{id: "remote"}}
 			if tt.hangingClientServer {
 				servers = append(servers, clientServer{
@@ -1974,24 +2044,23 @@ func TestToolExecutorClientTools(t *testing.T) {
 					startupTimeout: 20 * time.Second,
 				})
 			}
-			client.register(t, "c1", servers...)
-			opt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{
+			opt := executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t,
 				newEnvironmentFixture(t, "a", newLocalWorkspace(t), []*mcpclient.ServerDefinition{newFakeServerDefinition("fake", binary, []string{"a"})}, "bash", "read_file").environment,
-			}, &echoTool{
+			), &echoTool{
 				executorID: "agent",
 				name:       "list_agents",
 				schema:     echoSchema,
 			})
 			opt.ToolNames = tt.toolNames
 			opt.MCPServerIDs = tt.mcpServerIDs
-			opt.ClientMCPServers = client.client
+			registerDynamicEnvironment(t, opt.EnvironmentsManager, "c1", "connection-1", servers...)
 			toolExecutor, err := executor.NewToolExecutor(opt)
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			start := time.Now()
-			definitions, err := toolExecutor.GetTools(client.ctx)
+			definitions, err := toolExecutor.GetTools(t.Context())
 			if elapsed := time.Since(start); elapsed > promptly {
 				t.Fatalf("GetTools() took %v, want it not to wait for unselected client servers", elapsed)
 			}
@@ -2021,106 +2090,361 @@ func TestToolExecutorClientTools(t *testing.T) {
 				Arguments: `{"text":"hello"}`,
 			}})
 			result := results["echo"]
-			if result.Error != nil || string(result.Content) != `"hello"` || result.Executor != "" {
-				t.Fatalf("client echo result = %+v, want hello without an executor", result)
+			if result.Error != nil || string(result.Content) != `"hello"` || result.Executor != "c1" {
+				t.Fatalf("client echo result = %+v, want hello on c1", result)
 			}
 		})
 	}
 }
 
-// TestToolExecutorClientToolConflicts 验证客户端同名工具让位于环境工具和协作工具。
-func TestToolExecutorClientToolConflicts(t *testing.T) {
-	// 1. 准备环境、协作工具重名及无冲突用例。
-	binary := buildFakeMCPServer(t)
-	tests := []struct {
-		name string
-		// agentTools 是协作工具。
-		agentTools []executor.Tool
-		// environmentServerArguments 非 nil 时环境 a 带 server fake，参数为它。
-		environmentServerArguments []string
-		// wantExecutor 是调用 mcp__fake__argv 时实际执行的一方：executor、agent 或 client。
-		wantExecutor string
-		// wantReason 是 Warn 里记的重名对象；空表示不应有 Warn。
-		wantReason string
-	}{
-		{
-			name:                       "executor MCP tool wins over the client tool",
-			environmentServerArguments: []string{"from-executor"},
-			wantExecutor:               "executor",
-			wantReason:                 "tool name conflicts with an executor tool",
-		},
-		{
-			name: "agent tool wins over the client tool",
-			agentTools: []executor.Tool{&echoTool{
-				executorID: "agent",
-				name:       "mcp__fake__argv",
-				schema:     echoSchema,
-			}},
-			wantExecutor: "agent",
-			wantReason:   "tool name conflicts with an agent tool",
-		},
-		{
-			name:         "client tool is offered when nothing clashes",
-			wantExecutor: "client",
-		},
-	}
-	// 2. 逐项创建工具执行器，运行调用并核对期望结果。
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client := newClientMCPServersFixture(t)
-			client.register(t, "c1", clientServer{
-				id:        "fake",
-				arguments: []string{"from-client"},
-			})
-			var environments []executor.ExecutionEnvironment
-			if tt.environmentServerArguments != nil {
-				servers := []*mcpclient.ServerDefinition{newFakeServerDefinition("fake", binary, []string{"a"}, tt.environmentServerArguments...)}
-				environments = append(environments, newEnvironmentFixture(t, "a", newLocalWorkspace(t), servers, "bash", "read_file").environment)
-			}
-			opt := executor.NewToolExecutorOpt(environments, tt.agentTools...)
-			opt.ClientMCPServers = client.client
-			toolExecutor, err := executor.NewToolExecutor(opt)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			definitions, err := toolExecutor.GetTools(client.ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if count := len(slices.DeleteFunc(getToolNames(definitions), func(name string) bool { return name != "mcp__fake__argv" })); count != 1 {
-				t.Fatalf("mcp__fake__argv offered %d times in %v, want once", count, getToolNames(definitions))
-			}
-			results, _ := runToolCalls(t, toolExecutor, []*defs.ToolCall{{
-				CallID:    "argv",
-				Name:      "mcp__fake__argv",
-				Arguments: `{}`,
-			}})
-			result := results["argv"]
-			if result.Error != nil {
-				t.Fatalf("argv result = %+v, want success", result)
-			}
-			gotExecutor := "client"
-			switch content := string(result.Content); {
-			case strings.Contains(content, "from-executor"):
-				gotExecutor = "executor"
-			case strings.Contains(content, `"executor":"agent"`):
-				gotExecutor = "agent"
-			case !strings.Contains(content, "from-client"):
-				t.Fatalf("argv content = %s, want one of the executor, agent and client servers", content)
-			}
-			if gotExecutor != tt.wantExecutor {
-				t.Errorf("mcp__fake__argv ran on %s, want %s", gotExecutor, tt.wantExecutor)
-			}
-			// 每个跳过的工具都有日志，这里提取 argv 的记录。
-			var reasons []string
-			for _, record := range client.pipeline.GetLogRecords(t, "client mcp tool skipped") {
-				if record["level"] == "WARN" && record["gen_ai.tool.name"] == "mcp__fake__argv" && record["mcp_server_id"] == "fake" {
-					reasons = append(reasons, fmt.Sprint(record["reason"]))
+// TestToolExecutorDynamicMCPRouting 验证默认路由、三段工具顺序和客户端重连后的定义稳定性。
+func TestToolExecutorDynamicMCPRouting(t *testing.T) {
+	for _, withDefault := range []bool{true, false} {
+		t.Run(fmt.Sprintf("default_%t", withDefault), func(t *testing.T) {
+			manager := executor.NewExecutionEnvironmentsManager()
+			if withDefault {
+				server := newFakeServerDefinition("stable", buildFakeMCPServer(t), []string{"local"}, "from-local")
+				local := newEnvironmentFixture(t, "local", newLocalWorkspace(t), []*mcpclient.ServerDefinition{server}, "bash")
+				if _, err := manager.SetStatic("local", []executor.ExecutionEnvironment{local.environment}); err != nil {
+					t.Fatal(err)
 				}
 			}
-			if wantReasons := slices.DeleteFunc([]string{tt.wantReason}, func(reason string) bool { return reason == "" }); !slices.Equal(reasons, wantReasons) {
-				t.Fatalf("client mcp tool skipped reasons for argv = %v, want %v", reasons, wantReasons)
+			agentTool := &echoTool{
+				name:   "list_agents",
+				schema: echoSchema,
+			}
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager, agentTool))
+			if err != nil {
+				t.Fatal(err)
+			}
+			serversA := []clientServer{
+				{id: "only-a"},
+				{id: "stable", arguments: []string{"from-a"}},
+				{id: "shared", arguments: []string{"from-a"}},
+			}
+			serversB := []clientServer{
+				{id: "shared", arguments: []string{"from-b"}},
+				{id: "only-b"},
+			}
+			stopB := registerDynamicEnvironment(t, manager, "b", "b-1", serversB...)
+			stopA := registerDynamicEnvironment(t, manager, "a", "a-1", serversA...)
+			definitions, err := toolExecutor.GetTools(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var relevantOrder []string
+			for _, definition := range definitions {
+				switch definition.Name {
+				case "bash", "list_agents", "mcp__stable__argv", "mcp__shared__argv", "mcp__only-a__argv", "mcp__only-b__argv":
+					relevantOrder = append(relevantOrder, definition.Name)
+				}
+				if definition.Name == "mcp__shared__echo" {
+					var schema struct {
+						Required   []string `json:"required"`
+						Properties map[string]struct {
+							Description string   `json:"description"`
+							Enum        []string `json:"enum"`
+						} `json:"properties"`
+					}
+					if err := json.Unmarshal(definition.InputSchema, &schema); err != nil {
+						t.Fatal(err)
+					}
+					parameter := schema.Properties["executor"]
+					if !slices.Equal(parameter.Enum, []string{"a", "b"}) ||
+						!slices.Contains(schema.Required, "executor") || !slices.Contains(schema.Required, "text") ||
+						parameter.Description != prompt.FormatRequiredExecutorParameterDescription() {
+						t.Fatalf("shared echo schema = %s, want preserved text and required executor with [a b]", definition.InputSchema)
+					}
+				}
+			}
+			wantOrder := []string{"list_agents", "mcp__only-a__argv", "mcp__shared__argv", "mcp__stable__argv", "mcp__only-b__argv"}
+			if withDefault {
+				wantOrder = []string{"bash", "mcp__stable__argv", "list_agents", "mcp__only-a__argv", "mcp__shared__argv", "mcp__only-b__argv"}
+			}
+			if !slices.Equal(relevantOrder, wantOrder) {
+				t.Fatalf("GetTools() order = %v, want %v", relevantOrder, wantOrder)
+			}
+			calls := []*defs.ToolCall{
+				{CallID: "missing", Name: "mcp__shared__argv", Arguments: `{}`},
+				{CallID: "explicit", Name: "mcp__shared__argv", Arguments: `{"executor":"b"}`},
+			}
+			if withDefault {
+				calls = append(calls, &defs.ToolCall{CallID: "default", Name: "mcp__stable__argv", Arguments: `{}`})
+			}
+			results, _ := runToolCalls(t, toolExecutor, calls)
+			const hint = `; retry with an explicit "executor", or ask the user which one to use if unclear. Available: a (a 环境), b (b 环境)`
+			wantError := `multiple executors provide tool "mcp__shared__argv" with no default executor` + hint
+			if withDefault {
+				wantError = `default executor "local" does not provide tool "mcp__shared__argv", and multiple other executors provide it` + hint
+			}
+			if got := results["missing"]; got.Error == nil || got.Error.Code != "invalid_arguments" || got.Error.Message != wantError {
+				t.Fatalf("missing executor result = %+v, want %q", got.Error, wantError)
+			}
+			if got := results["explicit"]; got.Error != nil || got.Executor != "b" || !strings.Contains(string(got.Content), "from-b") {
+				t.Fatalf("explicit executor result = %+v, want b's MCP server", got)
+			}
+			if withDefault {
+				if got := results["default"]; got.Error != nil || got.Executor != "local" || !strings.Contains(string(got.Content), "from-local") {
+					t.Fatalf("default executor result = %+v, want local's MCP server", got)
+				}
+			}
+
+			if !manager.RemoveDynamic("a", "a-1") || !manager.RemoveDynamic("b", "b-1") {
+				t.Fatal("failed to remove the initial dynamic environments")
+			}
+			stopA()
+			stopB()
+			registerDynamicEnvironment(t, manager, "a", "a-2", serversA...)
+			registerDynamicEnvironment(t, manager, "b", "b-2", serversB...)
+			afterReconnect, err := toolExecutor.GetTools(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantJSON, err := json.Marshal(definitions)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotJSON, err := json.Marshal(afterReconnect)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(gotJSON) != string(wantJSON) {
+				t.Fatalf("tool definitions changed after reconnect in reverse order: %s", gotJSON)
+			}
+		})
+	}
+}
+
+// TestToolExecutorDuplicateDynamicMCPTools 检查开场和刷新都使用同设备上首个同名工具。
+func TestToolExecutorDuplicateDynamicMCPTools(t *testing.T) {
+	manager := executor.NewExecutionEnvironmentsManager()
+	registerDynamicEnvironment(t, manager, "device", "device-1",
+		clientServer{id: "client_mcp", arguments: []string{"from-second"}},
+		clientServer{id: "client.mcp", arguments: []string{"from-first"}},
+	)
+	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name     string
+		getTools func(context.Context) ([]*defs.ToolDefinition, error)
+	}{
+		{name: "opening", getTools: func(ctx context.Context) ([]*defs.ToolDefinition, error) {
+			environments, defaultID := manager.GetEnvironments()
+			return toolExecutor.GetToolsForEnvironments(ctx, environments, defaultID)
+		}},
+		{name: "refresh", getTools: toolExecutor.GetTools},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const name = "mcp__client_mcp__argv"
+			definitions, err := tt.getTools(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var serverIDs []string
+			for _, definition := range definitions {
+				if definition.Name == name {
+					serverIDs = append(serverIDs, definition.MCPServerID)
+				}
+			}
+			if !slices.Equal(serverIDs, []string{"client.mcp"}) {
+				t.Fatalf("servers for %s = %v, want [client.mcp]", name, serverIDs)
+			}
+			results, _ := runToolCalls(t, toolExecutor, []*defs.ToolCall{{CallID: "argv", Name: name, Arguments: `{}`}})
+			if got := results["argv"]; got.Error != nil || got.Executor != "device" || !strings.Contains(string(got.Content), "from-first") {
+				t.Fatalf("result = %+v, want the first MCP server on device", got)
+			}
+		})
+	}
+}
+
+// TestToolExecutorDynamicMCPReconnect 验证本轮路由重用、按设备恢复和断线单次报错。
+func TestToolExecutorDynamicMCPReconnect(t *testing.T) {
+	for _, tt := range []struct {
+		name              string
+		replacementServer string
+		wantError         string
+	}{
+		{name: "same server", replacementServer: "shared"},
+		{name: "offline", wantError: "mcp_server_unavailable"},
+		{name: "server removed", replacementServer: "other", wantError: "mcp_server_unavailable"},
+		{name: "static configuration takes over", wantError: "mcp_server_unavailable"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := executor.NewExecutionEnvironmentsManager()
+			stop := registerDynamicEnvironment(t, manager, "a", "a-1", clientServer{id: "shared", arguments: []string{"old-a"}})
+			registerDynamicEnvironment(t, manager, "b", "b-1", clientServer{id: "shared", arguments: []string{"from-b"}})
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := toolExecutor.GetTools(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			call := &defs.ToolCall{CallID: "argv", Name: "mcp__shared__argv", Arguments: `{"executor":"a"}`}
+			results, _ := runToolCalls(t, toolExecutor, []*defs.ToolCall{call})
+			if got := results["argv"]; got.Error != nil || got.Executor != "a" || !strings.Contains(string(got.Content), "old-a") {
+				t.Fatalf("initial call = %+v, want old connection on a", got)
+			}
+
+			stop()
+			switch {
+			case tt.replacementServer != "":
+				registerDynamicEnvironment(t, manager, "a", "a-2", clientServer{id: tt.replacementServer, arguments: []string{"new-a"}})
+				if manager.RemoveDynamic("a", "a-1") {
+					t.Fatal("late cleanup removed the replacement")
+				}
+				environment, _ := manager.GetEnvironment("a")
+				if _, err := environment.GetMCPTools(t.Context(), nil); err != nil {
+					t.Fatal(err)
+				}
+			case tt.name == "static configuration takes over":
+				server := newFakeServerDefinition("shared", buildFakeMCPServer(t), []string{"a"}, "from-static")
+				static := newEnvironmentFixture(t, "a", newLocalWorkspace(t), []*mcpclient.ServerDefinition{server})
+				if _, err := manager.SetStatic("a", []executor.ExecutionEnvironment{static.environment}); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				if !manager.RemoveDynamic("a", "a-1") {
+					t.Fatal("disconnect failed to remove a")
+				}
+			}
+
+			// 执行仍使用首次建表的路由，B 还在线且提供同名工具。
+			results, counts := runToolCalls(t, toolExecutor, []*defs.ToolCall{
+				call,
+				{CallID: "argv-again", Name: call.Name, Arguments: call.Arguments},
+				{CallID: "argv-b", Name: call.Name, Arguments: `{"executor":"b"}`},
+			})
+			for _, callID := range []string{"argv", "argv-again"} {
+				got := results[callID]
+				if counts[callID] != 1 || got.Executor != "a" {
+					t.Fatalf("%s result = %+v, want exactly one completion on a", callID, got)
+				}
+				if tt.wantError != "" {
+					if got.Error == nil || got.Error.Code != tt.wantError {
+						t.Fatalf("%s result = %+v, want %q", callID, got, tt.wantError)
+					}
+				} else if got.Error != nil || !strings.Contains(string(got.Content), "new-a") {
+					t.Fatalf("%s result = %+v, want new connection on a", callID, got)
+				}
+			}
+			if got := results["argv-b"]; got.Error != nil || got.Executor != "b" || !strings.Contains(string(got.Content), "from-b") {
+				t.Fatalf("argv-b = %+v, want b unaffected", got)
+			}
+		})
+	}
+}
+
+func TestToolExecutorSkipsUnavailableDynamicMCPServer(t *testing.T) {
+	pipeline := telemetrytest.NewPipeline(t)
+	ctx := telemetry.ContextWithTelemetry(t.Context(), pipeline.Telemetry)
+	manager := newStaticEnvironmentsManager(t, newEchoEnvironment(t, "local", "bash"))
+	registerDynamicEnvironment(t, manager, "remote", "connection",
+		clientServer{id: "broken", command: "/nonexistent/openvaala-mcp-client"},
+		clientServer{id: "working"},
+	)
+	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools, err := toolExecutor.GetTools(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := getToolNames(tools)
+	if !slices.Contains(names, "bash") || !slices.Contains(names, "mcp__working__echo") ||
+		slices.ContainsFunc(names, func(name string) bool { return strings.HasPrefix(name, "mcp__broken__") }) {
+		t.Fatalf("GetTools() = %v, want stable tools and tools from the working server", names)
+	}
+	records := pipeline.GetLogRecords(t, "mcp server skipped")
+	if len(records) != 1 || records[0]["level"] != "WARN" || records[0]["mcp_server_id"] != "broken" || records[0]["openvaala.executor.id"] != "remote" {
+		t.Fatalf("mcp server skipped records = %v, want warning for broken on remote", records)
+	}
+}
+
+func TestToolExecutorUsesOpeningEnvironments(t *testing.T) {
+	for _, includeEnvironment := range []bool{true, false} {
+		t.Run(fmt.Sprintf("opening_environment_%t", includeEnvironment), func(t *testing.T) {
+			manager := newStaticEnvironmentsManager(t, newEchoEnvironment(t, "opening", "open_tool"))
+			environments, defaultID := manager.GetEnvironments()
+			if !includeEnvironment {
+				environments, defaultID = nil, ""
+			}
+			if _, err := manager.SetStatic("live", []executor.ExecutionEnvironment{newEchoEnvironment(t, "live", "live_tool")}); err != nil {
+				t.Fatal(err)
+			}
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager, &echoTool{
+				name:   "list_agents",
+				schema: echoSchema,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			definitions, err := toolExecutor.GetToolsForEnvironments(t.Context(), environments, defaultID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantNames := []string{"list_agents"}
+			if includeEnvironment {
+				wantNames = []string{"open_tool", "list_agents"}
+			}
+			if names := getToolNames(definitions); !slices.Equal(names, wantNames) {
+				t.Fatalf("GetToolsForEnvironments() = %v, want %v", names, wantNames)
+			}
+			call := &defs.ToolCall{CallID: "live", Name: "live_tool", Arguments: `{}`}
+			results, _ := runToolCalls(t, toolExecutor, []*defs.ToolCall{call})
+			if result := results["live"]; result.Error == nil || result.Error.Code != "tool_not_found" {
+				t.Fatalf("live tool before refresh = %+v, want tool_not_found", result)
+			}
+			if _, err := toolExecutor.GetTools(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			results, _ = runToolCalls(t, toolExecutor, []*defs.ToolCall{call})
+			if result := results["live"]; result.Error != nil || result.Executor != "live" {
+				t.Fatalf("live tool after refresh = %+v, want success on live", result)
+			}
+		})
+	}
+}
+
+func TestToolExecutorFailedRefreshKeepsRoutes(t *testing.T) {
+	for _, explicit := range []bool{true, false} {
+		t.Run(fmt.Sprintf("explicit_environments_%t", explicit), func(t *testing.T) {
+			manager := newStaticEnvironmentsManager(t, newEchoEnvironment(t, "local", "good"))
+			toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := toolExecutor.GetTools(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			var invalid []executor.ExecutionEnvironment
+			for _, id := range []string{"a", "b"} {
+				environment, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt(id, "", nil, &echoTool{
+					name:   "boolean_schema",
+					schema: "true",
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				invalid = append(invalid, environment)
+			}
+			if _, err := manager.SetStatic("a", invalid); err != nil {
+				t.Fatal(err)
+			}
+			if explicit {
+				_, err = toolExecutor.GetToolsForEnvironments(t.Context(), invalid, "a")
+			} else {
+				_, err = toolExecutor.GetTools(t.Context())
+			}
+			if err == nil {
+				t.Fatal("refresh succeeded with an unsupported multi-provider schema")
+			}
+			results, _ := runToolCalls(t, toolExecutor, []*defs.ToolCall{{CallID: "good", Name: "good", Arguments: `{}`}})
+			if result := results["good"]; result.Error != nil || result.Executor != "local" {
+				t.Fatalf("previous tool after failed refresh = %+v, want success on local", result)
 			}
 		})
 	}
@@ -2494,9 +2818,12 @@ func TestToolExecutorHooksSkipEnvironmentsWithoutCommands(t *testing.T) {
 			wantCode:     "hook_blocked",
 		},
 		{
-			name:         "commands_unsupported_skips_hooks",
-			opt:          executor.NewExecutionEnvironmentOpt("files", "文件", nil).WithoutCommands(),
-			wantRequests: 0,
+			name: "commands_unsupported_skips_hooks",
+			opt:  executor.NewExecutionEnvironmentOpt("files", "文件", nil).WithoutCommands(),
+		},
+		{
+			name: "dynamic_environment_does_not_fall_back_to_static",
+			opt:  executor.NewExecutionEnvironmentOpt("files", "文件", nil).WithoutCommands().AsDynamic(),
 		},
 	}
 	// 2. 在环境里放一个探测工具，运行一次调用，核对 hook 请求数和工具结果。
@@ -2517,7 +2844,16 @@ func TestToolExecutorHooksSkipEnvironmentsWithoutCommands(t *testing.T) {
 				IsBlocked:   true,
 				BlockReason: "no",
 			}}}
-			toolOpt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{environment})
+			var manager executor.ExecutionEnvironmentsManager
+			if environment.IsDynamic() {
+				manager = newStaticEnvironmentsManager(t, newEchoEnvironment(t, "local"))
+				if err := manager.SetDynamic(environment, "connection"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				manager = newStaticEnvironmentsManager(t, environment)
+			}
+			toolOpt := executor.NewToolExecutorOpt(manager)
 			toolOpt.Hooks = hooks
 			toolExecutor, err := executor.NewToolExecutor(toolOpt)
 			if err != nil {
@@ -3027,9 +3363,9 @@ func TestToolExecutorPreparedCalls(t *testing.T) {
 	}
 }
 
-// TestToolExecutorSessionTools 验证 Session 工具独立绑定、重名和环境检查。
+// TestToolExecutorSessionTools 验证 Session 工具独立绑定、重名和无环境时的行为。
 func TestToolExecutorSessionTools(t *testing.T) {
-	// 1. 准备跨执行器隔离、重名、未知环境和没有环境的用例。
+	// 1. 准备跨执行器隔离、重名和没有环境的用例。
 	tests := []struct {
 		name string
 		run  func(t *testing.T)
@@ -3042,7 +3378,7 @@ func TestToolExecutorSessionTools(t *testing.T) {
 				// 1. 两个执行器共享环境，各自保存标签工具并建立工具表。
 				toolExecutors := make([]executor.ToolExecutor, len(labels))
 				for index, label := range labels {
-					opt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{environment})
+					opt := executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, environment))
 					opt.SessionTools = map[string][]executor.Tool{"local": {&labelTool{
 						name:  "probe",
 						label: label,
@@ -3076,7 +3412,7 @@ func TestToolExecutorSessionTools(t *testing.T) {
 		{
 			name: "session_tool_conflicts_with_environment_tool",
 			run: func(t *testing.T) {
-				opt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{newEchoEnvironment(t, "local", "echo")})
+				opt := executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, newEchoEnvironment(t, "local", "echo")))
 				opt.SessionTools = map[string][]executor.Tool{"local": {&labelTool{
 					name:  "echo",
 					label: "session",
@@ -3105,7 +3441,7 @@ func TestToolExecutorSessionTools(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				opt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{newEchoEnvironment(t, "a", "echo"), environmentB})
+				opt := executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, newEchoEnvironment(t, "a", "echo"), environmentB))
 				opt.SessionTools = map[string][]executor.Tool{"b": {&echoTool{
 					executorID: "b",
 					name:       "echo",
@@ -3118,20 +3454,6 @@ func TestToolExecutorSessionTools(t *testing.T) {
 				const wantErr = `execution environment "b" provides tool "echo" more than once`
 				if _, err := toolExecutor.GetTools(t.Context()); err == nil || !strings.Contains(err.Error(), wantErr) {
 					t.Fatalf("GetTools() error = %v, want it to contain %q", err, wantErr)
-				}
-			},
-		},
-		{
-			name: "session_tools_unknown_environment",
-			run: func(t *testing.T) {
-				opt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{newEchoEnvironment(t, "local")})
-				opt.SessionTools = map[string][]executor.Tool{"ssh": {&labelTool{
-					name:  "probe",
-					label: "ssh",
-				}}}
-				const wantErr = `unknown execution environment "ssh"`
-				if _, err := executor.NewToolExecutor(opt); err == nil || !strings.Contains(err.Error(), wantErr) {
-					t.Fatalf("NewToolExecutor() error = %v, want it to contain %q", err, wantErr)
 				}
 			},
 		},
@@ -3200,7 +3522,7 @@ func TestToolExecutorSharedEnvironmentConcurrent(t *testing.T) {
 				[]*mcpclient.ServerDefinition{newFakeServerDefinition("fake", binary, []string{"local"})}, "bash", "read_file").environment
 			var tasks sync.WaitGroup
 			for session := range tt.sessions {
-				toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{environment}))
+				toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, environment)))
 				if err != nil {
 					t.Fatal(err)
 				}

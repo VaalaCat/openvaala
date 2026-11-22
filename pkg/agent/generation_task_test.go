@@ -73,6 +73,9 @@ type taskTestToolExecutor struct{ failedCallID string }
 func (e taskTestToolExecutor) GetTools(context.Context) ([]*defs.ToolDefinition, error) {
 	return nil, nil
 }
+func (e taskTestToolExecutor) GetToolsForEnvironments(ctx context.Context, _ []executor.ExecutionEnvironment, _ string) ([]*defs.ToolDefinition, error) {
+	return e.GetTools(ctx)
+}
 func (e taskTestToolExecutor) PrepareCalls(_ context.Context, items []*defs.Item, _ chan<- executor.ExecutorEvent) []*executor.PreparedToolCall {
 	calls := make([]*executor.PreparedToolCall, 0, len(items))
 	for _, item := range items {

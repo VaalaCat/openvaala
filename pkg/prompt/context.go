@@ -62,8 +62,11 @@ func FormatExecutorsChange(change defs.ExecutorsChange) string {
 	// 1. 算出默认 Executor、移除、新增和目录的变化。
 	details := change.GetDetails()
 	var text strings.Builder
-	text.WriteString("Executor 已变更：\n")
-	// 2. 依次写入默认 Executor 的变化、不再可用的、新增的和目录变了的 Executor。
+	// 2. 首轮直接列出新增环境，后续通知带变更标题。
+	if len(change.PreviousExecutors) > 0 {
+		text.WriteString("Executor 已变更：\n")
+	}
+	// 3. 依次写入默认 Executor 的变化、不再可用的、新增的和目录变了的 Executor。
 	if details.NewDefault != nil {
 		fmt.Fprintf(&text, "- 默认 Executor 从 %s 改为 %s，省略 executor 参数的工具调用在 %s 的 %s 执行。\n",
 			details.PreviousDefaultID, details.NewDefault.ID, details.NewDefault.ID, details.NewDefault.WorkspaceDirectory)
@@ -72,13 +75,20 @@ func FormatExecutorsChange(change defs.ExecutorsChange) string {
 		fmt.Fprintf(&text, "- %s 不再可用。\n", removed.ID)
 	}
 	for _, added := range details.Added {
-		fmt.Fprintf(&text, "- 新增可用的 %s，目录 %s。\n", added.ID, added.WorkspaceDirectory)
+		text.WriteString("- 新增可用的 " + added.ID)
+		if added.Description != "" {
+			text.WriteString("（" + added.Description + "）")
+		}
+		if added.WorkspaceDirectory != "" {
+			text.WriteString("，目录 " + added.WorkspaceDirectory)
+		}
+		text.WriteString("。\n")
 	}
 	for _, changed := range details.DirectoryChanges {
 		fmt.Fprintf(&text, "- %s 的目录从 %s 改为 %s，相对路径以新目录为准。\n", changed.ID, changed.PreviousDirectory, changed.Directory)
 	}
-	// 3. 提示去系统提示里看当前的 Executor，包进系统通知。
-	text.WriteString("当前可用的 Executor 和说明见系统提示 <openvaala-executors>；之前历史里的路径属于原来的位置。\n")
+	// 4. 提示如何查询稳定环境和全部在线环境，包进系统通知。
+	text.WriteString("稳定环境见系统提示 <openvaala-executors>，全部在线环境与工具可用 list_executors 查询；之前历史里的路径属于原来的位置。\n")
 	return formatXMLBlock("openvaala-system-info", formatXMLBlock("openvaala-executors-change-event", text.String())+"\n")
 }
 

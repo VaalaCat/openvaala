@@ -509,6 +509,11 @@ func TestCodexItemTranslatorGetThreadItems(t *testing.T) {
 			want: `[]`,
 		},
 		{
+			name:  "list_executors_is_an_agent_mcp_tool_call",
+			items: []*defs.Item{newTestCall("c-1", "call-1", "list_executors", `{}`)},
+			want:  `[{"type":"mcpToolCall","id":"c-1","server":"agent","tool":"list_executors","status":"inProgress","arguments":{},"result":null,"error":null}]`,
+		},
+		{
 			name: "read_session_history_is_an_agent_mcp_tool_call",
 			items: []*defs.Item{
 				newTestCall("c-1", "call-1", "read_session_history", map[string]any{"session_id": "s-child"}),

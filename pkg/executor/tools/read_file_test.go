@@ -740,9 +740,14 @@ func newTestWorkspace(t *testing.T, root string) workspace.Workspace {
 
 // runTool 用只包含这个工具的执行器运行一次调用。
 func runTool(t *testing.T, tool executor.Tool, call *defs.ToolCall) *defs.ToolResult {
-	// 1. 创建工具执行器并执行调用。
+	// 1. 把工具登记到稳定环境并执行调用。
 	t.Helper()
-	instance, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(nil, tool))
+	environment := newCommandEnvironment(t, "local", nil, tool)
+	manager := executor.NewExecutionEnvironmentsManager()
+	if _, err := manager.SetStatic(environment.GetID(), []executor.ExecutionEnvironment{environment}); err != nil {
+		t.Fatal(err)
+	}
+	instance, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager))
 	if err != nil {
 		t.Fatal(err)
 	}

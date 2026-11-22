@@ -9,6 +9,7 @@ const (
 	ExecutorKindVirtual ExecutorKind = "virtual"
 	// ExecutorKindMemory 是内置的跨对话记忆 Executor；没有工作区目录，不能当默认 Executor，工作区要实现 workspace.MemoryWorkspace。
 	ExecutorKindMemory ExecutorKind = "memory"
+	ExecutorKindClient ExecutorKind = "client"
 )
 
 // ExecutorDefinition 是一个 Executor 的 ID、种类、说明和默认目录。

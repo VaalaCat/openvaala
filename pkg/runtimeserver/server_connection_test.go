@@ -494,8 +494,8 @@ func TestServerConnectionClientMCP(t *testing.T) {
 				var removed []defs.ConversationID
 				for range 2 {
 					request := f.runtime.receive(t)
-					if request.ClientID != stream.clientID || len(request.Servers) != 0 {
-						t.Fatalf("removal request = %+v, want an empty registration from client %s", request, stream.clientID)
+					if request.ConnectionID != stream.connectionID || request.ExecutorID != stream.connectionID || len(request.Servers) != 0 {
+						t.Fatalf("removal request = %+v, want to remove the default executor for connection %s", request, stream.connectionID)
 					}
 					removed = append(removed, request.ConversationID)
 				}
@@ -521,7 +521,7 @@ func TestServerConnectionClientMCP(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			rt := &clientMCPRuntime{
 				isRecordOnly: true,
-				requests:     make(chan *runtime.SetClientMCPServersRequest, 16),
+				requests:     make(chan *runtime.SetClientExecutorRequest, 16),
 			}
 			h := startTestServer(t, func(opt *runtimeserver.RuntimeServerOpt) {
 				rt.Runtime = opt.Runtime
@@ -566,7 +566,7 @@ func TestServerConnectionClientMCPRemovalErrors(t *testing.T) {
 			rt := &clientMCPRuntime{
 				isRecordOnly: true,
 				removeErr:    tt.err,
-				requests:     make(chan *runtime.SetClientMCPServersRequest, 16),
+				requests:     make(chan *runtime.SetClientExecutorRequest, 16),
 			}
 			h := startTestServerWithIdleTimeout(t, p.Telemetry, 0, func(opt *runtimeserver.RuntimeServerOpt) {
 				rt.Runtime = opt.Runtime
@@ -587,7 +587,7 @@ func TestServerConnectionClientMCPRemovalErrors(t *testing.T) {
 			}
 			// "connection closed" 在 Run 返回之后记录，此时移除登记的结果已处理。
 			p.WaitLogRecords(t, "connection closed", 1)
-			records := p.GetLogRecords(t, "remove client MCP servers failed")
+			records := p.GetLogRecords(t, "remove client executor failed")
 			if !tt.wantWarning {
 				if len(records) != 0 {
 					t.Fatalf("removal failure logs = %v, want none for %v", records, tt.err)
@@ -601,6 +601,42 @@ func TestServerConnectionClientMCPRemovalErrors(t *testing.T) {
 	}
 }
 
+// TestServerConnectionReplacedClientExecutor 检查旧连接断开时，同 ID 的新登记仍然可用。
+func TestServerConnectionReplacedClientExecutor(t *testing.T) {
+	p := telemetrytest.NewPipeline(t)
+	h := startTestServerWithIdleTimeout(t, p.Telemetry, 0)
+	first, second := h.dial(t), h.dial(t)
+	first.initialize(t)
+	second.initialize(t)
+	conv := first.createConversation(t)
+	for _, registration := range []struct {
+		client   *testClient
+		serverID string
+	}{{first, "old-server"}, {second, "new-server"}} {
+		registration.client.callResult(t, "conversation/setClientExecutor", map[string]any{
+			"conversation_id": conv.ID, "executor_id": "laptop", "mcp_server_ids": []string{registration.serverID},
+		}, nil)
+		registration.client.waitClientMCPConnect(t, registration.serverID)
+	}
+
+	if err := first.conn.CloseNow(); err != nil {
+		t.Fatal(err)
+	}
+	p.WaitLogRecords(t, "connection closed", 1)
+
+	var result listedMCPServers
+	second.callResult(t, "mcpServer/list", map[string]any{"conversation_id": conv.ID}, &result)
+	var clientServers []string
+	for _, server := range result.Servers {
+		if server.ExecutorID == "laptop" {
+			clientServers = append(clientServers, server.ServerID)
+		}
+	}
+	if !slices.Equal(clientServers, []string{"new-server"}) {
+		t.Fatalf("laptop MCP servers after the old connection closed = %v, want [new-server]", clientServers)
+	}
+}
+
 // clientMCPFixture 是一条已初始化的客户端连接和只记录登记的 Runtime。
 type clientMCPFixture struct {
 	client  *testClient
@@ -608,10 +644,10 @@ type clientMCPFixture struct {
 }
 
 // register 通过协议为对话登记客户端 MCP server。
-func (f *clientMCPFixture) register(t *testing.T, conversationID defs.ConversationID, serverIDs ...string) *runtime.SetClientMCPServersRequest {
+func (f *clientMCPFixture) register(t *testing.T, conversationID defs.ConversationID, serverIDs ...string) *runtime.SetClientExecutorRequest {
 	t.Helper()
 	// 1. 提交 server ID 列表，返回 Runtime 收到的登记请求。
-	f.client.callResult(t, "conversation/setClientMCPServers", map[string]any{"conversation_id": conversationID, "server_ids": serverIDs}, nil)
+	f.client.callResult(t, "conversation/setClientExecutor", map[string]any{"conversation_id": conversationID, "mcp_server_ids": serverIDs}, nil)
 	return f.runtime.receive(t)
 }
 
@@ -629,19 +665,19 @@ func (f *clientMCPFixture) connect(t *testing.T, conversationID defs.Conversatio
 	t.Cleanup(func() { _ = connection.Close() })
 	params := f.client.waitClientMCPConnect(t, serverID)
 	return &clientMCPStream{
-		transport:  transport,
-		connection: connection,
-		streamID:   params.StreamID,
-		clientID:   request.ClientID,
+		transport:    transport,
+		connection:   connection,
+		streamID:     params.StreamID,
+		connectionID: request.ConnectionID,
 	}
 }
 
 // clientMCPStream 是测试里扮演 Runtime 连上的一条转发流。
 type clientMCPStream struct {
-	transport  mcp.Transport
-	connection mcp.Connection
-	streamID   string
-	clientID   string
+	transport    mcp.Transport
+	connection   mcp.Connection
+	streamID     string
+	connectionID string
 }
 
 // read 读取转发流下一条请求的方法名。

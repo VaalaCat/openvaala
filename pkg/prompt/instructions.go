@@ -47,7 +47,7 @@ func FormatSkillInstructions(skills []*skill.Skill) string {
 	return formatXMLBlock("openvaala-skills", instructions.String())
 }
 
-// FormatExecutorInstructions 生成系统提示里的 Executor 列表，第一项是默认 Executor；没有 Executor 时返回空串。
+// FormatExecutorInstructions 生成系统提示里的稳定 Executor 列表，第一项是默认 Executor。列表为空时返回空串。
 func FormatExecutorInstructions(executors []ExecutorEntry) string {
 	// 1. 没有 Executor 时直接返回，否则记下第一项是默认的。
 	if len(executors) == 0 {
@@ -57,6 +57,7 @@ func FormatExecutorInstructions(executors []ExecutorEntry) string {
 	// 2. 写入 Executor 的用法和先读后改的提示。
 	var instructions strings.Builder
 	instructions.WriteString("Executor 是工具实际运行的环境（一台机器或一个虚拟环境），各自有独立的文件系统和命令行：读写文件和运行命令只作用于所选 Executor，不同 Executor 之间的文件互不可见。可在多个 Executor 上运行的工具带有 executor 参数，用它选择执行位置；省略时使用参数说明中的默认 Executor。\n")
+	instructions.WriteString("默认 Executor 不提供的多来源工具必须显式指定 executor，单来源工具无需指定。动态接入的客户端环境不在本列表内，可用 list_executors 查看。\n")
 	instructions.WriteString("修改文件前，先用 read_file 读取目标文件，收到结果后再修改。\n")
 	// 3. 按 ID 排序列出说明和工作目录，标出默认的。
 	for _, named := range slices.SortedFunc(slices.Values(executors), func(a, b ExecutorEntry) int {
@@ -66,7 +67,10 @@ func FormatExecutorInstructions(executors []ExecutorEntry) string {
 		if named.ID == defaultID {
 			label += "（默认）"
 		}
-		fmt.Fprintf(&instructions, "- %s: %s\n  workspace: %s\n", label, named.Description, named.WorkspaceDirectory)
+		fmt.Fprintf(&instructions, "- %s: %s\n", label, named.Description)
+		if named.WorkspaceDirectory != "" {
+			fmt.Fprintf(&instructions, "  workspace: %s\n", named.WorkspaceDirectory)
+		}
 	}
 	return formatXMLBlock("openvaala-executors", instructions.String())
 }

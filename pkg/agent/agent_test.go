@@ -1147,7 +1147,13 @@ func newTestEnvironment(t *testing.T, id string, environmentWorkspace workspace.
 func newTestToolExecutor(t *testing.T, environments ...executor.ExecutionEnvironment) executor.ToolExecutor {
 	// 1. 将环境列表交给 ToolExecutor 构造函数。
 	t.Helper()
-	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(environments))
+	manager := executor.NewExecutionEnvironmentsManager()
+	if len(environments) > 0 {
+		if _, err := manager.SetStatic(environments[0].GetID(), environments); err != nil {
+			t.Fatal(err)
+		}
+	}
+	toolExecutor, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1913,6 +1919,7 @@ func TestAgentCompactOnly(t *testing.T) {
 			}
 			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, model, history)
 			opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "offline", offline)}
+			opt.DefaultExecutorID = "offline"
 			opt.IsCompactOnly = true
 			instance, err := agent.NewAgent(opt)
 			if err != nil {
@@ -3203,7 +3210,8 @@ func TestAgentStopHooks(t *testing.T) {
 				opt.Hooks = hooks
 			}
 			if !tt.noExecutors {
-				opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "local", nil), newTestEnvironment(t, "remote", nil)}
+				opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "remote", nil), newTestEnvironment(t, "local", nil)}
+				opt.DefaultExecutorID = "local"
 			}
 			if tt.steer {
 				serveAgentInputs(t, opt, agent.AgentInputResult{Items: []*defs.Item{userMessage("补充说明")}})
@@ -3374,6 +3382,90 @@ func (c *sequenceAgentClient) Call(_ context.Context, req llmkit.Request, _ llmk
 	return events, nil
 }
 
+type agentToolsRecorder struct {
+	*testToolExecutor
+	openingReads int
+	liveReads    int
+}
+
+func (e *agentToolsRecorder) GetTools(context.Context) ([]*defs.ToolDefinition, error) {
+	e.liveReads++
+	online := e.GetDefinition()
+	online.Name = "online"
+	return []*defs.ToolDefinition{e.GetDefinition(), online}, nil
+}
+
+func (e *agentToolsRecorder) GetToolsForEnvironments(_ context.Context, environments []executor.ExecutionEnvironment, _ string) ([]*defs.ToolDefinition, error) {
+	e.openingReads++
+	if len(environments) == 0 {
+		return nil, nil
+	}
+	return []*defs.ToolDefinition{e.GetDefinition()}, nil
+}
+
+func TestAgentToolDefinitions(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		emptyOpening  bool
+		refresh       bool
+		wantLiveReads int
+		wantTools     [][]string
+	}{
+		{
+			name:      "no_refresh",
+			wantTools: [][]string{{"lookup"}, {"lookup"}},
+		},
+		{
+			name:          "refresh_before_next_model_request",
+			refresh:       true,
+			wantLiveReads: 1,
+			wantTools:     [][]string{{"lookup"}, {"lookup", "online"}},
+		},
+		{
+			name:         "empty_opening_environments",
+			emptyOpening: true,
+			wantTools:    [][]string{nil},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			responses := newToolLoopResponses()
+			if tt.emptyOpening {
+				responses = responses[1:]
+			}
+			client := &sequenceAgentClient{responses: responses}
+			tools := &agentToolsRecorder{testToolExecutor: &testToolExecutor{shouldRefreshTools: tt.refresh}}
+			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, newTestContext(t, "", []*defs.Item{userMessage("你好")}))
+			opt.ToolExecutor = tools
+			opt.HasOpeningEnvironments = true
+			if !tt.emptyOpening {
+				opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "local", nil)}
+				opt.DefaultExecutorID = "local"
+			}
+			instance, err := agent.NewAgent(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := instance.Run(t.Context(), nil); err != nil {
+				t.Fatal(err)
+			}
+			if tools.openingReads != 1 || tools.liveReads != tt.wantLiveReads {
+				t.Fatalf("opening reads = %d, live reads = %d, want 1 and %d", tools.openingReads, tools.liveReads, tt.wantLiveReads)
+			}
+			var gotTools [][]string
+			for _, request := range client.requests {
+				var names []string
+				for _, tool := range request.Tools {
+					names = append(names, tool.Name)
+				}
+				gotTools = append(gotTools, names)
+			}
+			if !reflect.DeepEqual(gotTools, tt.wantTools) {
+				t.Fatalf("model request tools = %v, want %v", gotTools, tt.wantTools)
+			}
+		})
+	}
+}
+
 // newToolLoopResponses 创建调用工具后回复的两步模型事件。
 func newToolLoopResponses() [][]llmkit.Event {
 	// 1. 第一步生成 lookup 调用并上报 100/10 用量，第二步生成回答并上报 200/20 用量。
@@ -3501,6 +3593,7 @@ func TestAgentWorkspaceInstructions(t *testing.T) {
 			}
 			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, &model, history)
 			opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "local", work)}
+			opt.DefaultExecutorID = "local"
 			instance, err := agent.NewAgent(opt)
 			if err != nil {
 				t.Fatal(err)
@@ -3574,6 +3667,8 @@ func TestAgentMemoryIndexes(t *testing.T) {
 		isUserIndexDirectory bool
 		// hasNoMemoryEnvironment 对话是不是没有 memory 环境？
 		hasNoMemoryEnvironment bool
+		isDynamicMemory        bool
+		hasNoMemoryWorkspace   bool
 		// wantPaths 是本轮新加的记忆目录，按顺序。
 		wantPaths []string
 		// wantTruncated 是 user/MEMORY.md 的预期结果：是否截断，以及检查截断后的正文。
@@ -3674,6 +3769,20 @@ func TestAgentMemoryIndexes(t *testing.T) {
 			userIndex:              "- 回复用中文\n",
 			hasNoMemoryEnvironment: true,
 		},
+		{
+			name:                 "dynamic_memory_without_workspace",
+			isDynamicMemory:      true,
+			hasNoMemoryWorkspace: true,
+		},
+		{
+			name:            "dynamic_memory_with_workspace",
+			isDynamicMemory: true,
+			userIndex:       "- 回复用中文\n",
+		},
+		{
+			name:                 "static_memory_without_workspace",
+			hasNoMemoryWorkspace: true,
+		},
 	}
 	// 2. 把目录放进记忆工作区，运行一轮，核对新加的 Item、请求里的消息和 Warn 日志。
 	for _, tt := range tests {
@@ -3709,8 +3818,21 @@ func TestAgentMemoryIndexes(t *testing.T) {
 			client := &compactingAgentClient{}
 			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, newTestContext(t, "", []*defs.Item{userMessage("你好")}))
 			opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "local", localWorkspace)}
+			opt.DefaultExecutorID = "local"
 			if !tt.hasNoMemoryEnvironment {
-				opt.Environments = append(opt.Environments, newTestEnvironment(t, defs.MemoryExecutorID, memoryWorkspace))
+				var memoryWork workspace.Workspace
+				if !tt.hasNoMemoryWorkspace {
+					memoryWork = memoryWorkspace
+				}
+				memoryOpt := executor.NewExecutionEnvironmentOpt(defs.MemoryExecutorID, "", memoryWork).WithoutCommands()
+				if tt.isDynamicMemory {
+					memoryOpt.AsDynamic()
+				}
+				environment, err := executor.NewExecutionEnvironment(memoryOpt)
+				if err != nil {
+					t.Fatal(err)
+				}
+				opt.Environments = append(opt.Environments, environment)
 			}
 			instance, err := agent.NewAgent(opt)
 			if err != nil {
@@ -3820,6 +3942,7 @@ func TestAgentMemoryIndexesFollowProject(t *testing.T) {
 				newTestEnvironment(t, "local", localWorkspace),
 				newTestEnvironment(t, defs.MemoryExecutorID, memoryWorkspace),
 			}
+			opt.DefaultExecutorID = "local"
 			instance, err := agent.NewAgent(opt)
 			if err != nil {
 				t.Fatal(err)
@@ -3898,6 +4021,7 @@ func TestAgentWorkspaceInstructionsFailure(t *testing.T) {
 			history := newTestContext(t, "", []*defs.Item{userMessage("继续工作")})
 			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, history)
 			opt.ToolExecutor, opt.Environments = newTestToolExecutor(t, environments...), environments
+			opt.DefaultExecutorID = environments[0].GetID()
 			instance, err := agent.NewAgent(opt)
 			if err != nil {
 				t.Fatal(err)
@@ -4106,6 +4230,7 @@ func TestAgentDefaultExecutorAgentsInstructions(t *testing.T) {
 			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, newTestContext(t, "", []*defs.Item{userMessage("开始")}))
 			if !tt.noExecutors {
 				opt.Environments = []executor.ExecutionEnvironment{newReadFileEnvironment("local", defaultWork), newReadFileEnvironment("remote", remoteWork)}
+				opt.DefaultExecutorID = "local"
 				opt.ToolExecutor = newTestToolExecutor(t, opt.Environments...)
 			}
 			instance, err := agent.NewAgent(opt)
@@ -4228,6 +4353,7 @@ func TestAgentWorkspaceInstructionsDiscoveryTiming(t *testing.T) {
 			history := newTestContext(t, "", []*defs.Item{userMessage("完成任务")})
 			opt := agent.NewAgentOpt(testTurnID, testSessionID, client, testModel, history)
 			opt.ToolExecutor, opt.Environments = newTestToolExecutor(t, environments...), environments
+			opt.DefaultExecutorID = environments[0].GetID()
 			instance, err := agent.NewAgent(opt)
 			if err != nil {
 				t.Fatal(err)
@@ -5364,6 +5490,7 @@ func TestAgentMaxSteps(t *testing.T) {
 			if len(tt.outcomes) > 0 {
 				opt.Hooks = hooks
 				opt.Environments = []executor.ExecutionEnvironment{newTestEnvironment(t, "local", nil)}
+				opt.DefaultExecutorID = "local"
 			}
 			if tt.steer {
 				serveAgentInputs(t, opt, agent.AgentInputResult{}, agent.AgentInputResult{Items: []*defs.Item{userMessage("补充说明")}})

@@ -21,6 +21,8 @@ const (
 	ListAgentsDescription = "使用空参数对象读取全部后代；sessions 中每项的 session 保存身份与父子关系，status 保存活动 Turn、排队数量和最近 Turn 状态，" +
 		"usage 是已保存 Turn 的累计 token 用量，context_window 是该 Session 所选模型的上下文窗口。" +
 		"使用 session.id 选择通信、等待或中断的目标；这是查询时的工作快照，不等待任务完成、不领取结果正文，也不启动历史任务。"
+	ListExecutorsDescription = "无参数时只查询当前在线的全部 Executor（含服务端与已连接客户端），返回默认标记、说明、工作目录和可用工具名，不影响前缀缓存。" +
+		"传入 refresh_tools: true 会在下一次模型请求前重建工具表，导致前缀缓存失效。仅在当前 Turn 确实需要立刻调用新上线的工具时使用，不要高频调用。"
 	ReadSessionHistoryDescription = "需要子任务的详细执行过程时，读取指定后代在 fork 之后自身已保存的消息、工具调用与结果。" +
 		"从最新内容向更早历史分页，每页 Items 按时间正序返回；使用非零 next_cursor 继续，为 0 时结束。" +
 		"返回资料省略加密推理、provider RawJSON 和图片 base64；查询不启动执行，也不影响结果通知。"
@@ -92,4 +94,10 @@ func FormatSpawnAgentDescription(agents []AgentEntry, models []*defs.ModelDefini
 func FormatExecutorParameterDescription(defaultExecutorID string) string {
 	// 1. 指向系统提示里的 Executor 列表，写上省略时用的 Executor。
 	return "执行此调用的 Executor，见系统提示 <openvaala-executors>；省略时使用 " + defaultExecutorID
+}
+
+// FormatRequiredExecutorParameterDescription 生成必须指定 Executor 时的参数说明。
+func FormatRequiredExecutorParameterDescription() string {
+	// 1. 说明必须指定的原因，并提示如何确认目标 Executor。
+	return "必填，执行此调用的 Executor，见系统提示 <openvaala-executors> 或用 list_executors 查询；默认 Executor 不提供此工具，必须显式指定，不确定目标时先向用户确认"
 }

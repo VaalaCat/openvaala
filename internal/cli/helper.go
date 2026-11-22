@@ -345,8 +345,8 @@ var (
 	acpRepeatedUnderscores     = regexp.MustCompile(`_+`)
 )
 
-// getACPClientMCPServers 筛出编辑器给的 MCP server，为每个生成合法且不重复的 server id。
-func getACPClientMCPServers(ctx context.Context, servers []acp.McpServer) []acpClientMCPServer {
+// getACPEditorMCPServers 筛出编辑器给的 MCP server，为每个生成合法且不重复的 server id。
+func getACPEditorMCPServers(ctx context.Context, servers []acp.McpServer) []acpClientMCPServer {
 	// 1. 保留 stdio、http 和 sse，其他类型或空名称记录警告后跳过；[A-Za-z0-9_-] 以外的字符换为下划线，连续下划线合并，重名追加 -2、-3 等后缀。
 	result := make([]acpClientMCPServer, 0, len(servers))
 	for _, server := range servers {

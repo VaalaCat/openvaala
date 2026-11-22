@@ -47,8 +47,10 @@ type agentTask interface {
 type agentImpl struct {
 	// 本轮配置与输入
 	opt *AgentOpt
-	// modelTools 是 Run 开始时从 ToolExecutor 读取并转换的本轮工具定义，供构建请求和测量上下文复用。
+	// modelTools 是供本轮模型请求和上下文测量复用的工具定义。
 	modelTools []llmkit.Tool
+	// shouldRefreshTools 是否有工具请求在下一次生成前刷新工具表？
+	shouldRefreshTools bool
 	// generationOpt 是 Run 初始化时组装的只读生成任务配置，创建首个和后续生成任务时传入。
 	generationOpt *generationTaskOpt
 	// workspaceAgentsInstructions 按 Executor 保存本轮读到的全局和目录规则；键存在就表示已经读过，值可以为空。
@@ -114,15 +116,19 @@ type AgentOpt struct {
 	Context agent_context.AgentContext
 	// ToolExecutor 列出本轮工具并执行工具调用；nil 表示没有工具。
 	ToolExecutor executor.ToolExecutor
-	// Environments 保存本对话的执行环境；第一个是默认环境，提供目录规则和 Stop hook 的工作区。
+	// Environments 保存本轮开场的执行环境，供工具、目录规则和记忆使用。
 	Environments []executor.ExecutionEnvironment
+	// DefaultExecutorID 指定提供开场目录规则和 Stop hook 工作区的稳定环境。
+	DefaultExecutorID string
+	// HasOpeningEnvironments 是否已提供开场环境列表？已提供的空列表也用于建立开场工具表。
+	HasOpeningEnvironments bool
 	// Requests 供 Agent 请求 Turn 读取补充输入或保存 checkpoint；nil 时独立运行，不读补充输入也不等待持久化。
 	Requests chan<- AgentRequest
 	// Resume 是 Turn 根据已保存历史计算的本次 Run 恢复输入；nil 表示从第一步开始。
 	Resume *AgentResumeInput
 	// IsCompactOnly 这个 Agent 是否只压缩上下文？是的话 Run 只把历史压成摘要就返回，不调用普通模型。
 	IsCompactOnly bool
-	// Hooks 在模型这一步没有工具调用时触发 Stop 或 SubagentStop；为 nil 或 Environments 为空时不触发。
+	// Hooks 在模型这一步没有工具调用时触发 Stop 或 SubagentStop；未配置 hook 或没有稳定默认环境时跳过。
 	Hooks hook.Hooks
 	// Session 是本 Agent 运行所在的 Session，随 hook 事件交给脚本；ParentSessionID 非空表示子 Session，触发 SubagentStop。
 	Session defs.Session
@@ -179,7 +185,7 @@ func (a *agentImpl) Run(ctx context.Context, events chan<- *AgentEvent) (result 
 	}
 	resumeAtSettlement := a.opt.Resume != nil && (a.opt.Resume.Finish != nil || a.opt.Resume.ToolBatch != nil)
 	if !resumeAtSettlement {
-		tools, err := a.getTools(ctx)
+		tools, err := a.getTools(ctx, a.opt.HasOpeningEnvironments)
 		if err != nil {
 			return result, err
 		}
@@ -241,8 +247,11 @@ func (a *agentImpl) Run(ctx context.Context, events chan<- *AgentEvent) (result 
 		a.startTask(taskCtx, manualCompaction, input)
 	} else {
 		var defaultEnvironment executor.ExecutionEnvironment
-		if len(a.opt.Environments) > 0 {
-			defaultEnvironment = a.opt.Environments[0]
+		index := slices.IndexFunc(a.opt.Environments, func(environment executor.ExecutionEnvironment) bool {
+			return !environment.IsDynamic() && environment.GetID() == a.opt.DefaultExecutorID
+		})
+		if index >= 0 {
+			defaultEnvironment = a.opt.Environments[index]
 		}
 		if a.opt.Resume == nil {
 			if err := a.loadGenerationEnvironment(ctx, defaultEnvironment); err != nil {
@@ -443,10 +452,14 @@ func (a *agentImpl) handleTaskRunReturned(ctx context.Context, event *agentTaskR
 			if a.opt.Model == nil || a.opt.Model.Target == nil || a.opt.Context == nil {
 				return errors.New("resume requires the recorded model to continue")
 			}
-			if resume := a.opt.Resume; resume != nil &&
+			resume := a.opt.Resume
+			readDeferredTools := resume != nil &&
 				(resume.Finish != nil && output.FinalModelCallID == resume.Finish.ModelCallID ||
-					resume.ToolBatch != nil && output.FinalModelCallID == resume.ToolBatch.ModelCallID) {
-				tools, err := a.getTools(ctx)
+					resume.ToolBatch != nil && output.FinalModelCallID == resume.ToolBatch.ModelCallID)
+			if readDeferredTools || a.shouldRefreshTools {
+				useOpeningEnvironments := a.opt.HasOpeningEnvironments && !a.shouldRefreshTools
+				a.shouldRefreshTools = false
+				tools, err := a.getTools(ctx, useOpeningEnvironments)
 				if err != nil {
 					return err
 				}
@@ -628,12 +641,18 @@ func (a *agentImpl) sendEvents(pending []*AgentEvent) {
 }
 
 // getTools 获取工具定义并转换为模型工具。
-func (a *agentImpl) getTools(ctx context.Context) ([]llmkit.Tool, error) {
+func (a *agentImpl) getTools(ctx context.Context, useOpeningEnvironments bool) ([]llmkit.Tool, error) {
 	// 1. 未配置工具执行器时返回空列表，否则读取工具定义。
 	if a.opt.ToolExecutor == nil {
 		return nil, nil
 	}
-	definitions, err := a.opt.ToolExecutor.GetTools(ctx)
+	var definitions []*defs.ToolDefinition
+	var err error
+	if useOpeningEnvironments {
+		definitions, err = a.opt.ToolExecutor.GetToolsForEnvironments(ctx, a.opt.Environments, a.opt.DefaultExecutorID)
+	} else {
+		definitions, err = a.opt.ToolExecutor.GetTools(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get executor tools: %w", err)
 	}
@@ -785,14 +804,17 @@ func (a *agentImpl) appendAgentsInstructions(instructions []*defs.AgentsInstruct
 // loadMemoryIndexes 在 Turn 开始时读 memory 环境的 user/MEMORY.md 和 project/MEMORY.md；
 // 没有 memory 环境时什么都不做，读失败只记 Warn。
 func (a *agentImpl) loadMemoryIndexes(ctx context.Context) {
-	// 1. 找 memory 环境，这个对话没有它就不读；memory 环境的工作区一定是记忆工作区。
+	// 1. 只从有记忆工作区的稳定 memory 环境读取目录。
 	environmentIndex := slices.IndexFunc(a.opt.Environments, func(environment executor.ExecutionEnvironment) bool {
-		return environment.GetID() == defs.MemoryExecutorID
+		return environment.GetID() == defs.MemoryExecutorID && !environment.IsDynamic() && environment.GetWorkspace() != nil
 	})
 	if environmentIndex < 0 {
 		return
 	}
-	memoryWorkspace := a.opt.Environments[environmentIndex].GetWorkspace().(workspace.MemoryWorkspace)
+	memoryWorkspace, ok := a.opt.Environments[environmentIndex].GetWorkspace().(workspace.MemoryWorkspace)
+	if !ok {
+		return
+	}
 	// 2. 依次读两份目录：文件不存在什么都不放，读失败记 Warn，内容是空白也不放；项目记忆带上项目名。
 	for _, indexPath := range []string{"user/MEMORY.md", "project/MEMORY.md"} {
 		project := ""

@@ -2624,8 +2624,8 @@ func requireHookRunPair(t *testing.T, started, completed *defs.HookRun, definiti
 	}
 }
 
-// TestOpenVaalaSetClientMCPServers 检查客户端 MCP 登记、连接 ID 和连接失败状态。
-func TestOpenVaalaSetClientMCPServers(t *testing.T) {
+// TestOpenVaalaSetClientExecutor 检查客户端 MCP 登记、连接 ID 和连接失败状态。
+func TestOpenVaalaSetClientExecutor(t *testing.T) {
 	// 1. 列出客户端 MCP 登记、连接 ID 和连接失败状态的测试场景。
 	tests := []struct {
 		name string
@@ -2634,11 +2634,11 @@ func TestOpenVaalaSetClientMCPServers(t *testing.T) {
 		run          func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime)
 	}{
 		{
-			name:         "registers_servers_under_the_connection_client_id",
+			name:         "registers_servers_under_the_default_executor_id",
 			isRecordOnly: true,
 			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
 				client.initialize(t)
-				response := client.call(t, "conversation/setClientMCPServers", map[string]any{"conversation_id": "conv-1", "server_ids": []string{"a", "b"}})
+				response := client.call(t, "conversation/setClientExecutor", map[string]any{"conversation_id": "conv-1", "mcp_server_ids": []string{"a", "b"}})
 				if response.Error != nil || string(response.Result) != "{}" {
 					t.Fatalf("response = %s (error %+v), want {}", response.Result, response.Error)
 				}
@@ -2650,41 +2650,105 @@ func TestOpenVaalaSetClientMCPServers(t *testing.T) {
 					}
 					serverIDs = append(serverIDs, server.ID)
 				}
-				if request.ConversationID != "conv-1" || request.ClientID == "" || !slices.Equal(serverIDs, []string{"a", "b"}) {
-					t.Fatalf("request = %+v (servers %v), want conv-1 with a client id and servers [a b]", request, serverIDs)
+				if request.ConversationID != "conv-1" || request.ConnectionID == "" || request.ExecutorID != request.ConnectionID || !slices.Equal(serverIDs, []string{"a", "b"}) {
+					t.Fatalf("request = %+v (servers %v), want conv-1 with executor ID defaulting to connection ID and servers [a b]", request, serverIDs)
 				}
 			},
 		},
 		{
-			name:         "empty_or_missing_server_ids_remove_all",
+			name:         "omitted_executor_id_removes_the_registered_executor",
 			isRecordOnly: true,
 			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
 				client.initialize(t)
 				for _, params := range []map[string]any{
-					{"conversation_id": "conv-1", "server_ids": []string{}},
+					{"conversation_id": "conv-1", "mcp_server_ids": []string{}},
 					{"conversation_id": "conv-1"},
 				} {
-					client.callResult(t, "conversation/setClientMCPServers", params, nil)
-					if request := rt.receive(t); len(request.Servers) != 0 {
-						t.Fatalf("params %v registered servers %+v, want none", params, request.Servers)
+					client.callResult(t, "conversation/setClientExecutor", map[string]any{
+						"conversation_id": "conv-1", "executor_id": "work-mac-acp",
+						"description": "Work Mac", "mcp_server_ids": []string{"a"},
+					}, nil)
+					registration := rt.receive(t)
+					if registration.ExecutorID != "work-mac-acp" || registration.Description != "Work Mac" {
+						t.Fatalf("registration = %+v, want the supplied ID and description", registration)
 					}
+					client.callResult(t, "conversation/setClientExecutor", params, nil)
+					removal := rt.receive(t)
+					if removal.ExecutorID != registration.ExecutorID || removal.ConnectionID != registration.ConnectionID || len(removal.Servers) != 0 {
+						t.Fatalf("removal = %+v, want to clear registration %+v", removal, registration)
+					}
+				}
+				client.callResult(t, "conversation/setClientExecutor", map[string]any{"conversation_id": "conv-1"}, nil)
+				select {
+				case request := <-rt.requests:
+					t.Fatalf("Runtime received %+v for an unregistered conversation", request)
+				default:
 				}
 			},
 		},
 		{
-			name:         "client_id_is_per_connection",
+			name:         "changing_or_removing_the_wrong_id_preserves_registration",
+			isRecordOnly: true,
+			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
+				client.initialize(t)
+				method := "conversation/setClientExecutor"
+				client.callResult(t, method, map[string]any{
+					"conversation_id": "conv-1", "executor_id": "first", "mcp_server_ids": []string{"a"},
+				}, nil)
+				rt.receive(t)
+				for _, serverIDs := range [][]string{{"a"}, {}} {
+					response := client.call(t, method, map[string]any{
+						"conversation_id": "conv-1", "executor_id": "second", "mcp_server_ids": serverIDs,
+					})
+					requireErrorCode(t, response, -32602, "first")
+				}
+				client.callResult(t, method, map[string]any{"conversation_id": "conv-1"}, nil)
+				if removal := rt.receive(t); removal.ExecutorID != "first" || len(removal.Servers) != 0 {
+					t.Fatalf("removal = %+v, want to clear first", removal)
+				}
+				client.callResult(t, method, map[string]any{
+					"conversation_id": "conv-1", "executor_id": "second", "mcp_server_ids": []string{"a"},
+				}, nil)
+				if registration := rt.receive(t); registration.ExecutorID != "second" || len(registration.Servers) != 1 {
+					t.Fatalf("registration = %+v, want second", registration)
+				}
+			},
+		},
+		{
+			name: "rejected_executor_id_does_not_create_a_registration",
+			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
+				client.initialize(t)
+				conv := client.createConversation(t)
+				method := "conversation/setClientExecutor"
+				for _, tt := range []struct{ id, wantMessage string }{
+					{defs.LocalExecutorID, "conflicts with a static environment"},
+					{defs.MemoryExecutorID, "is reserved"},
+				} {
+					response := client.call(t, method, map[string]any{
+						"conversation_id": conv.ID, "executor_id": tt.id, "mcp_server_ids": []string{"fake"},
+					})
+					requireErrorCode(t, response, -32602, tt.wantMessage)
+				}
+				client.callResult(t, method, map[string]any{
+					"conversation_id": conv.ID, "executor_id": "laptop", "mcp_server_ids": []string{"fake"},
+				}, nil)
+				client.waitClientMCPConnect(t, "fake")
+			},
+		},
+		{
+			name:         "connection_id_is_per_connection",
 			isRecordOnly: true,
 			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
 				other := h.dial(t)
 				client.initialize(t)
 				other.initialize(t)
-				var clientIDs []string
+				var connectionIDs []string
 				for _, connection := range []*testClient{client, client, other} {
-					connection.callResult(t, "conversation/setClientMCPServers", map[string]any{"conversation_id": "conv-1", "server_ids": []string{"a"}}, nil)
-					clientIDs = append(clientIDs, rt.receive(t).ClientID)
+					connection.callResult(t, "conversation/setClientExecutor", map[string]any{"conversation_id": "conv-1", "mcp_server_ids": []string{"a"}}, nil)
+					connectionIDs = append(connectionIDs, rt.receive(t).ConnectionID)
 				}
-				if clientIDs[0] == "" || clientIDs[0] != clientIDs[1] || clientIDs[0] == clientIDs[2] {
-					t.Fatalf("client ids = %v, want the same id on one connection and a different id on the other", clientIDs)
+				if connectionIDs[0] == "" || connectionIDs[0] != connectionIDs[1] || connectionIDs[0] == connectionIDs[2] {
+					t.Fatalf("client ids = %v, want the same id on one connection and a different id on the other", connectionIDs)
 				}
 			},
 		},
@@ -2693,7 +2757,7 @@ func TestOpenVaalaSetClientMCPServers(t *testing.T) {
 			isRecordOnly: true,
 			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
 				client.initialize(t)
-				requireErrorCode(t, client.call(t, "conversation/setClientMCPServers", map[string]any{"conversation_id": "conv-1", "server_ids": "a"}), -32602, "")
+				requireErrorCode(t, client.call(t, "conversation/setClientExecutor", map[string]any{"conversation_id": "conv-1", "mcp_server_ids": "a"}), -32602, "")
 				select {
 				case request := <-rt.requests:
 					t.Fatalf("Runtime received %+v for invalid params", request)
@@ -2702,10 +2766,35 @@ func TestOpenVaalaSetClientMCPServers(t *testing.T) {
 			},
 		},
 		{
+			name:         "unregister_requires_conversation_id",
+			isRecordOnly: true,
+			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
+				client.initialize(t)
+				response := client.call(t, "conversation/setClientExecutor", map[string]any{"mcp_server_ids": []string{}})
+				requireErrorCode(t, response, -32602, "conversation_id is required")
+			},
+		},
+		{
+			name:         "unregister_unregistered_explicit_executor_is_idempotent",
+			isRecordOnly: true,
+			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
+				client.initialize(t)
+				client.callResult(t, "conversation/setClientExecutor", map[string]any{
+					"conversation_id": "conv-1",
+					"executor_id":     "work-mac-acp",
+					"mcp_server_ids":  []string{},
+				}, nil)
+				request := rt.receive(t)
+				if request.ExecutorID != "work-mac-acp" || len(request.Servers) != 0 {
+					t.Fatalf("request = %+v, want removal for work-mac-acp", request)
+				}
+			},
+		},
+		{
 			name: "conversation_not_open_is_a_runtime_error",
 			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
 				client.initialize(t)
-				response := client.call(t, "conversation/setClientMCPServers", map[string]any{"conversation_id": uuid.NewString(), "server_ids": []string{"fake"}})
+				response := client.call(t, "conversation/setClientExecutor", map[string]any{"conversation_id": uuid.NewString(), "mcp_server_ids": []string{"fake"}})
 				requireErrorCode(t, response, -32000, "conversation is not open")
 			},
 		},
@@ -2714,31 +2803,31 @@ func TestOpenVaalaSetClientMCPServers(t *testing.T) {
 			run: func(t *testing.T, h *serverHarness, client *testClient, rt *clientMCPRuntime) {
 				client.initialize(t)
 				conv := client.createConversation(t)
-				client.callResult(t, "conversation/setClientMCPServers", map[string]any{"conversation_id": conv.ID, "server_ids": []string{"fake"}}, nil)
+				client.callResult(t, "conversation/setClientExecutor", map[string]any{"conversation_id": conv.ID, "executor_id": "laptop", "mcp_server_ids": []string{"fake"}}, nil)
 				connect := client.waitClientMCPConnect(t, "fake")
 				// 客户端连不上：clientMCP/closed 带原因，连接状态是 failed 并记下原因。
 				client.sendRaw(t, `{"method":"clientMCP/closed","params":{"stream_id":"`+connect.StreamID+`","error":"cannot start the server"}}`)
-				server := client.waitClientMCPServer(t, conv.ID, func(server conversation.MCPServerInfo) bool { return server.State == mcpclient.ConnectionStateFailed })
+				server := client.waitClientMCPServer(t, conv.ID, "laptop", func(server conversation.MCPServerInfo) bool { return server.State == mcpclient.ConnectionStateFailed })
 				if server.ServerID != "fake" || !strings.Contains(server.Error, "cannot start the server") {
 					t.Fatalf("client MCP server = %+v, want fake failed with the client's reason", server)
 				}
-				client.callResult(t, "conversation/setClientMCPServers", map[string]any{"conversation_id": conv.ID, "server_ids": []string{}}, nil)
+				client.callResult(t, "conversation/setClientExecutor", map[string]any{"conversation_id": conv.ID, "mcp_server_ids": []string{}}, nil)
 				var servers listedMCPServers
 				client.callResult(t, "mcpServer/list", map[string]any{"conversation_id": conv.ID}, &servers)
 				for _, server := range servers.Servers {
-					if server.ExecutorID == defs.ClientExecutorID {
+					if server.ExecutorID == "laptop" {
 						t.Fatalf("mcpServer/list = %+v, want no client entries after clearing the registration", servers.Servers)
 					}
 				}
 			},
 		},
 	}
-	// 2. 登记客户端 server，检查 Runtime 请求、连接级 ClientID、空列表移除请求及真实连接失败状态。
+	// 2. 通过真实连接检查登记、注销、参数错误和客户端 MCP 连接失败状态。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rt := &clientMCPRuntime{
 				isRecordOnly: tt.isRecordOnly,
-				requests:     make(chan *runtime.SetClientMCPServersRequest, 16),
+				requests:     make(chan *runtime.SetClientExecutorRequest, 16),
 			}
 			h := startTestServer(t, func(opt *runtimeserver.RuntimeServerOpt) {
 				rt.Runtime = opt.Runtime
@@ -2749,18 +2838,18 @@ func TestOpenVaalaSetClientMCPServers(t *testing.T) {
 	}
 }
 
-// clientMCPRuntime 是测试用的 Runtime：SetClientMCPServers 把收到的请求按到达顺序记进 requests，其余方法直接使用真实 Runtime。
+// clientMCPRuntime 是测试用的 Runtime：SetClientExecutor 把收到的请求按到达顺序记进 requests，其余方法直接使用真实 Runtime。
 type clientMCPRuntime struct {
 	runtime.Runtime
 	// isRecordOnly 是否只记录请求、不要求对话存在？为 false 时请求也交给真实 Runtime。
 	isRecordOnly bool
 	// removeErr 是只记录时，移除登记（Servers 为空）的请求返回的错误。
 	removeErr error
-	requests  chan *runtime.SetClientMCPServersRequest
+	requests  chan *runtime.SetClientExecutorRequest
 }
 
-// SetClientMCPServers 记录客户端 MCP 请求，按测试配置决定是否交给真实 Runtime。
-func (r *clientMCPRuntime) SetClientMCPServers(ctx context.Context, request *runtime.SetClientMCPServersRequest) error {
+// SetClientExecutor 记录客户端 MCP 请求，按测试配置决定是否交给真实 Runtime。
+func (r *clientMCPRuntime) SetClientExecutor(ctx context.Context, request *runtime.SetClientExecutorRequest) error {
 	// 1. 将请求写入记录通道。
 	r.requests <- request
 	// 2. 只记录模式下返回预设移除错误或成功，其余交给真实 Runtime。
@@ -2770,18 +2859,18 @@ func (r *clientMCPRuntime) SetClientMCPServers(ctx context.Context, request *run
 		}
 		return nil
 	}
-	return r.Runtime.SetClientMCPServers(ctx, request)
+	return r.Runtime.SetClientExecutor(ctx, request)
 }
 
 // receive 按到达顺序读取下一条客户端 MCP 登记请求。
-func (r *clientMCPRuntime) receive(t *testing.T) *runtime.SetClientMCPServersRequest {
+func (r *clientMCPRuntime) receive(t *testing.T) *runtime.SetClientExecutorRequest {
 	t.Helper()
 	// 1. 最多等待 5 秒，收到请求后返回，超时则结束测试。
 	select {
 	case request := <-r.requests:
 		return request
 	case <-time.After(5 * time.Second):
-		t.Fatal("SetClientMCPServers did not reach the Runtime")
+		t.Fatal("SetClientExecutor did not reach the Runtime")
 		return nil
 	}
 }
@@ -2813,7 +2902,7 @@ type listedMCPServers struct {
 }
 
 // waitClientMCPServer 等待客户端 MCP 连接条目满足指定条件。
-func (c *testClient) waitClientMCPServer(t *testing.T, conversationID defs.ConversationID, match func(conversation.MCPServerInfo) bool) conversation.MCPServerInfo {
+func (c *testClient) waitClientMCPServer(t *testing.T, conversationID defs.ConversationID, executorID string, match func(conversation.MCPServerInfo) bool) conversation.MCPServerInfo {
 	t.Helper()
 	// 1. 在 5 秒内轮询 mcpServer/list，筛选 client Executor 的匹配条目并返回，超时则结束测试。
 	deadline := time.Now().Add(5 * time.Second)
@@ -2821,7 +2910,7 @@ func (c *testClient) waitClientMCPServer(t *testing.T, conversationID defs.Conve
 		var servers listedMCPServers
 		c.callResult(t, "mcpServer/list", map[string]any{"conversation_id": conversationID}, &servers)
 		for _, server := range servers.Servers {
-			if server.ExecutorID == defs.ClientExecutorID && match(server) {
+			if server.ExecutorID == executorID && match(server) {
 				return server
 			}
 		}

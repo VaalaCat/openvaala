@@ -1786,7 +1786,7 @@ func TestContextExecutorsChangeMessage(t *testing.T) {
 	}
 	const notice = "<openvaala-system-info>\n<openvaala-executors-change-event>\n" +
 		"Executor 已变更：\n- 默认 Executor 从 local 改为 gpu，省略 executor 参数的工具调用在 gpu 的 /data 执行。\n" +
-		"当前可用的 Executor 和说明见系统提示 <openvaala-executors>；之前历史里的路径属于原来的位置。\n" +
+		"稳定环境见系统提示 <openvaala-executors>，全部在线环境与工具可用 list_executors 查询；之前历史里的路径属于原来的位置。\n" +
 		"</openvaala-executors-change-event>\n</openvaala-system-info>"
 	tests := []struct {
 		name    string

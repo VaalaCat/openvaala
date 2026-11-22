@@ -530,7 +530,15 @@ func (d *Desktop) executorsChangeView(c *ui.Context, view viewItem, key string) 
 		ui.Column(c.Key(label)).Gap(0).Children(func() {
 			t.TextRole(ui.Text(c, label), kit.TextCaption).TextColor(t.Colors.Muted)
 			for _, executor := range executors {
-				ui.Text(c, executor.ID+": "+executor.WorkspaceDirectory).SingleLine().Selectable()
+				detail := executor.WorkspaceDirectory
+				if detail == "" {
+					detail = executor.Description
+				}
+				text := executor.ID
+				if detail != "" {
+					text += ": " + detail
+				}
+				ui.Text(c, text).SingleLine().Selectable()
 			}
 		})
 	}

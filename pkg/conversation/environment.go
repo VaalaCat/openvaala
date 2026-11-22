@@ -121,12 +121,11 @@ func assembleExecutors(ctx context.Context, conversationID defs.ConversationID, 
 		config.environments = append(config.environments, memoryEnvironment)
 	}
 	// 4. 读取默认工作区的 Skill，合并共享 Skill 后保存。
-	var defaultExecutorID string
 	var defaultWorkspace workspace.Workspace
 	if len(config.environments) > 0 {
-		defaultExecutorID, defaultWorkspace = config.environments[0].GetID(), config.environments[0].GetWorkspace()
+		defaultWorkspace = config.environments[0].GetWorkspace()
 	}
-	skills, err := loadSkills(ctx, defaultExecutorID, defaultWorkspace, config.definitions.Skills)
+	skills, err := loadSkills(ctx, getDefaultExecutorID(config.environments), defaultWorkspace, config.definitions.Skills)
 	if err != nil {
 		return err
 	}

@@ -64,11 +64,10 @@ type Client interface {
 	// ListMCPServers 调 mcpServer/list，返回已打开的对话里各 Executor 上的 MCP 连接情况，读取不等待连接；
 	// 没有连接时返回空；对话在 serve 里没打开时返回错误。
 	ListMCPServers(ctx context.Context, conversationID defs.ConversationID) ([]conversation.MCPServerInfo, error)
-	// SetClientMCPServers 调 conversation/setClientMCPServers，换掉本连接为已打开的对话登记的全部客户端 MCP server；serverIDs 为空表示全部移除。
-	// server 在本机运行，serve 登记后经本连接请本机连接它们：Client 为每条转发流发出 ClientMCPConnectRequested、ClientMCPMessageReceived
-	// 与 ClientMCPDisconnectRequested，调用方用 SendClientMCPMessage、SendClientMCPClosed 回复。登记只属于当前这条连接：
-	// 连接断开后 serve 移除它，重连后需要重新登记。对话在 serve 里没打开时返回错误。
-	SetClientMCPServers(ctx context.Context, conversationID defs.ConversationID, serverIDs []string) error
+	// SetClientExecutor 为已打开的对话登记本机执行环境，MCPServerIDs 为空时注销。
+	// Client 为每条 MCP 转发流发出 ClientMCPConnectRequested、ClientMCPMessageReceived 与 ClientMCPDisconnectRequested，
+	// 调用方用 SendClientMCPMessage、SendClientMCPClosed 回复。连接断开后需用同一 ExecutorID 重新登记以恢复工具路由。
+	SetClientExecutor(ctx context.Context, request *SetClientExecutorRequest) error
 	// SendClientMCPMessage 发出 clientMCP/message 通知，把本机 MCP server 在 streamID 这条流上发来的一条完整 JSON-RPC 消息交给 serve；
 	// 写出后返回，不等待 serve 处理。当前没有已连接的连接时立即返回 ErrConnectionLost，不等重连：转发流属于发出它的那条连接，
 	// 连接断开后 serve 已结束它，重连后的新连接不认识旧的 streamID。
@@ -514,15 +513,17 @@ func (c *clientImpl) ListMCPServers(ctx context.Context, conversationID defs.Con
 	return result.Servers, err
 }
 
-// SetClientMCPServers 替换本连接为对话登记的客户端 MCP server。
-func (c *clientImpl) SetClientMCPServers(ctx context.Context, conversationID defs.ConversationID, serverIDs []string) error {
-	// 1. 将 nil 列表转换为空列表，提交本次完整登记。
+// SetClientExecutor 登记或注销本连接为对话提供的执行环境。
+func (c *clientImpl) SetClientExecutor(ctx context.Context, request *SetClientExecutorRequest) error {
+	serverIDs := request.MCPServerIDs
 	if serverIDs == nil {
 		serverIDs = []string{}
 	}
-	return c.call(ctx, "conversation/setClientMCPServers", &runtimeprotocol.SetClientMCPServersParams{
-		ConversationID: conversationID,
-		ServerIDs:      serverIDs,
+	return c.call(ctx, "conversation/setClientExecutor", &runtimeprotocol.SetClientExecutorParams{
+		ConversationID: request.ConversationID,
+		ExecutorID:     request.ExecutorID,
+		Description:    request.Description,
+		MCPServerIDs:   serverIDs,
 	}, nil)
 }
 

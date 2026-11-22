@@ -257,6 +257,14 @@ func TestFormatExecutorsChange(t *testing.T) {
 			}},
 			want: "Executor 已变更：移除 local",
 		},
+		{
+			name: "first_turn_dynamic_executors",
+			current: []defs.TurnExecutor{
+				{ID: "laptop", Description: "Laptop (ACP)", IsDynamic: true},
+				{ID: "tablet", IsDynamic: true},
+			},
+			want: "Executor 已变更：新增 laptop: Laptop (ACP) · 新增 tablet",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -266,6 +274,28 @@ func TestFormatExecutorsChange(t *testing.T) {
 			}
 			if got := formatExecutorsChange(change, tt.isLocalServer); got != tt.want {
 				t.Fatalf("formatExecutorsChange() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestFormatToolLabel 检查标题中的 Executor 显示和协作工具归属。
+func TestFormatToolLabel(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		tool   string
+		result *defs.ToolResult
+		want   string
+	}{
+		{name: "default_executor", tool: "read_file", want: "read_file@local"},
+		{name: "styled_multiline_executor", tool: "read_file", result: &defs.ToolResult{Executor: "\x1b[31mlaptop\x1b[0m\r\nsecond"}, want: "read_file@laptop"},
+		{name: "empty_after_sanitizing", tool: "read_file", result: &defs.ToolResult{Executor: "\x1b[31m\n\x1b[0m"}, want: "read_file"},
+		{name: "agent_tool", tool: "list_executors", want: "list_executors"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			call := &toolCall{call: defs.ToolCall{Name: tt.tool}, result: tt.result}
+			if got := formatToolLabel(call, "local"); got != tt.want {
+				t.Fatalf("formatToolLabel() = %q, want %q", got, tt.want)
 			}
 		})
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	goruntime "runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -84,9 +85,9 @@ type acpSession struct {
 	clientDirectory string
 	// httpHeaders 是 acp 进程已加载配置里的 http.headers（合并内置默认后）：连编辑器 MCP server 的 http、sse 请求先用它，编辑器配置的同名 header 覆盖它。
 	httpHeaders map[string]string
-	// clientMCPServers 是编辑器带来的 MCP server，id 已转换成合法的 server id；转发流按 serve 请求的 server id 在这里找配置，
+	// editorMCPServers 是编辑器带来的 MCP server，id 已转换成合法的 server id；转发流按 serve 请求的 server id 在这里找配置，
 	// 已经打开的会话再 session/load 时整体替换。只由会话的事件循环读写。
-	clientMCPServers []acpClientMCPServer
+	editorMCPServers []acpClientMCPServer
 	// relayStreams 是 serve 请求、还没结束的转发流（按 stream_id）：事件循环登记，流自己的 goroutine 结束时删除。
 	relayStreams syncmap.SyncMap[string, *acpRelayStream]
 	// tasks 是 Client 的 Run、正在执行的 Client 调用和各条转发流的 goroutine；Run 返回前等待。
@@ -139,8 +140,8 @@ func (s *acpSession) Run(ctx context.Context) (err error) {
 		return err
 	}
 	s.record = record
-	if len(s.clientMCPServers) > 0 {
-		s.registerClientMCPServers(ctx)
+	if len(s.editorMCPServers) > 0 {
+		s.registerClientExecutor(ctx)
 	}
 	s.refreshSessionDetails(ctx)
 	catalog, err := callClient(ctx, s, func(ctx context.Context) (runtime.ModelList, error) {
@@ -305,9 +306,9 @@ func (s *acpSession) handleRequest(ctx context.Context, request acpMessage) {
 			break
 		}
 		// 5. 重复加载：编辑器的 MCP 列表新旧有一边非空时整体替换并重新登记，再发送标题，回复当前设置；聊天记录不重放。
-		if len(params.McpServers) > 0 || len(s.clientMCPServers) > 0 {
-			s.clientDirectory, s.clientMCPServers = params.Cwd, getACPClientMCPServers(ctx, params.McpServers)
-			s.registerClientMCPServers(ctx)
+		if len(params.McpServers) > 0 || len(s.editorMCPServers) > 0 {
+			s.clientDirectory, s.editorMCPServers = params.Cwd, getACPEditorMCPServers(ctx, params.McpServers)
+			s.registerClientExecutor(ctx)
 		}
 		if s.record.Title != "" {
 			s.updateSessionTitle(s.record.Title)
@@ -432,19 +433,36 @@ func (s *acpSession) handleClientEvent(ctx context.Context, event runtimeclient.
 	return nil
 }
 
-// registerClientMCPServers 把编辑器的 MCP server 列表登记给 serve。
-func (s *acpSession) registerClientMCPServers(ctx context.Context) {
-	// 1. 提交全部 server id，替换本会话之前的登记；失败时记录警告，会话照常运行。
-	serverIDs := make([]string, 0, len(s.clientMCPServers))
-	for _, server := range s.clientMCPServers {
-		serverIDs = append(serverIDs, server.ID)
+// registerClientExecutor 将编辑器的 MCP server 登记为本机执行环境。
+func (s *acpSession) registerClientExecutor(ctx context.Context) {
+	request := &runtimeclient.SetClientExecutorRequest{
+		ConversationID: s.record.ID,
+		MCPServerIDs:   make([]string, 0, len(s.editorMCPServers)),
+	}
+	for _, server := range s.editorMCPServers {
+		request.MCPServerIDs = append(request.MCPServerIDs, server.ID)
+	}
+	if len(request.MCPServerIDs) > 0 {
+		request.ExecutorID, request.Description = getACPClientExecutorIdentity(os.Hostname())
 	}
 	_, err := callClient(ctx, s, func(ctx context.Context) (struct{}, error) {
-		return struct{}{}, s.client.SetClientMCPServers(ctx, s.record.ID, serverIDs)
+		return struct{}{}, s.client.SetClientExecutor(ctx, request)
 	})
 	if err != nil {
-		telemetry.GetLogger(ctx).Warn("ACP client MCP servers not registered", "error", err)
+		telemetry.GetLogger(ctx).Warn("ACP client executor registration failed", "error", err)
 	}
+}
+
+// getACPClientExecutorIdentity 用主机名生成执行环境身份，主机名不可用时由 serve 使用连接 ID。
+func getACPClientExecutorIdentity(hostname string, err error) (executorID, description string) {
+	if err != nil {
+		return "", ""
+	}
+	hostname = strings.Join(strings.Fields(hostname), "-")
+	if hostname == "" {
+		return "", ""
+	}
+	return hostname + "-acp", fmt.Sprintf("%s (%s/%s · acp)", hostname, goruntime.GOOS, goruntime.GOARCH)
 }
 
 // handleClientMCPConnectRequested serve 请求连接编辑器的 MCP server 时，登记并启动一条转发流。
@@ -465,11 +483,11 @@ func (s *acpSession) handleClientMCPConnectRequested(ctx context.Context, event 
 // getClientMCPTransport 按 server id 找到编辑器的 MCP server 配置，创建连接它的传输。
 func (s *acpSession) getClientMCPTransport(serverID string) (mcp.Transport, error) {
 	// 1. 找不到时返回错误；找到时在编辑器目录下、用当前进程环境创建传输。
-	index := slices.IndexFunc(s.clientMCPServers, func(server acpClientMCPServer) bool { return server.ID == serverID })
+	index := slices.IndexFunc(s.editorMCPServers, func(server acpClientMCPServer) bool { return server.ID == serverID })
 	if index < 0 {
 		return nil, fmt.Errorf("the editor has no MCP server %q", serverID)
 	}
-	return getACPClientMCPTransport(s.clientMCPServers[index].Server, s.clientDirectory, os.Environ(), s.httpHeaders), nil
+	return getACPClientMCPTransport(s.editorMCPServers[index].Server, s.clientDirectory, os.Environ(), s.httpHeaders), nil
 }
 
 // runRelayStream 在 serve 和本机 MCP server 之间转发一条流，结束后告知 serve。
@@ -608,8 +626,8 @@ func (s *acpSession) openDroppedConversation(ctx context.Context) error {
 	}
 	// 2. 清除放弃标记；重新打开的对话没有之前的 MCP 登记，编辑器有 MCP server 时重新登记。
 	s.isConversationDropped = false
-	if len(s.clientMCPServers) > 0 {
-		s.registerClientMCPServers(ctx)
+	if len(s.editorMCPServers) > 0 {
+		s.registerClientExecutor(ctx)
 	}
 	return nil
 }

@@ -37,9 +37,6 @@ const LocalExecutorID = "local"
 // MemoryExecutorID 是内置的记忆 Executor 的 ID；配置文件里不能用这个 ID。
 const MemoryExecutorID = "memory"
 
-// ClientExecutorID 是对话里客户端登记的 MCP server 所属的虚拟 Executor 的 ID；配置文件里不能用这个 ID。
-const ClientExecutorID = "client"
-
 // ToolError 是工具执行失败时的错误码和消息。
 type ToolError struct {
 	Code    string `json:"code"`

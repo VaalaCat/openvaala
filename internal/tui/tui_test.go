@@ -2950,8 +2950,8 @@ func (c *fakeClient) ListMCPServers(_ context.Context, conversationID defs.Conve
 	return slices.Clone(c.mcpServers), nil
 }
 
-// SetClientMCPServers 接收客户端 MCP 设置并返回成功。
-func (c *fakeClient) SetClientMCPServers(context.Context, defs.ConversationID, []string) error {
+// SetClientExecutor 接收客户端执行环境登记并返回成功。
+func (c *fakeClient) SetClientExecutor(context.Context, *runtimeclient.SetClientExecutorRequest) error {
 	// 1. 直接返回 nil。
 	return nil
 }

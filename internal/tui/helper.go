@@ -385,7 +385,11 @@ func formatExecutorsChange(change *defs.ExecutorsChange, isLocalServer bool) str
 		parts = append(parts, "移除 "+removed.ID)
 	}
 	for _, added := range details.Added {
-		parts = append(parts, "新增 "+added.ID)
+		label := added.ID
+		if added.WorkspaceDirectory == "" && added.Description != "" {
+			label += ": " + added.Description
+		}
+		parts = append(parts, "新增 "+label)
 	}
 	for _, changed := range details.DirectoryChanges {
 		parts = append(parts, changed.ID+" 目录 "+getDisplayWorkspaceDirectory(changed.ID, changed.Directory, isLocalServer))
@@ -747,7 +751,7 @@ func getStringArgument(arguments, name string) string {
 func getToolExecutor(call *toolCall, defaultExecutorID string) string {
 	// 1. Agent 协作工具返回空；已有结果时直接取结果中的 Executor，尚无结果时取参数或默认 Executor。
 	switch call.call.Name {
-	case "spawn_agent", "send_message", "interrupt_agent", "list_agents", "read_session_history", "wait_agent":
+	case "spawn_agent", "send_message", "interrupt_agent", "list_agents", "list_executors", "read_session_history", "wait_agent":
 		return ""
 	}
 	if call.result != nil {
@@ -763,7 +767,7 @@ func formatToolLabel(call *toolCall, defaultExecutorID string) string {
 	if serverID, toolName, ok := mcpclient.GetToolNameParts(name); ok {
 		name = serverID + " · " + toolName
 	}
-	if executorID := getToolExecutor(call, defaultExecutorID); executorID != "" {
+	if executorID := getFirstLine(sanitizeToolText(getToolExecutor(call, defaultExecutorID))); executorID != "" {
 		return name + "@" + executorID
 	}
 	return name

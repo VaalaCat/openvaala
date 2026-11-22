@@ -5,11 +5,29 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/egoist/mygo/ui"
 )
+
+// TestGetToolIcon 检查协作工具与普通工具使用各自的图标。
+func TestGetToolIcon(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		want *ui.SVG
+	}{
+		{name: "list_executors", want: kit.IconBot},
+		{name: "custom_tool", want: kit.IconWrench},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getToolIcon(tt.name); got != tt.want {
+				t.Errorf("getToolIcon(%q) = %p, want %p", tt.name, got, tt.want)
+			}
+		})
+	}
+}
 
 // TestToolOutputContent 检查真实字符串进度及各种合法 JSON 根值不丢失。
 func TestToolOutputContent(t *testing.T) {

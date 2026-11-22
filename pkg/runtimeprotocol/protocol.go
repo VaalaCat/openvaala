@@ -76,7 +76,7 @@ var Methods = []Method{
 	NewMethod[ListSkillsParams, []skill.SkillInfo]("skill/list"),
 	NewMethod[EmptyParams, *ListHooksResult]("hook/list"),
 	NewMethod[ConversationParams, *ListMCPServersResult]("mcpServer/list"),
-	NewMethod[SetClientMCPServersParams, *EmptyResult]("conversation/setClientMCPServers"),
+	NewMethod[SetClientExecutorParams, *EmptyResult]("conversation/setClientExecutor"),
 	NewMethod[ConversationParams, *SubscribeConversationResult]("conversation/subscribe"),
 	NewMethod[ConversationParams, *EmptyResult]("conversation/unsubscribe"),
 	NewMethod[EmptyParams, *runtime.RunningConversations]("conversation/running/subscribe"),

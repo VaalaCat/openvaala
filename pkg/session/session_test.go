@@ -1412,6 +1412,82 @@ func TestSessionLastTurnExecutors(t *testing.T) {
 	}
 }
 
+type sessionOpeningEnvironments struct {
+	executor.ExecutionEnvironmentsManager
+	reads atomic.Int32
+}
+
+func (m *sessionOpeningEnvironments) GetEnvironments() ([]executor.ExecutionEnvironment, string) {
+	if m.reads.Add(1) == 1 {
+		return m.ExecutionEnvironmentsManager.GetEnvironments()
+	}
+	return nil, ""
+}
+
+func TestSessionTurnOpeningEnvironments(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		compactOnly bool
+	}{
+		{name: "ordinary_turn"},
+		{name: "manual_compaction", compactOnly: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newSessionHarness(t)
+			h.environments = newLocalSessionEnvironments(t)
+			editor, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt("editor", "编辑器", nil).WithoutCommands().AsDynamic())
+			if err != nil {
+				t.Fatal(err)
+			}
+			manager := &sessionOpeningEnvironments{ExecutionEnvironmentsManager: executor.NewExecutionEnvironmentsManager()}
+			if _, err := manager.SetStatic("local", h.environments); err != nil {
+				t.Fatal(err)
+			}
+			if err := manager.SetDynamic(editor, "connection"); err != nil {
+				t.Fatal(err)
+			}
+			h.environmentsManager = manager
+			h.session = h.newSession(t, nil)
+			if got := manager.reads.Load(); got != 0 {
+				t.Fatalf("environment reads during NewSession = %d, want 0", got)
+			}
+			h.run(t, true)
+
+			var inputIDs []defs.ItemID
+			if tt.compactOnly {
+				if _, err := h.session.CompactContext(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				input := h.submit(t, session.SessionInputModeNormal, "第一轮")
+				inputIDs = []defs.ItemID{input.ID}
+				h.model.replies <- modelReply{text: "完成"}
+			}
+			finished := h.nextTurnFinished(t)
+			requireFinished(t, finished, inputIDs, defs.TurnStatusCompleted)
+			record, found, err := h.query.GetTurn(t.Context(), h.record.ID, finished.TurnID)
+			want := []defs.TurnExecutor{
+				{ID: "local", WorkspaceDirectory: h.environments[0].GetWorkspace().GetRootDirectory()},
+				{ID: "editor", Description: "编辑器", IsDynamic: true},
+			}
+			if err != nil || !found || !slices.Equal(record.Executors, want) {
+				t.Fatalf("Turn record = %+v, found = %v, error = %v, want executors %+v", record, found, err, want)
+			}
+			if got := manager.reads.Load(); got != 1 {
+				t.Fatalf("environment reads for Turn = %d, want 1", got)
+			}
+			if !tt.compactOnly {
+				body := h.nextModelBody(t)
+				tools, _ := json.Marshal(body["tools"])
+				messages, _ := json.Marshal(body["messages"])
+				if !strings.Contains(string(tools), `"name":"bash"`) || !strings.Contains(string(messages), "新增可用的 editor（编辑器）") {
+					t.Fatalf("opening request lacks the local command tool or dynamic executor notice: %v", body)
+				}
+			}
+		})
+	}
+}
+
 // TestSessionCommands 检查后台命令跨 Turn 保留、中断 Turn 不停命令、父子 Session 互相看不到命令、Session 停止时结束命令进程。
 func TestSessionCommands(t *testing.T) {
 	// 1. 准备跨轮命令、中断 Turn、父子隔离和 Session 停止场景。
@@ -1562,6 +1638,7 @@ func TestNewSessionValidation(t *testing.T) {
 	}
 	withModels := func(opt *session.SessionOpt) *session.SessionOpt {
 		opt.Models = models
+		opt.EnvironmentsManager = executor.NewExecutionEnvironmentsManager()
 		return opt
 	}
 	tests := []struct {
@@ -1588,6 +1665,10 @@ func TestNewSessionValidation(t *testing.T) {
 		{
 			name: "nil_agent",
 			opt:  withModels(session.NewSessionOpt(record, query, mutation, client, nil)),
+		},
+		{
+			name: "nil_environments_manager",
+			opt:  session.NewSessionOpt(record, query, mutation, client, definition),
 		},
 	}
 	// 2. 检查每种缺失都返回创建错误。
@@ -1639,6 +1720,7 @@ func TestSessionCompactionWithResponses(t *testing.T) {
 				Model:        sessionModel.Ref,
 			})
 			opt.Models = map[defs.ModelRef]*defs.ModelDefinition{sessionModel.Ref: sessionModel}
+			opt.EnvironmentsManager = executor.NewExecutionEnvironmentsManager()
 			instance, err := session.NewSession(opt)
 			if err != nil {
 				t.Fatal(err)
@@ -1930,8 +2012,9 @@ type sessionHarness struct {
 	// skills 是下一次创建的 Session 可用的 Skill。
 	skills []*skill.Skill
 	// environments 是下一次创建的 Session 可用的执行环境。
-	environments []executor.ExecutionEnvironment
-	model        *controlledModel
+	environments        []executor.ExecutionEnvironment
+	environmentsManager executor.ExecutionEnvironmentsManager
+	model               *controlledModel
 	// models 是下一次创建的 Session 用的模型目录。
 	models   map[defs.ModelRef]*defs.ModelDefinition
 	query    dao.Query
@@ -2014,6 +2097,15 @@ func (h *sessionHarness) newSession(t *testing.T, mutation dao.Mutation) session
 	opt.Models = h.models
 	opt.Skills = h.skills
 	opt.Environments = h.environments
+	opt.EnvironmentsManager = h.environmentsManager
+	if opt.EnvironmentsManager == nil {
+		opt.EnvironmentsManager = executor.NewExecutionEnvironmentsManager()
+		if len(h.environments) > 0 {
+			if _, err := opt.EnvironmentsManager.SetStatic(h.environments[0].GetID(), h.environments); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	opt.Hooks = h.hooks
 	opt.HookStartSource = h.hookStartSource
 	instance, err := session.NewSession(opt)

@@ -766,6 +766,10 @@ func TestItemValidateExecutorsChange(t *testing.T) {
 		ID:                 "local",
 		WorkspaceDirectory: "/a",
 	}}
+	client := defs.TurnExecutor{
+		ID:        "laptop",
+		IsDynamic: true,
+	}
 	tests := []struct {
 		name    string
 		item    *defs.Item
@@ -849,12 +853,40 @@ func TestItemValidateExecutorsChange(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "empty_previous",
+			name: "initial_dynamic_executors",
 			item: &defs.Item{
 				ID:              "c",
 				TurnID:          "T",
 				Kind:            defs.ItemExecutorsChange,
-				ExecutorsChange: &defs.ExecutorsChange{Executors: current},
+				ExecutorsChange: &defs.ExecutorsChange{Executors: []defs.TurnExecutor{client}},
+			},
+		},
+		{
+			name: "initial_mixed_executors",
+			item: &defs.Item{
+				ID:              "c",
+				TurnID:          "T",
+				Kind:            defs.ItemExecutorsChange,
+				ExecutorsChange: &defs.ExecutorsChange{Executors: []defs.TurnExecutor{client, previous[0]}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "both_lists_empty",
+			item: &defs.Item{
+				ID:              "c",
+				TurnID:          "T",
+				Kind:            defs.ItemExecutorsChange,
+				ExecutorsChange: &defs.ExecutorsChange{},
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing_item_id",
+			item: &defs.Item{
+				TurnID:          "T",
+				Kind:            defs.ItemExecutorsChange,
+				ExecutorsChange: &defs.ExecutorsChange{Executors: []defs.TurnExecutor{client}},
 			},
 			wantErr: true,
 		},
@@ -899,29 +931,57 @@ func TestItemValidateExecutorsChange(t *testing.T) {
 
 // TestItemExecutorsChangeClone 检查 Executor 切换的复制。
 func TestItemExecutorsChangeClone(t *testing.T) {
-	// 1. 复制切换记录，修改副本后检查原列表。
-	item := &defs.Item{
-		ID:     "c",
-		TurnID: "T",
-		Kind:   defs.ItemExecutorsChange,
-		ExecutorsChange: &defs.ExecutorsChange{
-			PreviousExecutors: []defs.TurnExecutor{{
+	// 1. 准备稳定和动态 Executor，检查副本保留属性且列表独立。
+	for _, tt := range []struct {
+		name     string
+		previous defs.TurnExecutor
+		executor defs.TurnExecutor
+	}{
+		{
+			name: "stable_executors",
+			previous: defs.TurnExecutor{
 				ID:                 "local",
 				WorkspaceDirectory: "/a",
-			}},
-			Executors: []defs.TurnExecutor{{
+			},
+			executor: defs.TurnExecutor{
 				ID:                 "gpu",
 				WorkspaceDirectory: "/data",
-			}},
+			},
 		},
-	}
-	cloned := item.Clone()
-	if !reflect.DeepEqual(cloned, item) || cloned.ExecutorsChange == item.ExecutorsChange {
-		t.Fatalf("Clone() = %+v, want an independent copy", cloned)
-	}
-	cloned.ExecutorsChange.Executors[0].ID = "other"
-	if item.ExecutorsChange.Executors[0].ID != "gpu" {
-		t.Fatalf("Clone() shares the executors slice with the original")
+		{
+			name: "dynamic_executors",
+			previous: defs.TurnExecutor{
+				ID:          "laptop",
+				Description: "已断开设备",
+				IsDynamic:   true,
+			},
+			executor: defs.TurnExecutor{
+				ID:          "desktop",
+				Description: "新接入设备",
+				IsDynamic:   true,
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &defs.Item{
+				ID:     "c",
+				TurnID: "T",
+				Kind:   defs.ItemExecutorsChange,
+				ExecutorsChange: &defs.ExecutorsChange{
+					PreviousExecutors: []defs.TurnExecutor{tt.previous},
+					Executors:         []defs.TurnExecutor{tt.executor},
+				},
+			}
+			cloned := item.Clone()
+			if !reflect.DeepEqual(cloned, item) || cloned.ExecutorsChange == item.ExecutorsChange {
+				t.Fatalf("Clone() = %+v, want an independent copy", cloned)
+			}
+			cloned.ExecutorsChange.PreviousExecutors[0] = defs.TurnExecutor{}
+			cloned.ExecutorsChange.Executors[0] = defs.TurnExecutor{}
+			if item.ExecutorsChange.PreviousExecutors[0] != tt.previous || item.ExecutorsChange.Executors[0] != tt.executor {
+				t.Fatal("Clone() shares executor slices with the original")
+			}
+		})
 	}
 }
 
@@ -944,11 +1004,21 @@ func TestExecutorsChangeGetDetails(t *testing.T) {
 		ID:                 "gpu",
 		WorkspaceDirectory: "/data/proj",
 	}
+	laptop := defs.TurnExecutor{
+		ID:          "laptop",
+		Description: "笔记本",
+		IsDynamic:   true,
+	}
+	desktop := defs.TurnExecutor{
+		ID:        "desktop",
+		IsDynamic: true,
+	}
 	tests := []struct {
-		name     string
-		previous []defs.TurnExecutor
-		current  []defs.TurnExecutor
-		want     defs.ExecutorsChangeDetails
+		name      string
+		previous  []defs.TurnExecutor
+		current   []defs.TurnExecutor
+		want      defs.ExecutorsChangeDetails
+		wantEmpty bool
 	}{
 		{
 			name:     "new_default_is_not_added",
@@ -1002,6 +1072,22 @@ func TestExecutorsChangeGetDetails(t *testing.T) {
 				PreviousDefaultID: "local",
 			},
 		},
+		{
+			name:      "dynamic_reorder_has_no_default_change",
+			previous:  []defs.TurnExecutor{laptop, desktop},
+			current:   []defs.TurnExecutor{desktop, laptop},
+			wantEmpty: true,
+		},
+		{
+			name:     "description_only_has_no_details",
+			previous: []defs.TurnExecutor{laptop},
+			current: []defs.TurnExecutor{{
+				ID:          laptop.ID,
+				Description: "工作笔记本",
+				IsDynamic:   true,
+			}},
+			wantEmpty: true,
+		},
 	}
 	// 2. 检查各类变化及新默认不重复列出。
 	for _, tt := range tests {
@@ -1010,8 +1096,12 @@ func TestExecutorsChangeGetDetails(t *testing.T) {
 				PreviousExecutors: tt.previous,
 				Executors:         tt.current,
 			}
-			if got := change.GetDetails(); !reflect.DeepEqual(got, tt.want) {
+			got := change.GetDetails()
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("GetDetails() = %+v, want %+v", got, tt.want)
+			}
+			if got.IsEmpty() != tt.wantEmpty {
+				t.Fatalf("GetDetails().IsEmpty() = %v, want %v", got.IsEmpty(), tt.wantEmpty)
 			}
 		})
 	}

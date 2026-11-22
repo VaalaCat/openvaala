@@ -437,7 +437,7 @@ func getItemPreview(item *defs.Item, statuses *sessionStatuses, isLocalServer bo
 	case defs.ItemModelChange:
 		return "切换到 " + item.ModelChange.Model.String()
 	case defs.ItemExecutorsChange:
-		return formatExecutorsChange(item.ExecutorsChange, isLocalServer)
+		return firstLine(formatExecutorsChange(item.ExecutorsChange, isLocalServer))
 	case defs.ItemTurnInterrupted:
 		return "已中断"
 	}

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -15,7 +16,7 @@ import (
 )
 
 // ExecutionEnvironment 是对话里供模型选择的一个执行环境，包含工作区、各 Session 共用的无状态工具和它自己的 MCP 连接；
-// 由 Conversation 创建、运行和停止，Session 只借用。系统提示里列出它的 ID 和说明。
+// 由 Conversation 创建、运行和停止，Session 只借用。稳定环境的 ID 和说明列入系统提示。
 type ExecutionEnvironment interface {
 	// GetID 返回模型选择执行环境时使用的 ID。
 	GetID() string
@@ -32,6 +33,8 @@ type ExecutionEnvironment interface {
 	GetMCPServers() []mcpclient.ConnectionInfo
 	// IsCommandSupported 这个环境能不能跑命令？不能时 Session 不给它建命令工具，工具调用也不跑 hook。
 	IsCommandSupported() bool
+	// IsDynamic 这个环境是不是运行期热插拔的？
+	IsDynamic() bool
 	// Run 运行各 MCP 连接直到 ctx 结束，全部断开后返回 ctx.Err()；某个连接运行出错时返回它的错误，没有 MCP 连接时直接返回 nil。只能调用一次。
 	Run(ctx context.Context) error
 }
@@ -52,8 +55,12 @@ type ExecutionEnvironmentOpt struct {
 	// MCPServers 由 Conversation 填入本对话 Agent 会用到的 server；只取 ExecutorIDs 里含本环境 ID 的，
 	// NewExecutionEnvironment 按本环境的工作区为它们创建连接，Run 之后才开始连。
 	MCPServers []*mcpclient.ServerDefinition
+	// MCPConnections 是调用方提供的连接，由环境的 Run 启动和停止。
+	MCPConnections []mcpclient.Connection
 	// IsCommandSupported 这个环境能不能跑命令？默认能；memory 这类只能读写文件的环境不能。
 	IsCommandSupported bool
+	// IsDynamic 这个环境是不是运行期热插拔的？默认不是。
+	IsDynamic bool
 }
 
 // NewExecutionEnvironmentOpt 保存执行环境标识、说明、工作区和工具。
@@ -75,6 +82,18 @@ func (o *ExecutionEnvironmentOpt) WithMCPServers(servers []*mcpclient.ServerDefi
 	return o
 }
 
+// WithMCPConnections 设置调用方提供的 MCP 连接并返回本配置。
+func (o *ExecutionEnvironmentOpt) WithMCPConnections(connections ...mcpclient.Connection) *ExecutionEnvironmentOpt {
+	o.MCPConnections = slices.Clone(connections)
+	return o
+}
+
+// AsDynamic 标记这个环境可运行期热插拔并返回本配置。
+func (o *ExecutionEnvironmentOpt) AsDynamic() *ExecutionEnvironmentOpt {
+	o.IsDynamic = true
+	return o
+}
+
 // WithoutCommands 标记这个环境不能跑命令并返回本配置；memory 环境使用。
 func (o *ExecutionEnvironmentOpt) WithoutCommands() *ExecutionEnvironmentOpt {
 	// 1. 关闭命令支持。
@@ -91,17 +110,40 @@ func NewExecutionEnvironment(opt *ExecutionEnvironmentOpt) (ExecutionEnvironment
 	if err := validateToolDefinitions(opt.Tools); err != nil {
 		return nil, err
 	}
-	// 2. 为分配给本环境的 server 创建连接，再保存环境配置。
-	var connections []mcpclient.Connection
-	for _, definition := range getAssignedMCPServers(opt.ID, opt.MCPServers) {
+	// 2. 为分配给本环境的 server 创建连接，再和调用方提供的连接合并。
+	connections := slices.Clone(opt.MCPConnections)
+	for _, definition := range opt.MCPServers {
+		if definition == nil {
+			return nil, errors.New("MCP server definition is missing")
+		}
+		if !slices.Contains(definition.ExecutorIDs, opt.ID) {
+			continue
+		}
 		connection, err := mcpclient.NewConnection(mcpclient.NewConnectionOpt(definition, opt.Workspace))
 		if err != nil {
 			return nil, err
 		}
 		connections = append(connections, connection)
 	}
-	savedOpt := NewExecutionEnvironmentOpt(opt.ID, opt.Description, opt.Workspace, opt.Tools...).WithMCPServers(opt.MCPServers)
+
+	// 3. 校验连接和 server ID，按 server ID 排序后保存。
+	serverIDs := make(map[string]struct{}, len(connections))
+	for _, connection := range connections {
+		if connection == nil {
+			return nil, errors.New("MCP connection is missing")
+		}
+		serverID := connection.GetInfo().ServerID
+		if _, exists := serverIDs[serverID]; exists {
+			return nil, fmt.Errorf("executor %q has more than one MCP connection for server %q", opt.ID, serverID)
+		}
+		serverIDs[serverID] = struct{}{}
+	}
+	slices.SortFunc(connections, func(a, b mcpclient.Connection) int {
+		return cmp.Compare(a.GetInfo().ServerID, b.GetInfo().ServerID)
+	})
+	savedOpt := NewExecutionEnvironmentOpt(opt.ID, opt.Description, opt.Workspace, opt.Tools...)
 	savedOpt.IsCommandSupported = opt.IsCommandSupported
+	savedOpt.IsDynamic = opt.IsDynamic
 	return &executionEnvironmentImpl{
 		opt:            savedOpt,
 		mcpConnections: connections,
@@ -168,7 +210,7 @@ func (e *executionEnvironmentImpl) GetMCPTools(ctx context.Context, serverIDs de
 			selected = append(selected, connection)
 		}
 	}
-	return getMCPTools(telemetry.ContextWithAttrs(ctx, telemetry.ExecutorID(e.opt.ID)), selected)
+	return e.getMCPTools(telemetry.ContextWithAttrs(ctx, telemetry.ExecutorID(e.opt.ID)), selected)
 }
 
 // GetMCPServers 返回全部 MCP 连接的状态。
@@ -177,14 +219,29 @@ func (e *executionEnvironmentImpl) GetMCPServers() []mcpclient.ConnectionInfo {
 	return getConnectionInfos(e.mcpConnections)
 }
 
-// IsCommandSupported 返回环境能不能跑命令。
+// IsCommandSupported 这个环境能不能跑命令？
 func (e *executionEnvironmentImpl) IsCommandSupported() bool {
 	// 1. 读取配置中的命令支持。
 	return e.opt.IsCommandSupported
 }
 
+// IsDynamic 这个环境是不是运行期热插拔的？
+func (e *executionEnvironmentImpl) IsDynamic() bool {
+	return e.opt.IsDynamic
+}
+
+// getMCPConnection 按 server ID 查询本环境的连接。
+func (e *executionEnvironmentImpl) getMCPConnection(serverID string) (mcpclient.Connection, bool) {
+	for _, connection := range e.mcpConnections {
+		if connection.GetInfo().ServerID == serverID {
+			return connection, true
+		}
+	}
+	return nil, false
+}
+
 // getMCPTools 并发读取各连接提供的 MCP 工具。
-func getMCPTools(ctx context.Context, connections []mcpclient.Connection) ([]Tool, error) {
+func (e *executionEnvironmentImpl) getMCPTools(ctx context.Context, connections []mcpclient.Connection) ([]Tool, error) {
 	// 1. 并发读取各连接的工具列表，等待本次读取结束。
 	type connectionTools struct {
 		definitions []*defs.ToolDefinition
@@ -201,17 +258,20 @@ func getMCPTools(ctx context.Context, connections []mcpclient.Connection) ([]Too
 	var tools []Tool
 	for index, reading := range readings {
 		connection := connections[index]
+		serverID := connection.GetInfo().ServerID
 		if reading.err == nil {
 			for _, definition := range reading.definitions {
 				tools = append(tools, &mcpTool{
 					definition: definition,
 					connection: connection,
+					executorID: e.opt.ID,
+					serverID:   serverID,
+					isDynamic:  e.IsDynamic(),
 				})
 			}
 			continue
 		}
-		serverID := connection.GetInfo().ServerID
-		if connection.IsRequired() {
+		if !e.IsDynamic() && connection.IsRequired() {
 			return nil, fmt.Errorf("mcp server %q is unavailable: %w", serverID, reading.err)
 		}
 		telemetry.GetLogger(ctx).Warn("mcp server skipped", "mcp_server_id", serverID, "error", reading.err)

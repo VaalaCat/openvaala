@@ -421,3 +421,89 @@ func TestBaseToolModelRequest(t *testing.T) {
 			})
 	}
 }
+
+type executorArgumentTool struct {
+	*executor.BaseTool[executorBusinessArguments]
+}
+
+type executorBusinessArguments struct {
+	Executor int `json:"executor"`
+}
+
+func (t *executorArgumentTool) Execute(_ context.Context, call *defs.Item, _ chan<- *executor.ExecutionProgressEvent) *executor.ToolExecutionResult {
+	result := &defs.ToolResult{
+		CallID:  call.ToolCall.CallID,
+		Content: json.RawMessage("null"),
+	}
+	arguments, err := t.ParseArguments(call.ToolCall.Arguments)
+	if err != nil {
+		result.Error = &defs.ToolError{
+			Code:    "invalid_arguments",
+			Message: err.Error(),
+		}
+		return &executor.ToolExecutionResult{Result: result}
+	}
+	result.Content, _ = json.Marshal(arguments.Executor)
+	return &executor.ToolExecutionResult{
+		Result:             result,
+		ShouldRefreshTools: arguments.Executor > 0,
+	}
+}
+
+// TestBaseToolSingleProviderExecutorArgument 验证业务 executor 参数和刷新标记透传。
+func TestBaseToolSingleProviderExecutorArgument(t *testing.T) {
+	base, err := executor.NewBaseTool[executorBusinessArguments](&executor.BaseToolOpt{Name: "business_executor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt("local", "", nil, &executorArgumentTool{BaseTool: base}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newStaticEnvironmentsManager(t, environment)
+	instance, err := executor.NewToolExecutor(executor.NewToolExecutorOpt(manager))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions, err := instance.GetTools(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(definitions) != 1 || string(definitions[0].InputSchema) != string(base.GetDefinition().InputSchema) {
+		t.Fatalf("GetTools() = %v, want original tool definition", getToolNames(definitions))
+	}
+	for _, tt := range []struct {
+		name        string
+		arguments   string
+		wantContent string
+		wantRefresh bool
+	}{
+		{
+			name:        "business executor is forwarded",
+			arguments:   `{ "executor": 42 }`,
+			wantContent: "42",
+			wantRefresh: true,
+		},
+		{
+			name:        "refresh flag may be false",
+			arguments:   `{"executor":0}`,
+			wantContent: "0",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			events := collectToolEvents(t, instance, executorCallItems([]*defs.ToolCall{{
+				CallID:    "business",
+				Name:      "business_executor",
+				Arguments: tt.arguments,
+			}}))
+			if len(events) != 1 {
+				t.Fatalf("events = %v, want one finished event", events)
+			}
+			finished, ok := events[0].(*executor.ExecutionFinishedEvent)
+			if !ok || finished.Result.Error != nil || finished.Result.Executor != "local" ||
+				string(finished.Result.Content) != tt.wantContent || finished.ShouldRefreshTools != tt.wantRefresh {
+				t.Fatalf("finished = %+v, want success with content %s and refresh %t", finished, tt.wantContent, tt.wantRefresh)
+			}
+		})
+	}
+}

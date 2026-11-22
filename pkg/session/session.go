@@ -67,7 +67,7 @@ type sessionImpl struct {
 	toolExecutor executor.ToolExecutor
 	// terminalManager 管理本 Session 的后台命令，命令工具在其中启动、查找；Run 在事件循环返回后停止并等待全部命令。
 	terminalManager terminal.TerminalManager
-	// turnOpt 是 Run 开始时组装一次的 Turn 配置，带上工具表、执行环境、模型客户端，Inbox 是本 Session。
+	// turnOpt 是 Run 开始时组装一次的 Turn 配置，带上工具表和模型客户端，Inbox 是本 Session。
 	turnOpt turn.TurnOpt
 
 	// requests 收 HandleInput、TakeSteer、WaitSteer、GetStatus、InterruptTurn、CompactContext、SelectModel、AppendContextItems 交来的请求。
@@ -132,12 +132,12 @@ type SessionOpt struct {
 	Agent *agent.AgentDefinition
 	// Models 是只读的模型目录，由 Conversation 建立索引后共享给全部 Session。
 	Models map[defs.ModelRef]*defs.ModelDefinition
-	// Environments 是本对话的执行环境实例，第一个为默认；由 Conversation 持有，Session 只借用。
+	// Environments 是本对话的稳定执行环境，供 Session 创建命令工具。
 	Environments []executor.ExecutionEnvironment
+	// EnvironmentsManager 提供每轮开场的在线环境和默认环境，由 Conversation 持有。
+	EnvironmentsManager executor.ExecutionEnvironmentsManager
 	// AgentTools 是 Conversation 为本 Session 建的协作工具，在 Agent 侧执行。
 	AgentTools []executor.Tool
-	// ClientMCPServers 提供 Conversation 持有的客户端 MCP 工具，nil 表示没有。
-	ClientMCPServers executor.ClientMCPServers
 	// Skills 是本 Agent 可用的 Skill，接收用户输入时按消息里的斜杠指令读取正文。
 	Skills []*skill.Skill
 	// Hooks 交给每个 Turn 触发 SessionStart、SubagentStart、UserPromptSubmit 与 Stop 等事件；nil 表示没有 hook。
@@ -172,6 +172,9 @@ func NewSession(opt *SessionOpt) (Session, error) {
 		opt.Agent == nil {
 		return nil, errors.New("session requires an ID, DAO query, DAO mutation, model client and agent definition")
 	}
+	if opt.EnvironmentsManager == nil {
+		return nil, errors.New("session requires an execution environments manager")
+	}
 	sessionOpt := *opt
 	sessionOpt.Agent = opt.Agent.Clone()
 	terminalManager, err := terminal.NewTerminalManager(terminal.NewTerminalManagerOpt())
@@ -191,9 +194,8 @@ func NewSession(opt *SessionOpt) (Session, error) {
 		sessionTools[environment.GetID()] = commandTools
 	}
 	// 3. 按 Agent 的工具名单、MCP 选择和 hook 创建工具表，初始化请求通道和 InputID 去重记录。
-	toolExecutorOpt := executor.NewToolExecutorOpt(sessionOpt.Environments, sessionOpt.AgentTools...)
+	toolExecutorOpt := executor.NewToolExecutorOpt(sessionOpt.EnvironmentsManager, sessionOpt.AgentTools...)
 	toolExecutorOpt.SessionTools = sessionTools
-	toolExecutorOpt.ClientMCPServers = sessionOpt.ClientMCPServers
 	toolExecutorOpt.ToolNames = sessionOpt.Agent.ToolNames
 	toolExecutorOpt.MCPServerIDs = sessionOpt.Agent.MCPServerIDs
 	toolExecutorOpt.Hooks = sessionOpt.Hooks
@@ -249,7 +251,6 @@ func (s *sessionImpl) Run(ctx context.Context, events chan<- SessionEvent) error
 
 	turnOpt := turn.NewTurnOpt(s.opt.Session.ConversationID, s.opt.Session.ID, s.opt.Agent, s.opt.Query, s.opt.Mutation, s.opt.Client)
 	turnOpt.ToolExecutor = s.toolExecutor
-	turnOpt.Environments = s.opt.Environments
 	turnOpt.Inbox = s
 	turnOpt.Hooks = s.opt.Hooks
 	turnOpt.Session = s.opt.Session
@@ -1017,6 +1018,7 @@ func (s *sessionImpl) startTurn(ctx context.Context, events chan<- SessionEvent,
 		turnOpt.CompactModel = s.opt.Models[s.opt.Agent.CompactModel]
 	}
 	turnOpt.PreviousModel, turnOpt.PreviousContextUsage, turnOpt.PreviousExecutors = s.lastTurnModel, s.lastTurnContextUsage, s.lastTurnExecutors
+	turnOpt.Environments, turnOpt.DefaultExecutorID = s.opt.EnvironmentsManager.GetEnvironments()
 	// 2. 普通轮只接收自己的开场；恢复已写 running 的旧轮不再注入启动 hook。
 	var turnInput []*defs.Item
 	if !turnOpt.IsCompactOnly {
@@ -1025,7 +1027,7 @@ func (s *sessionImpl) startTurn(ctx context.Context, events chan<- SessionEvent,
 		}
 		s.lastTurnModel = turnSelection.Ref
 		if turnResume.Record == nil {
-			s.lastTurnExecutors = executor.GetTurnExecutors(s.opt.Environments)
+			s.lastTurnExecutors = executor.GetTurnExecutors(turnOpt.Environments)
 			turnOpt.HookStartSource = s.pendingHookStartSource
 			turnOpt.ContextItems, s.pendingContextItems = s.pendingContextItems, nil
 		}

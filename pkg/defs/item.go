@@ -387,8 +387,7 @@ func (item *Item) ValidateModelChange() error {
 	return nil
 }
 
-// ExecutorsChange 由 Turn 在本轮 Executor 列表和上一轮不同时写在本轮输入之前：默认换了、目录换了、增加或减少都在这一条里，
-// 作为提示发给模型。
+// ExecutorsChange 由 Turn 在本轮输入之前写入，通知模型首轮接入的动态 Executor 或与上一轮相比的环境变化。
 type ExecutorsChange struct {
 	PreviousExecutors []TurnExecutor `json:"previous_executors"`
 	Executors         []TurnExecutor `json:"executors"`
@@ -396,7 +395,7 @@ type ExecutorsChange struct {
 
 // ExecutorsChangeDetails 按变化种类拆开一条 ExecutorsChange，发给模型的文字和 TUI 显示共用。
 type ExecutorsChangeDetails struct {
-	// NewDefault 是换上的默认 Executor；默认没换或新列表为空时为 nil。
+	// NewDefault 是换上的默认 Executor，仅在变更前后都有不同的默认 Executor 时填写。
 	NewDefault *TurnExecutor
 	// PreviousDefaultID 是原来的默认 Executor ID；NewDefault 为 nil 时为空。
 	PreviousDefaultID string
@@ -424,11 +423,19 @@ func (item *Item) ValidateExecutorsChange() error {
 		}
 		return nil
 	}
-	// 2. 要求有 Item 和 Turn ID、没有模型调用 ID，旧列表不为空且和新列表不同；新列表可以为空。
+	// 2. 要求有 Item 和 Turn ID、没有模型调用 ID，且前后列表不同。
 	change := item.ExecutorsChange
 	if item.ID == "" || item.TurnID == "" || item.ModelCallID != "" || change == nil ||
-		len(change.PreviousExecutors) == 0 || slices.Equal(change.PreviousExecutors, change.Executors) {
-		return fmt.Errorf("executors change requires item and turn IDs, no model call ID and different executors with a previous list")
+		slices.Equal(change.PreviousExecutors, change.Executors) {
+		return fmt.Errorf("executors change requires item and turn IDs, no model call ID and different executor lists")
+	}
+	// 3. 没有上一轮列表时，只通知首次接入的动态 Executor。
+	if len(change.PreviousExecutors) == 0 {
+		for _, executor := range change.Executors {
+			if !executor.IsDynamic {
+				return fmt.Errorf("executors change without a previous list requires only dynamic executors")
+			}
+		}
 	}
 	return nil
 }

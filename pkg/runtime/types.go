@@ -86,12 +86,13 @@ type SetConversationExecutorSettingsRequest struct {
 	ExecutorSettings defs.ExecutorSettings
 }
 
-// SetClientMCPServersRequest 是一条客户端连接为一个对话登记的全部 MCP server，换掉它之前为这个对话登记的；Servers 为空表示全部移除。
-type SetClientMCPServersRequest struct {
+// SetClientExecutorRequest 登记对话中的一个客户端环境；Servers 为空时注销同一连接的登记。
+type SetClientExecutorRequest struct {
 	ConversationID defs.ConversationID
-	// ClientID 是 serve 上这条客户端连接的 ID。
-	ClientID string
-	Servers  []conversation.ClientMCPServer
+	ConnectionID   string
+	ExecutorID     string
+	Description    string
+	Servers        []conversation.ClientMCPServer
 }
 
 // Definitions 是从配置加载出的整份定义，reload 时整份换掉；构造后只读。

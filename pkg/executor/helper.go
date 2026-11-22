@@ -2,12 +2,12 @@ package executor
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
@@ -134,12 +134,16 @@ func logUndispatchedCall(ctx context.Context, call *defs.Item, errorCode string,
 // executorArgument 是多个执行环境提供的同名工具上加入的参数名，模型用它选择执行环境。
 const executorArgument = "executor"
 
-// GetTurnExecutors 按环境顺序返回 Turn 记录所需的 ID 和根目录。
+// GetTurnExecutors 按环境顺序返回 Turn 记录所需的执行环境信息。
 func GetTurnExecutors(environments []ExecutionEnvironment) []defs.TurnExecutor {
-	// 1. 逐个读取 ID；有工作区时读取根目录，没有时目录为空。
+	// 1. 读取环境标识、说明和类型；有工作区时读取根目录。
 	var turnExecutors []defs.TurnExecutor
 	for _, environment := range environments {
-		turnExecutor := defs.TurnExecutor{ID: environment.GetID()}
+		turnExecutor := defs.TurnExecutor{
+			ID:          environment.GetID(),
+			Description: environment.GetDescription(),
+			IsDynamic:   environment.IsDynamic(),
+		}
 		if environmentWorkspace := environment.GetWorkspace(); environmentWorkspace != nil {
 			turnExecutor.WorkspaceDirectory = environmentWorkspace.GetRootDirectory()
 		}
@@ -193,20 +197,6 @@ func validateToolDefinitions(tools []Tool) error {
 	return nil
 }
 
-// getDuplicateToolName 按工具顺序找出第一个重复的工具名；没有重名时第二个返回值为 false。
-func getDuplicateToolName(tools []Tool) (string, bool) {
-	// 1. 按工具顺序记录已经出现的名称，遇到重复时返回。
-	names := make(map[string]struct{}, len(tools))
-	for _, tool := range tools {
-		name := tool.GetDefinition().Name
-		if _, found := names[name]; found {
-			return name, true
-		}
-		names[name] = struct{}{}
-	}
-	return "", false
-}
-
 // findRoute 在工具表里按工具名找到这个工具；没有时返回 nil。
 func (r *toolRoutes) findRoute(name string) *toolRoute {
 	// 1. 遍历工具表并匹配名称。
@@ -229,35 +219,73 @@ func (r *toolRoute) findProvider(environmentID string) (toolProvider, bool) {
 	return toolProvider{}, false
 }
 
-// getProviderIDs 按提供方顺序返回环境 ID。
-func (r *toolRoute) getProviderIDs() []string {
-	// 1. 逐个收集提供方的环境 ID。
-	ids := make([]string, 0, len(r.providers))
-	for _, provider := range r.providers {
-		ids = append(ids, provider.environment.GetID())
+// isExecutorArgumentDeclared 原始 schema 是否声明了顶层 executor 字段？
+func (r *toolRoute) isExecutorArgumentDeclared() bool {
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
 	}
-	return ids
+	if err := json.Unmarshal(r.definition.InputSchema, &schema); err != nil {
+		return false
+	}
+	_, declared := schema.Properties[executorArgument]
+	return declared || slices.Contains(schema.Required, executorArgument)
 }
 
-// getDefinitionWithExecutorParameter 返回带可选 executor 参数的工具定义副本。
-func (r *toolRoute) getDefinitionWithExecutorParameter() (*defs.ToolDefinition, error) {
+// hasDefaultProvider 默认环境是否提供这个工具？
+func (r *toolRoutes) hasDefaultProvider(route *toolRoute) bool {
+	return r.defaultID != "" && route.providers[0].environment.GetID() == r.defaultID
+}
+
+// getProviderDescriptions 按提供方顺序格式化环境 ID 和说明。
+func (r *toolRoute) getProviderDescriptions() string {
+	descriptions := make([]string, 0, len(r.providers))
+	for _, provider := range r.providers {
+		environment := provider.environment
+		label := environment.GetID()
+		if description := environment.GetDescription(); description != "" {
+			label += " (" + description + ")"
+		}
+		descriptions = append(descriptions, label)
+	}
+	return strings.Join(descriptions, ", ")
+}
+
+// getDefinitionWithExecutorParameter 返回带 executor 路由参数的工具定义副本。
+func (r *toolRoute) getDefinitionWithExecutorParameter(defaultID string, isRequired bool) (*defs.ToolDefinition, error) {
 	// 1. 解码工具输入 schema，补齐 properties 对象。
 	var schema map[string]any
 	if err := json.Unmarshal(r.definition.InputSchema, &schema); err != nil {
 		return nil, fmt.Errorf("decode tool %q schema: %w", r.definition.Name, err)
+	}
+	if schema == nil {
+		return nil, fmt.Errorf("tool %q input schema must be an object", r.definition.Name)
 	}
 	properties, _ := schema["properties"].(map[string]any)
 	if properties == nil {
 		properties = make(map[string]any)
 		schema["properties"] = properties
 	}
-	// 2. 写入环境 ID 枚举和默认提供方说明。
-	providerIDs := r.getProviderIDs()
+
+	// 2. 写入环境枚举和参数说明；默认环境不提供工具时标记必填。
+	providerIDs := make([]string, 0, len(r.providers))
+	for _, provider := range r.providers {
+		providerIDs = append(providerIDs, provider.environment.GetID())
+	}
+	description := prompt.FormatExecutorParameterDescription(defaultID)
+	if isRequired {
+		description = prompt.FormatRequiredExecutorParameterDescription()
+		required, _ := schema["required"].([]any)
+		if !slices.Contains(required, executorArgument) {
+			schema["required"] = append(required, executorArgument)
+		}
+	}
 	properties[executorArgument] = map[string]any{
 		"type":        "string",
 		"enum":        providerIDs,
-		"description": prompt.FormatExecutorParameterDescription(providerIDs[0]),
+		"description": description,
 	}
+
 	// 3. 编码 schema 并放入工具定义副本。
 	var encoded bytes.Buffer
 	encoder := json.NewEncoder(&encoded)
@@ -295,20 +323,6 @@ func GetToolResultText(content json.RawMessage) string {
 		return text
 	}
 	return string(content)
-}
-
-// getAssignedMCPServers 返回分配给指定环境的 server 定义，按 server ID 排序。
-func getAssignedMCPServers(executorID string, servers []*mcpclient.ServerDefinition) []*mcpclient.ServerDefinition {
-	// 1. 筛选 ExecutorIDs 包含该环境 ID 的 server。
-	var assigned []*mcpclient.ServerDefinition
-	for _, server := range servers {
-		if slices.Contains(server.ExecutorIDs, executorID) {
-			assigned = append(assigned, server)
-		}
-	}
-	// 2. 按 server ID 稳定排序。
-	slices.SortStableFunc(assigned, func(a, b *mcpclient.ServerDefinition) int { return cmp.Compare(a.ID, b.ID) })
-	return assigned
 }
 
 // getConnectionInfos 按连接顺序返回各连接此刻的状态。

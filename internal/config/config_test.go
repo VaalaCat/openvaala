@@ -1472,10 +1472,10 @@ func TestConfigExecutors(t *testing.T) {
 			wantErr: "reserved",
 		},
 		{
-			name:    "reserved_client",
-			file:    "client.yaml",
-			body:    "id: client\nkind: local\ndescription: 客户端\nworkspace_directory: {{workspace}}\n",
-			wantErr: `executor id "client" is reserved`,
+			name:          "client_id_can_be_configured",
+			file:          "client.yaml",
+			body:          "id: client\nkind: local\ndescription: 试验目录\nworkspace_directory: {{workspace}}\n",
+			wantWorkspace: "ws",
 		},
 		{
 			name:    "unsupported_kind",
@@ -1620,7 +1620,7 @@ func TestConfigExecutors(t *testing.T) {
 				wantKind = defs.ExecutorKindLocal
 			}
 			executors := cfg.GetExecutors()
-			if len(executors) != 1 || executors[0].ID != "sandbox" || executors[0].Kind != wantKind ||
+			if len(executors) != 1 || executors[0].ID != strings.TrimSuffix(tt.file, ".yaml") || executors[0].Kind != wantKind ||
 				executors[0].Description != "试验目录" || executors[0].WorkspaceDirectory != wantWorkspace {
 				t.Fatalf("executors = %+v", executors)
 			}

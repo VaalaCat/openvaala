@@ -14,8 +14,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// TestGetACPClientMCPServers 检查 MCP 服务名称转换、重复后缀和支持类型筛选。
-func TestGetACPClientMCPServers(t *testing.T) {
+// TestGetACPEditorMCPServers 检查 MCP 服务名称转换、重复后缀和支持类型筛选。
+func TestGetACPEditorMCPServers(t *testing.T) {
 	// 1. 列出各种传输、名称和重复 ID 场景。
 	stdio := func(name string) acp.McpServer {
 		return acp.McpServer{Stdio: &acp.McpServerStdio{
@@ -112,7 +112,7 @@ func TestGetACPClientMCPServers(t *testing.T) {
 	// 2. 整理编辑器 MCP 配置，检查登记 ID 的内容和顺序。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := getACPClientMCPServers(context.Background(), tt.servers)
+			got := getACPEditorMCPServers(context.Background(), tt.servers)
 			gotIDs := make([]string, 0, len(got))
 			for _, server := range got {
 				gotIDs = append(gotIDs, server.ID)

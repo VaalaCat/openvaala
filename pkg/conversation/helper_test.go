@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 )
 
@@ -353,6 +355,39 @@ func TestGetUsedMCPServers(t *testing.T) {
 			}
 			if !slices.Equal(got, tt.want) {
 				t.Fatalf("getUsedMCPServers() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidateConversationConfigCandidateTools 检查候选环境的工具也参与协作工具撞名校验。
+func TestValidateConversationConfigCandidateTools(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		toolName string
+		wantErr  string
+	}{
+		{name: "valid_environment", toolName: "example"},
+		{name: "collaboration_tool_collision", toolName: "list_executors", wantErr: "conflicts with an agent tool"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			model := newConversationModel(t)
+			tool, err := newCollaborationTool(&executor.BaseToolOpt{Name: tt.toolName, Description: "Test tool"},
+				func(context.Context, *defs.Item, *listAgentsParam) *executor.ToolExecutionResult { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			environment, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt("candidate", "", nil, tool).WithoutCommands())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = validateConversationConfig(t.Context(), conversationDefinitions(model), nil, []executor.ExecutionEnvironment{environment})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateConversationConfig() = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}

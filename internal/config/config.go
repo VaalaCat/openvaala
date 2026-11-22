@@ -982,7 +982,7 @@ func loadProviderDefinition(path string) (*defs.ProviderConfig, error) {
 
 // loadExecutorDefinition 读取并校验一个 Executor 文件。
 func loadExecutorDefinition(path, home string) (*ExecutorConfig, error) {
-	// 1. 读取配置，检查 ID 和文件名一致、不是保留的 local、client、openvaala、memory，说明非空。
+	// 1. 读取配置，检查 ID 和文件名一致、不是保留的 local、openvaala、memory，说明非空。
 	definition := &ExecutorConfig{}
 	if err := readYAML(path, definition); err != nil {
 		return nil, err
@@ -991,7 +991,7 @@ func loadExecutorDefinition(path, home string) (*ExecutorConfig, error) {
 	if !isValidID(definition.ID) || definition.ID != name {
 		return nil, errors.New("executor id must be valid and match filename")
 	}
-	if definition.ID == defs.LocalExecutorID || definition.ID == defs.ClientExecutorID || definition.ID == BuiltinExecutorID ||
+	if definition.ID == defs.LocalExecutorID || definition.ID == BuiltinExecutorID ||
 		definition.ID == defs.MemoryExecutorID {
 		return nil, fmt.Errorf("executor id %q is reserved", definition.ID)
 	}

@@ -133,6 +133,9 @@ func (a *agentImpl) handleExecutorEvent(ctx context.Context, event executor.Exec
 		if event.Result == nil {
 			return errors.New("executor returned a nil tool result")
 		}
+		if event.ShouldRefreshTools {
+			a.shouldRefreshTools = true
+		}
 		events, err = a.handleExecutionResult(event)
 	case *executor.ExecutionHookRunEvent:
 		if event.Run == nil {

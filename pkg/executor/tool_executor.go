@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/hook"
+	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/sourcegraph/conc/pool"
 )
@@ -21,6 +21,8 @@ import (
 type ToolExecutor interface {
 	// GetTools 建出本轮工具表并存下，返回交给模型的工具定义；多个环境提供的工具带 executor 参数。返回内容由调用方持有。
 	GetTools(ctx context.Context) ([]*defs.ToolDefinition, error)
+	// GetToolsForEnvironments 按环境管理器返回的轮次开场列表和默认 ID 建表；列表为空时只提供协作工具。
+	GetToolsForEnvironments(ctx context.Context, environments []ExecutionEnvironment, defaultID string) ([]*defs.ToolDefinition, error)
 	// PrepareCalls 为整批调用选择提供方并运行 PreToolUse hook，发送准备阶段的 *ExecutionHookRunEvent 与已结束调用的 *ExecutionFinishedEvent，
 	// 返回与输入同顺序、同数量的准备结果；不关闭 events。
 	PrepareCalls(ctx context.Context, calls []*defs.Item, events chan<- ExecutorEvent) []*PreparedToolCall
@@ -32,21 +34,18 @@ type ToolExecutor interface {
 // toolExecutorImpl 一个 Session 一个实例；执行环境由 Conversation 持有，各 Session 共用。
 type toolExecutorImpl struct {
 	opt *ToolExecutorOpt
-	// turnToolRoutes 是最近一次 GetTools 建出的工具表，PrepareCalls 直接按它分发；
-	// 没调过 GetTools 时为 nil，PrepareCalls 现建一次并存下。
+	// turnToolRoutes 是最近成功发布的工具表，PrepareCalls 直接按它分发；没有工具表时现建。
 	turnToolRoutes atomic.Pointer[toolRoutes]
 }
 
-// ToolExecutorOpt 保存环境、工具筛选条件、客户端 MCP 和 hook 配置，构造后只读。
+// ToolExecutorOpt 保存环境管理器、工具筛选条件和 hook 配置，构造后只读。
 type ToolExecutorOpt struct {
-	// Environments 是能用的执行环境，第一个是默认环境；由 Conversation 持有，ToolExecutor 只借用。
-	Environments []ExecutionEnvironment
-	// SessionTools 是本 Session 为各环境构造的工具，键是环境 ID；和环境自带的工具一样参与 ToolNames 过滤、executor 参数和 hook。
+	// EnvironmentsManager 提供在线环境和默认环境，nil 表示没有执行环境。
+	EnvironmentsManager ExecutionEnvironmentsManager
+	// SessionTools 是本 Session 为各稳定环境构造的工具，键是环境 ID；和环境自带的工具一样参与 ToolNames 过滤、executor 参数和 hook。
 	SessionTools map[string][]Tool
 	// AgentTools 是协作工具，不带 executor 参数，不受 ToolNames 过滤。
 	AgentTools []Tool
-	// ClientMCPServers 提供客户端登记的 MCP 工具；nil 表示没有。只在 MCPServerIDs 为 nil 时使用，与其他工具重名时让位。
-	ClientMCPServers ClientMCPServers
 	// ToolNames 是内置工具和 Session 工具的可用名单；为空时全部可用。MCP 工具不受它过滤。
 	ToolNames []string
 	// MCPServerIDs 是可用的 MCP server；nil 表示全部，[] 表示不用。
@@ -57,46 +56,31 @@ type ToolExecutorOpt struct {
 	Session defs.Session
 }
 
-// NewToolExecutorOpt 保存可用环境和协作工具。
-func NewToolExecutorOpt(environments []ExecutionEnvironment, agentTools ...Tool) *ToolExecutorOpt {
-	// 1. 复制环境列表和协作工具列表。
+// NewToolExecutorOpt 保存环境管理器和协作工具。
+func NewToolExecutorOpt(manager ExecutionEnvironmentsManager, agentTools ...Tool) *ToolExecutorOpt {
 	return &ToolExecutorOpt{
-		Environments: slices.Clone(environments),
-		AgentTools:   slices.Clone(agentTools),
+		EnvironmentsManager: manager,
+		AgentTools:          slices.Clone(agentTools),
 	}
 }
 
 // NewToolExecutor 校验配置并创建 Session 的工具执行器。
 func NewToolExecutor(opt *ToolExecutorOpt) (ToolExecutor, error) {
-	// 1. 校验配置和环境都不为空、环境 ID 不重复、Session 工具只指向已有环境，以及各组工具定义。
+	// 1. 校验配置及各组工具定义。
 	if opt == nil {
 		return nil, errors.New("tool executor options are required")
-	}
-	var environmentIDs []string
-	for _, environment := range opt.Environments {
-		if environment == nil {
-			return nil, errors.New("execution environment is missing")
-		}
-		if slices.Contains(environmentIDs, environment.GetID()) {
-			return nil, fmt.Errorf("executor %q is defined more than once", environment.GetID())
-		}
-		environmentIDs = append(environmentIDs, environment.GetID())
 	}
 	if err := validateToolDefinitions(opt.AgentTools); err != nil {
 		return nil, err
 	}
-	for environmentID, tools := range opt.SessionTools {
-		if !slices.Contains(environmentIDs, environmentID) {
-			return nil, fmt.Errorf("session tools refer to unknown execution environment %q", environmentID)
-		}
+	for _, tools := range opt.SessionTools {
 		if err := validateToolDefinitions(tools); err != nil {
 			return nil, err
 		}
 	}
 	// 2. 复制配置并保存工具执行器。
-	executorOpt := NewToolExecutorOpt(opt.Environments, opt.AgentTools...)
+	executorOpt := NewToolExecutorOpt(opt.EnvironmentsManager, opt.AgentTools...)
 	executorOpt.SessionTools = maps.Clone(opt.SessionTools)
-	executorOpt.ClientMCPServers = opt.ClientMCPServers
 	executorOpt.ToolNames = slices.Clone(opt.ToolNames)
 	executorOpt.MCPServerIDs = slices.Clone(opt.MCPServerIDs)
 	executorOpt.Hooks = opt.Hooks
@@ -104,15 +88,28 @@ func NewToolExecutor(opt *ToolExecutorOpt) (ToolExecutor, error) {
 	return &toolExecutorImpl{opt: executorOpt}, nil
 }
 
-// GetTools 建立并保存本轮工具表，返回工具定义。
+// GetTools 按此刻在线的环境建立并发布工具表。
 func (e *toolExecutorImpl) GetTools(ctx context.Context) ([]*defs.ToolDefinition, error) {
-	// 1. 建立工具表，保存后提取定义副本。
-	routes, err := e.buildToolRoutes(ctx)
+	var environments []ExecutionEnvironment
+	var defaultID string
+	if e.opt.EnvironmentsManager != nil {
+		environments, defaultID = e.opt.EnvironmentsManager.GetEnvironments()
+	}
+	return e.GetToolsForEnvironments(ctx, environments, defaultID)
+}
+
+// GetToolsForEnvironments 按给定环境建立工具表，生成模型工具定义后再发布。
+func (e *toolExecutorImpl) GetToolsForEnvironments(ctx context.Context, environments []ExecutionEnvironment, defaultID string) ([]*defs.ToolDefinition, error) {
+	routes, err := e.buildToolRoutes(ctx, environments, defaultID)
+	if err != nil {
+		return nil, err
+	}
+	definitions, err := routes.getDefinitions()
 	if err != nil {
 		return nil, err
 	}
 	e.turnToolRoutes.Store(routes)
-	return routes.getDefinitions()
+	return definitions, nil
 }
 
 // PrepareCalls 为整批调用选择提供方并运行前置 hook，返回与输入同顺序的准备结果。
@@ -165,83 +162,83 @@ func (e *toolExecutorImpl) Run(ctx context.Context, call *PreparedToolCall, even
 	e.executeCall(ctx, call, events)
 }
 
-// buildToolRoutes 汇总协作工具、环境工具、环境 MCP 工具和客户端 MCP 工具，建立本轮工具表。
-func (e *toolExecutorImpl) buildToolRoutes(ctx context.Context) (*toolRoutes, error) {
-	// 1. 并发读取各环境选中的 MCP 工具；有客户端 MCP 且 MCPServerIDs 为 nil 时也读取客户端 MCP 工具。
+// buildToolRoutes 汇总协作工具、环境工具和 MCP 工具，建立本轮工具表。
+func (e *toolExecutorImpl) buildToolRoutes(ctx context.Context, environments []ExecutionEnvironment, defaultID string) (*toolRoutes, error) {
+	// 1. 并发读取各环境选中的 MCP 工具。显式选择 MCP server 时只读取稳定环境的 MCP 工具。
 	type environmentMCPTools struct {
 		tools []Tool
 		err   error
 	}
-	mcpReadings := make([]environmentMCPTools, len(e.opt.Environments))
-	var clientTools []Tool
-	var clientErr error
+	mcpReadings := make([]environmentMCPTools, len(environments))
 	tasks := pool.New()
-	for index, environment := range e.opt.Environments {
+	for index, environment := range environments {
+		if environment.IsDynamic() && e.opt.MCPServerIDs != nil {
+			continue
+		}
 		tasks.Go(func() {
 			mcpReadings[index].tools, mcpReadings[index].err = environment.GetMCPTools(ctx, e.opt.MCPServerIDs)
 		})
 	}
-	if e.opt.ClientMCPServers != nil && e.opt.MCPServerIDs == nil {
-		tasks.Go(func() { clientTools, clientErr = e.opt.ClientMCPServers.GetMCPTools(ctx) })
-	}
 	tasks.Wait()
 
-	// 2. 先登记协作工具，再按环境顺序筛选内置工具和 Session 工具、合并 MCP 工具并检查重名；某个环境读取 MCP 工具失败时返回错误。
-	routes := &toolRoutes{environments: e.opt.Environments}
+	// 2. 先登记协作工具，随后按环境顺序合并各环境提供的工具。
+	routes := &toolRoutes{
+		environments: slices.Clone(environments),
+		defaultID:    defaultID,
+	}
 	for _, tool := range e.opt.AgentTools {
 		routes.routes = append(routes.routes, &toolRoute{
 			definition: tool.GetDefinition(),
 			providers:  []toolProvider{{tool: tool}},
 		})
 	}
-	for index, environment := range e.opt.Environments {
+	for index, environment := range environments {
 		reading := mcpReadings[index]
+		environmentID := environment.GetID()
 		if reading.err != nil {
-			return nil, fmt.Errorf("get tools of executor %q: %w", environment.GetID(), reading.err)
+			return nil, fmt.Errorf("get tools of executor %q: %w", environmentID, reading.err)
 		}
-		selectedTools := slices.DeleteFunc(slices.Concat(environment.GetTools(), e.opt.SessionTools[environment.GetID()]), func(tool Tool) bool {
+		var sessionTools []Tool
+		if !environment.IsDynamic() {
+			sessionTools = e.opt.SessionTools[environmentID]
+		}
+		selectedTools := slices.DeleteFunc(slices.Concat(environment.GetTools(), sessionTools), func(tool Tool) bool {
 			return len(e.opt.ToolNames) > 0 && !slices.Contains(e.opt.ToolNames, tool.GetDefinition().Name)
 		})
 		environmentTools := slices.Concat(selectedTools, reading.tools)
-		if name, found := getDuplicateToolName(environmentTools); found {
-			return nil, fmt.Errorf("execution environment %q provides tool %q more than once", environment.GetID(), name)
-		}
+		environmentToolNames := make(map[string]struct{}, len(environmentTools))
 		for _, tool := range environmentTools {
+			definition := tool.GetDefinition()
+			if _, exists := environmentToolNames[definition.Name]; exists {
+				if !environment.IsDynamic() {
+					return nil, fmt.Errorf("execution environment %q provides tool %q more than once", environmentID, definition.Name)
+				}
+				telemetry.GetLogger(telemetry.ContextWithAttrs(ctx, telemetry.ExecutorID(environmentID), telemetry.ToolName(definition.Name))).Warn("duplicate dynamic tool skipped",
+					"mcp_server_id", definition.MCPServerID)
+				continue
+			}
+			environmentToolNames[definition.Name] = struct{}{}
 			if err := routes.addEnvironmentTool(ctx, toolProvider{
 				environment: environment,
 				tool:        tool,
-				executorID:  environment.GetID(),
+				executorID:  environmentID,
 			}); err != nil {
 				return nil, err
 			}
 		}
 	}
-	// 3. 最后登记客户端 MCP 工具；读取失败时返回错误，与已有工具重名时跳过。
-	if clientErr != nil {
-		return nil, fmt.Errorf("get tools of executor %q: %w", defs.ClientExecutorID, clientErr)
-	}
-	for _, tool := range clientTools {
-		routes.addClientTool(ctx, toolProvider{
-			tool:       tool,
-			executorID: defs.ClientExecutorID,
-		})
-	}
 	return routes, nil
 }
 
-// getTurnToolRoutes 取得本轮工具表。
+// getTurnToolRoutes 取得本轮工具表，首次使用时读取在线环境建表。
 func (e *toolExecutorImpl) getTurnToolRoutes(ctx context.Context) (*toolRoutes, error) {
-	// 1. 有本轮工具表时直接返回。
 	if routes := e.turnToolRoutes.Load(); routes != nil {
 		return routes, nil
 	}
-	// 2. 建立并保存首次使用的工具表。
-	routes, err := e.buildToolRoutes(ctx)
-	if err != nil {
+	if _, err := e.GetTools(ctx); err != nil {
 		return nil, err
 	}
-	e.turnToolRoutes.Store(routes)
-	return routes, nil
+	return e.turnToolRoutes.Load(), nil
 }
 
 // addEnvironmentTool 登记环境提供的工具，处理同名工具。
@@ -271,123 +268,114 @@ func (r *toolRoutes) addEnvironmentTool(ctx context.Context, provider toolProvid
 	return nil
 }
 
-// addClientTool 登记客户端 MCP 工具并处理同名冲突。
-func (r *toolRoutes) addClientTool(ctx context.Context, provider toolProvider) {
-	// 1. 读取定义，未重名时追加客户端工具。
-	definition := provider.tool.GetDefinition()
-	route := r.findRoute(definition.Name)
-	if route == nil {
-		r.routes = append(r.routes, &toolRoute{
-			definition: definition,
-			providers:  []toolProvider{provider},
-		})
-		return
-	}
-	// 2. 保留已有同名工具，识别提供方类型并用 Warn 记录客户端工具被跳过。
-	var conflict string
-	switch kept := route.providers[0]; {
-	case kept.environment != nil:
-		conflict = "executor tool"
-	case kept.executorID == defs.ClientExecutorID:
-		conflict = "client tool"
-	default:
-		conflict = "agent tool"
-	}
-	telemetry.GetLogger(telemetry.ContextWithAttrs(ctx, telemetry.ToolName(definition.Name))).Warn("client mcp tool skipped",
-		"mcp_server_id", definition.MCPServerID, "reason", "tool name conflicts with an "+conflict)
-}
-
-// getDefinitions 生成交给模型的工具定义副本：环境工具在前，协作工具和客户端 MCP 工具在后。
+// getDefinitions 按稳定环境工具、协作工具、纯动态环境工具的顺序返回定义副本。
 func (r *toolRoutes) getDefinitions() ([]*defs.ToolDefinition, error) {
-	// 1. 先收集环境工具，多提供方时补充 executor 参数。
-	var definitions []*defs.ToolDefinition
+	var staticTools, agentTools, dynamicTools []*defs.ToolDefinition
 	for _, route := range r.routes {
-		if route.providers[0].environment == nil {
-			continue
+		definition := route.definition
+		if len(route.providers) == 1 {
+			definition = definition.Clone()
+		} else {
+			withExecutor, err := route.getDefinitionWithExecutorParameter(r.defaultID, !r.hasDefaultProvider(route))
+			if err != nil {
+				return nil, err
+			}
+			definition = withExecutor
 		}
-		if len(route.providers) < 2 {
-			definitions = append(definitions, route.definition.Clone())
-			continue
+		// 稳定环境先登记，同名工具有稳定提供方时一定排在首位。
+		switch environment := route.providers[0].environment; {
+		case environment == nil:
+			agentTools = append(agentTools, definition)
+		case environment.IsDynamic():
+			dynamicTools = append(dynamicTools, definition)
+		default:
+			staticTools = append(staticTools, definition)
 		}
-		definition, err := route.getDefinitionWithExecutorParameter()
-		if err != nil {
-			return nil, err
-		}
-		definitions = append(definitions, definition)
 	}
-	// 2. 按加入顺序收集协作工具和客户端 MCP 工具。
-	for _, route := range r.routes {
-		if route.providers[0].environment == nil {
-			definitions = append(definitions, route.definition.Clone())
-		}
-	}
-	return definitions, nil
+	return slices.Concat(staticTools, agentTools, dynamicTools), nil
 }
 
 // routeCall 按工具名和 executor 选择提供方，返回调用或分发错误。
 func (r *toolRoutes) routeCall(call *defs.Item) (toolProvider, *defs.Item, *defs.ToolResult) {
-	// 1. 查找工具；协作工具和客户端 MCP 工具直接交给它唯一的提供方，参数不动。
+	// 1. 协作工具或声明自有 executor 参数的单来源工具直接转发。
 	callID := call.ToolCall.CallID
 	route := r.findRoute(call.ToolCall.Name)
 	if route == nil {
 		return toolProvider{}, nil, newToolErrorResult(callID, "tool_not_found", fmt.Errorf("tool %q is not available", call.ToolCall.Name))
 	}
-	if route.providers[0].environment == nil {
-		return route.providers[0], call.Clone(), nil
+	provider := route.providers[0]
+	if provider.environment == nil || (len(route.providers) == 1 && route.isExecutorArgumentDeclared()) {
+		return provider, call.Clone(), nil
 	}
-	// 2. 取出 executor，省略时用第一个提供方；环境没配置或不提供这个工具时返回 invalid_arguments。
+
+	// 2. 取出 executor；有多个提供方且默认环境不提供工具时要求显式指定。
 	executorID, arguments, err := takeExecutorArgument(call.ToolCall.Arguments)
 	if err != nil {
 		return toolProvider{}, nil, newToolErrorResult(callID, "invalid_arguments", err)
 	}
-	provider, found := route.providers[0], true
+	if executorID == "" && len(route.providers) > 1 && !r.hasDefaultProvider(route) {
+		const hint = `; retry with an explicit "executor", or ask the user which one to use if unclear. Available: %s`
+		available := route.getProviderDescriptions()
+		if r.defaultID != "" {
+			err = fmt.Errorf("default executor %q does not provide tool %q, and multiple other executors provide it"+hint, r.defaultID, call.ToolCall.Name, available)
+		} else {
+			err = fmt.Errorf("multiple executors provide tool %q with no default executor"+hint, call.ToolCall.Name, available)
+		}
+		return toolProvider{}, nil, newToolErrorResult(callID, "invalid_arguments", err)
+	}
 	if executorID != "" {
+		var found bool
 		provider, found = route.findProvider(executorID)
+		if !found {
+			available := route.getProviderDescriptions()
+			if !slices.ContainsFunc(r.environments, func(environment ExecutionEnvironment) bool { return environment.GetID() == executorID }) {
+				return toolProvider{}, nil, newToolErrorResult(callID, "invalid_arguments",
+					fmt.Errorf("executor %q is not configured; available: %s", executorID, available))
+			}
+			return toolProvider{}, nil, newToolErrorResult(callID, "invalid_arguments",
+				fmt.Errorf("executor %q does not provide tool %q; available: %s", executorID, call.ToolCall.Name, available))
+		}
 	}
-	isEnvironmentConfigured := slices.ContainsFunc(r.environments, func(environment ExecutionEnvironment) bool { return environment.GetID() == executorID })
-	if !found && !isEnvironmentConfigured {
-		return toolProvider{}, nil, newToolErrorResult(callID, "invalid_arguments",
-			fmt.Errorf("executor %q is not configured; available: %s", executorID, strings.Join(route.getProviderIDs(), ", ")))
-	}
-	if !found {
-		return toolProvider{}, nil, newToolErrorResult(callID, "invalid_arguments",
-			fmt.Errorf("executor %q does not provide tool %q; available: %s", executorID, call.ToolCall.Name, strings.Join(route.getProviderIDs(), ", ")))
-	}
-	// 3. 复制调用并删除交给工具的 executor 参数。
+
+	// 3. 复制调用并剥离路由参数。
 	routedCall := call.Clone()
 	routedCall.ToolCall.Arguments = arguments
 	return provider, routedCall, nil
 }
 
-// getHookEnvironment 选择工具 hook 的执行环境。
+// getHookEnvironment 选择能执行命令的提供方环境，协作工具使用默认稳定环境。
 func (e *toolExecutorImpl) getHookEnvironment(provider toolProvider) ExecutionEnvironment {
-	// 1. 优先取提供方环境，非环境工具取配置中的第一个环境，没有环境时返回 nil。
-	if provider.environment != nil {
-		return provider.environment
+	environment := provider.environment
+	if environment == nil && e.opt.EnvironmentsManager != nil {
+		environments, defaultID := e.opt.EnvironmentsManager.GetEnvironments()
+		if defaultID != "" {
+			environment = environments[0]
+		}
 	}
-	if len(e.opt.Environments) > 0 {
-		return e.opt.Environments[0]
+	if environment == nil || !environment.IsCommandSupported() {
+		return nil
 	}
-	return nil
-}
-
-// isHooked 这次调用是否配置了 hook，且有环境运行 hook？
-func (e *toolExecutorImpl) isHooked(prepared *PreparedToolCall) bool {
-	// 1. 检查 Hooks 和运行 hook 的环境。
-	return e.opt.Hooks != nil && e.getHookEnvironment(prepared.provider) != nil
+	return environment
 }
 
 // runPreToolUseHooks 并发运行前置 hook，并返回与 preparedCalls 位置对应的合并结果。
 func (e *toolExecutorImpl) runPreToolUseHooks(ctx context.Context, preparedCalls []*PreparedToolCall, events chan<- ExecutorEvent) []*hook.HookOutcome {
 	// 1. 为未提前结束且配置了 hook 的调用并发触发 PreToolUse，等待全部结束。
 	preOutcomes := make([]*hook.HookOutcome, len(preparedCalls))
+	if e.opt.Hooks == nil {
+		return preOutcomes
+	}
 	tasks := pool.New()
 	for index, prepared := range preparedCalls {
-		if prepared.Finished != nil || !e.isHooked(prepared) {
+		if prepared.Finished != nil {
+			continue
+		}
+		environment := e.getHookEnvironment(prepared.provider)
+		if environment == nil {
 			continue
 		}
 		tasks.Go(func() {
-			preOutcomes[index] = e.runToolHookEvent(ctx, e.getHookEnvironment(prepared.provider), &hook.HookEvent{
+			preOutcomes[index] = e.runToolHookEvent(ctx, environment, &hook.HookEvent{
 				Name:     defs.HookEventPreToolUse,
 				Session:  e.opt.Session,
 				TurnID:   prepared.Call.TurnID,
@@ -408,10 +396,10 @@ func (e *toolExecutorImpl) applyPreToolUseOutcomes(
 ) {
 	// 1. 逐个处理调用：拦截或停止时记录并发送错误结果，放行时应用改写参数与前置运行记录。
 	for index, prepared := range preparedCalls {
-		if prepared.Finished != nil || !e.isHooked(prepared) {
+		outcome := preOutcomes[index]
+		if outcome == nil {
 			continue
 		}
-		outcome := preOutcomes[index]
 		var errorCode, message string
 		switch {
 		case outcome.IsBlocked:
@@ -461,7 +449,18 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, prepared *PreparedTo
 			events <- event
 		}
 	})
-	result := prepared.provider.tool.Execute(toolCtx, call.Clone(), progress)
+	var result *ToolExecutionResult
+	if tool, ok := prepared.provider.tool.(*mcpTool); ok && tool.isDynamic {
+		connection, found := e.getDynamicMCPConnection(tool.executorID, tool.serverID)
+		if found {
+			result = &ToolExecutionResult{Result: connection.CallTool(toolCtx, call.Clone())}
+		} else {
+			err := fmt.Errorf("executor %q MCP server %q is not connected", tool.executorID, tool.serverID)
+			result = &ToolExecutionResult{Result: newToolErrorResult(call.ToolCall.CallID, "mcp_server_unavailable", err)}
+		}
+	} else {
+		result = prepared.provider.tool.Execute(toolCtx, call.Clone(), progress)
+	}
 	close(progress)
 	forwarding.Wait()
 	if recorder.IsContentCaptured() {
@@ -469,7 +468,7 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, prepared *PreparedTo
 	}
 	recorder.End(getToolErrorCode(result.Result))
 
-	// 3. 给结果和目录规则填入实际环境 ID，协作工具和客户端工具留空；没有 hook 时直接发送完成事件。
+	// 3. 给结果和目录规则填入实际环境 ID，协作工具留空；没有 hook 时直接发送完成事件。
 	environmentID := ""
 	if prepared.provider.environment != nil {
 		environmentID = prepared.provider.environment.GetID()
@@ -481,15 +480,16 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, prepared *PreparedTo
 	finished := &ExecutionFinishedEvent{
 		Result:             result.Result,
 		AgentsInstructions: result.AgentsInstructions,
+		ShouldRefreshTools: result.ShouldRefreshTools,
+		HookRuns:           prepared.preRuns,
 	}
-	if !e.isHooked(prepared) {
+	// 4. 调用成功且有可用的 hook 环境时运行后置 hook，最后发送完成事件。
+	if e.opt.Hooks == nil || finished.Result.Error != nil {
 		events <- finished
 		return
 	}
-	// 4. 加入前置 hook 记录；成功时运行后置 hook，最后发送完成事件。
-	finished.HookRuns = prepared.preRuns
-	if finished.Result.Error == nil {
-		postOutcome := e.runToolHookEvent(ctx, e.getHookEnvironment(prepared.provider), &hook.HookEvent{
+	if environment := e.getHookEnvironment(prepared.provider); environment != nil {
+		postOutcome := e.runToolHookEvent(ctx, environment, &hook.HookEvent{
 			Name:       defs.HookEventPostToolUse,
 			Session:    e.opt.Session,
 			TurnID:     call.TurnID,
@@ -501,13 +501,22 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, prepared *PreparedTo
 	events <- finished
 }
 
+// getDynamicMCPConnection 查询同一动态环境上登记的同名 MCP 连接。
+func (e *toolExecutorImpl) getDynamicMCPConnection(executorID, serverID string) (mcpclient.Connection, bool) {
+	if e.opt.EnvironmentsManager == nil {
+		return nil, false
+	}
+	environment, _ := e.opt.EnvironmentsManager.GetEnvironment(executorID)
+	dynamic, ok := environment.(*executionEnvironmentImpl)
+	if !ok || !dynamic.IsDynamic() {
+		return nil, false
+	}
+	return dynamic.getMCPConnection(serverID)
+}
+
 // runToolHookEvent 运行一个工具 hook 事件，并转发运行记录。
 func (e *toolExecutorImpl) runToolHookEvent(ctx context.Context, environment ExecutionEnvironment, event *hook.HookEvent, events chan<- ExecutorEvent) *hook.HookOutcome {
-	// 1. 不能跑命令的环境没法运行 hook 脚本，直接返回空结果。
-	if !environment.IsCommandSupported() {
-		return &hook.HookOutcome{}
-	}
-	// 2. 启动 hook 记录转发，把每条记录包成 ExecutionHookRunEvent 发出。
+	// 1. 启动 hook 记录转发，把每条记录包成 ExecutionHookRunEvent 发出。
 	runUpdates := make(chan *defs.HookRun)
 	tasks := pool.New()
 	tasks.Go(func() {
@@ -515,7 +524,7 @@ func (e *toolExecutorImpl) runToolHookEvent(ctx context.Context, environment Exe
 			events <- &ExecutionHookRunEvent{Run: run}
 		}
 	})
-	// 3. 在指定环境运行 hook，关闭记录通道并等待转发结束。
+	// 2. 在指定环境运行 hook，关闭记录通道并等待转发结束。
 	outcome := e.opt.Hooks.RunEvent(ctx, &hook.HookEventRequest{
 		Event:      event,
 		ExecutorID: environment.GetID(),

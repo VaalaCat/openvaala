@@ -60,6 +60,14 @@ type ConversationDefinitions struct {
 	Skills []*skill.Skill
 }
 
+// ClientExecutorRegistration 是对话中一条连接登记的客户端执行环境；Servers 为空表示注销。
+type ClientExecutorRegistration struct {
+	ConnectionID string
+	ExecutorID   string
+	Description  string
+	Servers      []ClientMCPServer
+}
+
 // ClientMCPServer 是客户端登记的一个 MCP server；客户端 MCP 一律是弱依赖，超时取 mcpclient 的默认值。
 type ClientMCPServer struct {
 	// ID 是这个 MCP server 的 ID，工具名里也用它。
@@ -181,13 +189,17 @@ type configChangeReply struct {
 	err       error
 }
 
-// clientMCPChange 由 SetClientMCPServers 在新连接创建后交给 Run，替换 clientID 登记的全部连接。
+// clientMCPChange 由 SetClientExecutor 提交给 Run，以更新客户端环境并返回实际登记结果。
 type clientMCPChange struct {
-	clientID string
-	// connections 是新连接；为空时移除这个客户端的登记。
-	connections []mcpclient.Connection
-	// applied 在 Run 换完登记后关闭。
-	applied chan struct{}
+	registration ClientExecutorRegistration
+	reply        chan error
+}
+
+// ── Conversation 客户端环境运行状态 ──
+
+type clientExecutorRun struct {
+	connectionID string
+	cancel       context.CancelFunc
 }
 
 // ── 协作工具参数 ──
@@ -339,7 +351,7 @@ type ExecutorDetails struct {
 	WorkspaceDirectory string            `json:"workspace_directory,omitempty"`
 }
 
-// MCPServerInfo 是对话里一个执行环境上的一个 MCP 连接；客户端登记的 ExecutorID 为 defs.ClientExecutorID。
+// MCPServerInfo 是对话里一个执行环境上的一个 MCP 连接。
 type MCPServerInfo struct {
 	ExecutorID string `json:"executor_id"`
 	mcpclient.ConnectionInfo

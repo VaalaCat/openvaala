@@ -82,8 +82,10 @@ type TurnOpt struct {
 	Client   llmkit.Client
 	// ToolExecutor 是本 Session 的工具表，交给 Agent 列出工具和执行调用；nil 表示没有工具。
 	ToolExecutor executor.ToolExecutor
-	// Environments 是本对话的执行环境，第一个是默认环境；Turn 用它记录本轮 Executor、交给 Agent 读目录规则，并在默认环境运行 hook。
+	// Environments 是本轮开场的执行环境，供 Turn 记录和 Agent 使用。
 	Environments []executor.ExecutionEnvironment
+	// DefaultExecutorID 指定本轮默认的稳定环境。
+	DefaultExecutorID string
 	// Inbox 提供本轮的补充输入。
 	Inbox TurnInbox
 	// Model 是本 Turn 使用的模型，指向目录里的只读定义。
@@ -104,7 +106,7 @@ type TurnOpt struct {
 	// RunningReply 在 running 记录写成后收到确认；nil 表示调用方不等待这条确认。
 	RunningReply chan<- error
 	// Hooks 在写输入前触发 SessionStart、SubagentStart 和 UserPromptSubmit，也交给 Agent 触发工具与 Stop 事件；
-	// nil 或 Environments 为空表示不触发 hook。
+	// 未配置 hook 或没有稳定默认环境时跳过。
 	Hooks hook.Hooks
 	// Session 是本 Turn 所属 Session 的记录，随 hook 事件交给脚本；ParentSessionID 非空表示子 Session。
 	Session defs.Session
@@ -722,6 +724,8 @@ func (t *turnImpl) runTurn(
 	agentOpt := agent.NewAgentOpt(t.opt.TurnID, t.opt.SessionID, t.opt.Client, model, agentContext)
 	agentOpt.ToolExecutor = t.opt.ToolExecutor
 	agentOpt.Environments = t.opt.Environments
+	agentOpt.DefaultExecutorID = t.opt.DefaultExecutorID
+	agentOpt.HasOpeningEnvironments = true
 	agentOpt.Requests = requests
 	agentOpt.IsCompactOnly = t.opt.IsCompactOnly
 	agentOpt.Hooks = t.opt.Hooks
@@ -763,16 +767,27 @@ func (t *turnImpl) appendTurnInput(ctx context.Context, turnExecutors []defs.Tur
 			},
 		})
 	}
-	if !hasRunningRecord && len(t.opt.PreviousExecutors) > 0 && !slices.Equal(t.opt.PreviousExecutors, turnExecutors) {
-		batch = append(batch, &defs.Item{
-			ID:     defs.NewItemID(),
-			TurnID: t.opt.TurnID,
-			Kind:   defs.ItemExecutorsChange,
-			ExecutorsChange: &defs.ExecutorsChange{
-				PreviousExecutors: t.opt.PreviousExecutors,
-				Executors:         turnExecutors,
-			},
-		})
+	if !hasRunningRecord {
+		var change defs.ExecutorsChange
+		if len(t.opt.PreviousExecutors) == 0 {
+			change.PreviousExecutors = []defs.TurnExecutor{}
+			for _, turnExecutor := range turnExecutors {
+				if turnExecutor.IsDynamic {
+					change.Executors = append(change.Executors, turnExecutor)
+				}
+			}
+		} else {
+			change.PreviousExecutors = t.opt.PreviousExecutors
+			change.Executors = turnExecutors
+		}
+		if !slices.Equal(change.PreviousExecutors, change.Executors) && !change.GetDetails().IsEmpty() {
+			batch = append(batch, &defs.Item{
+				ID:              defs.NewItemID(),
+				TurnID:          t.opt.TurnID,
+				Kind:            defs.ItemExecutorsChange,
+				ExecutorsChange: &change,
+			})
+		}
 	}
 	// 2. 追加 Session 交来的注入 Item，补上本轮 TurnID。
 	for _, item := range t.opt.ContextItems {
@@ -833,13 +848,19 @@ func (t *turnImpl) runUserPromptSubmitHook(ctx context.Context, group []*defs.It
 
 // runHookEvent 在默认环境运行 hook 并转发运行记录。
 func (t *turnImpl) runHookEvent(ctx context.Context, event *hook.HookEvent) *hook.HookOutcome {
-	// 1. 没有 hook 或环境时返回空结果，否则填写本轮 Session 和 TurnID。
-	if t.opt.Hooks == nil || len(t.opt.Environments) == 0 {
+	// 1. 只在稳定默认环境运行 hook，填写本轮 Session 和 TurnID。
+	if t.opt.Hooks == nil {
+		return &hook.HookOutcome{}
+	}
+	index := slices.IndexFunc(t.opt.Environments, func(environment executor.ExecutionEnvironment) bool {
+		return !environment.IsDynamic() && environment.GetID() == t.opt.DefaultExecutorID
+	})
+	if index < 0 {
 		return &hook.HookOutcome{}
 	}
 	event.Session = t.opt.Session
 	event.TurnID = t.opt.TurnID
-	defaultEnvironment := t.opt.Environments[0]
+	defaultEnvironment := t.opt.Environments[index]
 	// 2. 按发生顺序转发开始和结束记录，在默认环境执行 hook。
 	runUpdates := make(chan *defs.HookRun)
 	var tasks sync.WaitGroup

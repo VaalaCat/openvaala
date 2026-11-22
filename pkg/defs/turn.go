@@ -34,10 +34,14 @@ func (u TokenUsage) Add(other TokenUsage) TokenUsage {
 	}
 }
 
-// TurnExecutor 是一个 Executor 和它在对话里的根目录。
+// TurnExecutor 是一个 Executor 和它在对话里的根目录与说明。
 type TurnExecutor struct {
 	ID                 string `json:"id"`
-	WorkspaceDirectory string `json:"workspace_directory"`
+	WorkspaceDirectory string `json:"workspace_directory,omitempty"`
+	// Description 是执行环境的说明，动态环境接入时由变更通知展示。
+	Description string `json:"description,omitempty"`
+	// IsDynamic 这个 Executor 是否可以在对话运行期间接入或移除？
+	IsDynamic bool `json:"is_dynamic,omitempty"`
 }
 
 // TurnItemRange 是一轮已保存 Item 的对外序号范围，两端都包含；起点为零表示还没有 Item，运行中终点为零。

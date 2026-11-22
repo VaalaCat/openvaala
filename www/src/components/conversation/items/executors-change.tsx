@@ -8,7 +8,7 @@ import {
 import type { TurnExecutor } from "@/lib/api/protocol.gen"
 import type { ItemRendererProps } from "@/lib/item-renderers"
 
-// executors_change：对话可用的 Executor 变了；一句话列出前后的 Executor，点开看各自的工作目录
+// executors_change：列出变更前后的 Executor，展开后显示目录或说明。
 export function ExecutorsChangeItem({ view }: ItemRendererProps) {
   const { t } = useTranslation()
   const change = view.item.executors_change
@@ -41,14 +41,17 @@ export function ExecutorsChangeItem({ view }: ItemRendererProps) {
 function ExecutorList({ executors }: { executors: TurnExecutor[] }) {
   return (
     <ul className="flex flex-col">
-      {executors.map((executor) => (
-        <OverflowTooltip
-          key={executor.id}
-          render={<li className="truncate text-table" />}
-        >
-          {executor.id}: {executor.workspace_directory}
-        </OverflowTooltip>
-      ))}
+      {executors.map((executor) => {
+        const detail = executor.workspace_directory || executor.description
+        return (
+          <OverflowTooltip
+            key={executor.id}
+            render={<li className="truncate text-table" />}
+          >
+            {detail ? `${executor.id}: ${detail}` : executor.id}
+          </OverflowTooltip>
+        )
+      })}
     </ul>
   )
 }

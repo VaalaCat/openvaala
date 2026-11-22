@@ -64,7 +64,7 @@ var openvaalaMethods = map[string]methodHandler{
 	"skill/list":                          newMethodHandler(handleSkillList),
 	"hook/list":                           newMethodHandler(handleHookList),
 	"mcpServer/list":                      newMethodHandler(handleMCPServerList),
-	"conversation/setClientMCPServers":    newMethodHandler(handleConversationSetClientMCPServers),
+	"conversation/setClientExecutor":      newMethodHandler(handleConversationSetClientExecutor),
 	"conversation/subscribe":              newMethodHandler(handleConversationSubscribe),
 	"conversation/unsubscribe":            newMethodHandler(handleConversationUnsubscribe),
 	"conversation/running/subscribe":      newMethodHandler(handleRunningConversationsSubscribe),
@@ -405,31 +405,56 @@ func handleMCPServerList(ctx context.Context, connection *serverConnection, para
 	return &runtimeprotocol.ListMCPServersResult{Servers: getNonNilSlice(servers)}, nil
 }
 
-// handleConversationSetClientMCPServers 替换本连接为对话登记的客户端 MCP server。
-func handleConversationSetClientMCPServers(ctx context.Context, connection *serverConnection, params *runtimeprotocol.SetClientMCPServersParams) (*runtimeprotocol.EmptyResult, error) {
-	// 1. 为各 server_id 创建经本连接转发的传输；调用 Runtime 前先记下对话登记。
-	servers := make([]conversation.ClientMCPServer, len(params.ServerIDs))
-	for index, serverID := range params.ServerIDs {
+// handleConversationSetClientExecutor 登记或注销本连接为对话提供的执行环境。
+func handleConversationSetClientExecutor(ctx context.Context, connection *serverConnection, params *runtimeprotocol.SetClientExecutorParams) (*runtimeprotocol.EmptyResult, error) {
+	if params.ConversationID == "" {
+		return nil, newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams, "conversation_id is required")
+	}
+	registeredID, hasRegistered := connection.clientExecutors[params.ConversationID]
+	executorID := params.ExecutorID
+	isRemoval := len(params.MCPServerIDs) == 0
+	if isRemoval {
+		if executorID == "" {
+			if !hasRegistered {
+				return &runtimeprotocol.EmptyResult{}, nil
+			}
+			executorID = registeredID
+		}
+		if hasRegistered && executorID != registeredID {
+			return nil, newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams,
+				fmt.Sprintf("cannot unregister executor %q: registered executor is %q", executorID, registeredID))
+		}
+	} else {
+		if executorID == "" {
+			executorID = connection.connectionID
+		}
+		if hasRegistered && registeredID != executorID {
+			return nil, newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams,
+				fmt.Sprintf("unregister executor %q before registering %q", registeredID, executorID))
+		}
+	}
+
+	servers := make([]conversation.ClientMCPServer, len(params.MCPServerIDs))
+	for index, serverID := range params.MCPServerIDs {
 		servers[index] = conversation.ClientMCPServer{
 			ID:        serverID,
 			Transport: connection.newClientMCPTransport(serverID),
 		}
 	}
-	if len(servers) > 0 {
-		connection.clientMCPConversations[params.ConversationID] = struct{}{}
-	}
-	// 2. 交给已打开对话替换登记，空列表表示移除全部；server 在客户端运行。
-	err := connection.runtime.SetClientMCPServers(ctx, &runtime.SetClientMCPServersRequest{
+	err := connection.runtime.SetClientExecutor(ctx, &runtime.SetClientExecutorRequest{
 		ConversationID: params.ConversationID,
-		ClientID:       connection.clientID,
+		ConnectionID:   connection.connectionID,
+		ExecutorID:     executorID,
+		Description:    params.Description,
 		Servers:        servers,
 	})
 	if err != nil {
 		return nil, err
 	}
-	// 3. 全部移除成功时清除本连接的对话登记。
-	if len(servers) == 0 {
-		delete(connection.clientMCPConversations, params.ConversationID)
+	if isRemoval {
+		delete(connection.clientExecutors, params.ConversationID)
+	} else {
+		connection.clientExecutors[params.ConversationID] = executorID
 	}
 	return &runtimeprotocol.EmptyResult{}, nil
 }

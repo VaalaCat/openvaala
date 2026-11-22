@@ -40,10 +40,9 @@ type serverConnection struct {
 	// connectionCtx 是 Run 的 ctx，即连接的生命周期；转发给客户端的 MCP 消息没有调用方 ctx，用它发送，连接结束时发送立即返回。
 	// 由 Run 在启动任何任务之前设置，之后只读。
 	connectionCtx context.Context
-	// clientID 是这条连接在 Runtime 里登记客户端 MCP 时的 ID。
-	clientID string
-	// clientMCPConversations 是本连接登记过客户端 MCP 的对话：连接结束时对它们移除登记。只由请求主循环读写，Run 在主循环结束后读取。
-	clientMCPConversations map[defs.ConversationID]struct{}
+	connectionID  string
+	// clientExecutors 记录本连接在每个对话登记的 Executor ID。只由请求主循环读写，Run 在主循环结束后注销登记。
+	clientExecutors map[defs.ConversationID]string
 	// clientMCPStreams 是还没结束的转发流：stream_id 对应所属 server 的转发传输，客户端发来的消息按它分发；
 	// 流由 clientMCPSender 在连接和断开时登记与移除，客户端发来 clientMCP/closed 或连接结束时也移除。
 	clientMCPStreams syncmap.SyncMap[string, mcpclient.RelayTransport]
@@ -63,13 +62,13 @@ const (
 	outgoingBufferSize = 16
 	// incomingBufferSize 是读任务已读、请求主循环还没取走的帧数上限；满了读任务就停在交帧上，不再读新帧。
 	incomingBufferSize = 4
-	// clientMCPReleaseTimeout 是连接结束时向 Runtime 移除客户端 MCP 登记的等待上限，所有登记过的对话共用。
-	clientMCPReleaseTimeout = 5 * time.Second
+	// clientExecutorReleaseTimeout 是连接结束时向 Runtime 注销客户端执行环境的等待上限，所有对话共用。
+	clientExecutorReleaseTimeout = 5 * time.Second
 )
 
 // newServerConnection 创建协议连接的处理实例。
 func newServerConnection(conn *websocket.Conn, opt *RuntimeServerOpt, methods map[string]methodHandler) *serverConnection {
-	// 1. 填入连接配置，创建发送队列、客户端 ID 和 MCP 对话登记表。
+	// 1. 填入连接配置，创建发送队列、连接 ID 和客户端执行环境登记表。
 	return &serverConnection{
 		conn:          conn,
 		runtime:       opt.Runtime,
@@ -79,8 +78,8 @@ func newServerConnection(conn *websocket.Conn, opt *RuntimeServerOpt, methods ma
 		methods:       methods,
 		outgoing:      make(chan *runtimeprotocol.JSONRPCMessage, outgoingBufferSize),
 
-		clientID:               uuid.NewString(),
-		clientMCPConversations: make(map[defs.ConversationID]struct{}),
+		connectionID:    uuid.NewString(),
+		clientExecutors: make(map[defs.ConversationID]string),
 	}
 }
 
@@ -91,7 +90,7 @@ func (c *serverConnection) Run(ctx context.Context) (closeReason error) {
 	c.connectionCtx = ctx
 	defer func() {
 		cancel(closeReason)
-		c.releaseClientMCP(ctx)
+		c.releaseClientExecutors(ctx)
 		c.tasks.Wait()
 		_ = c.conn.CloseNow()
 	}()
@@ -400,8 +399,8 @@ func (c *serverConnection) newClientMCPTransport(serverID string) mcpclient.Rela
 	return sender.transport
 }
 
-// releaseClientMCP 释放本连接的客户端 MCP 转发与登记。
-func (c *serverConnection) releaseClientMCP(ctx context.Context) {
+// releaseClientExecutors 释放本连接的 MCP 转发并注销客户端执行环境。
+func (c *serverConnection) releaseClientExecutors(ctx context.Context) {
 	// 1. 以连接取消原因为错误，移除并结束全部转发流，使进行中的工具调用失败。
 	reason := fmt.Errorf("client connection closed: %w", context.Cause(ctx))
 	c.clientMCPStreams.Range(func(streamID string, transport mcpclient.RelayTransport) bool {
@@ -410,16 +409,17 @@ func (c *serverConnection) releaseClientMCP(ctx context.Context) {
 		return true
 	})
 	// 2. 创建不随连接取消的限时上下文，所有对话共用移除时限。
-	removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clientMCPReleaseTimeout)
+	removeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clientExecutorReleaseTimeout)
 	defer cancel()
-	// 3. 逐个移除客户端 MCP 登记；Runtime 停止和对话未打开的错误忽略，其余记 Warn。
-	for conversationID := range c.clientMCPConversations {
-		err := c.runtime.SetClientMCPServers(removeCtx, &runtime.SetClientMCPServersRequest{
+	// 3. 逐个注销本连接登记的执行环境；Runtime 停止和对话未打开的错误忽略，其余记 Warn。
+	for conversationID, executorID := range c.clientExecutors {
+		err := c.runtime.SetClientExecutor(removeCtx, &runtime.SetClientExecutorRequest{
 			ConversationID: conversationID,
-			ClientID:       c.clientID,
+			ConnectionID:   c.connectionID,
+			ExecutorID:     executorID,
 		})
 		if err != nil && !errors.Is(err, runtime.ErrConversationNotOpen) && !errors.Is(err, runtime.ErrRuntimeStopped) {
-			telemetry.GetLogger(ctx).Warn("remove client MCP servers failed", "gen_ai.conversation.id", string(conversationID), "error", err)
+			telemetry.GetLogger(ctx).Warn("remove client executor failed", "gen_ai.conversation.id", string(conversationID), "executor_id", executorID, "error", err)
 		}
 	}
 }

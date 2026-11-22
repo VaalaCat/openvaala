@@ -524,12 +524,17 @@ type testToolExecutor struct {
 	preparedCallID              string
 	beforePreparedCallsReturned func()
 	agentsInstructions          []*defs.AgentsInstruction
+	shouldRefreshTools          bool
 }
 
 // GetTools 返回测试查询工具定义。
 func (e *testToolExecutor) GetTools(context.Context) ([]*defs.ToolDefinition, error) {
 	// 1. 读取查询工具定义并组成列表。
 	return []*defs.ToolDefinition{e.GetDefinition()}, nil
+}
+
+func (e *testToolExecutor) GetToolsForEnvironments(ctx context.Context, _ []executor.ExecutionEnvironment, _ string) ([]*defs.ToolDefinition, error) {
+	return e.GetTools(ctx)
 }
 
 // GetDefinition 返回 lookup 工具的名称和参数定义。
@@ -614,6 +619,7 @@ func (e *testToolExecutor) Run(ctx context.Context, call *executor.PreparedToolC
 	events <- &executor.ExecutionFinishedEvent{
 		Result:             result.Result,
 		AgentsInstructions: slices.Concat(result.AgentsInstructions, e.agentsInstructions),
+		ShouldRefreshTools: e.shouldRefreshTools,
 	}
 	if e.parallel && callID == "call_b" {
 		close(e.callBFinished)

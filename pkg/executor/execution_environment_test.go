@@ -242,7 +242,7 @@ func newEnvironmentFixture(t *testing.T, id string, environmentWorkspace workspa
 func (f *environmentFixture) newToolExecutor(t *testing.T, serverIDs defs.OptionalStringList) executor.ToolExecutor {
 	// 1. 设置环境和 server 筛选条件，构造执行器。
 	t.Helper()
-	opt := executor.NewToolExecutorOpt([]executor.ExecutionEnvironment{f.environment})
+	opt := executor.NewToolExecutorOpt(newStaticEnvironmentsManager(t, f.environment))
 	opt.MCPServerIDs = serverIDs
 	toolExecutor, err := executor.NewToolExecutor(opt)
 	if err != nil {
@@ -491,6 +491,63 @@ func TestExecutionEnvironmentMCPTools(t *testing.T) {
 				newWorkspace = newLocalWorkspace
 			}
 			tt.run(t, newEnvironmentFixture(t, "local", newWorkspace(t), newServers(), "bash"))
+		})
+	}
+}
+
+// TestExecutionEnvironmentExternalMCPConnections 验证两种来源的 server ID 统一校验和排序。
+func TestExecutionEnvironmentExternalMCPConnections(t *testing.T) {
+	externalA := newClientMCPConnection(t, clientServer{id: "a"})
+	externalB := newClientMCPConnection(t, clientServer{id: "b"})
+	externalZ := newClientMCPConnection(t, clientServer{id: "z"})
+	static := &mcpclient.ServerDefinition{
+		ID:          "b",
+		ExecutorIDs: []string{"local"},
+	}
+	for _, tt := range []struct {
+		name        string
+		connections []mcpclient.Connection
+		wantIDs     []string
+		wantError   string
+	}{
+		{
+			name:        "merged in server ID order",
+			connections: []mcpclient.Connection{externalZ, externalA},
+			wantIDs:     []string{"a", "b", "z"},
+		},
+		{
+			name:        "nil external connection",
+			connections: []mcpclient.Connection{nil},
+			wantError:   "MCP connection is missing",
+		},
+		{
+			name:        "duplicate external server",
+			connections: []mcpclient.Connection{externalA, externalA},
+			wantError:   `more than one MCP connection for server "a"`,
+		},
+		{
+			name:        "configured server and external connection share ID",
+			connections: []mcpclient.Connection{externalB},
+			wantError:   `more than one MCP connection for server "b"`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			opt := executor.NewExecutionEnvironmentOpt("local", "", newLocalWorkspace(t)).
+				WithMCPServers([]*mcpclient.ServerDefinition{static}).
+				WithMCPConnections(tt.connections...)
+			environment, err := executor.NewExecutionEnvironment(opt)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("NewExecutionEnvironment() error = %v, want %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := getServerIDs(environment.GetMCPServers()); !slices.Equal(got, tt.wantIDs) {
+				t.Fatalf("GetMCPServers() IDs = %v, want %v", got, tt.wantIDs)
+			}
 		})
 	}
 }

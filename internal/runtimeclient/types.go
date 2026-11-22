@@ -157,6 +157,14 @@ type OpenConversationRequest struct {
 	SkipHistory bool
 }
 
+// SetClientExecutorRequest 登记本机执行环境。MCPServerIDs 为空时注销，ExecutorID 为空时由 serve 选择。
+type SetClientExecutorRequest struct {
+	ConversationID defs.ConversationID
+	ExecutorID     string
+	Description    string
+	MCPServerIDs   []string
+}
+
 // TerminalOpenRequest 指定新终端用哪个 Executor、起始目录和初始尺寸。
 type TerminalOpenRequest struct {
 	// ExecutorID 为空时用 local Executor。

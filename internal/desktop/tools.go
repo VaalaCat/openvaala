@@ -269,7 +269,7 @@ func getToolIcon(name string) *ui.SVG {
 		return kit.IconFileText
 	case "apply_patch":
 		return kit.IconPencil
-	case "spawn_agent", "send_message", "wait_agent", "interrupt_agent", "list_agents", "read_session_history":
+	case "spawn_agent", "send_message", "wait_agent", "interrupt_agent", "list_agents", "list_executors", "read_session_history":
 		return kit.IconBot
 	default:
 		return kit.IconWrench

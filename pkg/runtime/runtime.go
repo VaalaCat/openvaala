@@ -90,8 +90,8 @@ type Runtime interface {
 	GetSessionDetails(ctx context.Context, request *GetSessionDetailsRequest) (conversation.SessionDetails, error)
 	// GetMCPServers 返回已打开对话的执行环境及客户端 MCP 连接情况，不等待连接；未打开时返回 ErrConversationNotOpen。
 	GetMCPServers(ctx context.Context, request *GetConversationRequest) ([]conversation.MCPServerInfo, error)
-	// SetClientMCPServers 替换客户端为已打开对话登记的全部 MCP server，下个 Turn 起生效；空列表移除全部，无效登记返回错误且保留原登记。
-	SetClientMCPServers(ctx context.Context, request *SetClientMCPServersRequest) error
+	// SetClientExecutor 登记已打开对话的客户端环境；Servers 为空时注销同一连接的登记。
+	SetClientExecutor(ctx context.Context, request *SetClientExecutorRequest) error
 	// ListModels 返回公开模型目录和指定 Agent 的默认模型，不含连接信息与凭证。
 	ListModels(ctx context.Context, request *ListModelsRequest) (ModelList, error)
 	// GetHooks 按配置顺序返回 Hook 信息，未配置时返回空切片。
@@ -448,15 +448,23 @@ func (r *runtimeImpl) SetConversationExecutorSettings(ctx context.Context, reque
 	}
 }
 
-// SetClientMCPServers 替换客户端为已打开对话登记的 MCP server。
-func (r *runtimeImpl) SetClientMCPServers(ctx context.Context, request *SetClientMCPServersRequest) error {
-	// 1. 取得运行对话。
+// SetClientExecutor 将客户端环境登记转发给已打开的对话。
+func (r *runtimeImpl) SetClientExecutor(ctx context.Context, request *SetClientExecutorRequest) error {
+	// 1. 校验登记所需的标识，取得运行中的对话。
+	if request == nil || request.ConversationID == "" || request.ConnectionID == "" || request.ExecutorID == "" {
+		return fmt.Errorf("%w: set client executor requires a conversation ID, a connection ID and an executor ID", conversation.ErrInvalidExecutorSettings)
+	}
 	running, err := r.getRunningConversation(ctx, request.ConversationID)
 	if err != nil {
 		return err
 	}
-	// 2. 交给对话换掉这个客户端的全部登记。
-	return running.conversation.SetClientMCPServers(ctx, request.ClientID, request.Servers)
+	// 2. 交给对话更新登记。
+	return running.conversation.SetClientExecutor(ctx, conversation.ClientExecutorRegistration{
+		ConnectionID: request.ConnectionID,
+		ExecutorID:   request.ExecutorID,
+		Description:  request.Description,
+		Servers:      request.Servers,
+	})
 }
 
 // GetConversation 读取对话记录。
@@ -1027,7 +1035,7 @@ func (r *runtimeImpl) GetMCPServers(ctx context.Context, request *GetConversatio
 	if err != nil {
 		return nil, err
 	}
-	// 2. 返回当前连接情况，不等待连接：环境按对话内顺序、环境内按 server ID 排列；客户端登记在最后，ExecutorID 为 defs.ClientExecutorID。
+	// 2. 返回当前连接情况，不等待连接：环境按对话内顺序、环境内按 server ID 排列。
 	return running.conversation.GetMCPServers(), nil
 }
 

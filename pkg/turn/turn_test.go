@@ -72,16 +72,19 @@ func TestTurnCheckpointBeforeIO(t *testing.T) {
 			if tt.toolBatch {
 				hooks := &checkpointTestHooks{}
 				environment := newTurnEnvironments(t, []defs.TurnExecutor{{ID: "local", WorkspaceDirectory: "/checkpoint"}})[0]
-				baseExecutor, err := executor.NewToolExecutor(&executor.ToolExecutorOpt{
-					Environments: []executor.ExecutionEnvironment{environment},
-					AgentTools:   []executor.Tool{&checkpointTestTool{}},
-					Hooks:        hooks,
-				})
+				opt.Environments = []executor.ExecutionEnvironment{environment}
+				opt.DefaultExecutorID = "local"
+				manager := executor.NewExecutionEnvironmentsManager()
+				if _, err := manager.SetStatic(opt.DefaultExecutorID, opt.Environments); err != nil {
+					t.Fatal(err)
+				}
+				executorOpt := executor.NewToolExecutorOpt(manager, &checkpointTestTool{})
+				executorOpt.Hooks = hooks
+				baseExecutor, err := executor.NewToolExecutor(executorOpt)
 				if err != nil {
 					t.Fatal(err)
 				}
 				opt.ToolExecutor = &checkpointCountingExecutor{ToolExecutor: baseExecutor}
-				opt.Environments = []executor.ExecutionEnvironment{environment}
 				opt.Hooks = hooks
 				gate.preToolUseCalls = &hooks.preToolUseCalls
 			}
@@ -2005,6 +2008,7 @@ func TestTurnCancellationRecordsInterrupted(t *testing.T) {
 					ID:                 "local",
 					WorkspaceDirectory: "/a",
 				}})
+				turnOpt.DefaultExecutorID = "local"
 			}
 			turnInstance, err := newTestTurn(turnOpt)
 			if err != nil {
@@ -2300,7 +2304,11 @@ type reverseTurnExecutor struct {
 }
 
 // GetTools 返回测试 lookup 工具定义。
-func (*reverseTurnExecutor) GetTools(context.Context) ([]*defs.ToolDefinition, error) {
+func (e *reverseTurnExecutor) GetTools(ctx context.Context) ([]*defs.ToolDefinition, error) {
+	return e.GetToolsForEnvironments(ctx, nil, "")
+}
+
+func (*reverseTurnExecutor) GetToolsForEnvironments(context.Context, []executor.ExecutionEnvironment, string) ([]*defs.ToolDefinition, error) {
 	// 1. 返回查询工具的名称、说明和对象参数结构。
 	return []*defs.ToolDefinition{
 		{
@@ -3298,11 +3306,19 @@ func newTurnEnvironments(t *testing.T, executors []defs.TurnExecutor) []executor
 	t.Helper()
 	var environments []executor.ExecutionEnvironment
 	for _, each := range executors {
-		work, err := workspace.NewVirtualWorkspace(workspace.NewVirtualWorkspaceOpt(each.WorkspaceDirectory, nil))
-		if err != nil {
-			t.Fatal(err)
+		var work workspace.Workspace
+		if each.WorkspaceDirectory != "" {
+			var err error
+			work, err = workspace.NewVirtualWorkspace(workspace.NewVirtualWorkspaceOpt(each.WorkspaceDirectory, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
-		environment, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt(each.ID, "", work))
+		opt := executor.NewExecutionEnvironmentOpt(each.ID, each.Description, work)
+		if each.IsDynamic {
+			opt.WithoutCommands().AsDynamic()
+		}
+		environment, err := executor.NewExecutionEnvironment(opt)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3335,6 +3351,9 @@ func TestTurnExecutorsChange(t *testing.T) {
 		ID:                 "openvaala",
 		WorkspaceDirectory: "/workspace",
 	}}
+	dynamic := defs.TurnExecutor{ID: "editor", Description: "开发机上的编辑器", IsDynamic: true}
+	renamed := slices.Clone(previousList)
+	renamed[0].Description = "更新后的说明"
 	tests := []struct {
 		name          string
 		previous      []defs.TurnExecutor
@@ -3342,6 +3361,8 @@ func TestTurnExecutorsChange(t *testing.T) {
 		current       []defs.TurnExecutor
 		// wantKinds 是用户输入之前依次写入的 Item 种类。
 		wantKinds []defs.ItemKind
+		// wantOpeningExecutors 是首轮变更通知中的动态环境。
+		wantOpeningExecutors []defs.TurnExecutor
 	}{
 		{
 			name:     "new_default_added",
@@ -3397,6 +3418,17 @@ func TestTurnExecutorsChange(t *testing.T) {
 			name:    "no_previous_turn",
 			current: previousList,
 		},
+		{
+			name:                 "first_turn_with_dynamic_executor",
+			current:              append(slices.Clone(previousList), dynamic),
+			wantKinds:            []defs.ItemKind{defs.ItemExecutorsChange},
+			wantOpeningExecutors: []defs.TurnExecutor{dynamic},
+		},
+		{
+			name:     "description_only_change",
+			previous: previousList,
+			current:  renamed,
+		},
 	}
 	// 2. 运行不同环境配置，检查 running 记录、输入前变化 Item 和模型请求里的环境通知。
 	for _, tt := range tests {
@@ -3409,6 +3441,9 @@ func TestTurnExecutorsChange(t *testing.T) {
 			opt := turn.NewTurnOpt(conversationID, sid, &agent.AgentDefinition{Name: "assistant"}, store.query, recorder, client)
 			opt.Model, opt.CompactModel, opt.PreviousModel = modelB, modelB, tt.previousModel
 			opt.Environments, opt.PreviousExecutors = newTurnEnvironments(t, tt.current), tt.previous
+			if len(tt.current) != 0 {
+				opt.DefaultExecutorID = tt.current[0].ID
+			}
 			instance, err := newTestTurn(opt)
 			if err != nil {
 				t.Fatal(err)
@@ -3439,7 +3474,7 @@ func TestTurnExecutorsChange(t *testing.T) {
 				t.Fatalf("items before input = %v, want %v", gotKinds, tt.wantKinds)
 			}
 			payload, _ := json.Marshal(client.requests[0].Messages)
-			hasNotice := strings.Contains(string(payload), "Executor 已变更")
+			hasNotice := strings.Contains(string(payload), "openvaala-executors-change-event")
 			if wantNotice := slices.Contains(tt.wantKinds, defs.ItemExecutorsChange); hasNotice != wantNotice {
 				t.Fatalf("request has executors change notice = %v, want %v: %s", hasNotice, wantNotice, payload)
 			}
@@ -3447,8 +3482,18 @@ func TestTurnExecutorsChange(t *testing.T) {
 				return
 			}
 			change := page.Items[inputIndex-1].Item
-			if change.TurnID != opt.TurnID || !slices.Equal(change.ExecutorsChange.PreviousExecutors, tt.previous) || !slices.Equal(change.ExecutorsChange.Executors, tt.current) {
-				t.Fatalf("executors change = %+v (turn %s), want %+v -> %+v", change.ExecutorsChange, change.TurnID, tt.previous, tt.current)
+			wantExecutors := tt.current
+			if tt.wantOpeningExecutors != nil {
+				wantExecutors = tt.wantOpeningExecutors
+				if change.ExecutorsChange.PreviousExecutors == nil {
+					t.Fatal("opening notice must encode previous_executors as []")
+				}
+				if !strings.Contains(string(payload), "新增可用的 editor（开发机上的编辑器）") {
+					t.Fatalf("opening notice lacks the dynamic executor: %s", payload)
+				}
+			}
+			if change.TurnID != opt.TurnID || !slices.Equal(change.ExecutorsChange.PreviousExecutors, tt.previous) || !slices.Equal(change.ExecutorsChange.Executors, wantExecutors) {
+				t.Fatalf("executors change = %+v (turn %s), want %+v -> %+v", change.ExecutorsChange, change.TurnID, tt.previous, wantExecutors)
 			}
 		})
 	}
@@ -4310,13 +4355,14 @@ func TestTurnHooks(t *testing.T) {
 			var environments []executor.ExecutionEnvironment
 			if !tt.noExecutors {
 				environments = newTurnEnvironments(t, []defs.TurnExecutor{{
-					ID:                 "local",
-					WorkspaceDirectory: "/a",
-				}, {
 					ID:                 "gpu",
 					WorkspaceDirectory: "/data",
+				}, {
+					ID:                 "local",
+					WorkspaceDirectory: "/a",
 				}})
 				opt.Environments = environments
+				opt.DefaultExecutorID = "local"
 			}
 			inbox := &testTurnInbox{}
 			input := turnUserMessage("first")
@@ -4410,7 +4456,7 @@ func TestTurnHooks(t *testing.T) {
 			for _, request := range stub.requests {
 				event := request.Event
 				if request.ExecutorID != "local" || event.TurnID != opt.TurnID || event.Session.ID != sessionID || event.Session.ParentSessionID != tt.parentSessionID ||
-					request.Workspace != environments[0].GetWorkspace() {
+					request.Workspace != environments[1].GetWorkspace() {
 					t.Fatalf("request = %+v event = %+v, want the default executor, turn and session", request, event)
 				}
 				gotRequests = append(gotRequests, hookRequest{
@@ -4509,6 +4555,7 @@ func TestTurnItemsRangeWrites(t *testing.T) {
 					ID:                 "local",
 					WorkspaceDirectory: "/a",
 				}})
+				opt.DefaultExecutorID = "local"
 				opt.Hooks = &turnHooksStub{outcomes: map[turnHookKey]*hook.HookOutcome{{
 					defs.HookEventUserPromptSubmit,
 					"input",
@@ -4596,6 +4643,7 @@ func TestCheckInputHandoff(t *testing.T) {
 			if tt.hookStatus != "" {
 				const event = defs.HookEventUserPromptSubmit
 				opt.Environments = newTurnEnvironments(t, []defs.TurnExecutor{{ID: "local", WorkspaceDirectory: "/workspace"}})
+				opt.DefaultExecutorID = "local"
 				opt.Hooks = &turnHooksStub{outcomes: map[turnHookKey]*hook.HookOutcome{
 					{name: event, prompt: "用 /review 审 PR"}: newTurnHookOutcome(event, tt.hookStatus),
 				}}
@@ -4708,6 +4756,7 @@ func TestTurnResumeConversation(t *testing.T) {
 				hooks.outcomes = map[turnHookKey]*hook.HookOutcome{{name: defs.HookEventStop}: withTurnHookContext(newTurnHookOutcome(defs.HookEventStop, defs.HookRunBlocked), "hook asks to continue")}
 				opt.Hooks = hooks
 				opt.Environments = newTurnEnvironments(t, []defs.TurnExecutor{{ID: "local", WorkspaceDirectory: "/work"}})
+				opt.DefaultExecutorID = "local"
 			}
 			if tt.missingModel {
 				opt.Model = nil
@@ -4831,7 +4880,14 @@ func TestTurnResumeToolBatch(t *testing.T) {
 			opt.Environments = newTurnEnvironments(t, []defs.TurnExecutor{{ID: "local", WorkspaceDirectory: "/work"}})
 			hooks := &turnHooksStub{}
 			opt.Hooks = hooks
-			baseExecutor, err := executor.NewToolExecutor(&executor.ToolExecutorOpt{Environments: opt.Environments, AgentTools: []executor.Tool{&checkpointTestTool{}}, Hooks: hooks})
+			opt.DefaultExecutorID = "local"
+			manager := executor.NewExecutionEnvironmentsManager()
+			if _, err := manager.SetStatic(opt.DefaultExecutorID, opt.Environments); err != nil {
+				t.Fatal(err)
+			}
+			executorOpt := executor.NewToolExecutorOpt(manager, &checkpointTestTool{})
+			executorOpt.Hooks = hooks
+			baseExecutor, err := executor.NewToolExecutor(executorOpt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -5330,6 +5386,7 @@ func TestTurnResumeCompaction(t *testing.T) {
 					t.Fatal(err)
 				}
 				opt.Environments = []executor.ExecutionEnvironment{environment, memoryEnvironment}
+				opt.DefaultExecutorID = "local"
 			}
 			previousTurnID := defs.NewTurnID()
 			old, covered, retained := turnUserMessage("already summarized"), turnUserMessage("original coverage end"), turnUserMessage("uncovered history")

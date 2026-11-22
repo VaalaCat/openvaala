@@ -69,9 +69,11 @@ func run(ctx context.Context, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := rt.SetClientMCPServers(ctx, &runtime.SetClientMCPServersRequest{
-		ConversationID: record.ID, ClientID: "host",
-		Servers: []conversation.ClientMCPServer{{ID: "business", Transport: businessTransport{}}},
+	if err := rt.SetClientExecutor(ctx, &runtime.SetClientExecutorRequest{
+		ConversationID: record.ID,
+		ConnectionID:   "host",
+		ExecutorID:     "host",
+		Servers:        []conversation.ClientMCPServer{{ID: "business", Transport: businessTransport{}}},
 	}); err != nil {
 		return err
 	}

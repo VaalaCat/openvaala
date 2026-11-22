@@ -187,17 +187,17 @@ func validateConversationConfig(
 		agentDefinitions[definition.Name] = definition
 	}
 	// 3. 创建协作工具，和执行环境的内置工具放在一起校验工具定义，MCP 工具不参与。
-	collaborationTools, err := newCollaborationTools(nil, defs.Session{}, definitions)
+	collaborationTools, err := newCollaborationTools(nil, defs.Session{}, definitions, nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	toolExecutorOpt := executor.NewToolExecutorOpt(environments, collaborationTools...)
+	toolExecutorOpt := executor.NewToolExecutorOpt(nil, collaborationTools...)
 	toolExecutorOpt.MCPServerIDs = defs.OptionalStringList{}
 	toolExecutor, err := executor.NewToolExecutor(toolExecutorOpt)
 	if err != nil {
 		return nil, nil, err
 	}
-	if _, err := toolExecutor.GetTools(ctx); err != nil {
+	if _, err := toolExecutor.GetToolsForEnvironments(ctx, environments, getDefaultExecutorID(environments)); err != nil {
 		return nil, nil, err
 	}
 	// 4. 有执行环境时，校验各 Agent 选的工具名和 Skill 名都存在。
@@ -314,7 +314,9 @@ func newExecutorDetails(environments []executor.ExecutionEnvironment, executors 
 		}
 		// 2. 在列表里找同 ID 的 Executor，取它的种类。
 		var kind defs.ExecutorKind
-		if executorIndex := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == environment.GetID() }); executorIndex >= 0 {
+		if environment.IsDynamic() {
+			kind = defs.ExecutorKindClient
+		} else if executorIndex := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == environment.GetID() }); executorIndex >= 0 {
 			kind = executors[executorIndex].GetDefinition().Kind
 		}
 		details[index] = ExecutorDetails{
@@ -338,49 +340,48 @@ func getSkillNames(skills []*skill.Skill) []string {
 }
 
 // getSessionToolNames 返回 Agent 可用的内置工具、已连接 MCP 工具和协作工具名。
-func getSessionToolNames(environments []executor.ExecutionEnvironment, clientMCPServers executor.ClientMCPServers, definition *agent.AgentDefinition, collaborationTools []executor.Tool) []string {
-	// 1. 按 Agent 的 ToolNames 筛选内置工具，名单为空时全要，并去掉重名。
+func getSessionToolNames(environments []executor.ExecutionEnvironment, definition *agent.AgentDefinition, collaborationTools []executor.Tool) []string {
+	// 1. 汇总各环境上 Agent 可见的工具并去掉重名。
 	var names []string
-	for _, name := range getExecutorToolNames(environments) {
-		if len(definition.ToolNames) > 0 && !slices.Contains(definition.ToolNames, name) {
-			continue
+	for _, environment := range environments {
+		for _, name := range getEnvironmentToolNames(environment, environment.GetMCPServers(), definition) {
+			if !slices.Contains(names, name) {
+				names = append(names, name)
+			}
 		}
-		if !slices.Contains(names, name) {
+	}
+	// 2. 追加协作工具名。
+	for _, tool := range collaborationTools {
+		names = append(names, tool.GetDefinition().Name)
+	}
+	return names
+}
+
+// getEnvironmentToolNames 返回 Agent 在此环境可用的工具名，不等待 MCP 连接。
+func getEnvironmentToolNames(environment executor.ExecutionEnvironment, servers []mcpclient.ConnectionInfo, definition *agent.AgentDefinition) []string {
+	// 1. 按 ToolNames 筛选内置工具，名单为空时全要。
+	names := make([]string, 0)
+	for _, name := range getExecutorToolNames([]executor.ExecutionEnvironment{environment}) {
+		if len(definition.ToolNames) == 0 || slices.Contains(definition.ToolNames, name) {
 			names = append(names, name)
 		}
 	}
-	// 2. 按 MCPServerIDs 筛选执行环境里已连接的 MCP 工具，nil 时全要，空列表时一个不要。
-	for _, environment := range environments {
-		for _, info := range environment.GetMCPServers() {
-			if info.State != mcpclient.ConnectionStateConnected {
-				continue
-			}
-			if definition.MCPServerIDs != nil && !slices.Contains(definition.MCPServerIDs, info.ServerID) {
-				continue
-			}
-			for _, tool := range info.Tools {
-				if !slices.Contains(names, tool.Name) {
-					names = append(names, tool.Name)
-				}
+	// 2. 显式选择 MCP server 的 Agent 只使用稳定环境的连接。
+	if environment.IsDynamic() && definition.MCPServerIDs != nil {
+		return names
+	}
+	for _, info := range servers {
+		if info.State != mcpclient.ConnectionStateConnected {
+			continue
+		}
+		if definition.MCPServerIDs != nil && !slices.Contains(definition.MCPServerIDs, info.ServerID) {
+			continue
+		}
+		for _, tool := range info.Tools {
+			if !slices.Contains(names, tool.Name) {
+				names = append(names, tool.Name)
 			}
 		}
-	}
-	// 3. MCPServerIDs 为 nil 时追加已连接的客户端 MCP 工具。
-	if definition.MCPServerIDs == nil {
-		for _, info := range clientMCPServers.GetMCPServers() {
-			if info.State != mcpclient.ConnectionStateConnected {
-				continue
-			}
-			for _, tool := range info.Tools {
-				if !slices.Contains(names, tool.Name) {
-					names = append(names, tool.Name)
-				}
-			}
-		}
-	}
-	// 4. 追加协作工具名。
-	for _, tool := range collaborationTools {
-		names = append(names, tool.GetDefinition().Name)
 	}
 	return names
 }
@@ -635,20 +636,31 @@ func logConversationStopped(logger *slog.Logger, err error) {
 	logger.Error("conversation stopped with error", "error", err)
 }
 
-// newExecutorPromptEntries 按执行环境生成系统提示里的 Executor 条目。
+// getDefaultExecutorID 返回配置里的首个执行环境 ID。
+func getDefaultExecutorID(environments []executor.ExecutionEnvironment) string {
+	if len(environments) == 0 {
+		return ""
+	}
+	return environments[0].GetID()
+}
+
+// newExecutorPromptEntries 按稳定执行环境生成系统提示里的 Executor 条目。
 func newExecutorPromptEntries(environments []executor.ExecutionEnvironment) []prompt.ExecutorEntry {
 	// 1. 按环境顺序填写 ID、说明和工作区根目录，第一个仍是默认 Executor。
-	entries := make([]prompt.ExecutorEntry, len(environments))
-	for index, environment := range environments {
+	entries := make([]prompt.ExecutorEntry, 0, len(environments))
+	for _, environment := range environments {
+		if environment.IsDynamic() {
+			continue
+		}
 		directory := ""
 		if environmentWorkspace := environment.GetWorkspace(); environmentWorkspace != nil {
 			directory = environmentWorkspace.GetRootDirectory()
 		}
-		entries[index] = prompt.ExecutorEntry{
+		entries = append(entries, prompt.ExecutorEntry{
 			ID:                 environment.GetID(),
 			Description:        environment.GetDescription(),
 			WorkspaceDirectory: directory,
-		}
+		})
 	}
 	return entries
 }

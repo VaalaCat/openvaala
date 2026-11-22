@@ -2,6 +2,7 @@ package prompt_test
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
@@ -81,6 +82,52 @@ func TestFormatExecutorParameterDescription(t *testing.T) {
 			want := "执行此调用的 Executor，见系统提示 <openvaala-executors>；省略时使用 " + id
 			if got := prompt.FormatExecutorParameterDescription(id); got != want {
 				t.Fatalf("got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestExecutorToolDescriptions 核对必填路由和刷新工具表的提示。
+func TestExecutorToolDescriptions(t *testing.T) {
+	// 1. 检查必填参数的选址说明，以及查询与刷新对前缀缓存的影响。
+	for _, tt := range []struct {
+		name        string
+		description string
+		want        []string
+	}{
+		{
+			name:        "required_executor",
+			description: prompt.FormatRequiredExecutorParameterDescription(),
+			want: []string{
+				"必填，执行此调用的 Executor，见系统提示 <openvaala-executors> 或用 list_executors 查询；默认 Executor 不提供此工具，必须显式指定，不确定目标时先向用户确认",
+			},
+		},
+		{
+			name:        "list_executors_without_refresh",
+			description: prompt.ListExecutorsDescription,
+			want: []string{
+				"无参数时只查询当前在线的全部 Executor",
+				"默认标记、说明、工作目录和可用工具名",
+				"不影响前缀缓存",
+			},
+		},
+		{
+			name:        "list_executors_with_refresh",
+			description: prompt.ListExecutorsDescription,
+			want: []string{
+				"refresh_tools: true",
+				"下一次模型请求前重建工具表",
+				"导致前缀缓存失效",
+				"仅在当前 Turn 确实需要立刻调用新上线的工具时使用",
+				"不要高频调用",
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, want := range tt.want {
+				if !strings.Contains(tt.description, want) {
+					t.Errorf("description %q does not contain %q", tt.description, want)
+				}
 			}
 		})
 	}

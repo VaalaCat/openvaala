@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -772,17 +773,18 @@ func TestConversationReconfigure(t *testing.T) {
 		{
 			name: "client_mcp_survives_reconfigure",
 			run: func(t *testing.T, h *conversationHarness, newDefinitions func() *ConversationDefinitions) {
-				if err := h.c.SetClientMCPServers(t.Context(), "client-1", []ClientMCPServer{{
-					ID:        "echo",
-					Transport: pingMCPTransport{},
-				}}); err != nil {
-					t.Fatalf("SetClientMCPServers() error = %v", err)
+				if err := h.c.SetClientExecutor(t.Context(), ClientExecutorRegistration{
+					ConnectionID: "client-1",
+					ExecutorID:   "desktop",
+					Servers:      []ClientMCPServer{{ID: "echo", Transport: pingMCPTransport{}}},
+				}); err != nil {
+					t.Fatalf("SetClientExecutor() error = %v", err)
 				}
 				if _, err := h.c.SetDefinitions(t.Context(), newDefinitions()); err != nil {
 					t.Fatalf("SetDefinitions() error = %v", err)
 				}
 				if !slices.ContainsFunc(h.c.GetMCPServers(), func(info MCPServerInfo) bool {
-					return info.ExecutorID == defs.ClientExecutorID && info.ServerID == "echo"
+					return info.ExecutorID == "desktop" && info.ServerID == "echo"
 				}) {
 					t.Fatalf("MCP servers after reconfigure = %+v, want the client server echo", h.c.GetMCPServers())
 				}
@@ -1272,11 +1274,13 @@ func requireNoEvent(t *testing.T, h *conversationHarness, match func(Conversatio
 	}
 }
 
-// pingMCPTransport 每次 Connect 起一个进程内的 MCP server，只有一个回复 pong 的 ping 工具。
-type pingMCPTransport struct{}
+// pingMCPTransport 每次 Connect 启动一个提供 ping 工具的进程内 MCP server。
+type pingMCPTransport struct {
+	response string
+}
 
 // Connect 创建带 ping 工具的进程内 MCP 连接。
-func (pingMCPTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+func (transport pingMCPTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 	// 1. 创建只返回 pong 的 ping 工具，通过进程内传输连接 server 和 client。
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "ping",
@@ -1287,13 +1291,200 @@ func (pingMCPTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 		InputSchema: json.RawMessage(`{"type":"object"}`),
 	},
 		func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "pong"}}}, nil
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: cmp.Or(transport.response, "pong")}}}, nil
 		})
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	if _, err := server.Connect(ctx, serverTransport, nil); err != nil {
 		return nil, err
 	}
 	return clientTransport.Connect(ctx)
+}
+
+// TestConversationClientExecutorChanges 检查首轮和后续轮的动态环境通知以及 Session 生命周期。
+func TestConversationClientExecutorChanges(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		firstTurnOpen bool
+		wantPrevious  int
+	}{
+		{name: "connected_before_first_turn"},
+		{name: "connected_during_first_turn", firstTurnOpen: true, wantPrevious: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store, model := openConversationDAO(t), newConversationModel(t)
+			opt := conversationOpt(store, model)
+			opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := startTestConversation(t, store, model, c)
+			h.waitEvent(t, func(event ConversationEvent) bool {
+				_, started := event.(*ConversationSessionStarted)
+				return started
+			})
+			var system string
+			finishTurn := func(id defs.ItemID, req modelRequest, wantTool bool) {
+				t.Helper()
+				message := req.body["messages"].([]any)[0].(map[string]any)
+				got := message["content"].(string)
+				if message["role"] != "system" || !strings.Contains(got, "- local（默认）") || strings.Contains(got, "workstation") {
+					t.Fatalf("unexpected system message: %+v", message)
+				}
+				if system != "" && got != system {
+					t.Fatalf("system changed from %q to %q", system, got)
+				}
+				system = got
+				if gotTool := slices.Contains(requestToolNames(req), "mcp__desk__ping"); gotTool != wantTool {
+					t.Fatalf("request tools = %v, want client tool: %v", requestToolNames(req), wantTool)
+				}
+				req.reply <- modelResponse{text: "done"}
+				if finished, _ := h.waitTurnFinished(t, id); finished.Err != nil {
+					t.Fatal(finished.Err)
+				}
+			}
+			var firstID defs.ItemID
+			var firstRequest modelRequest
+			if tt.firstTurnOpen {
+				firstID = h.input(t, session.SessionInputModeNormal, "first")
+				firstRequest = receiveModelRequest(t, model)
+			}
+			registration := ClientExecutorRegistration{
+				ConnectionID: "ws-1",
+				ExecutorID:   "workstation",
+				Description:  "Work laptop",
+				Servers:      []ClientMCPServer{{ID: "desk", Transport: pingMCPTransport{}}},
+			}
+			if err := c.SetClientExecutor(t.Context(), registration); err != nil {
+				t.Fatal(err)
+			}
+			waitMCPServerConnected(t, c, registration.ExecutorID, "desk")
+			if tt.firstTurnOpen {
+				finishTurn(firstID, firstRequest, false)
+			}
+			addedInput := h.input(t, session.SessionInputModeNormal, "connected")
+			finishTurn(addedInput, receiveModelRequest(t, model), true)
+
+			details, err := c.GetSessionDetails(t.Context(), c.GetRootSessionID())
+			if err != nil || len(details.Executors) != 1 || details.Executors[0].ID != "local" || !slices.Contains(details.Tools, "mcp__desk__ping") {
+				t.Fatalf("Session details = %+v, %v", details, err)
+			}
+			registration.Servers = nil
+			if err := c.SetClientExecutor(t.Context(), registration); err != nil {
+				t.Fatal(err)
+			}
+			removedInput := h.input(t, session.SessionInputModeNormal, "disconnected")
+			finishTurn(removedInput, receiveModelRequest(t, model), false)
+
+			var changes []*defs.ExecutorsChange
+			var nextInputIDs []defs.ItemID
+			items := listSessionItems(t, store, c.GetID(), c.GetRootSessionID())
+			for index, item := range items {
+				if item.Kind == defs.ItemExecutorsChange {
+					changes = append(changes, item.ExecutorsChange)
+					if index+1 < len(items) {
+						nextInputIDs = append(nextInputIDs, items[index+1].ID)
+					}
+				}
+			}
+			if !slices.Equal(nextInputIDs, []defs.ItemID{addedInput, removedInput}) || len(changes) != 2 {
+				t.Fatalf("executor notifications = %+v; following items = %v", changes, nextInputIDs)
+			}
+			want := []defs.TurnExecutor{{ID: registration.ExecutorID, Description: registration.Description, IsDynamic: true}}
+			if got := changes[0].GetDetails().Added; !slices.Equal(got, want) || len(changes[0].PreviousExecutors) != tt.wantPrevious {
+				t.Fatalf("addition = %+v; previous = %+v", got, changes[0].PreviousExecutors)
+			}
+			if got := changes[1].GetDetails().Removed; !slices.Equal(got, want) {
+				t.Fatalf("removal = %+v", got)
+			}
+			requireNoEvent(t, h, func(event ConversationEvent) bool {
+				switch event.(type) {
+				case *ConversationSessionStarted, *ConversationSessionStopped:
+					return true
+				}
+				return false
+			})
+		})
+	}
+}
+
+// TestConversationClientExecutorRegistration 检查无效登记的错误回传和稳定配置接管同名环境。
+func TestConversationClientExecutorRegistration(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		executorID   string
+		connectionID string
+		serverID     string
+		wantError    string
+	}{
+		{name: "static_collision", executorID: "local", connectionID: "ws-2", serverID: "desk", wantError: "conflicts with a static environment"},
+		{name: "reserved_id", executorID: defs.MemoryExecutorID, connectionID: "ws-2", serverID: "desk", wantError: "reserved"},
+		{name: "missing_executor_id", connectionID: "ws-2", serverID: "desk", wantError: "requires an executor ID"},
+		{name: "missing_connection_id", executorID: "workstation", serverID: "desk", wantError: "requires an executor ID"},
+		{name: "invalid_replacement", executorID: "workstation", connectionID: "ws-2", wantError: "create client MCP server"},
+		{name: "static_takes_priority"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store, model := openConversationDAO(t), newConversationModel(t)
+			opt := conversationOpt(store, model)
+			opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			startTestConversation(t, store, model, c)
+			var transport mcp.Transport = pingMCPTransport{}
+			pidPath := filepath.Join(t.TempDir(), "client.pid")
+			if tt.wantError == "" {
+				transport = &commandTransport{command: buildFakeMCPServer(t), arguments: []string{"-pidfile", pidPath}}
+			}
+			if err := c.SetClientExecutor(t.Context(), ClientExecutorRegistration{
+				ConnectionID: "ws-1",
+				ExecutorID:   "workstation",
+				Servers:      []ClientMCPServer{{ID: "desk", Transport: transport}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			waitMCPServerConnected(t, c, "workstation", "desk")
+			if tt.wantError != "" {
+				err := c.SetClientExecutor(t.Context(), ClientExecutorRegistration{
+					ConnectionID: tt.connectionID,
+					ExecutorID:   tt.executorID,
+					Servers:      []ClientMCPServer{{ID: tt.serverID, Transport: pingMCPTransport{}}},
+				})
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("SetClientExecutor() = %v, want %q", err, tt.wantError)
+				}
+				servers := c.GetMCPServers()
+				if len(servers) != 1 || servers[0].ExecutorID != "workstation" || servers[0].ServerID != "desk" || servers[0].State != mcpclient.ConnectionStateConnected {
+					t.Fatalf("MCP servers after rejected registration = %+v", servers)
+				}
+				return
+			}
+
+			pid := readFakeMCPServerPID(t, pidPath)
+			next := conversationDefinitions(model)
+			next.Executors = newTestExecutorProvider(newTestExecutors("local", "workstation"))
+			pending, err := c.SetDefinitions(t.Context(), next)
+			if err != nil || pending {
+				t.Fatalf("SetDefinitions() = %t, %v", pending, err)
+			}
+			details, err := c.GetSessionDetails(t.Context(), c.GetRootSessionID())
+			if err != nil || len(details.Executors) != 2 || details.Executors[1].ID != "workstation" || details.Executors[1].Kind != defs.ExecutorKindVirtual {
+				t.Fatalf("Session details after reconfigure = %+v, %v", details, err)
+			}
+			if servers := c.GetMCPServers(); len(servers) != 0 {
+				t.Fatalf("MCP servers after static takeover = %+v", servers)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for isProcessAlive(pid) {
+				if time.Now().After(deadline) {
+					t.Fatalf("evicted MCP server process %d is still running", pid)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
 }
 
 // TestConversationReopenUsesSavedAgent 检查重开对话后子 Session 仍用保存的 Agent，这个 Agent 被删出定义时重开失败。
@@ -1356,7 +1547,7 @@ func TestConversationReopenUsesSavedAgent(t *testing.T) {
 }
 
 // collaborationToolNames 是每个对话的 Session 固定带有的协作工具名，多个测试按它推算期望的工具集合。
-var collaborationToolNames = []string{"spawn_agent", "send_message", "interrupt_agent", "list_agents", "read_session_history", "wait_agent"}
+var collaborationToolNames = []string{"spawn_agent", "send_message", "interrupt_agent", "list_agents", "read_session_history", "wait_agent", "list_executors"}
 
 // allLocalToolNames 是测试环境 local 不按名单过滤时的全部内置工具名：执行环境带的 read_file、apply_patch、glob、grep，加上 Session 为有工作区的
 // 执行环境建的五个命令工具。
@@ -1652,7 +1843,7 @@ func TestConversationSystemInstructions(t *testing.T) {
 				opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local", "sandbox"))
 				want += "\n<openvaala-skills>\n以下 skill 为特定任务提供说明。任务符合某项描述时，先用 read_file 完整读取它的 SKILL.md 再行动（条目带 executor 时，调用 read_file 传入同一 executor）；SKILL.md 中的相对路径以其所在目录为基准。\n- alpha: Alpha 技能\n  path: /skills/alpha/SKILL.md\n</openvaala-skills>"
 			}
-			want += "\n<openvaala-executors>\nExecutor 是工具实际运行的环境（一台机器或一个虚拟环境），各自有独立的文件系统和命令行：读写文件和运行命令只作用于所选 Executor，不同 Executor 之间的文件互不可见。可在多个 Executor 上运行的工具带有 executor 参数，用它选择执行位置；省略时使用参数说明中的默认 Executor。\n修改文件前，先用 read_file 读取目标文件，收到结果后再修改。\n- local（默认）: local 测试环境\n  workspace: /workspace/local\n"
+			want += "\n<openvaala-executors>\nExecutor 是工具实际运行的环境（一台机器或一个虚拟环境），各自有独立的文件系统和命令行：读写文件和运行命令只作用于所选 Executor，不同 Executor 之间的文件互不可见。可在多个 Executor 上运行的工具带有 executor 参数，用它选择执行位置；省略时使用参数说明中的默认 Executor。\n默认 Executor 不提供的多来源工具必须显式指定 executor，单来源工具无需指定。动态接入的客户端环境不在本列表内，可用 list_executors 查看。\n修改文件前，先用 read_file 读取目标文件，收到结果后再修改。\n- local（默认）: local 测试环境\n  workspace: /workspace/local\n"
 			if tt.catalogs {
 				want += "- sandbox: sandbox 测试环境\n  workspace: /workspace/sandbox\n"
 			}
@@ -2667,15 +2858,16 @@ func registerClientMCPTestServer(t *testing.T, c Conversation, serverID string) 
 	if serverID == "hang" {
 		transport.arguments = []string{"-hang"}
 	}
-	if err := c.SetClientMCPServers(t.Context(), "c1", []ClientMCPServer{{
-		ID:        serverID,
-		Transport: transport,
-	}}); err != nil {
+	if err := c.SetClientExecutor(t.Context(), ClientExecutorRegistration{
+		ConnectionID: "c1",
+		ExecutorID:   "desktop",
+		Servers:      []ClientMCPServer{{ID: serverID, Transport: transport}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	// 2. 不是 hang 时等连接完成。
 	if serverID != "hang" {
-		waitMCPServerConnected(t, c, defs.ClientExecutorID, serverID)
+		waitMCPServerConnected(t, c, "desktop", serverID)
 	}
 }
 

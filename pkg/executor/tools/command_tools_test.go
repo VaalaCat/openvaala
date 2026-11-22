@@ -531,7 +531,13 @@ func newCommandEnvironment(t *testing.T, id string, environmentWorkspace workspa
 func newCommandToolExecutor(t *testing.T, manager terminal.TerminalManager, environments ...executor.ExecutionEnvironment) executor.ToolExecutor {
 	// 1. 逐环境创建五个命令工具，记入 SessionTools 后构造执行器。
 	t.Helper()
-	toolExecutorOpt := executor.NewToolExecutorOpt(environments)
+	environmentsManager := executor.NewExecutionEnvironmentsManager()
+	if len(environments) > 0 {
+		if _, err := environmentsManager.SetStatic(environments[0].GetID(), environments); err != nil {
+			t.Fatal(err)
+		}
+	}
+	toolExecutorOpt := executor.NewToolExecutorOpt(environmentsManager)
 	toolExecutorOpt.SessionTools = make(map[string][]executor.Tool, len(environments))
 	for _, environment := range environments {
 		commandTools, err := tools.NewCommandTools(tools.NewCommandToolsOpt(environment.GetID(), environment.GetWorkspace(), manager))

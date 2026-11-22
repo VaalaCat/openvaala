@@ -123,9 +123,18 @@ func TestFormatContextEvents(t *testing.T) {
 // TestFormatExecutorsChange 核对执行环境变化的展示顺序和合并结果。
 func TestFormatExecutorsChange(t *testing.T) {
 	// 1. 生成执行环境变更通知，比较默认、移除、新增和目录变化的顺序。
-	const footer = "当前可用的 Executor 和说明见系统提示 <openvaala-executors>；之前历史里的路径属于原来的位置。\n" +
+	const footer = "稳定环境见系统提示 <openvaala-executors>，全部在线环境与工具可用 list_executors 查询；之前历史里的路径属于原来的位置。\n" +
 		"</openvaala-executors-change-event>\n</openvaala-system-info>"
 	const header = "<openvaala-system-info>\n<openvaala-executors-change-event>\n"
+	local := defs.TurnExecutor{
+		ID:                 "local",
+		WorkspaceDirectory: "/a",
+	}
+	laptop := defs.TurnExecutor{
+		ID:          "laptop",
+		Description: "工作笔记本",
+		IsDynamic:   true,
+	}
 	for _, tt := range []struct {
 		name     string
 		previous []defs.TurnExecutor
@@ -213,6 +222,20 @@ func TestFormatExecutorsChange(t *testing.T) {
 				WorkspaceDirectory: "/workspace",
 			}},
 			want: header + "Executor 已变更：\n- 新增可用的 sandbox，目录 /workspace。\n" + footer,
+		},
+		{
+			name:     "added_dynamic_executor_without_workspace",
+			previous: []defs.TurnExecutor{local},
+			current:  []defs.TurnExecutor{local, laptop},
+			want:     header + "Executor 已变更：\n- 新增可用的 laptop（工作笔记本）。\n" + footer,
+		},
+		{
+			name: "initial_dynamic_executors",
+			current: []defs.TurnExecutor{{
+				ID:        "desktop",
+				IsDynamic: true,
+			}, laptop},
+			want: header + "- 新增可用的 desktop。\n- 新增可用的 laptop（工作笔记本）。\n" + footer,
 		},
 		{
 			name: "directory_changed",

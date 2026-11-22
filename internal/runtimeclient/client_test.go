@@ -703,17 +703,19 @@ func TestClient(t *testing.T) {
 			},
 		},
 		{
-			// 登记请求和两条通知的线上格式：server_ids 为空时是 []，通知没有 id，closed 的 error 为空时省略；
+			// 登记请求和转发通知的线上格式：mcp_server_ids 为空时是 []，通知没有 id，closed 的 error 为空时省略；
 			// serve 不认识的 stream_id 的通知被丢弃，连接保持可用。
-			name: "client_mcp_requests_wire_format",
+			name: "client_executor_requests_and_mcp_notifications_wire_format",
 			run: func(t *testing.T, h *clientHarness) {
 				// 1. 登记非空和空 MCP 列表，发送消息、带错和无错关闭通知。
 				conversation := h.openNewConversation(t)
 				ctx := t.Context()
-				if err := h.client.SetClientMCPServers(ctx, conversation.ID, []string{"a", "b"}); err != nil {
+				if err := h.client.SetClientExecutor(ctx, &runtimeclient.SetClientExecutorRequest{
+					ConversationID: conversation.ID, ExecutorID: "laptop", Description: "Work laptop", MCPServerIDs: []string{"a", "b"},
+				}); err != nil {
 					t.Fatal(err)
 				}
-				if err := h.client.SetClientMCPServers(ctx, conversation.ID, nil); err != nil {
+				if err := h.client.SetClientExecutor(ctx, &runtimeclient.SetClientExecutorRequest{ConversationID: conversation.ID}); err != nil {
 					t.Fatal(err)
 				}
 				message := json.RawMessage(`{"jsonrpc":"2.0","method":"ping"}`)
@@ -732,15 +734,15 @@ func TestClient(t *testing.T) {
 				// 2. 收集上行帧，核对方法、参数、请求 ID 和省略字段。
 				var frames []string
 				for _, frame := range h.proxy.getUpstreamFrames() {
-					if strings.Contains(frame, "ClientMCP") || strings.Contains(frame, "clientMCP") {
+					if strings.Contains(frame, "setClientExecutor") || strings.Contains(frame, "clientMCP") {
 						frames = append(frames, frame)
 					}
 				}
 				id := `"conversation_id":"` + string(conversation.ID) + `"`
-				wantMethods := []string{"conversation/setClientMCPServers", "conversation/setClientMCPServers", "clientMCP/message", "clientMCP/closed", "clientMCP/closed"}
+				wantMethods := []string{"conversation/setClientExecutor", "conversation/setClientExecutor", "clientMCP/message", "clientMCP/closed", "clientMCP/closed"}
 				wantParams := []string{
-					`{` + id + `,"server_ids":["a","b"]}`,
-					`{` + id + `,"server_ids":[]}`,
+					`{` + id + `,"executor_id":"laptop","description":"Work laptop","mcp_server_ids":["a","b"]}`,
+					`{` + id + `,"mcp_server_ids":[]}`,
 					`{"stream_id":"unknown-stream","message":{"jsonrpc":"2.0","method":"ping"}}`,
 					`{"stream_id":"unknown-stream","error":"boom"}`,
 					`{"stream_id":"unknown-stream"}`,
@@ -757,7 +759,7 @@ func TestClient(t *testing.T) {
 					if err := json.Unmarshal([]byte(frame), &decoded); err != nil {
 						t.Fatal(err)
 					}
-					isRequest := decoded.Method == "conversation/setClientMCPServers"
+					isRequest := decoded.Method == "conversation/setClientExecutor"
 					if decoded.Method != wantMethods[index] || string(decoded.Params) != wantParams[index] || (decoded.ID != nil) != isRequest {
 						t.Fatalf("frame %d = %s, want method %s params %s (request with id: %v)", index, frame, wantMethods[index], wantParams[index], isRequest)
 					}
@@ -3927,7 +3929,7 @@ func TestClientMCPRelay(t *testing.T) {
 			run: func(t *testing.T, h *clientHarness, relay *testRelay) {
 				// 1. 登记客户端 MCP 并等待连接，提交工具调用。
 				conversation := h.openNewConversation(t)
-				h.setClientMCPServers(t, conversation.ID, "fake")
+				h.setClientExecutor(t, conversation.ID, "fake")
 				h.waitClientMCPServer(t, conversation.ID, "fake", mcpclient.ConnectionStateConnected)
 				h.submit(t, conversation, "回显")
 				request := h.model.receive(t)
@@ -3954,15 +3956,15 @@ func TestClientMCPRelay(t *testing.T) {
 			run: func(t *testing.T, h *clientHarness, relay *testRelay) {
 				// 1. 登记客户端 MCP 后清空登记。
 				conversation := h.openNewConversation(t)
-				h.setClientMCPServers(t, conversation.ID, "fake")
+				h.setClientExecutor(t, conversation.ID, "fake")
 				h.waitClientMCPServer(t, conversation.ID, "fake", mcpclient.ConnectionStateConnected)
 				streamID := relay.waitConnect(t).StreamID
-				h.setClientMCPServers(t, conversation.ID)
+				h.setClientExecutor(t, conversation.ID)
 				// 2. 核对旧流断开，后续模型请求已无客户端工具。
 				if disconnected := relay.waitDisconnect(t); disconnected != streamID {
 					t.Fatalf("disconnected stream = %q, want %q", disconnected, streamID)
 				}
-				h.waitNoClientMCPServers(t, conversation.ID)
+				h.waitNoRegisteredMCPServers(t, conversation.ID)
 				h.submit(t, conversation, "没有工具了")
 				request := h.model.receive(t)
 				if toolNames := getModelToolNames(request.body); slices.Contains(toolNames, "mcp__fake__echo") {
@@ -3973,42 +3975,55 @@ func TestClientMCPRelay(t *testing.T) {
 			},
 		},
 		{
-			// 客户端连接断开：serve 清掉这条连接的登记，进行中的调用以 mcp_server_unavailable 结束；重连后重新登记，新连接的流照常工作。
-			name: "connection_loss_removes_registration_and_fails_in_flight_call",
+			// 连接断开使正在执行的调用失败，同 ID 重新登记后，本轮下一次调用通过新的转发流执行。
+			name: "connection_loss_and_reregistration_recovers_tools_in_the_same_turn",
 			run: func(t *testing.T, h *clientHarness, relay *testRelay) {
-				// 1. 开始 MCP 慢调用，调用到达转发流后切断客户端连接。
 				conversation := h.openNewConversation(t)
-				h.setClientMCPServers(t, conversation.ID, "fake")
+				h.setClientExecutor(t, conversation.ID, "fake")
 				h.waitClientMCPServer(t, conversation.ID, "fake", mcpclient.ConnectionStateConnected)
+				firstStream := relay.waitConnect(t).StreamID
 				h.submit(t, conversation, "慢调用")
-				h.model.receive(t).reply <- clientModelResponse{calls: []llmkit.ToolCall{{
+				initial := h.model.receive(t)
+				initial.reply <- clientModelResponse{calls: []llmkit.ToolCall{{
 					ID:        "slow",
 					Name:      "mcp__fake__slow",
 					Arguments: `{"seconds":30}`,
 				}}}
-				relay.waitToolCall(t)
+				if streamID := relay.waitToolCall(t); streamID != firstStream {
+					t.Fatalf("slow tool call reached stream %q, want %q", streamID, firstStream)
+				}
 				h.proxy.cut()
-				// 2. 核对调用以真实连接原因失败，等待本轮结束和登记清空。
+
 				failed := h.model.receive(t)
-				// 失败原因里带着连接真实的结束原因（读失败或写失败都可能），不只是 context canceled。
 				body := fmt.Sprint(failed.body)
 				if !strings.Contains(body, "mcp_server_unavailable") || !strings.Contains(body, "client connection closed") || strings.Contains(body, "client connection closed: context canceled") {
 					t.Fatalf("model request after the connection was lost = %s, want the call to fail with mcp_server_unavailable and a real connection end reason", body)
 				}
-				failed.reply <- clientModelResponse{chunks: []string{"好"}}
-				h.waitTurnsCompleted(t, conversation.ID, conversation.RootSessionID, 1)
-				h.waitNoClientMCPServers(t, conversation.ID)
-
-				// 3. 重新登记并执行新一轮，核对工具恢复可用。
-				h.setClientMCPServers(t, conversation.ID, "fake")
+				h.waitNoRegisteredMCPServers(t, conversation.ID)
+				h.setClientExecutor(t, conversation.ID, "fake")
 				h.waitClientMCPServer(t, conversation.ID, "fake", mcpclient.ConnectionStateConnected)
-				h.submit(t, conversation, "重连后回显")
-				request := h.model.receive(t)
-				if toolNames := getModelToolNames(request.body); !slices.Contains(toolNames, "mcp__fake__echo") {
-					t.Fatalf("model tools after re-registering = %v, want mcp__fake__echo", toolNames)
+				secondStream := relay.waitConnect(t).StreamID
+				if secondStream == firstStream {
+					t.Fatalf("reconnected on old stream %q", secondStream)
 				}
-				request.reply <- clientModelResponse{chunks: []string{"好"}}
-				h.waitTurnsCompleted(t, conversation.ID, conversation.RootSessionID, 2)
+
+				failed.reply <- clientModelResponse{calls: []llmkit.ToolCall{{
+					ID:        "echo-after-reconnect",
+					Name:      "mcp__fake__echo",
+					Arguments: `{"text":"RECONNECTED_ECHO_OK"}`,
+				}}}
+				recovered := h.model.receive(t)
+				if streamID := relay.waitToolCall(t); streamID != secondStream {
+					t.Fatalf("retried tool call reached stream %q, want %q", streamID, secondStream)
+				}
+				if count := strings.Count(fmt.Sprint(recovered.body), "RECONNECTED_ECHO_OK"); count < 2 {
+					t.Fatalf("echo result missing after reconnect (%d occurrences): %v", count, recovered.body)
+				}
+				if !reflect.DeepEqual(initial.body["tools"], failed.body["tools"]) || !reflect.DeepEqual(initial.body["tools"], recovered.body["tools"]) {
+					t.Fatal("model tool definitions changed during the turn")
+				}
+				recovered.reply <- clientModelResponse{chunks: []string{"好"}}
+				h.waitTurnsCompleted(t, conversation.ID, conversation.RootSessionID, 1)
 			},
 		},
 		{
@@ -4021,8 +4036,8 @@ func TestClientMCPRelay(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				h.setClientMCPServers(t, first.ID, "fake")
-				h.setClientMCPServers(t, second.ID, "fake")
+				h.setClientExecutor(t, first.ID, "fake")
+				h.setClientExecutor(t, second.ID, "fake")
 				// 2. 核对两者均有工具，且分配不同 stream ID。
 				for _, conversationID := range []defs.ConversationID{first.ID, second.ID} {
 					server := h.waitClientMCPServer(t, conversationID, "fake", mcpclient.ConnectionStateConnected)
@@ -4041,7 +4056,7 @@ func TestClientMCPRelay(t *testing.T) {
 			run: func(t *testing.T, h *clientHarness, relay *testRelay) {
 				// 1. 登记 MCP 并等待首个流连接。
 				conversation := h.openNewConversation(t)
-				h.setClientMCPServers(t, conversation.ID, "fake")
+				h.setClientExecutor(t, conversation.ID, "fake")
 				h.waitClientMCPServer(t, conversation.ID, "fake", mcpclient.ConnectionStateConnected)
 				first := relay.waitConnect(t)
 				// 2. 杀掉进程，核对重连使用新流 ID、同一 server 并恢复 connected。
@@ -4060,7 +4075,7 @@ func TestClientMCPRelay(t *testing.T) {
 			run: func(t *testing.T, h *clientHarness, relay *testRelay) {
 				// 1. 使用不存在的命令登记客户端 MCP。
 				conversation := h.openNewConversation(t)
-				h.setClientMCPServers(t, conversation.ID, "fake")
+				h.setClientExecutor(t, conversation.ID, "fake")
 				// 2. 等待 failed 状态，核对包含本机连接失败原因。
 				server := h.waitClientMCPServer(t, conversation.ID, "fake", mcpclient.ConnectionStateFailed)
 				if !strings.Contains(server.Error, "/nonexistent/mcp-server") {
@@ -4093,11 +4108,15 @@ func getModelToolNames(body map[string]any) []string {
 	return names
 }
 
-// setClientMCPServers 替换本连接为对话登记的客户端 MCP server。
-func (h *clientHarness) setClientMCPServers(t *testing.T, conversationID defs.ConversationID, serverIDs ...string) {
+const testClientExecutorID = "test-laptop"
+
+// setClientExecutor 替换本连接为对话登记的客户端 MCP server。
+func (h *clientHarness) setClientExecutor(t *testing.T, conversationID defs.ConversationID, serverIDs ...string) {
 	t.Helper()
 	// 1. 调用 Client，失败时结束测试。
-	if err := h.client.SetClientMCPServers(t.Context(), conversationID, serverIDs); err != nil {
+	if err := h.client.SetClientExecutor(t.Context(), &runtimeclient.SetClientExecutorRequest{
+		ConversationID: conversationID, ExecutorID: testClientExecutorID, MCPServerIDs: serverIDs,
+	}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -4108,25 +4127,25 @@ func (h *clientHarness) waitClientMCPServer(t *testing.T, conversationID defs.Co
 	// 1. 轮询对话的客户端 MCP 列表，匹配 server ID 和状态后返回，超过十秒则失败。
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		for _, server := range h.listClientMCPServers(t, conversationID) {
+		for _, server := range h.listRegisteredMCPServers(t, conversationID) {
 			if server.ServerID == serverID && server.State == state {
 				return server.ConnectionInfo
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("client MCP servers = %+v, want %s in state %s", h.listClientMCPServers(t, conversationID), serverID, state)
+			t.Fatalf("client MCP servers = %+v, want %s in state %s", h.listRegisteredMCPServers(t, conversationID), serverID, state)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// waitNoClientMCPServers 等待对话的客户端 MCP 列表为空。
-func (h *clientHarness) waitNoClientMCPServers(t *testing.T, conversationID defs.ConversationID) {
+// waitNoRegisteredMCPServers 等待对话的客户端 MCP 列表为空。
+func (h *clientHarness) waitNoRegisteredMCPServers(t *testing.T, conversationID defs.ConversationID) {
 	t.Helper()
 	// 1. 轮询客户端 MCP 条目，空时返回，超过十秒则失败。
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		servers := h.listClientMCPServers(t, conversationID)
+		servers := h.listRegisteredMCPServers(t, conversationID)
 		if len(servers) == 0 {
 			return
 		}
@@ -4137,15 +4156,15 @@ func (h *clientHarness) waitNoClientMCPServers(t *testing.T, conversationID defs
 	}
 }
 
-// listClientMCPServers 返回对话中 ExecutorID 为 client 的 MCP 连接。
-func (h *clientHarness) listClientMCPServers(t *testing.T, conversationID defs.ConversationID) []conversation.MCPServerInfo {
+// listRegisteredMCPServers 返回测试客户端执行环境的 MCP 连接。
+func (h *clientHarness) listRegisteredMCPServers(t *testing.T, conversationID defs.ConversationID) []conversation.MCPServerInfo {
 	t.Helper()
 	// 1. 查询 MCP 列表，失败时结束测试，再移除其他 Executor 条目。
 	servers, err := h.client.ListMCPServers(t.Context(), conversationID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return slices.DeleteFunc(servers, func(server conversation.MCPServerInfo) bool { return server.ExecutorID != defs.ClientExecutorID })
+	return slices.DeleteFunc(servers, func(server conversation.MCPServerInfo) bool { return server.ExecutorID != testClientExecutorID })
 }
 
 // testRelay 扮演客户端一侧的转发循环（ACP 要做的事）：接管 Client 的事件流，每收到 ClientMCPConnectRequested，

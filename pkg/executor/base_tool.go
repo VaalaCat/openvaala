@@ -114,10 +114,14 @@ func (t *BaseTool[T]) ParseArguments(input string) (*T, error) {
 	return arguments, nil
 }
 
-// mcpTool 是某个 MCP 连接提供的一个工具：保存工具定义和提供它的连接；连接断开时调用返回 mcp_server_unavailable。
+// mcpTool 保存工具定义和开场连接；动态环境调用时按环境 ID 和 server ID 查询在线连接。
 type mcpTool struct {
 	definition *defs.ToolDefinition
 	connection mcpclient.Connection
+	executorID string
+	serverID   string
+	// isDynamic 工具是否来自动态环境？
+	isDynamic bool
 }
 
 // GetDefinition 返回 MCP 工具定义的副本。

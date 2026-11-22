@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -40,6 +41,27 @@ func assertACPPromptResult(t *testing.T, message acpWireMessage, reason acp.Stop
 	var result acp.PromptResponse
 	if err := json.Unmarshal(message.Result, &result); err != nil || result.StopReason != reason {
 		t.Fatalf("prompt = %s (%v), want %s", message.Result, err, reason)
+	}
+}
+
+// TestACPClientExecutorIdentity 检查主机名生成的登记身份及读取失败时的回退。
+func TestACPClientExecutorIdentity(t *testing.T) {
+	platform := goruntime.GOOS + "/" + goruntime.GOARCH
+	for _, tt := range []struct {
+		name, hostname, wantID, wantDescription string
+		err                                     error
+	}{
+		{name: "hostname", hostname: "work-mac", wantID: "work-mac-acp", wantDescription: "work-mac (" + platform + " · acp)"},
+		{name: "whitespace", hostname: "  work	 mac  ", wantID: "work-mac-acp", wantDescription: "work-mac (" + platform + " · acp)"},
+		{name: "empty hostname", hostname: "  "},
+		{name: "hostname error", hostname: "work-mac", err: errors.New("hostname unavailable")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			id, description := getACPClientExecutorIdentity(tt.hostname, tt.err)
+			if id != tt.wantID || description != tt.wantDescription {
+				t.Fatalf("executor identity = (%q, %q), want (%q, %q)", id, description, tt.wantID, tt.wantDescription)
+			}
+		})
 	}
 }
 
@@ -1487,7 +1509,10 @@ func TestACPConversationSyncFailed(t *testing.T) {
 			cfg := newACPConfigWithExecutor(t, model.server.URL, "extra", t.TempDir())
 			var refusing *acpSyncRefusingRuntime
 			wire := startACPHostWithServer(t, cfg, func(opt *runtimeserver.RuntimeServerOpt) {
-				refusing = &acpSyncRefusingRuntime{Runtime: opt.Runtime}
+				refusing = &acpSyncRefusingRuntime{
+					Runtime:                     opt.Runtime,
+					clientExecutorRegistrations: make(chan *runtime.SetClientExecutorRequest, 8),
+				}
 				opt.Runtime = refusing
 			})
 			wire.initialize(t)
@@ -1530,8 +1555,19 @@ func TestACPConversationSyncFailed(t *testing.T) {
 				strings.Count(text, "FIRST_ANSWER") != 1 || strings.Count(text, "LATE_ANSWER") != 1 {
 				t.Fatalf("editor user text = %q, agent text = %q; want each message once", user, text)
 			}
-			if registrations := refusing.clientMCPRegistrations.Load(); registrations != 2 {
+			if registrations := len(refusing.clientExecutorRegistrations); registrations != 2 {
 				t.Fatalf("client MCP registrations = %d, want 2: when the session opened and when it reopened the dropped conversation", registrations)
+			}
+			first := <-refusing.clientExecutorRegistrations
+			second := <-refusing.clientExecutorRegistrations
+			wantID, wantDescription := getACPClientExecutorIdentity(os.Hostname())
+			if wantID == "" {
+				wantID = first.ConnectionID
+			}
+			for _, request := range []*runtime.SetClientExecutorRequest{first, second} {
+				if request.ExecutorID != wantID || request.Description != wantDescription {
+					t.Fatalf("ACP executor identity = (%q, %q), want (%q, %q)", request.ExecutorID, request.Description, wantID, wantDescription)
+				}
 			}
 		})
 	}
@@ -1633,8 +1669,8 @@ func getACPModelToolResult(t *testing.T, body map[string]any) defs.ToolResult {
 	return defs.ToolResult{}
 }
 
-// TestACPClientMCPServers 检查编辑器带来的 MCP server 经转发出现在模型的工具里、能调用且带着请求头，acp 类型被跳过，重复加载时整体替换。
-func TestACPClientMCPServers(t *testing.T) {
+// TestACPRelayedMCPServers 检查编辑器带来的 MCP server 经转发出现在模型的工具里、能调用且带着请求头，acp 类型被跳过，重复加载时整体替换。
+func TestACPRelayedMCPServers(t *testing.T) {
 	// 1. 列出 http、sse、acp 类型被跳过和重复加载替换四种场景。
 	getEditorServer := func(transport, name, url string) map[string]any {
 		return map[string]any{"type": transport, "name": name, "url": url, "headers": []any{map[string]any{"name": acpEditorHeaderName, "value": acpEditorHeaderValue}}}
@@ -1788,22 +1824,26 @@ func waitACPRuntimeIdle(t *testing.T, wire *acpWire) {
 // errACPOpenRefused 是 acpSyncRefusingRuntime 拒绝打开对话时返回的错误。
 var errACPOpenRefused = errors.New(`executor "extra": connect refused`)
 
-// acpSyncRefusingRuntime 包住测试 Runtime：能按开关拒绝打开对话、取消最近一次 Session 订阅，并统计客户端 MCP 登记次数。
+// acpSyncRefusingRuntime 包住测试 Runtime：能按开关拒绝打开对话、取消最近一次 Session 订阅，并记录客户端执行环境登记。
 type acpSyncRefusingRuntime struct {
 	runtime.Runtime
 	// isRefusing 是否拒绝 OpenConversation？
 	isRefusing atomic.Bool
 	// cancelSessionSubscription 是最近一次 SubscribeSession 的取消函数。
-	cancelSessionSubscription atomic.Pointer[context.CancelFunc]
-	// clientMCPRegistrations 是 serve 收到的客户端 MCP 登记次数。
-	clientMCPRegistrations atomic.Int32
+	cancelSessionSubscription   atomic.Pointer[context.CancelFunc]
+	clientExecutorRegistrations chan *runtime.SetClientExecutorRequest
 }
 
-// SetClientMCPServers 记一次登记，再交给测试 Runtime。
-func (r *acpSyncRefusingRuntime) SetClientMCPServers(ctx context.Context, request *runtime.SetClientMCPServersRequest) error {
-	// 1. 登记次数加一，交给测试 Runtime。
-	r.clientMCPRegistrations.Add(1)
-	return r.Runtime.SetClientMCPServers(ctx, request)
+// SetClientExecutor 记录登记请求并交给测试 Runtime。
+func (r *acpSyncRefusingRuntime) SetClientExecutor(ctx context.Context, request *runtime.SetClientExecutorRequest) error {
+	if len(request.Servers) > 0 {
+		select {
+		case r.clientExecutorRegistrations <- request:
+		default:
+			return errors.New("too many client executor registrations")
+		}
+	}
+	return r.Runtime.SetClientExecutor(ctx, request)
 }
 
 // OpenConversation 开关打开时拒绝打开对话，否则交给测试 Runtime。

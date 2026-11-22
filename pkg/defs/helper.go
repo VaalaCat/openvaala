@@ -331,9 +331,11 @@ func (change *ExecutorsChange) Clone() *ExecutorsChange {
 
 // GetDetails 按种类列出 Executor 列表的变化。
 func (change *ExecutorsChange) GetDetails() ExecutorsChangeDetails {
-	// 1. 按列表首项找出默认 Executor 的变化。
+	// 1. 前后列表的首项都是稳定 Executor 时，比较默认 Executor 的 ID。
 	var details ExecutorsChangeDetails
-	if len(change.PreviousExecutors) > 0 && len(change.Executors) > 0 && change.PreviousExecutors[0].ID != change.Executors[0].ID {
+	if len(change.PreviousExecutors) > 0 && len(change.Executors) > 0 &&
+		!change.PreviousExecutors[0].IsDynamic && !change.Executors[0].IsDynamic &&
+		change.PreviousExecutors[0].ID != change.Executors[0].ID {
 		details.NewDefault = &change.Executors[0]
 		details.PreviousDefaultID = change.PreviousExecutors[0].ID
 	}
@@ -361,6 +363,12 @@ func (change *ExecutorsChange) GetDetails() ExecutorsChangeDetails {
 		}
 	}
 	return details
+}
+
+// IsEmpty 是否没有默认切换、增减或目录变化？
+func (details ExecutorsChangeDetails) IsEmpty() bool {
+	// 1. 检查四类明细是否都为空？
+	return details.NewDefault == nil && len(details.Removed) == 0 && len(details.Added) == 0 && len(details.DirectoryChanges) == 0
 }
 
 // Clone 复制 Agent 消息发送方。

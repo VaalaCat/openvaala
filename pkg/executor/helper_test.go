@@ -75,7 +75,7 @@ func TestGetToolResultText(t *testing.T) {
 	}
 }
 
-// TestGetTurnExecutors 验证环境列表的顺序和根目录。
+// TestGetTurnExecutors 验证环境顺序、说明、动态标记和根目录。
 func TestGetTurnExecutors(t *testing.T) {
 	// 1. 创建各类环境列表，核对 Turn 保存的 ID 和根目录。
 	for _, tt := range []struct {
@@ -94,22 +94,24 @@ func TestGetTurnExecutors(t *testing.T) {
 			},
 			want: []defs.TurnExecutor{{
 				ID:                 "local",
+				Description:        "local 环境",
 				WorkspaceDirectory: "/workspace/local",
 			}, {
 				ID:                 "gpu",
+				Description:        "gpu 环境",
 				WorkspaceDirectory: "/workspace/gpu",
 			}},
 		},
 		{
-			name: "nil_workspace_has_no_directory",
+			name: "dynamic_environment_has_no_directory",
 			environments: func(t *testing.T) []executor.ExecutionEnvironment {
-				environment, err := executor.NewExecutionEnvironment(executor.NewExecutionEnvironmentOpt("local", "", nil))
-				if err != nil {
-					t.Fatal(err)
-				}
-				return []executor.ExecutionEnvironment{environment}
+				return []executor.ExecutionEnvironment{newDynamicEnvironment(t, "remote")}
 			},
-			want: []defs.TurnExecutor{{ID: "local"}},
+			want: []defs.TurnExecutor{{
+				ID:          "remote",
+				Description: "remote 环境",
+				IsDynamic:   true,
+			}},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

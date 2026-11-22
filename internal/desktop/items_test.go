@@ -675,6 +675,38 @@ func TestItemActivityTitles(t *testing.T) {
 	}
 }
 
+// TestExecutorsChangeItem 检查展开后显示 Executor 的目录、说明或 ID。
+func TestExecutorsChangeItem(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		executor defs.TurnExecutor
+		want     string
+	}{
+		{"directory", defs.TurnExecutor{ID: "local", WorkspaceDirectory: "/workspace", Description: "Server"}, "local: /workspace"},
+		{"description", defs.TurnExecutor{ID: "laptop", Description: "Laptop (ACP)", IsDynamic: true}, "laptop: Laptop (ACP)"},
+		{"id", defs.TurnExecutor{ID: "tablet", IsDynamic: true}, "tablet"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.items = []viewItem{{Ordinal: 1, Item: &defs.Item{
+				ID: "executors", TurnID: "turn", Kind: defs.ItemExecutorsChange,
+				ExecutorsChange: &defs.ExecutorsChange{
+					PreviousExecutors: []defs.TurnExecutor{{ID: "server", WorkspaceDirectory: "/previous"}},
+					Executors:         []defs.TurnExecutor{tt.executor},
+				},
+			}}}
+			tester := ui.NewTester(func(c *ui.Context) { d.applyAppearance(c); ui.Column(c).Fill().Children(func() { d.itemsView(c) }) }, 640, 480)
+			if err := tester.Click(fmt.Sprintf(d.t("executors.changed.to"), "server", tt.executor.ID)); err != nil {
+				t.Fatal(err)
+			}
+			tester.Advance(300 * time.Millisecond)
+			if !slices.Contains(tester.Texts(), tt.want) {
+				t.Fatalf("missing detail %q: %q", tt.want, tester.Texts())
+			}
+		})
+	}
+}
+
 // TestMemoryIndexItem 检查记忆目录条目：标题行带路径，展开后有「路径@memory」和正文，截断过的多一行提示，不显示成未知类型的记录。
 func TestMemoryIndexItem(t *testing.T) {
 	for _, tt := range []struct {

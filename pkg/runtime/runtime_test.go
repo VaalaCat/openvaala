@@ -527,8 +527,13 @@ func TestRuntimeEmbeddedMCP(t *testing.T) {
 			h := startTestRuntime(t, store, model)
 			conv := h.create(t)
 			watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
-			register := &runtime.SetClientMCPServersRequest{ConversationID: conv.ID, ClientID: "host", Servers: []conversation.ClientMCPServer{{ID: "host", Transport: embeddedMCPTransport{unavailable: name == "unavailable"}}}}
-			if err := h.rt.SetClientMCPServers(t.Context(), register); err != nil {
+			register := &runtime.SetClientExecutorRequest{
+				ConversationID: conv.ID,
+				ConnectionID:   "host-connection",
+				ExecutorID:     "host",
+				Servers:        []conversation.ClientMCPServer{{ID: "host", Transport: embeddedMCPTransport{unavailable: name == "unavailable"}}},
+			}
+			if err := h.rt.SetClientExecutor(t.Context(), register); err != nil {
 				t.Fatal(err)
 			}
 			if strings.HasPrefix(name, "reopen") {
@@ -540,7 +545,7 @@ func TestRuntimeEmbeddedMCP(t *testing.T) {
 					t.Fatal(err)
 				}
 				if name == "reopen_registered" {
-					if err := h.rt.SetClientMCPServers(t.Context(), register); err != nil {
+					if err := h.rt.SetClientExecutor(t.Context(), register); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -2074,9 +2079,9 @@ func TestRuntimeMCPServers(t *testing.T) {
 			name: "environment_and_client_servers_listed_together",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
 				f.waitMCPServers(t, connectedFake)
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client"))
 				f.waitMCPServers(t, []mcpServerState{connectedFake[0], {
-					executorID: defs.ClientExecutorID,
+					executorID: "c1",
 					serverID:   clientFakeServerID,
 					state:      mcpclient.ConnectionStateConnected,
 				}})
@@ -2283,25 +2288,26 @@ func (f *mcpRuntimeFixture) newClientServer(id, pidName string) conversation.Cli
 	}
 }
 
-// setClientMCPServers 以指定客户端 ID 替换对话的 MCP 登记。
-func (f *mcpRuntimeFixture) setClientMCPServers(t *testing.T, clientID string, servers ...conversation.ClientMCPServer) {
+// setClientExecutor 以指定客户端 ID 替换对话的 MCP 登记。
+func (f *mcpRuntimeFixture) setClientExecutor(t *testing.T, executorID string, servers ...conversation.ClientMCPServer) {
 	t.Helper()
 	// 1. 提交全部 server，失败则结束测试。
-	request := &runtime.SetClientMCPServersRequest{
+	request := &runtime.SetClientExecutorRequest{
 		ConversationID: f.conversation.ID,
-		ClientID:       clientID,
+		ConnectionID:   "ws-" + executorID,
+		ExecutorID:     executorID,
 		Servers:        servers,
 	}
-	if err := f.h.rt.SetClientMCPServers(t.Context(), request); err != nil {
-		t.Fatalf("SetClientMCPServers() error = %v", err)
+	if err := f.h.rt.SetClientExecutor(t.Context(), request); err != nil {
+		t.Fatalf("SetClientExecutor() error = %v", err)
 	}
 }
 
 // getClientStates 返回 MCP 列表中属于客户端的条目。
 func (f *mcpRuntimeFixture) getClientStates(t *testing.T) []mcpServerState {
 	t.Helper()
-	// 1. 移除 ExecutorID 不是 client 的连接状态。
-	return slices.DeleteFunc(f.getMCPServerStates(t), func(state mcpServerState) bool { return state.executorID != defs.ClientExecutorID })
+	// 1. 只保留测试里登记的两个客户端执行环境。
+	return slices.DeleteFunc(f.getMCPServerStates(t), func(state mcpServerState) bool { return state.executorID != "c1" && state.executorID != "c2" })
 }
 
 // waitClientServers 等待客户端 MCP 连接状态匹配预期。
@@ -2350,12 +2356,12 @@ func hasClientFakeTools(toolNames []string) bool {
 	return slices.Contains(toolNames, "mcp__"+clientFakeServerID+"__echo")
 }
 
-// TestRuntimeClientMCPServers 检查客户端 MCP 登记、工具使用和进程收尾。
-func TestRuntimeClientMCPServers(t *testing.T) {
+// TestRuntimeClientExecutors 检查客户端 MCP 登记、工具使用和进程收尾。
+func TestRuntimeClientExecutors(t *testing.T) {
 	// 1. 编译假 MCP server，列出客户端登记替换、工具调用和进程退出场景。
 	binary := buildFakeMCPServer(t)
 	connectedClient := mcpServerState{
-		executorID: defs.ClientExecutorID,
+		executorID: "c1",
 		serverID:   clientFakeServerID,
 		state:      mcpclient.ConnectionStateConnected,
 	}
@@ -2375,7 +2381,7 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 				if toolNames, _ := f.runClientTurn(t, watcher); hasClientFakeTools(toolNames) {
 					t.Fatalf("model tools before registration = %v, want no client tools", toolNames)
 				}
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client"))
 				f.waitClientServers(t, connectedClient)
 				call := llmkit.ToolCall{
 					ID:        "echo",
@@ -2395,13 +2401,13 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 			name: "empty_registration_removes_tools_and_stops_process",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
 				watcher := f.h.subscribeSession(t, f.conversation.ID, f.conversation.RootSessionID)
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client"))
 				f.waitClientServers(t, connectedClient)
 				pid := f.waitPID(t, "client", 0)
 				if toolNames, _ := f.runClientTurn(t, watcher); !hasClientFakeTools(toolNames) {
 					t.Fatalf("model tools = %v, want the client server's tools", toolNames)
 				}
-				f.setClientMCPServers(t, "c1")
+				f.setClientExecutor(t, "c1")
 				waitProcessExited(t, pid)
 				f.waitClientServers(t)
 				if toolNames, _ := f.runClientTurn(t, watcher); hasClientFakeTools(toolNames) {
@@ -2414,10 +2420,10 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 			name: "replacing_registration_swaps_process",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
 				watcher := f.h.subscribeSession(t, f.conversation.ID, f.conversation.RootSessionID)
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client-1"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client-1"))
 				f.waitClientServers(t, connectedClient)
 				oldPID := f.waitPID(t, "client-1", 0)
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client-2"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client-2"))
 				newPID := f.waitPID(t, "client-2", 0)
 				waitProcessExited(t, oldPID)
 				f.waitClientServers(t, connectedClient)
@@ -2433,24 +2439,24 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 			// 两条客户端连接各自登记，互不影响：移除一条只停它的进程。
 			name: "clients_register_independently",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
-				f.setClientMCPServers(t, "c1", f.newClientServer("first", "first"))
-				f.setClientMCPServers(t, "c2", f.newClientServer("second", "second"))
+				f.setClientExecutor(t, "c1", f.newClientServer("first", "first"))
+				f.setClientExecutor(t, "c2", f.newClientServer("second", "second"))
 				first, second := f.waitPID(t, "first", 0), f.waitPID(t, "second", 0)
 				f.waitClientServers(t,
 					mcpServerState{
-						executorID: defs.ClientExecutorID,
+						executorID: "c1",
 						serverID:   "first",
 						state:      mcpclient.ConnectionStateConnected,
 					},
 					mcpServerState{
-						executorID: defs.ClientExecutorID,
+						executorID: "c2",
 						serverID:   "second",
 						state:      mcpclient.ConnectionStateConnected,
 					})
-				f.setClientMCPServers(t, "c1")
+				f.setClientExecutor(t, "c1")
 				waitProcessExited(t, first)
 				f.waitClientServers(t, mcpServerState{
-					executorID: defs.ClientExecutorID,
+					executorID: "c2",
 					serverID:   "second",
 					state:      mcpclient.ConnectionStateConnected,
 				})
@@ -2465,7 +2471,7 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 			agentMCPServerIDs: defs.OptionalStringList{"configured"},
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
 				watcher := f.h.subscribeSession(t, f.conversation.ID, f.conversation.RootSessionID)
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client"))
 				f.waitClientServers(t, connectedClient)
 				if toolNames, _ := f.runClientTurn(t, watcher); hasClientFakeTools(toolNames) {
 					t.Fatalf("model tools = %v, want no client tools when the agent lists mcp_servers", toolNames)
@@ -2476,7 +2482,7 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 			// reload 原地换配置：旧订阅关闭，客户端登记和进程不动，下一轮仍有客户端的工具。
 			name: "reload_keeps_registration_and_process",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client"))
 				f.waitClientServers(t, connectedClient)
 				pid := f.waitPID(t, "client", 0)
 				statuses := f.h.subscribeConversation(t, f.conversation.ID)
@@ -2510,7 +2516,7 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 		{
 			name: "executor_settings_change_keeps_registration_and_process",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client"))
 				f.waitClientServers(t, connectedClient)
 				pid := f.waitPID(t, "client", 0)
 				statuses := f.h.subscribeConversation(t, f.conversation.ID)
@@ -2540,7 +2546,7 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 				if _, err := f.h.rt.SubscribeConversation(subscriptionCtx, &runtime.SubscribeConversationRequest{ConversationID: f.conversation.ID}); err != nil {
 					t.Fatal(err)
 				}
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client"))
 				f.waitClientServers(t, connectedClient)
 				pid := f.waitPID(t, "client", 0)
 				unsubscribe()
@@ -2551,7 +2557,7 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 		{
 			name: "runtime_exit_stops_client_process",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client"))
 				f.waitClientServers(t, connectedClient)
 				pid := f.waitPID(t, "client", 0)
 				if err := f.h.stop(t); !errors.Is(err, context.Canceled) {
@@ -2563,13 +2569,14 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 		{
 			name: "conversation_not_open",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
-				request := &runtime.SetClientMCPServersRequest{
+				request := &runtime.SetClientExecutorRequest{
 					ConversationID: defs.NewConversationID(),
-					ClientID:       "c1",
+					ConnectionID:   "ws-c1",
+					ExecutorID:     "c1",
 					Servers:        []conversation.ClientMCPServer{f.newClientServer(clientFakeServerID, "client")},
 				}
-				if err := f.h.rt.SetClientMCPServers(t.Context(), request); !errors.Is(err, runtime.ErrConversationNotOpen) {
-					t.Fatalf("SetClientMCPServers() error = %v, want %v", err, runtime.ErrConversationNotOpen)
+				if err := f.h.rt.SetClientExecutor(t.Context(), request); !errors.Is(err, runtime.ErrConversationNotOpen) {
+					t.Fatalf("SetClientExecutor() error = %v, want %v", err, runtime.ErrConversationNotOpen)
 				}
 				if _, err := os.Stat(f.getPIDPath("client")); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("client server was started for a conversation that is not open: %v", err)
@@ -2580,16 +2587,17 @@ func TestRuntimeClientMCPServers(t *testing.T) {
 			// 登记里有建不出连接的 server（没有 ID）：报错，这条客户端连接之前的登记原样保留，不启动新进程。
 			name: "invalid_server_changes_nothing",
 			run: func(t *testing.T, f *mcpRuntimeFixture) {
-				f.setClientMCPServers(t, "c1", f.newClientServer(clientFakeServerID, "client-1"))
+				f.setClientExecutor(t, "c1", f.newClientServer(clientFakeServerID, "client-1"))
 				f.waitClientServers(t, connectedClient)
 				pid := f.waitPID(t, "client-1", 0)
-				request := &runtime.SetClientMCPServersRequest{
+				request := &runtime.SetClientExecutorRequest{
 					ConversationID: f.conversation.ID,
-					ClientID:       "c1",
+					ConnectionID:   "ws-c1",
+					ExecutorID:     "c1",
 					Servers:        []conversation.ClientMCPServer{f.newClientServer("other", "client-2"), f.newClientServer("", "client-3")},
 				}
-				if err := f.h.rt.SetClientMCPServers(t.Context(), request); err == nil {
-					t.Fatal("SetClientMCPServers() error = nil, want an error for the server without an ID")
+				if err := f.h.rt.SetClientExecutor(t.Context(), request); err == nil {
+					t.Fatal("SetClientExecutor() error = nil, want an error for the server without an ID")
 				}
 				f.waitClientServers(t, connectedClient)
 				if !isProcessAlive(pid) {
@@ -3795,20 +3803,21 @@ func TestRuntimeSetConversationExecutorSettings(t *testing.T) {
 					ID:        clientFakeServerID,
 					Transport: &commandTransport{command: buildFakeMCPServer(t)},
 				}
-				request := &runtime.SetClientMCPServersRequest{
+				request := &runtime.SetClientExecutorRequest{
 					ConversationID: conv.ID,
-					ClientID:       "c1",
+					ConnectionID:   "ws-c1",
+					ExecutorID:     "c1",
 					Servers:        []conversation.ClientMCPServer{server},
 				}
-				if err := h.rt.SetClientMCPServers(t.Context(), request); err != nil {
-					t.Fatalf("SetClientMCPServers() error = %v", err)
+				if err := h.rt.SetClientExecutor(t.Context(), request); err != nil {
+					t.Fatalf("SetClientExecutor() error = %v", err)
 				}
 				if _, err := h.setExecutorSettings(t, fixture.request); err != nil {
 					t.Fatalf("SetConversationExecutorSettings() error = %v", err)
 				}
 				servers, err := h.rt.GetMCPServers(t.Context(), &runtime.GetConversationRequest{ConversationID: conv.ID})
 				if err != nil || !slices.ContainsFunc(servers, func(info conversation.MCPServerInfo) bool {
-					return info.ExecutorID == defs.ClientExecutorID && info.ServerID == clientFakeServerID
+					return info.ExecutorID == "c1" && info.ServerID == clientFakeServerID
 				}) {
 					t.Fatalf("GetMCPServers() = %+v, %v; want the client server %s", servers, err, clientFakeServerID)
 				}

@@ -70,9 +70,8 @@ type Conversation interface {
 	// SetDefinitions 按新定义装配配置，空闲时替换，忙时暂存并在空闲后自动替换；isPending 表示仍等待应用。
 	// 校验全部 Session 的 Agent 都在新定义里；WithoutExecutors 的对话不装配 Executor 和 Skill。
 	SetDefinitions(ctx context.Context, definitions *ConversationDefinitions) (isPending bool, err error)
-	// SetClientMCPServers 替换指定客户端登记的全部 MCP server，空列表表示移除；等 Run 换完登记后返回，从下个 Turn 起生效。
-	// 创建连接失败、对话已停止或调用方取消时返回错误。
-	SetClientMCPServers(ctx context.Context, clientID string, servers []ClientMCPServer) error
+	// SetClientExecutor 登记客户端执行环境；Servers 为空时，只移除同一连接的登记。
+	SetClientExecutor(ctx context.Context, registration ClientExecutorRegistration) error
 }
 
 // conversationImpl 由 Run 串行处理换配置和客户端 MCP 登记，每个 Session 各有一个 Run 任务和一个事件转发任务。
@@ -89,10 +88,10 @@ type conversationImpl struct {
 	pendingConfig *conversationConfig
 	// configApplyTimer 到期后尝试应用 pendingConfig，仍忙时重新计时，只由 Run 读写。
 	configApplyTimer *time.Timer
-	// clientMCPServers 给 Session 提供客户端登记的 MCP 工具，构造时建好，换配置时不动。
-	clientMCPServers executor.ClientMCPServers
-	// clientMCPRunCancels 以客户端 ID 为键，值是取消这个客户端全部连接的 Run 的函数；只由 Run 读写。
-	clientMCPRunCancels map[string]context.CancelFunc
+	// environmentsManager 保存稳定环境和客户端环境；启动后只由 Run 更新。
+	environmentsManager executor.ExecutionEnvironmentsManager
+	// clientMCPRunCancels 按 ExecutorID 保存客户端环境任务；只由 Run 读写。
+	clientMCPRunCancels map[string]clientExecutorRun
 	// configChanges 是交给 Run 串行处理的换配置请求。
 	configChanges chan *configChange
 	// configBaseRequests 接收 setter 对装配 base 的查询。
@@ -164,27 +163,17 @@ func CreateConversation(ctx context.Context, conversationID defs.ConversationID,
 	if err != nil {
 		return nil, err
 	}
-	// 2. 保存根 Session 和对话记录，创建尚未启动的对话实例；保存失败时关闭已创建的工作区。
-	record, root, err := saveNewConversation(ctx, conversationID, rootAgentName, model, config, opt)
+	// 2. 选择根 Agent 和模型，创建尚未启动的对话实例。
+	definition, found := config.agentDefinitions[rootAgentName]
+	if !found {
+		closeWorkspaces(ctx, config.workspaces)
+		return nil, fmt.Errorf("root agent %q is not configured", rootAgentName)
+	}
+	selection, err := getRequestedModelSelection(config.models, model, definition.Model)
 	if err != nil {
 		closeWorkspaces(ctx, config.workspaces)
 		return nil, err
 	}
-	return newConversation(record, []defs.Session{root}, opt, config), nil
-}
-
-// saveNewConversation 选择根 Agent 和模型，保存根 Session 和对话记录。
-func saveNewConversation(ctx context.Context, conversationID defs.ConversationID, rootAgentName string, model defs.ModelSelection, config *conversationConfig, opt *ConversationOpt) (defs.Conversation, defs.Session, error) {
-	// 1. 查找根 Agent，未指定模型时使用 Agent 默认模型。
-	definition, found := config.agentDefinitions[rootAgentName]
-	if !found {
-		return defs.Conversation{}, defs.Session{}, fmt.Errorf("root agent %q is not configured", rootAgentName)
-	}
-	selection, err := getRequestedModelSelection(config.models, model, definition.Model)
-	if err != nil {
-		return defs.Conversation{}, defs.Session{}, err
-	}
-	// 2. 分配根 Session ID，先保存根 Session，再保存含 Executor 设置的对话记录。
 	record := defs.Conversation{
 		ID:               conversationID,
 		RootSessionID:    defs.NewSessionID(),
@@ -196,13 +185,21 @@ func saveNewConversation(ctx context.Context, conversationID defs.ConversationID
 		AgentName:      rootAgentName,
 		Model:          selection,
 	}
+	c, err := newConversation(record, []defs.Session{root}, opt, config)
+	if err != nil {
+		closeWorkspaces(ctx, config.workspaces)
+		return nil, err
+	}
+	// 3. 先保存根 Session，再保存对话记录。
 	if err := opt.Mutation.SetSession(ctx, root); err != nil {
-		return defs.Conversation{}, defs.Session{}, fmt.Errorf("create Conversation %s root %s: %w", record.ID, root.ID, err)
+		closeWorkspaces(ctx, config.workspaces)
+		return nil, fmt.Errorf("create Conversation %s root %s: %w", record.ID, root.ID, err)
 	}
 	if err := opt.Mutation.SetConversation(ctx, record); err != nil {
-		return defs.Conversation{}, defs.Session{}, fmt.Errorf("create Conversation %s; root %s saved: %w", record.ID, root.ID, err)
+		closeWorkspaces(ctx, config.workspaces)
+		return nil, fmt.Errorf("create Conversation %s; root %s saved: %w", record.ID, root.ID, err)
 	}
-	return record, root, nil
+	return c, nil
 }
 
 // GetConversation 按已保存的对话记录读取全部 Session、装配配置，返回还没启动的对话。
@@ -236,19 +233,28 @@ func GetConversation(ctx context.Context, record defs.Conversation, storedSettin
 	if err != nil {
 		return nil, err
 	}
-	return newConversation(record, records, opt, config), nil
+	c, err := newConversation(record, records, opt, config)
+	if err != nil {
+		closeWorkspaces(ctx, config.workspaces)
+		return nil, err
+	}
+	return c, nil
 }
 
 // newConversation 用已校验的记录和配置创建对话实例。
-func newConversation(record defs.Conversation, records []defs.Session, opt *ConversationOpt, config *conversationConfig) *conversationImpl {
-	// 1. 创建共享模型客户端、空的客户端 MCP 登记和运行通道。
+func newConversation(record defs.Conversation, records []defs.Session, opt *ConversationOpt, config *conversationConfig) (*conversationImpl, error) {
+	// 1. 登记已装配的稳定环境，再创建共享模型客户端和运行通道。
+	environmentsManager := executor.NewExecutionEnvironmentsManager()
+	if _, err := environmentsManager.SetStatic(getDefaultExecutorID(config.environments), config.environments); err != nil {
+		return nil, err
+	}
 	c := &conversationImpl{
 		opt:                 *opt,
 		id:                  record.ID,
 		rootSessionID:       record.RootSessionID,
 		modelClient:         opt.ModelClient,
-		clientMCPServers:    executor.NewClientMCPServers(),
-		clientMCPRunCancels: make(map[string]context.CancelFunc),
+		environmentsManager: environmentsManager,
+		clientMCPRunCancels: make(map[string]clientExecutorRun),
 		configChanges:       make(chan *configChange),
 		configBaseRequests:  make(chan *configBaseRequested),
 		clientMCPChanges:    make(chan *clientMCPChange),
@@ -264,7 +270,7 @@ func newConversation(record defs.Conversation, records []defs.Session, opt *Conv
 	for _, value := range records {
 		c.sessionRecords.Store(value.ID, value)
 	}
-	return c
+	return c, nil
 }
 
 // GetID 返回对话 ID。
@@ -305,21 +311,16 @@ func (c *conversationImpl) GetSkills() []skill.SkillInfo {
 
 // GetMCPServers 返回环境和客户端登记的 MCP 连接信息。
 func (c *conversationImpl) GetMCPServers() []MCPServerInfo {
-	// 1. 按执行环境顺序收集 MCP 连接，最后追加客户端登记的连接。
+	// 1. 按执行环境顺序收集 MCP 连接。
+	environments, _ := c.environmentsManager.GetEnvironments()
 	var servers []MCPServerInfo
-	for _, environment := range c.config.Load().environments {
+	for _, environment := range environments {
 		for _, info := range environment.GetMCPServers() {
 			servers = append(servers, MCPServerInfo{
 				ExecutorID:     environment.GetID(),
 				ConnectionInfo: info,
 			})
 		}
-	}
-	for _, info := range c.clientMCPServers.GetMCPServers() {
-		servers = append(servers, MCPServerInfo{
-			ExecutorID:     defs.ClientExecutorID,
-			ConnectionInfo: info,
-		})
 	}
 	return servers
 }
@@ -380,7 +381,7 @@ func (c *conversationImpl) Run(ctx context.Context, events chan<- ConversationEv
 				logger.Warn("apply pending conversation configuration failed", "error", err)
 			}
 		case change := <-c.clientMCPChanges:
-			c.handleClientMCPChange(change)
+			change.reply <- c.handleClientMCPChange(change.registration)
 		}
 	}
 	// 5. 停止接收请求，等全部 Session 任务结束，再停止执行环境和客户端 MCP 连接，最后关闭 events。
@@ -394,8 +395,8 @@ func (c *conversationImpl) Run(ctx context.Context, events chan<- ConversationEv
 	}
 	c.tasks.Wait()
 	c.stopEnvironments(c.config.Load())
-	for _, cancel := range c.clientMCPRunCancels {
-		cancel()
+	for _, run := range c.clientMCPRunCancels {
+		run.cancel()
 	}
 	c.clientMCPTasks.Wait()
 	if events != nil {
@@ -469,12 +470,22 @@ func (c *conversationImpl) applyPendingConfig(deferIfBusy bool) (isPending bool,
 			return false, newAgentNotConfiguredError(record)
 		}
 	}
-	// 4. 以 errConversationReconfiguring 取消旧 Session，等全部任务结束后停止旧环境。
+	// 4. 换上稳定环境，取消与稳定环境撞名的客户端任务。
+	removedIDs, err := c.environmentsManager.SetStatic(getDefaultExecutorID(next.environments), next.environments)
+	if err != nil {
+		closeWorkspaces(c.runCtx, next.workspaces)
+		return false, err
+	}
+	for _, executorID := range removedIDs {
+		c.clientMCPRunCancels[executorID].cancel()
+		delete(c.clientMCPRunCancels, executorID)
+	}
+	// 5. 以 errConversationReconfiguring 取消旧 Session，等全部任务结束后停止旧环境。
 	current := c.config.Load()
 	current.stopSessions(errConversationReconfiguring)
 	c.tasks.Wait()
 	c.stopEnvironments(current)
-	// 5. 换上新配置，启动执行环境和根 Session；对话已取消时不再启动，根 Session 启动失败时停止对话。
+	// 6. 换上新配置，启动执行环境和根 Session；对话已取消时不再启动，根 Session 启动失败时停止对话。
 	next.sessionsCtx, next.stopSessions = context.WithCancelCause(c.runCtx)
 	c.config.Store(next)
 	if err := c.runCtx.Err(); err != nil {
@@ -486,7 +497,7 @@ func (c *conversationImpl) applyPendingConfig(deferIfBusy bool) (isPending bool,
 		c.stopRun(err)
 		return false, err
 	}
-	// 6. 发出新模型目录、Agent 默认模型和 Executor 设置。
+	// 7. 发出新模型目录、Agent 默认模型和 Executor 设置。
 	c.sendEvent(&ConversationReconfigured{
 		Models:             next.models,
 		AgentDefaultModels: getAgentDefaultModels(next.definitions.Agents),
@@ -495,28 +506,47 @@ func (c *conversationImpl) applyPendingConfig(deferIfBusy bool) (isPending bool,
 	return false, nil
 }
 
-// handleClientMCPChange 替换一个客户端登记的全部 MCP 连接。
-func (c *conversationImpl) handleClientMCPChange(change *clientMCPChange) {
-	// 1. 取消这个客户端原先登记的连接任务。
-	if cancel, found := c.clientMCPRunCancels[change.clientID]; found {
-		cancel()
-		delete(c.clientMCPRunCancels, change.clientID)
-	}
-	// 2. 启动新连接；连接 ctx 不随对话 ctx 取消，换登记时或 Run 在全部 Session 停止后取消。
-	if len(change.connections) > 0 {
-		runCtx, cancel := context.WithCancel(telemetry.ContextWithAttrs(context.WithoutCancel(c.runCtx), telemetry.ExecutorID(defs.ClientExecutorID)))
-		for _, connection := range change.connections {
-			c.clientMCPTasks.Go(func() {
-				if err := connection.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-					telemetry.GetLogger(runCtx).Warn("client MCP connection stopped", "mcp_server_id", connection.GetInfo().ServerID, "error", err)
-				}
-			})
+// handleClientMCPChange 更新客户端执行环境及其连接任务。
+func (c *conversationImpl) handleClientMCPChange(registration ClientExecutorRegistration) error {
+	executorID, connectionID := registration.ExecutorID, registration.ConnectionID
+	// 1. 只注销仍属于这条连接的登记。
+	if len(registration.Servers) == 0 {
+		if c.environmentsManager.RemoveDynamic(executorID, connectionID) {
+			c.clientMCPRunCancels[executorID].cancel()
+			delete(c.clientMCPRunCancels, executorID)
 		}
-		c.clientMCPRunCancels[change.clientID] = cancel
+		return nil
 	}
-	// 3. 替换登记并关闭 applied，Session 从下一个 Turn 起使用新工具。
-	c.clientMCPServers.SetMCPServers(change.clientID, change.connections)
-	close(change.applied)
+	// 2. 构造环境并尝试发布，失败时保留原登记。
+	if executorID == "" || connectionID == "" {
+		return fmt.Errorf("%w: client executor registration requires an executor ID and a connection ID", ErrInvalidExecutorSettings)
+	}
+	connections, err := newClientMCPConnections(registration.Servers)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidExecutorSettings, err)
+	}
+	environment, err := executor.NewExecutionEnvironment(
+		executor.NewExecutionEnvironmentOpt(executorID, registration.Description, nil).
+			WithoutCommands().AsDynamic().WithMCPConnections(connections...))
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidExecutorSettings, err)
+	}
+	if err := c.environmentsManager.SetDynamic(environment, connectionID); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidExecutorSettings, err)
+	}
+	// 3. 取消旧任务并启动新环境；对话关闭时等 Session 停止后再取消客户端环境任务。
+	if previous, found := c.clientMCPRunCancels[executorID]; found {
+		previous.cancel()
+	}
+	runCtx, cancel := context.WithCancel(telemetry.ContextWithAttrs(context.WithoutCancel(c.runCtx), telemetry.ExecutorID(executorID)))
+	run := clientExecutorRun{connectionID: connectionID, cancel: cancel}
+	c.clientMCPRunCancels[executorID] = run
+	c.clientMCPTasks.Go(func() {
+		if err := environment.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			telemetry.GetLogger(runCtx).Warn("client executor MCP connections stopped", "connection_id", run.connectionID, "error", err)
+		}
+	})
+	return nil
 }
 
 // startEnvironments 启动各执行环境的 MCP 连接任务。
@@ -624,19 +654,13 @@ func (c *conversationImpl) applyConfig(ctx context.Context, base, next *conversa
 	return result.isPending, result.err
 }
 
-// SetClientMCPServers 创建客户端的新 MCP 连接交给 Run 替换登记，等替换完成后返回。
-func (c *conversationImpl) SetClientMCPServers(ctx context.Context, clientID string, servers []ClientMCPServer) error {
-	// 1. 创建全部新连接，任一失败时返回错误。
-	connections, err := newClientMCPConnections(servers)
-	if err != nil {
-		return err
-	}
-	// 2. 向 Run 提交替换请求，提交前对话停止或调用方取消时返回错误。
+// SetClientExecutor 将登记交给 Run，等登记完成后返回。
+func (c *conversationImpl) SetClientExecutor(ctx context.Context, registration ClientExecutorRegistration) error {
 	change := &clientMCPChange{
-		clientID:    clientID,
-		connections: connections,
-		applied:     make(chan struct{}),
+		registration: registration,
+		reply:        make(chan error),
 	}
+	// 1. 提交前对话停止或调用方取消时返回错误。
 	select {
 	case c.clientMCPChanges <- change:
 	case <-c.stopped:
@@ -644,9 +668,8 @@ func (c *conversationImpl) SetClientMCPServers(ctx context.Context, clientID str
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	// 3. 等待 Run 完成替换。
-	<-change.applied
-	return nil
+	// 2. Run 收到登记后等待它回复。
+	return <-change.reply
 }
 
 // HandleInput 向根 Session 提交应用发来的消息，返回接收的 ItemID。
@@ -792,16 +815,17 @@ func (c *conversationImpl) GetSessionDetails(_ context.Context, sessionID defs.S
 		return SessionDetails{}, newAgentNotConfiguredError(record)
 	}
 	// 2. 创建协作工具，汇总 Executor、Skill 和模型可见的工具名（含已连接的 MCP 工具）。
-	collaborationTools, err := newCollaborationTools(c, record, config.definitions)
+	collaborationTools, err := newCollaborationTools(c, record, config.definitions, definition)
 	if err != nil {
 		return SessionDetails{}, err
 	}
+	environments, _ := c.environmentsManager.GetEnvironments()
 	details := SessionDetails{
 		ConversationID: c.id,
 		Session:        record,
 		Executors:      newExecutorDetails(config.environments, config.executors),
 		Skills:         getSkillNames(skill.GetSkillsByNames(definition.SkillNames, config.skills)),
-		Tools:          getSessionToolNames(config.environments, c.clientMCPServers, definition, collaborationTools),
+		Tools:          getSessionToolNames(environments, definition, collaborationTools),
 	}
 	// 3. 所选模型存在时填写公开模型信息和压缩模型，否则两者留空。
 	if model, _, found := defs.GetSelectedModel(config.models, record.Model, definition.Model); found {
@@ -869,7 +893,7 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 	}
 	definition.Instructions += "\n" + prompt.FormatSessionIdentity(record)
 	// 3. 创建协作工具和 Session 配置，读取日志最新序号并确定 SessionStart hook 的来源。
-	collaborationTools, err := newCollaborationTools(c, record, config.definitions)
+	collaborationTools, err := newCollaborationTools(c, record, config.definitions, &definition)
 	if err != nil {
 		return nil, err
 	}
@@ -877,7 +901,7 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 	opt.Models = config.models
 	opt.Environments = config.environments
 	opt.AgentTools = collaborationTools
-	opt.ClientMCPServers = c.clientMCPServers
+	opt.EnvironmentsManager = c.environmentsManager
 	opt.Skills = skills
 	opt.Hooks = config.hooks
 	lastSavedOrdinal, err := dao.GetLastOrdinal(config.sessionsCtx, c.opt.Query, c.id, record.ID)
