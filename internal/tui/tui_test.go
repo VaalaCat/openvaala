@@ -3054,6 +3054,40 @@ func (c *fakeClient) ReloadConfig(context.Context) (runtime.SetDefinitionsResult
 	return c.configWriteResult, c.configWriteErr
 }
 
+// ListExecutorConfigs 记录查询并返回空列表。
+func (c *fakeClient) ListExecutorConfigs(context.Context) ([]defs.ExecutorConfig, error) {
+	c.record("ListExecutorConfigs")
+	return nil, nil
+}
+
+// SetExecutor 记录写入并返回预设结果。
+func (c *fakeClient) SetExecutor(_ context.Context, executor defs.ExecutorConfig) (runtime.SetDefinitionsResult, error) {
+	c.record("SetExecutor " + executor.ID)
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.configWriteResult, c.configWriteErr
+}
+
+// DeleteExecutor 记录删除并返回预设结果。
+func (c *fakeClient) DeleteExecutor(_ context.Context, executorID string) (runtime.SetDefinitionsResult, error) {
+	c.record("DeleteExecutor " + executorID)
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.configWriteResult, c.configWriteErr
+}
+
+// TestSSHExecutor 记录测试并返回目标目录。
+func (c *fakeClient) TestSSHExecutor(_ context.Context, _ defs.SSHExecutorConfig, workspaceDirectory string) (string, error) {
+	c.record("TestSSHExecutor " + workspaceDirectory)
+	return workspaceDirectory, nil
+}
+
+// ListSSHConfigHosts 记录查询并返回空列表。
+func (c *fakeClient) ListSSHConfigHosts(context.Context) ([]defs.SSHConfigHost, error) {
+	c.record("ListSSHConfigHosts")
+	return nil, nil
+}
+
 // ListCatalogProviders 查询测试目录的 Provider 列表。
 func (c *fakeClient) ListCatalogProviders(context.Context) ([]defs.CatalogProvider, error) {
 	// 1. 记录查询，读取暂停通道并等待它关闭。

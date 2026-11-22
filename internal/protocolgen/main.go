@@ -96,7 +96,7 @@ func generateProtocolTypes() (string, error) {
 		"encoding/json.RawMessage": config.OverrideLiteral(bindings.KeywordUnknown),
 	})
 	if err := golang.IncludeCustom(map[string]string{
-		"github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.Role": "string",
+		"github.com/VaalaCat/llmkit/ir.Role": "string",
 		"time.Time": "string",
 	}); err != nil {
 		return "", fmt.Errorf("map custom types: %w", err)

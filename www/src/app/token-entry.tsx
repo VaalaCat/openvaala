@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react"
+import { useState, type FormEvent, type ReactNode } from "react"
 import { AlertCircleIcon } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { SecretInput } from "@/components/base/secret-input"
@@ -9,10 +9,14 @@ import { Button } from "@/components/ui/button"
 // token 输入页：地址里没有 token，或 serve 拒绝了已保存的 token（isTokenInvalid）时显示
 export function TokenEntryPage({
   isTokenInvalid,
+  serverLabel,
   onSubmit,
+  footer,
 }: {
   isTokenInvalid: boolean
+  serverLabel?: string
   onSubmit: (token: string) => void
+  footer?: ReactNode
 }) {
   const { t } = useTranslation()
   const [token, setToken] = useState("")
@@ -23,28 +27,35 @@ export function TokenEntryPage({
   return (
     <StandalonePage
       title={t("connection.tokenEntry.title")}
-      description={t("connection.tokenEntry.description")}
+      description={
+        serverLabel
+          ? t("connection.tokenEntry.remoteDescription", { name: serverLabel })
+          : t("connection.tokenEntry.description")
+      }
     >
-      <form onSubmit={submit} className="flex flex-col gap-4">
-        {isTokenInvalid && (
-          <Alert variant="destructive">
-            <AlertCircleIcon />
-            <AlertDescription className="text-caption">
-              {t("connection.tokenEntry.invalid")}
-            </AlertDescription>
-          </Alert>
-        )}
-        <SecretInput
-          id="token"
-          label={t("connection.tokenEntry.label")}
-          isLabelHidden
-          value={token}
-          onChange={setToken}
-        />
-        <Button className="text-ui" type="submit" disabled={!token.trim()}>
-          {t("connection.tokenEntry.submit")}
-        </Button>
-      </form>
+      <div className="flex flex-col gap-4">
+        <form onSubmit={submit} className="flex flex-col gap-4">
+          {isTokenInvalid && (
+            <Alert variant="destructive">
+              <AlertCircleIcon />
+              <AlertDescription className="text-caption">
+                {t("connection.tokenEntry.invalid")}
+              </AlertDescription>
+            </Alert>
+          )}
+          <SecretInput
+            id="token"
+            label={t("connection.tokenEntry.label")}
+            isLabelHidden
+            value={token}
+            onChange={setToken}
+          />
+          <Button className="text-ui" type="submit" disabled={!token.trim()}>
+            {t("connection.tokenEntry.submit")}
+          </Button>
+        </form>
+        {footer}
+      </div>
     </StandalonePage>
   )
 }

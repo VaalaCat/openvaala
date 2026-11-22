@@ -47,9 +47,39 @@ type confirmation struct {
 	TurnID       defs.TurnID
 	ProviderID   string
 	Provider     defs.ProviderConfig
+	ExecutorID   string
+	Executor     defs.ExecutorConfig
 	CatalogID    string
 	Page         string
 	Name         string
+	ServerID     string
+}
+
+// ---- Executor 编辑原文 ----
+
+// executorDraft 保存设置 → Executor 页中正在编辑的 SSH Executor 表单字段。
+type executorDraft struct {
+	EditingID          string
+	ID                 string
+	Description        string
+	Address            string
+	IdentityFile       string
+	WorkspaceDirectory string
+	IDError            string
+}
+
+// ---- Desktop 远端服务器编辑草稿 ----
+
+// serverFormDraft 保存「管理服务器」弹窗里新增或编辑远端服务器的表单原文与解析反馈。
+type serverFormDraft struct {
+	EditingID       string
+	Name            string
+	URL             string
+	Token           string
+	ShowToken       bool
+	ParsedURL       string
+	TokenAutoFilled bool
+	URLError        string
 }
 
 // ---- Composer 技能补全 ----
@@ -132,7 +162,7 @@ var errInvalidImageDataURL = errors.New("invalid image data URL")
 // settingInputOpt 是设置行里输入框的选项；Error 非空时显示在输入框下方并把边线改成危险色。
 type settingInputOpt struct {
 	Password, ReadOnly bool
-	Error              string
+	Error, Placeholder string
 }
 
 // ---- Provider 编辑原文 ----
@@ -254,3 +284,52 @@ type settingsPageKey struct{}
 
 // settingsChangedKey 是设置页在根元素上保存页面切换时刻的键。
 type settingsChangedKey struct{}
+
+// userMessageListKey 是超长用户消息虚拟阅读列表在元素上保存滚动状态的键。
+type userMessageListKey struct{}
+
+// userMessageChunksKey 是超长用户消息在元素上缓存分段切片的键。
+type userMessageChunksKey struct{}
+
+// userMessageChunksCache 保存超长用户消息按行和长度切分后的结果，避免每帧重复拆分。
+type userMessageChunksCache struct {
+	Text   string
+	Chunks []string
+}
+
+// toolSummaryCacheKey 是工具条目在元素上缓存标题摘要与失败判定的键。
+type toolSummaryCacheKey struct{}
+
+// toolSummaryCache 保存工具折叠态所需的摘要和失败标记，避免每帧重复解析 JSON。
+type toolSummaryCache struct {
+	Name, Arguments string
+	ResultContent   string
+	ResultHasError  bool
+	HasResult       bool
+	Summary         string
+	Failed          bool
+}
+
+// toolDetailCacheKey 是工具展开详情缓存已解析参数与结果对象的键。
+type toolDetailCacheKey struct{}
+
+// toolDetailCache 保存工具展开态解析后的参数和结果表，只在原文变化时重算。
+type toolDetailCache struct {
+	Arguments     string
+	ResultContent string
+	Args          map[string]any
+	Content       map[string]any
+}
+
+// diffCacheKey 是补丁视图缓存拆行结果的键。
+type diffCacheKey struct{}
+
+// diffCache 保存补丁拆行和摘要，避免展开态每帧重复切分。
+type diffCache struct {
+	Patch   string
+	Summary string
+	Lines   []kit.PatchLine
+}
+
+// jsonRawSourceKey 是 JSON 视图在元素上保存上次 json.RawMessage 原文的键。
+type jsonRawSourceKey struct{}

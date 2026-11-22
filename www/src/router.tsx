@@ -47,6 +47,14 @@ const ExecutorSettingsPage = lazyPage(
   () => import("@/app/settings/executors"),
   "ExecutorSettingsPage"
 )
+const ExecutorCreatePage = lazyPage(
+  () => import("@/app/settings/executors"),
+  "ExecutorCreatePage"
+)
+const ExecutorEditPage = lazyPage(
+  () => import("@/app/settings/executors"),
+  "ExecutorEditPage"
+)
 const HookSettingsPage = lazyPage(
   () => import("@/app/settings/hooks"),
   "HookSettingsPage"
@@ -77,6 +85,8 @@ export function AppRouter() {
             <Route path="providers/new" element={<ProviderCreatePage />} />
             <Route path="providers/edit" element={<ProviderEditPage />} />
             <Route path="executors" element={<ExecutorSettingsPage />} />
+            <Route path="executors/new" element={<ExecutorCreatePage />} />
+            <Route path="executors/edit" element={<ExecutorEditPage />} />
             <Route path="hooks" element={<HookSettingsPage />} />
             <Route path="skills" element={<SkillSettingsPage />} />
           </Route>

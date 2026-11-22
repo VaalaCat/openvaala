@@ -160,6 +160,37 @@ type ListDirectoriesParams struct {
 	BaseDirectory string `json:"base_directory,omitempty"`
 }
 
+// ListExecutorConfigsResult 是 executor/config/list 的返回结果。
+type ListExecutorConfigsResult struct {
+	Executors []defs.ExecutorConfig `json:"executors"`
+}
+
+// SetExecutorParams 是 executor/set 的参数。
+type SetExecutorParams struct {
+	Executor defs.ExecutorConfig `json:"executor"`
+}
+
+// DeleteExecutorParams 是 executor/delete 的参数。
+type DeleteExecutorParams struct {
+	ExecutorID string `json:"executor_id"`
+}
+
+// TestSSHExecutorParams 是 executor/test 的参数。
+type TestSSHExecutorParams struct {
+	SSH                defs.SSHExecutorConfig `json:"ssh"`
+	WorkspaceDirectory string                 `json:"workspace_directory"`
+}
+
+// TestSSHExecutorResult 是 executor/test 的返回结果；失败直接走 JSON-RPC error。
+type TestSSHExecutorResult struct {
+	ResolvedDirectory string `json:"resolved_directory"`
+}
+
+// ListSSHConfigHostsResult 是 executor/sshConfigHosts 的返回结果。
+type ListSSHConfigHostsResult struct {
+	Hosts []defs.SSHConfigHost `json:"hosts"`
+}
+
 // SetSessionModelParams 是 session/setModel 的参数。
 type SetSessionModelParams struct {
 	ConversationID defs.ConversationID `json:"conversation_id"`

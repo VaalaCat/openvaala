@@ -75,7 +75,8 @@
     "reconnectPending": "正在重连",
     "connecting": {
       "title": "正在连接…",
-      "retrying": "无法连接 {{host}}，正在重试。请确认 openvaala serve 正在运行。"
+      "remoteTitle": "正在连接「{{name}}」…",
+      "retrying": "无法连接 {{host}}，正在重试。"
     },
     "incompatible": {
       "title": "版本不一致",
@@ -84,6 +85,7 @@
     "tokenEntry": {
       "title": "输入 token",
       "description": "运行 openvaala web 获取带 token 的地址",
+      "remoteDescription": "输入「{{name}}」的 Token",
       "label": "Token",
       "submit": "连接",
       "invalid": "token 无效，请重新运行 openvaala web 获取地址"
@@ -94,6 +96,47 @@
       "reconnecting": "已断开，正在重连",
       "unauthorized": "token 无效",
       "incompatible": "版本不一致"
+    },
+    "servers": {
+      "pageDefault": "本页",
+      "current": "当前",
+      "switch": "切换",
+      "switchDefault": "切回默认",
+      "switchOther": "切换服务器",
+      "manageAction": "管理服务器…",
+      "manageTitle": "管理服务器",
+      "addTitle": "添加服务器",
+      "editTitle": "编辑服务器",
+      "add": "添加服务器",
+      "edit": "编辑",
+      "delete": "删除",
+      "deleteConfirm": "删除",
+      "deleteActiveConfirm": "删除「{{name}}」并切回默认？",
+      "close": "关闭",
+      "back": "返回",
+      "saveOnly": "保存",
+      "saveAndSwitch": "保存并切换",
+      "nameLabel": "名称",
+      "namePlaceholder": "公司开发机",
+      "addressLabel": "地址",
+      "addressPlaceholder": "ws://host:8790 或 openvaala web 链接",
+      "tokenLabel": "Token",
+      "tokenAutoFilled": "已从链接提取",
+      "test": "测试",
+      "testing": "测试中…",
+      "testSuccess": "连接成功",
+      "testErrors": {
+        "unauthorized": "Token 无效",
+        "incompatible": "协议版本不兼容",
+        "unreachable": "无法连接",
+        "timeout": "连接超时"
+      },
+      "errors": {
+        "required": "请输入地址",
+        "invalid": "地址格式无效",
+        "unsupportedScheme": "仅支持 http / https / ws / wss",
+        "missingHost": "缺少主机地址"
+      }
     }
   },
   "jsonView": {
@@ -669,7 +712,36 @@
     "executors": {
       "empty": "没有 Executor",
       "workspaceDirectory": "默认根目录 {{directory}}",
-      "noWorkspaceDirectory": "没有默认根目录"
+      "noWorkspaceDirectory": "没有默认根目录",
+      "builtinBadge": "内置",
+      "addSSH": "新增 SSH",
+      "createTitle": "新增 SSH",
+      "importSSHConfigPlaceholder": "从 ~/.ssh/config 导入",
+      "sshSection": "SSH",
+      "idLabel": "ID",
+      "descriptionLabel": "说明",
+      "descriptionPlaceholder": "Linux 编译机",
+      "addressLabel": "地址",
+      "identityFileLabel": "私钥",
+      "identityFilePlaceholder": "~/.ssh/id_ed25519（留空用 ssh-agent）",
+      "workspaceDirectoryLabel": "工作目录",
+      "revert": "撤销",
+      "test": "测试",
+      "testing": "测试中…",
+      "save": "保存",
+      "testSuccess": "已连接 · {{directory}}",
+      "saved": "已保存「{{id}}」",
+      "deleted": "已删除「{{id}}」",
+      "deleteAction": "删除",
+      "deleteConfirmTitle": "删除「{{id}}」？",
+      "deleteConfirmDescription": "删除 executors/{{id}}.yaml 并重载配置。",
+      "backToList": "返回 Executor",
+      "missingID": "缺少 Executor ID",
+      "errors": {
+        "builtinID": "内置 ID 不可用",
+        "invalidID": "仅支持字母、数字、. _ -",
+        "duplicateID": "ID 已存在"
+      }
     },
     "hooks": {
       "empty": "还没有配置 hook",

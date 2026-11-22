@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,8 +34,23 @@ type Desktop struct {
 	window                        *mygo.Window
 	ctx                           context.Context
 	cancel                        context.CancelFunc
+	clientCtx                     context.Context
+	clientCancel                  context.CancelFunc
+	connectGeneration             uint64
 	tasks                         sync.WaitGroup
 	client                        runtimeclient.Client
+	serverOverride                *remoteServer
+	defaultRemote                 *remoteServer
+	startTargetError              error
+	serversDialogOpen             bool
+	serverFormOpen                bool
+	serverForm                    serverFormDraft
+	serverDeleteConfirmID         string
+	serverTestPending             bool
+	serverTestSuccess             string
+	serverTestError               error
+	serverTestCancel              context.CancelFunc
+	serverTestRequest             uint64
 	preferences                   preferences
 	translations                  map[string]map[string]string
 	preferencesPath               string
@@ -93,6 +109,20 @@ type Desktop struct {
 	newAgent                      string
 	executors                     []conversation.ExecutorDetails
 	executorsLoading              bool
+	executorConfigs               []defs.ExecutorConfig
+	executorConfigsLoading        bool
+	executorConfigsError          error
+	sshConfigHosts                []defs.SSHConfigHost
+	sshConfigHostsLoaded          bool
+	sshImportSelected             string
+	executorDraft                 *executorDraft
+	executorBaseline              *executorDraft
+	executorSaving                bool
+	executorError                 error
+	executorTesting               bool
+	executorTestSuccess           string
+	executorTestError             error
+	executorTestRequest           uint64
 	newExecutor                   string
 	newDirectory                  string
 	recentConversations           []defs.Conversation
@@ -198,9 +228,10 @@ type Desktop struct {
 	closingTerminalIDs      []string
 }
 
-// DesktopOpt 指定本机服务启动参数、可选的偏好文件路径和图片下载带的 header。
+// DesktopOpt 指定本机服务启动参数、可选远端启动目标、可选偏好文件路径和图片下载带的 header。
 type DesktopOpt struct {
 	RuntimeServerStart cli.RuntimeServerStartOpt
+	StartTarget        cli.DesktopStartTarget
 	PreferencesPath    string
 	// HTTPHeaders 是配置里的 http.headers（已合并内置默认）；原生界面自己下载 Markdown 里的网络图片时带上。
 	HTTPHeaders map[string]string
@@ -208,8 +239,8 @@ type DesktopOpt struct {
 
 // NewDesktop 校验并保存桌面启动参数。
 func NewDesktop(opt *DesktopOpt) (*Desktop, error) {
-	// 1. 保存启动配置。
-	if opt == nil || opt.RuntimeServerStart.Executable == "" {
+	// 1. 保存启动配置；指定远端目标时不强制要求本机可执行文件。
+	if opt == nil || (opt.RuntimeServerStart.Executable == "" && strings.TrimSpace(opt.StartTarget.URL) == "") {
 		return nil, errors.New("desktop requires a runtime executable")
 	}
 	// 2. 建立图片下载客户端，整个桌面进程共用。
@@ -250,6 +281,7 @@ func (d *Desktop) Run(ctx context.Context) error {
 		d.showFailure(err)
 		d.preferencesBroken = true
 	}
+	d.applyStartTarget()
 	if err := registerFonts(); err != nil {
 		d.showFailure(err)
 	}
@@ -377,6 +409,7 @@ func (d *Desktop) view(c *ui.Context) {
 	d.confirmationView(c)
 	d.imagePreviewView(c)
 	d.workLocationDialog(c)
+	d.serversDialogView(c)
 	// 通知先入队再画宿主；ShowToast 自己请求下一帧，窗口空闲时通知也能立刻出现。
 	for _, toast := range d.pendingToasts {
 		kit.ShowToast(c, toast)
@@ -389,7 +422,7 @@ func (d *Desktop) view(c *ui.Context) {
 		d.window.Close()
 	}
 	// 4. 任何弹窗从打开变为关闭的那一帧，焦点回到输入框；命令面板里选了自己要焦点的命令（搜索、终端、重命名）时除外。
-	dialogOpen := d.confirmOpen || d.locationOpen || d.confirmExit || d.imagePreviewOpen || d.commandPaletteOpen
+	dialogOpen := d.confirmOpen || d.locationOpen || d.serversDialogOpen || d.confirmExit || d.imagePreviewOpen || d.commandPaletteOpen
 	if d.dialogWasOpen && !dialogOpen && !focusedByCommand {
 		d.composerFocusRequested = true
 	}
@@ -454,20 +487,33 @@ func (d *Desktop) statusLeftView(c *ui.Context) {
 			label = d.t("connection.failed")
 		}
 	}
-	// 3. 悬停状态文字时提示完整的错误原文。
-	ui.Row(c).Shrink(1).Padding(0, t.Space(1)).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-		kit.StatusDot(c, color)
-		status := ui.Text(c, label).SingleLine().Shrink(0)
-		if d.connectionError != nil {
-			kit.Tooltip(c, status, d.connectionError.Error())
+	// 3. 可点击的服务器状态触发器：显示「● 本机 · 已连接 ▾」，点击弹出快捷切换菜单。
+	serverLabel := d.getActiveServerLabel()
+	trigger := ui.ButtonBase(c.Key("server-status-menu")).Shrink(1).Height(t.Metrics.CompactHeight).Padding(0, t.Space(2)).Gap(t.Space(1) + 2).AlignItems(ui.Center).Radius(t.Metrics.Radius).Label(d.t("server.switch.menu"))
+	trigger.Draw(func(p *ui.Painter, r ui.Rect) {
+		if trigger.Hovered() || trigger.Pressed() {
+			p.Fill(r, t.Colors.Hover, t.Metrics.Radius)
 		}
 	})
+	trigger.Children(func() {
+		kit.StatusDot(c, color)
+		ui.Text(c, serverLabel).SingleLine().Shrink(1).TextColor(t.Colors.Text)
+		ui.Text(c, "·").SingleLine().Shrink(0).TextColor(t.Colors.Muted)
+		ui.Text(c, label).SingleLine().Shrink(0).TextColor(t.Colors.Muted)
+		ui.Icon(c, kit.IconChevronDown).Size(kit.IconSizeSmall, kit.IconSizeSmall).TextColor(t.Colors.Muted)
+	})
+	if d.connectionError != nil {
+		kit.Tooltip(c, trigger, d.connectionError.Error())
+	} else if target, isLocal := d.getActiveServerTarget(); !isLocal && target != nil {
+		kit.Tooltip(c, trigger, target.URL)
+	}
+	kit.MenuButton(c, trigger, d.getServerMenuItems())
 }
 
 // isUnsavedWorkPresent 是否有尚未应用的设置或未发送内容？
 func (d *Desktop) isUnsavedWorkPresent() bool {
 	// 1. 检查完整设置草稿与全部对话草稿。
-	if d.isProviderDirty() {
+	if d.isProviderDirty() || d.isExecutorDirty() {
 		return true
 	}
 	for _, draft := range d.drafts {

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"slices"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 )
 
 // ReasoningStatus 是推理内容已经完成还是被中断。

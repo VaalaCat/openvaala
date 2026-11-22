@@ -9,16 +9,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/VaalaCat/openvaala/internal/cli"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 )
 
 // TestDesktopCommand 验证桌面命令树保留 CLI 帮助、版本和参数错误，不加载窗口或配置。
 func TestDesktopCommand(t *testing.T) {
 	// 1. 定义无图形会话下可以执行的公开命令行为；损坏的配置文件用来确认打开桌面前不加载配置。
-	brokenConfig := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(brokenConfig, []byte("http: [\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	cases := []struct {
 		name       string
 		arguments  []string
@@ -33,17 +30,17 @@ func TestDesktopCommand(t *testing.T) {
 		{
 			name:       "explicit app help without configuration",
 			arguments:  []string{"--config-file", filepath.Join(t.TempDir(), "missing.yaml"), "app", "--help"},
-			wantOutput: []string{"Open the Web UI in a desktop window", "openvaala app", "--native"},
+			wantOutput: []string{"Open the Web UI in a desktop window", "openvaala app", "--native", "--url"},
 		},
 		{
 			name:       "native app help",
 			arguments:  []string{"app", "--native", "--help"},
-			wantOutput: []string{"openvaala app", "--native"},
+			wantOutput: []string{"openvaala app", "--native", "--url"},
 		},
 		{
 			name:       "native root help",
 			arguments:  []string{"--native", "--help"},
-			wantOutput: []string{"--native"},
+			wantOutput: []string{"--native", "--url"},
 		},
 		{
 			name:      "native flag is not a serve flag",
@@ -75,16 +72,6 @@ func TestDesktopCommand(t *testing.T) {
 			arguments: []string{"app", "unexpected"},
 			wantError: "unknown command",
 		},
-		{
-			name:      "remote terminal flag is not silently ignored",
-			arguments: []string{"--url", "ws://127.0.0.1:1"},
-			wantError: "openvaala tui --url",
-		},
-		{
-			name:      "broken config does not stop the desktop command",
-			arguments: []string{"--config-file", brokenConfig, "--url", "ws://127.0.0.1:1"},
-			wantError: "openvaala tui --url",
-		},
 	}
 	// 2. 通过实际命令解析和执行检查输出，不执行 GUI 或真实后台服务。
 	for _, tc := range cases {
@@ -108,6 +95,64 @@ func TestDesktopCommand(t *testing.T) {
 				if !strings.Contains(output.String(), text) {
 					t.Fatalf("output does not contain %q: %s", text, output.String())
 				}
+			}
+		})
+	}
+}
+
+// TestDesktopStartTargetResolution 验证桌面命令按 --url > client.url 解析远端目标，且配置损坏时不阻断显式 --url。
+func TestDesktopStartTargetResolution(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	brokenConfig := filepath.Join(t.TempDir(), "broken.yaml")
+	if err := os.WriteFile(brokenConfig, []byte("http: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	remoteConfig := filepath.Join(t.TempDir(), "remote.yaml")
+	if err := os.WriteFile(remoteConfig, []byte("client:\n  url: ws://10.0.0.5:8790/api/v1/openvaala\n  token: cfg-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missingConfig := filepath.Join(t.TempDir(), "missing.yaml")
+
+	tests := []struct {
+		name string
+		args []string
+		want cli.DesktopStartTarget
+	}{
+		{
+			name: "flag url overrides client.url",
+			args: []string{"--config-file", remoteConfig, "--url", "ws://10.0.0.9:8790/api/v1/openvaala"},
+			want: cli.DesktopStartTarget{URL: "ws://10.0.0.9:8790/api/v1/openvaala", Token: "cfg-token", IsOverride: true},
+		},
+		{
+			name: "flag url with inline token does not use client.token",
+			args: []string{"--config-file", remoteConfig, "--url", "ws://10.0.0.9:8790/api/v1/openvaala?token=inline"},
+			want: cli.DesktopStartTarget{URL: "ws://10.0.0.9:8790/api/v1/openvaala?token=inline", Token: "", IsOverride: true},
+		},
+		{
+			name: "client.url used when flag omitted",
+			args: []string{"--config-file", remoteConfig},
+			want: cli.DesktopStartTarget{URL: "ws://10.0.0.5:8790/api/v1/openvaala", Token: "cfg-token", IsOverride: false},
+		},
+		{
+			name: "broken config does not stop explicit --url",
+			args: []string{"--config-file", brokenConfig, "--url", "ws://127.0.0.1:8790"},
+			want: cli.DesktopStartTarget{URL: "ws://127.0.0.1:8790", Token: "", IsOverride: true},
+		},
+		{
+			name: "missing config without flag falls back to local",
+			args: []string{"--config-file", missingConfig},
+			want: cli.DesktopStartTarget{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			command := newDesktopCommand()
+			if err := command.ParseFlags(tt.args); err != nil {
+				t.Fatal(err)
+			}
+			got := cli.ResolveDesktopStartTarget(command)
+			if got != tt.want {
+				t.Fatalf("ResolveDesktopStartTarget() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}

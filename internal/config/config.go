@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
@@ -113,7 +113,7 @@ type Config struct {
 	// models 是按引用索引的模型目录，加载后只读。
 	models map[defs.ModelRef]*defs.ModelDefinition
 	// executorDefinitions 是 executors/ 里按 ID 索引的 Executor，不含 local 和内置 Executor；加载后只读。
-	executorDefinitions map[string]*ExecutorConfig
+	executorDefinitions map[string]*defs.ExecutorConfig
 	// mcpServerDefinitions 是按 ID 索引的 MCP server，包括 disabled 的和插件声明的；加载后只读。
 	mcpServerDefinitions map[string]*MCPServerConfig
 	// hookDefinitions 先放 hooks/ 里各文件的 hook，再按插件名顺序放插件的 hook；加载后只读。
@@ -593,9 +593,9 @@ func (cfg *Config) newModelDefinition(provider *defs.ProviderConfig, modelID str
 }
 
 // GetExecutors 按 ID 顺序返回 executors/ 里 Executor 配置的副本，不含 local 和内置 Executor。
-func (cfg *Config) GetExecutors() []*ExecutorConfig {
+func (cfg *Config) GetExecutors() []*defs.ExecutorConfig {
 	// 1. 按 ID 顺序复制配置，SSH 段另外复制一份。
-	executors := make([]*ExecutorConfig, 0, len(cfg.executorDefinitions))
+	executors := make([]*defs.ExecutorConfig, 0, len(cfg.executorDefinitions))
 	for _, id := range slices.Sorted(maps.Keys(cfg.executorDefinitions)) {
 		definition := *cfg.executorDefinitions[id]
 		if definition.SSH != nil {
@@ -780,7 +780,7 @@ func (cfg *Config) loadDefinitions(home string) error {
 	}
 
 	// 2. 加载 Executor，再加载引用这些 Executor 的 MCP server。
-	cfg.executorDefinitions = make(map[string]*ExecutorConfig)
+	cfg.executorDefinitions = make(map[string]*defs.ExecutorConfig)
 	executorFiles, err := getDefinitionFiles(cfg.Executors.Directory)
 	if err != nil {
 		return err
@@ -981,9 +981,9 @@ func loadProviderDefinition(path string) (*defs.ProviderConfig, error) {
 }
 
 // loadExecutorDefinition 读取并校验一个 Executor 文件。
-func loadExecutorDefinition(path, home string) (*ExecutorConfig, error) {
+func loadExecutorDefinition(path, home string) (*defs.ExecutorConfig, error) {
 	// 1. 读取配置，检查 ID 和文件名一致、不是保留的 local、openvaala、memory，说明非空。
-	definition := &ExecutorConfig{}
+	definition := &defs.ExecutorConfig{}
 	if err := readYAML(path, definition); err != nil {
 		return nil, err
 	}
@@ -1036,7 +1036,7 @@ func loadExecutorDefinition(path, home string) (*ExecutorConfig, error) {
 }
 
 // loadMCPServerDefinition 读取并校验 mcp_servers/ 下的一个文件。
-func loadMCPServerDefinition(path string, executors map[string]*ExecutorConfig) (*MCPServerConfig, error) {
+func loadMCPServerDefinition(path string, executors map[string]*defs.ExecutorConfig) (*MCPServerConfig, error) {
 	// 1. 读取配置，检查 ID 和文件名一致，再校验传输方式和 Executor。
 	definition := &MCPServerConfig{}
 	if err := readYAML(path, definition); err != nil {
@@ -1052,7 +1052,7 @@ func loadMCPServerDefinition(path string, executors map[string]*ExecutorConfig) 
 }
 
 // validateMCPServerConfig 校验 mcp_servers/ 文件或插件声明的 MCP server。
-func validateMCPServerConfig(definition *MCPServerConfig, executors map[string]*ExecutorConfig) error {
+func validateMCPServerConfig(definition *MCPServerConfig, executors map[string]*defs.ExecutorConfig) error {
 	// 1. 检查 ID 只含字母、数字、- 和 _，不含 __。
 	if !isValidID(definition.ID) || strings.Contains(definition.ID, ".") || strings.Contains(definition.ID, "__") {
 		return errors.New("mcp server id must contain only letters, digits, - and _, without __")

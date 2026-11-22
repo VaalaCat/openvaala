@@ -106,6 +106,16 @@ type Client interface {
 	SetDefaultModel(ctx context.Context, ref defs.ModelRef) (runtime.SetDefinitionsResult, error)
 	// ReloadConfig 调 config/reload，让 serve 不改文件、重新加载整份配置；返回值同 SetProvider。
 	ReloadConfig(ctx context.Context) (runtime.SetDefinitionsResult, error)
+	// ListExecutorConfigs 调 executor/config/list，返回 executors/*.yaml 里的原样配置。
+	ListExecutorConfigs(ctx context.Context) ([]defs.ExecutorConfig, error)
+	// SetExecutor 调 executor/set，原子写入 Executor 配置并重新加载。
+	SetExecutor(ctx context.Context, executor defs.ExecutorConfig) (runtime.SetDefinitionsResult, error)
+	// DeleteExecutor 调 executor/delete，删除 Executor 配置并重新加载。
+	DeleteExecutor(ctx context.Context, executorID string) (runtime.SetDefinitionsResult, error)
+	// TestSSHExecutor 调 executor/test，测试 SSH 连通性与远端目录，返回规范后的绝对目录。
+	TestSSHExecutor(ctx context.Context, sshCfg defs.SSHExecutorConfig, workspaceDirectory string) (string, error)
+	// ListSSHConfigHosts 调 executor/sshConfigHosts，读取 serve 本机 ~/.ssh/config 的非通配符主机列表。
+	ListSSHConfigHosts(ctx context.Context) ([]defs.SSHConfigHost, error)
 	// ListCatalogProviders 调 catalog/providers/list，返回模型目录里可选的模型服务；目录拿不到时返回错误。
 	ListCatalogProviders(ctx context.Context) ([]defs.CatalogProvider, error)
 	// ListCatalogModels 调 catalog/models/list，返回模型目录里一个服务的全部模型，key 是写进配置文件的模型 id。
@@ -658,6 +668,44 @@ func (c *clientImpl) ReloadConfig(ctx context.Context) (runtime.SetDefinitionsRe
 	var result runtime.SetDefinitionsResult
 	err := c.call(ctx, "config/reload", nil, &result)
 	return result, err
+}
+
+// ListExecutorConfigs 读取 executors/*.yaml 里的原样配置列表。
+func (c *clientImpl) ListExecutorConfigs(ctx context.Context) ([]defs.ExecutorConfig, error) {
+	var result runtimeprotocol.ListExecutorConfigsResult
+	err := c.call(ctx, "executor/config/list", nil, &result)
+	return result.Executors, err
+}
+
+// SetExecutor 保存 Executor 配置并热重载，返回重新加载结果。
+func (c *clientImpl) SetExecutor(ctx context.Context, executor defs.ExecutorConfig) (runtime.SetDefinitionsResult, error) {
+	var result runtime.SetDefinitionsResult
+	err := c.call(ctx, "executor/set", runtimeprotocol.SetExecutorParams{Executor: executor}, &result)
+	return result, err
+}
+
+// DeleteExecutor 删除 Executor 配置并热重载，返回重新加载结果。
+func (c *clientImpl) DeleteExecutor(ctx context.Context, executorID string) (runtime.SetDefinitionsResult, error) {
+	var result runtime.SetDefinitionsResult
+	err := c.call(ctx, "executor/delete", runtimeprotocol.DeleteExecutorParams{ExecutorID: executorID}, &result)
+	return result, err
+}
+
+// TestSSHExecutor 测试 SSH 连接与远端工作目录，返回规范后的绝对路径。
+func (c *clientImpl) TestSSHExecutor(ctx context.Context, sshCfg defs.SSHExecutorConfig, workspaceDirectory string) (string, error) {
+	var result runtimeprotocol.TestSSHExecutorResult
+	err := c.call(ctx, "executor/test", runtimeprotocol.TestSSHExecutorParams{
+		SSH:                sshCfg,
+		WorkspaceDirectory: workspaceDirectory,
+	}, &result)
+	return result.ResolvedDirectory, err
+}
+
+// ListSSHConfigHosts 读取 serve 本机 ~/.ssh/config 里的主机列表。
+func (c *clientImpl) ListSSHConfigHosts(ctx context.Context) ([]defs.SSHConfigHost, error) {
+	var result runtimeprotocol.ListSSHConfigHostsResult
+	err := c.call(ctx, "executor/sshConfigHosts", nil, &result)
+	return result.Hosts, err
 }
 
 // ListCatalogProviders 读取模型目录中的服务列表。

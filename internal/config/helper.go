@@ -18,7 +18,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/docs"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
@@ -410,7 +410,7 @@ func newBuiltinExecutor() (executor.Executor, error) {
 }
 
 // newConfiguredExecutor 按种类把 executors/ 里的配置转成 Executor；种类在加载时已校验。
-func newConfiguredExecutor(executorConfig *ExecutorConfig) executor.Executor {
+func newConfiguredExecutor(executorConfig *defs.ExecutorConfig) executor.Executor {
 	// 1. 复制定义字段。
 	definition := &defs.ExecutorDefinition{
 		ID:                 executorConfig.ID,

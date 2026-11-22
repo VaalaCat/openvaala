@@ -7,7 +7,14 @@ import {
   useRef,
   useState,
 } from "react"
-import { Link, Outlet, useLocation, useMatch } from "react-router"
+import {
+  Link,
+  Navigate,
+  Outlet,
+  useLocation,
+  useMatch,
+  useParams,
+} from "react-router"
 import { useTranslation } from "react-i18next"
 import { useQuery } from "@tanstack/react-query"
 import { useStore } from "@nanostores/react"
@@ -67,6 +74,8 @@ import {
 // 自己排版的整页（对话页）用 PageActions 把控件放进顶栏右侧
 export function AppLayout() {
   const { t } = useTranslation()
+  const { serverID: routeServerID } = useParams()
+  const connection = useServerConnection()
   const location = useLocation()
   const conversationRoute = useMatch("/s/:serverID/c/:conversationID/*")
   const isSidebarOpen = useStore($isSidebarOpen)
@@ -74,6 +83,7 @@ export function AppLayout() {
   const [navigation, setNavigation] = useState<PageNavigation | null>(null)
   const [pageActionsTarget, setPageActionsTarget] =
     useState<HTMLDivElement | null>(null)
+  const activeServerID = connection.getServerID()
   const page = navigation?.locationKey === location.key ? navigation : undefined
   const title = page?.title ?? t("common.loading")
   const parent = page?.parent
@@ -84,8 +94,8 @@ export function AppLayout() {
   useLayoutEffect(() => {
     // 1. 页面框跟随软键盘和浏览器栏留下的可见区域，手动缩放时保留布局。
     const viewport = window.visualViewport
-    if (!viewport) return
-    const container = viewportRef.current!
+    if (!viewport || !viewportRef.current) return
+    const container = viewportRef.current
     const updateViewport = () => {
       if (viewport.scale !== 1) return
       container.style.height = `${viewport.height}px`
@@ -100,6 +110,8 @@ export function AppLayout() {
       viewport.removeEventListener("scroll", updateViewport)
     }
   }, [])
+  if (routeServerID && routeServerID !== activeServerID)
+    return <Navigate to={getServerPath(activeServerID)} replace />
   return (
     <LayoutGroup id="app-navigation">
       <SidebarProvider

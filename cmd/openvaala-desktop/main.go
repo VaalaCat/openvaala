@@ -51,13 +51,14 @@ func newDesktopCommand() *cobra.Command {
 		RunE:  flags.runAppCommand,
 	}
 	appCommand.Flags().BoolVar(&flags.Native, "native", false, "use the native interface instead of the WebView")
+	cli.AddURLFlag(appCommand.Flags())
 	command.AddCommand(appCommand)
 	return command
 }
 
-// runAppCommand 收集本机服务启动参数，在主 goroutine 运行所选桌面界面。
+// runAppCommand 收集服务启动参数与可选远端目标，在主 goroutine 运行所选桌面界面。
 func (f *desktopCommandFlags) runAppCommand(command *cobra.Command, _ []string) error {
-	// 1. 读取当前程序和原配置参数，交给后台 serve。
+	// 1. 读取当前程序、原配置参数以及 --url / client.url 指定的远端目标。
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate desktop executable: %w", err)
@@ -66,23 +67,28 @@ func (f *desktopCommandFlags) runAppCommand(command *cobra.Command, _ []string) 
 	if err != nil {
 		return err
 	}
-	if flag := command.Flags().Lookup("url"); flag != nil && flag.Changed {
-		return fmt.Errorf("the desktop connects to the local runtime server; use `openvaala tui --url` for a remote terminal session")
-	}
-	// 2. 两种界面均复用或启动常驻的本机 serve，分别运行自己的窗口。
+	startTarget := cli.ResolveDesktopStartTarget(command)
+	// 2. 两种界面均支持远端目标，未指定时复用或启动常驻的本机 serve。
 	runtimeServerStart := cli.RuntimeServerStartOpt{
 		Executable:  executable,
 		ConfigFlags: configFlags,
 		IdleTimeout: 0,
 	}
 	if f.Native {
-		app, err := desktop.NewDesktop(&desktop.DesktopOpt{RuntimeServerStart: runtimeServerStart, HTTPHeaders: getDesktopHTTPHeaders(command)})
+		app, err := desktop.NewDesktop(&desktop.DesktopOpt{
+			RuntimeServerStart: runtimeServerStart,
+			StartTarget:        startTarget,
+			HTTPHeaders:        getDesktopHTTPHeaders(command),
+		})
 		if err != nil {
 			return err
 		}
 		return app.Run(command.Context())
 	}
-	app, err := desktop.NewWebViewDesktop(&desktop.WebViewDesktopOpt{RuntimeServerStart: runtimeServerStart})
+	app, err := desktop.NewWebViewDesktop(&desktop.WebViewDesktopOpt{
+		RuntimeServerStart: runtimeServerStart,
+		StartTarget:        startTarget,
+	})
 	if err != nil {
 		return err
 	}

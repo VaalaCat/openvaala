@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
@@ -1839,6 +1839,79 @@ func TestOpenVaalaConfigurationErrors(t *testing.T) {
 				t.Fatalf("%s calls = %+v, want %+v", tt.method, got, tt.wantCalls)
 			}
 		})
+	}
+}
+
+// TestExecutorConfigMethods 验证 5 个 Executor 配置与测试 RPC 的正常调用与错误透传。
+func TestExecutorConfigMethods(t *testing.T) {
+	sampleExecutor := defs.ExecutorConfig{
+		ID:                 "dev-box",
+		Kind:               defs.ExecutorKindSSH,
+		Description:        "Remote Linux box",
+		WorkspaceDirectory: "/home/coder/workspace",
+		SSH: &defs.SSHExecutorConfig{
+			Address:      "coder@10.0.0.5:2222",
+			IdentityFile: "~/.ssh/id_ed25519",
+		},
+	}
+	sampleHost := defs.SSHConfigHost{
+		Alias:        "dev-box",
+		Address:      "coder@10.0.0.5:2222",
+		IdentityFile: "~/.ssh/id_ed25519",
+	}
+	calls := make(testCalls, 16)
+	recording := &definitionsRecordingRuntime{calls: calls}
+	h := startTestServer(t, func(opt *runtimeserver.RuntimeServerOpt) {
+		recording.Runtime = opt.Runtime
+		opt.Runtime = recording
+		opt.Configuration = &testConfiguration{
+			executors: []defs.ExecutorConfig{sampleExecutor},
+			sshHosts:  []defs.SSHConfigHost{sampleHost},
+			calls:     calls,
+		}
+	})
+	client := h.dial(t)
+	client.initialize(t)
+
+	// 1. executor/config/list
+	listResp := client.call(t, "executor/config/list", nil)
+	if listResp.Error != nil {
+		t.Fatalf("executor/config/list error = %+v", listResp.Error)
+	}
+	var listResult runtimeprotocol.ListExecutorConfigsResult
+	if err := json.Unmarshal(listResp.Result, &listResult); err != nil || !reflect.DeepEqual(listResult.Executors, []defs.ExecutorConfig{sampleExecutor}) {
+		t.Fatalf("executor/config/list = %+v, %v", listResult, err)
+	}
+
+	// 2. executor/sshConfigHosts
+	hostsResp := client.call(t, "executor/sshConfigHosts", nil)
+	if hostsResp.Error != nil {
+		t.Fatalf("executor/sshConfigHosts error = %+v", hostsResp.Error)
+	}
+	var hostsResult runtimeprotocol.ListSSHConfigHostsResult
+	if err := json.Unmarshal(hostsResp.Result, &hostsResult); err != nil || !reflect.DeepEqual(hostsResult.Hosts, []defs.SSHConfigHost{sampleHost}) {
+		t.Fatalf("executor/sshConfigHosts = %+v, %v", hostsResult, err)
+	}
+
+	// 3. executor/test
+	testResp := client.call(t, "executor/test", runtimeprotocol.TestSSHExecutorParams{
+		SSH:                *sampleExecutor.SSH,
+		WorkspaceDirectory: "/home/coder/workspace",
+	})
+	if testResp.Error != nil {
+		t.Fatalf("executor/test error = %+v", testResp.Error)
+	}
+	var testResult runtimeprotocol.TestSSHExecutorResult
+	if err := json.Unmarshal(testResp.Result, &testResult); err != nil || testResult.ResolvedDirectory != "/home/coder/workspace" {
+		t.Fatalf("executor/test = %+v, %v", testResult, err)
+	}
+
+	// 4. executor/set & executor/delete
+	if setResp := client.call(t, "executor/set", runtimeprotocol.SetExecutorParams{Executor: sampleExecutor}); setResp.Error != nil {
+		t.Fatalf("executor/set error = %+v", setResp.Error)
+	}
+	if delResp := client.call(t, "executor/delete", runtimeprotocol.DeleteExecutorParams{ExecutorID: "dev-box"}); delResp.Error != nil {
+		t.Fatalf("executor/delete error = %+v", delResp.Error)
 	}
 }
 

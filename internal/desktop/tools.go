@@ -13,16 +13,28 @@ import (
 
 // toolView 把工具调用画成一行 ActivityCard，展开后按内置工具类别显示参数、输出与来源链接。
 func (d *Desktop) toolView(c *ui.Context, call *defs.ToolCall, result *defs.ToolResult, view viewItem) {
-	// 1. CallID 对应的结果独立于展开与调试选择。
+	// 1. 折叠态按源数据缓存摘要和失败判定，不反序列化完整参数与结果表。
 	key := "tool-" + call.CallID
-	var args map[string]any
-	_ = json.Unmarshal([]byte(call.Arguments), &args)
-	var content map[string]any
+	root := ui.Column(c.Key(key)).MinWidth(0)
+	summaryCache := ui.Local(root, toolSummaryCacheKey{}, func() toolSummaryCache { return toolSummaryCache{} })
+	resultContent := ""
+	resultHasError := false
+	hasResult := result != nil
 	if result != nil {
-		_ = json.Unmarshal(result.Content, &content)
+		resultContent = string(result.Content)
+		resultHasError = result.Error != nil
 	}
-	status := d.getToolActivityStatus(call, result, view)
-	opt := kit.ActivityCardOpt{Icon: getToolIcon(call.Name), Title: call.Name, Summary: getToolPreview(call.Name, call.Arguments), Status: status, Shimmer: status == kit.ActivityRunning}
+	if summaryCache.Summary == "" && summaryCache.Name == "" || summaryCache.Name != call.Name || summaryCache.Arguments != call.Arguments || summaryCache.ResultContent != resultContent || summaryCache.ResultHasError != resultHasError || summaryCache.HasResult != hasResult {
+		summaryCache.Name = call.Name
+		summaryCache.Arguments = call.Arguments
+		summaryCache.ResultContent = resultContent
+		summaryCache.ResultHasError = resultHasError
+		summaryCache.HasResult = hasResult
+		summaryCache.Summary = getToolPreview(call.Name, call.Arguments)
+		summaryCache.Failed = isToolFailed(call.Name, result)
+	}
+	status := d.getToolActivityStatus(call, result, summaryCache.Failed, view)
+	opt := kit.ActivityCardOpt{Icon: getToolIcon(call.Name), Title: call.Name, Summary: summaryCache.Summary, Status: status, Shimmer: status == kit.ActivityRunning}
 	t := kit.GetTheme(c)
 	// 仅在有值时绘制事实行。
 	showFacts := func(facts []kit.Fact) {
@@ -30,126 +42,143 @@ func (d *Desktop) toolView(c *ui.Context, call *defs.ToolCall, result *defs.Tool
 			kit.Facts(c, facts...)
 		}
 	}
-	d.activityItem(c, key, view, opt, nil, func() {
-		// 2. 专用展示保留全参数 JSON 作为独立调试入口。
-		switch call.Name {
-		case "bash", "read_command_output", "write_stdin", "stop_command":
-			if call.Name == "bash" {
-				d.outputView(c, d.t("run.command"), d.t("copy.command"), stringField(args, "command"))
+	root.Children(func() {
+		d.activityItem(c, key, view, opt, nil, func() {
+			// 2. 只有展开后才解析完整参数与结果，并按原文缓存避免后续帧重复反序列化。
+			detailCache := ui.Local(root, toolDetailCacheKey{}, func() toolDetailCache { return toolDetailCache{} })
+			if detailCache.Args == nil && call.Arguments != "" || detailCache.Arguments != call.Arguments {
+				detailCache.Arguments = call.Arguments
+				detailCache.Args = nil
+				_ = json.Unmarshal([]byte(call.Arguments), &detailCache.Args)
 			}
-			if call.Name == "write_stdin" {
-				d.outputView(c, d.t("input"), d.t("copy.output"), stringField(args, "chars"))
-			}
-			showFacts(append(getFacts(args, "cwd"), getFacts(content, "command_id", "status", "exit_code", "stop_reason", "written_bytes", "next_cursor")...))
-			if failure := stringField(content, "error"); failure != "" {
-				kit.FieldMessage(c, kit.MessageError, failure).Selectable()
-			}
-			output := stringField(content, "output")
-			if result == nil {
-				output = d.toolProgress[call.CallID]
-			}
-			if output != "" {
-				d.ansiOutputView(c, output)
-			}
-			if content["has_more"] == true || content["truncated"] == true {
-				d.warningView(c, fmt.Sprintf(d.t("output.truncated.lines"), countOutputLines(output)))
-			}
-		case "list_commands":
-			if commands, ok := content["commands"].([]any); ok {
-				for _, entry := range commands {
-					command, ok := entry.(map[string]any)
-					if !ok {
-						continue
-					}
-					ui.Column(c.Key(stringField(command, "command_id"))).Gap(4).Children(func() {
-						t.TextRole(ui.Text(c, stringField(command, "command_id")+" · "+stringField(command, "status")), kit.TextUI).TextColor(t.Colors.Text)
-						t.TextRole(ui.Text(c, stringField(command, "command")).Selectable(), kit.TextCode)
-						showFacts(getFacts(command, "cwd", "exit_code", "stop_reason", "interactive"))
-					})
+			if detailCache.Content == nil && resultContent != "" || detailCache.ResultContent != resultContent {
+				detailCache.ResultContent = resultContent
+				detailCache.Content = nil
+				if result != nil {
+					_ = json.Unmarshal(result.Content, &detailCache.Content)
 				}
 			}
-		case "read_file":
-			t.TextRole(ui.Text(c, stringField(args, "path")).Selectable(), kit.TextCode)
-			if text, ok := content["content"].(string); ok {
-				d.outputView(c, d.t("file.content"), d.t("copy.output"), text)
-			}
-			showFacts(getFacts(content, "offset", "next_offset", "size", "eof"))
-			if content["truncated"] == true {
-				text, _ := content["content"].(string)
-				d.warningView(c, fmt.Sprintf(d.t("output.truncated.lines"), countOutputLines(text)))
-			}
-		case "apply_patch":
-			patch := stringField(args, "patch")
-			d.diffView(c, patch)
-			if content["outcome"] == "partially_applied" {
-				d.warningView(c, d.t("partially.applied"))
-				d.jsonView(c, "applied-files", d.t("applied.files.and.error"), content)
-			}
-		case "spawn_agent":
-			d.markdownView(c, stringField(args, "message"), false)
-			showFacts(getFacts(args, "agent_name", "model", "reasoning_effort", "fork_turns"))
-			sessionID := stringField(content, "session_id")
-			for _, info := range d.sessionInfos {
-				if info.Session.ParentCallID == call.CallID {
-					sessionID = string(info.Session.ID)
+			args, content := detailCache.Args, detailCache.Content
+			// 3. 专用展示保留全参数 JSON 作为独立调试入口。
+			switch call.Name {
+			case "bash", "read_command_output", "write_stdin", "stop_command":
+				if call.Name == "bash" {
+					d.outputView(c, d.t("run.command"), d.t("copy.command"), stringField(args, "command"))
 				}
-			}
-			d.sessionLink(c, defs.SessionID(sessionID)).AlignSelf(ui.Start)
-		case "send_message":
-			d.sessionLink(c, defs.SessionID(stringField(args, "session_id"))).AlignSelf(ui.Start)
-			d.markdownView(c, stringField(args, "message"), false)
-			showFacts(getFacts(args, "mode", "model"))
-		case "wait_agent":
-			ui.Text(c, stringField(content, "reason"))
-			if from, ok := content["from"].([]any); ok {
-				for _, id := range from {
-					if value, ok := id.(string); ok {
-						d.sessionLink(c, defs.SessionID(value)).AlignSelf(ui.Start)
+				if call.Name == "write_stdin" {
+					d.outputView(c, d.t("input"), d.t("copy.output"), stringField(args, "chars"))
+				}
+				showFacts(append(getFacts(args, "cwd"), getFacts(content, "command_id", "status", "exit_code", "stop_reason", "written_bytes", "next_cursor")...))
+				if failure := stringField(content, "error"); failure != "" {
+					kit.FieldMessage(c, kit.MessageError, failure).Selectable()
+				}
+				output := stringField(content, "output")
+				if result == nil {
+					output = d.toolProgress[call.CallID]
+				}
+				if output != "" {
+					d.ansiOutputView(c, output)
+				}
+				if content["has_more"] == true || content["truncated"] == true {
+					d.warningView(c, fmt.Sprintf(d.t("output.truncated.lines"), countOutputLines(output)))
+				}
+			case "list_commands":
+				if commands, ok := content["commands"].([]any); ok {
+					for _, entry := range commands {
+						command, ok := entry.(map[string]any)
+						if !ok {
+							continue
+						}
+						ui.Column(c.Key(stringField(command, "command_id"))).Gap(t.Space(1)).Children(func() {
+							t.TextRole(ui.Text(c, stringField(command, "command_id")+" · "+stringField(command, "status")), kit.TextUI).TextColor(t.Colors.Text)
+							t.TextRole(ui.Text(c, stringField(command, "command")).MinWidth(0).Selectable(), kit.TextCode)
+							showFacts(getFacts(command, "cwd", "exit_code", "stop_reason", "interactive"))
+						})
 					}
 				}
-			}
-		case "interrupt_agent":
-			d.sessionLink(c, defs.SessionID(stringField(args, "session_id"))).AlignSelf(ui.Start)
-			ui.Text(c, stringField(content, "status"))
-		case "list_agents":
-			if sessions, ok := content["sessions"].([]any); ok {
-				for _, entry := range sessions {
-					value, _ := entry.(map[string]any)
-					sessionValue, _ := value["session"].(map[string]any)
-					d.sessionLink(c, defs.SessionID(stringField(sessionValue, "id"))).AlignSelf(ui.Start)
-					d.jsonView(c, "session-"+stringField(sessionValue, "id"), stringField(sessionValue, "task_name"), value["status"])
+			case "read_file":
+				t.TextRole(ui.Text(c, stringField(args, "path")).MinWidth(0).Selectable(), kit.TextCode)
+				if text, ok := content["content"].(string); ok {
+					d.outputView(c, d.t("file.content"), d.t("copy.output"), text)
+				}
+				showFacts(getFacts(content, "offset", "next_offset", "size", "eof"))
+				if content["truncated"] == true {
+					text, _ := content["content"].(string)
+					d.warningView(c, fmt.Sprintf(d.t("output.truncated.lines"), countOutputLines(text)))
+				}
+			case "apply_patch":
+				patch := stringField(args, "patch")
+				d.diffView(c, patch)
+				if content["outcome"] == "partially_applied" {
+					d.warningView(c, d.t("partially.applied"))
+					d.jsonView(c, "applied-files", d.t("applied.files.and.error"), content)
+				}
+			case "spawn_agent":
+				d.markdownView(c, stringField(args, "message"), false)
+				showFacts(getFacts(args, "agent_name", "model", "reasoning_effort", "fork_turns"))
+				sessionID := stringField(content, "session_id")
+				for _, info := range d.sessionInfos {
+					if info.Session.ParentCallID == call.CallID {
+						sessionID = string(info.Session.ID)
+					}
+				}
+				d.sessionLink(c, defs.SessionID(sessionID)).AlignSelf(ui.Start)
+			case "send_message":
+				d.sessionLink(c, defs.SessionID(stringField(args, "session_id"))).AlignSelf(ui.Start)
+				d.markdownView(c, stringField(args, "message"), false)
+				showFacts(getFacts(args, "mode", "model"))
+			case "wait_agent":
+				ui.Text(c, stringField(content, "reason"))
+				if from, ok := content["from"].([]any); ok {
+					for _, id := range from {
+						if value, ok := id.(string); ok {
+							d.sessionLink(c, defs.SessionID(value)).AlignSelf(ui.Start)
+						}
+					}
+				}
+			case "interrupt_agent":
+				d.sessionLink(c, defs.SessionID(stringField(args, "session_id"))).AlignSelf(ui.Start)
+				ui.Text(c, stringField(content, "status"))
+			case "list_agents":
+				if sessions, ok := content["sessions"].([]any); ok {
+					for _, entry := range sessions {
+						value, _ := entry.(map[string]any)
+						sessionValue, _ := value["session"].(map[string]any)
+						d.sessionLink(c, defs.SessionID(stringField(sessionValue, "id"))).AlignSelf(ui.Start)
+						d.jsonView(c, "session-"+stringField(sessionValue, "id"), stringField(sessionValue, "task_name"), value["status"])
+					}
+				}
+			case "read_session_history":
+				d.sessionLink(c, defs.SessionID(stringField(args, "session_id"))).AlignSelf(ui.Start)
+				d.jsonView(c, "history", d.t("history"), content["items"])
+			default:
+				if result != nil {
+					d.jsonView(c, "result", d.t("result"), result.Content)
 				}
 			}
-		case "read_session_history":
-			d.sessionLink(c, defs.SessionID(stringField(args, "session_id"))).AlignSelf(ui.Start)
-			d.jsonView(c, "history", d.t("history"), content["items"])
-		default:
 			if result != nil {
-				d.jsonView(c, "result", d.t("result"), result.Content)
-			}
-		}
-		if result != nil {
-			if result.Error != nil {
-				kit.FieldMessage(c, kit.MessageError, result.Error.Message).Selectable()
-			}
-			if result.Truncated {
-				d.warningView(c, d.t("tool.result.truncated"))
-			}
-			for _, image := range result.Images {
-				if image != nil {
-					d.imageView(c, image.DataURL, image.Alt, 200)
+				if result.Error != nil {
+					kit.FieldMessage(c, kit.MessageError, result.Error.Message).Selectable()
+				}
+				if result.Truncated {
+					d.warningView(c, d.t("tool.result.truncated"))
+				}
+				for _, image := range result.Images {
+					if image != nil {
+						d.imageView(c, image.DataURL, image.Alt, 200)
+					}
 				}
 			}
-		}
-		d.jsonView(c, "full-arguments", d.t("full.arguments"), json.RawMessage(call.Arguments))
+			d.jsonView(c, "full-arguments", d.t("full.arguments"), json.RawMessage(call.Arguments))
+		})
 	})
 }
 
 // getToolActivityStatus 由调用与结果事实得到标题行状态：生成参数和执行中为 running，无结果且 Turn 已结束为 interrupted，成功为空。
-func (d *Desktop) getToolActivityStatus(call *defs.ToolCall, result *defs.ToolResult, view viewItem) kit.ActivityStatus {
-	// 1. 有结果时按结果判断成败。
+func (d *Desktop) getToolActivityStatus(call *defs.ToolCall, result *defs.ToolResult, failed bool, view viewItem) kit.ActivityStatus {
+	// 1. 有结果时按缓存的失败判定返回。
 	if result != nil {
-		if isToolFailed(call.Name, result) {
+		if failed {
 			return kit.ActivityFailed
 		}
 		return ""
@@ -221,31 +250,38 @@ func patchSummary(patch string) string {
 	return strings.Join(parts, ", ") + fmt.Sprintf(" +%d −%d", added, deleted)
 }
 
-// diffView 将工具补丁转换为真实片段行，不把 @@ 上下文猜成完整文件行号。
+// diffView 将工具补丁转换为真实片段行，按原文缓存避免每帧重复切分，不把 @@ 上下文猜成完整文件行号。
 func (d *Desktop) diffView(c *ui.Context, patch string) {
-	// 1. 只解析工具格式的行种类，复制保留原始补丁文本。
-	lines := []kit.PatchLine{}
-	for _, text := range strings.Split(patch, "\n") {
-		line := kit.PatchLine{Kind: kit.PatchContext, Text: text}
-		switch {
-		case strings.HasPrefix(text, "***") || strings.HasPrefix(text, "@@"):
-			line.Kind = kit.PatchHeader
-		case strings.HasPrefix(text, "+"):
-			line.Kind = kit.PatchAdded
-			line.Text = text[1:]
-		case strings.HasPrefix(text, "-"):
-			line.Kind = kit.PatchDeleted
-			line.Text = text[1:]
-		case strings.HasPrefix(text, " "):
-			line.Text = text[1:]
-		}
-		lines = append(lines, line)
-	}
+	// 1. 原文变化时重新解析行种类和摘要，复制保留原始补丁文本。
 	t := kit.GetTheme(c)
 	root := ui.Column(c)
+	cache := ui.Local(root, diffCacheKey{}, func() diffCache { return diffCache{} })
+	if cache.Lines == nil || cache.Patch != patch {
+		cache.Patch = patch
+		cache.Summary = patchSummary(patch)
+		rawLines := strings.Split(patch, "\n")
+		lines := make([]kit.PatchLine, 0, len(rawLines))
+		for _, text := range rawLines {
+			line := kit.PatchLine{Kind: kit.PatchContext, Text: text}
+			switch {
+			case strings.HasPrefix(text, "***") || strings.HasPrefix(text, "@@"):
+				line.Kind = kit.PatchHeader
+			case strings.HasPrefix(text, "+"):
+				line.Kind = kit.PatchAdded
+				line.Text = text[1:]
+			case strings.HasPrefix(text, "-"):
+				line.Kind = kit.PatchDeleted
+				line.Text = text[1:]
+			case strings.HasPrefix(text, " "):
+				line.Text = text[1:]
+			}
+			lines = append(lines, line)
+		}
+		cache.Lines = lines
+	}
 	state := ui.Local(root, patchScrollKey{}, func() ui.ListState { return ui.ListState{} })
 	root.Children(func() {
-		kit.PatchLines(c, state, lines, kit.PatchOpt{Title: patchSummary(patch), CopyLabel: d.t("copy.patch"), Source: patch}).Height(getOutputHeight(patch, 360, &t)).MinHeight(80)
+		kit.PatchLines(c, state, cache.Lines, kit.PatchOpt{Title: cache.Summary, CopyLabel: d.t("copy.patch"), Source: patch}).Height(getOutputHeight(patch, 360, &t)).MinHeight(80)
 	})
 }
 

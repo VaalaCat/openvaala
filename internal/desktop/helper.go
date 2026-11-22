@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
@@ -630,4 +632,164 @@ func toProviderHeaders(rows []*providerHeaderDraft) map[string]string {
 		headers[name] = row.Value
 	}
 	return headers
+}
+
+const (
+	// userMessagePreviewLines 是用户卡片与 Agent 来信默认折叠时保留的可见行数。
+	userMessagePreviewLines = 4
+	// userMessagePreviewHardMaxLines 与 userMessagePreviewMaxRunes 限定折叠态送入排版引擎的最大预览预算。
+	userMessagePreviewHardMaxLines = 8
+	userMessagePreviewMaxRunes     = 1200
+	// userMessageDirectMaxBytes 与 userMessageDirectMaxLines 超过后展开态切到分段虚拟列表，避免单段超大排版击穿缓存。
+	userMessageDirectMaxBytes    = 8 << 10
+	userMessageDirectMaxLines    = 80
+	userMessageChunkMaxRunes     = 512
+	userMessageMaxExpandedHeight = 480
+)
+
+// getMessagePreviewText 按硬换行和字符上限截取折叠态预览文本，并返回原文是否被截断。
+func getMessagePreviewText(text string, maxLines, maxRunes int) (string, bool) {
+	// 1. 按 UTF-8 字符顺序扫描，达到行数或字符预算立即截断，不遍历整篇超长正文。
+	lines := 1
+	runes := 0
+	for index, r := range text {
+		if r == '\n' {
+			lines++
+			if lines > maxLines {
+				return text[:index], true
+			}
+		}
+		runes++
+		if runes > maxRunes {
+			return text[:index], true
+		}
+	}
+	return text, false
+}
+
+// isLargeUserMessage 用户消息展开后是否应走分段虚拟列表？
+func isLargeUserMessage(text string) bool {
+	return len(text) > userMessageDirectMaxBytes || strings.Count(text, "\n") > userMessageDirectMaxLines
+}
+
+// splitUserMessageChunks 把超长文本按换行和单段字符上限切分成虚拟列表行；保留空行，超长无换行行尽量在空白处断开。
+func splitUserMessageChunks(text string, maxRunes int) []string {
+	// 1. 按硬换行拆分，短行直接保留，超长单行再按字符预算切片。
+	rawLines := strings.Split(text, "\n")
+	chunks := make([]string, 0, len(rawLines))
+	for _, line := range rawLines {
+		if len(line) <= maxRunes {
+			chunks = append(chunks, line)
+			continue
+		}
+		rest := line
+		for len(rest) > 0 {
+			if len(rest) <= maxRunes {
+				chunks = append(chunks, rest)
+				break
+			}
+			// 2. 扫描最多 maxRunes 个字符，并在末尾 64 个字符内记住最后一个空白位置以便整词断开。
+			cut := len(rest)
+			lastSpace := -1
+			count := 0
+			for index, r := range rest {
+				if count == maxRunes {
+					cut = index
+					break
+				}
+				if (r == ' ' || r == '\t') && count >= maxRunes-64 {
+					lastSpace = index + utf8.RuneLen(r)
+				}
+				count++
+			}
+			if cut == len(rest) {
+				chunks = append(chunks, rest)
+				break
+			}
+			if lastSpace > 0 {
+				cut = lastSpace
+			}
+			chunks = append(chunks, rest[:cut])
+			rest = rest[cut:]
+		}
+	}
+	return chunks
+}
+
+const (
+	// localServerID 表示默认本机 Runtime Server。
+	localServerID = "local"
+	// runtimeServerWSPath 是 Runtime Server 默认的 WebSocket 路径。
+	runtimeServerWSPath = "/api/v1/openvaala"
+)
+
+// parseRemoteServerInput 把用户粘贴的 openvaala web 链接、ws(s) 链接或 host:port 规范成干净的 WebSocket 地址和令牌。
+// 当输入串自带 token 时 extractedToken 为 true，调用方可据此自动覆盖表单里的令牌框。
+func parseRemoteServerInput(rawURL, fallbackToken string) (parsedURL, parsedToken, defaultName string, extractedToken bool, err error) {
+	// 1. 去掉空白；无 scheme 时默认按 ws:// 解析。
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return "", "", "", false, errors.New("server address is required")
+	}
+	candidate := trimmed
+	if !strings.Contains(candidate, "://") {
+		candidate = "ws://" + candidate
+	}
+	parsed, err := url.Parse(candidate)
+	if err != nil {
+		return "", "", "", false, fmt.Errorf("invalid server address: %w", err)
+	}
+	// 2. 按协议规范 scheme 和路径，并从 fragment 或 query 里拆出 token。
+	token := ""
+	if parsed.Fragment != "" {
+		if fragQuery, fragErr := url.ParseQuery(parsed.Fragment); fragErr == nil {
+			token = strings.TrimSpace(fragQuery.Get("token"))
+		}
+	}
+	if token == "" {
+		token = strings.TrimSpace(parsed.Query().Get("token"))
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http":
+		parsed.Scheme = "ws"
+		parsed.Path, parsed.RawPath = runtimeServerWSPath, ""
+	case "https":
+		parsed.Scheme = "wss"
+		parsed.Path, parsed.RawPath = runtimeServerWSPath, ""
+	case "ws", "wss":
+		parsed.Scheme = strings.ToLower(parsed.Scheme)
+		if parsed.Path == "" || parsed.Path == "/" {
+			parsed.Path, parsed.RawPath = runtimeServerWSPath, ""
+		}
+	default:
+		return "", "", "", false, fmt.Errorf("unsupported server url scheme %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return "", "", "", false, errors.New("server host is required")
+	}
+	// 3. 清除查询参数和 fragment，只保存干净连接地址。
+	parsed.RawQuery, parsed.Fragment, parsed.RawFragment = "", "", ""
+	if token != "" {
+		return parsed.String(), token, parsed.Host, true, nil
+	}
+	return parsed.String(), strings.TrimSpace(fallbackToken), parsed.Host, false, nil
+}
+
+// getRemoteServerHost 提取服务器地址里的 host[:port] 供副标题显示；解析失败时返回原文。
+func getRemoteServerHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return rawURL
+	}
+	return parsed.Host
+}
+
+// newRemoteServerID 生成不与现有档案冲突的远端服务器稳定 ID。
+func newRemoteServerID(existing []remoteServer) string {
+	for index := 1; ; index++ {
+		candidate := fmt.Sprintf("remote-%d", index)
+		if !slices.ContainsFunc(existing, func(s remoteServer) bool { return s.ID == candidate }) {
+			return candidate
+		}
+	}
 }

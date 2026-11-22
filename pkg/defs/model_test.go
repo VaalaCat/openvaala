@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 )
 

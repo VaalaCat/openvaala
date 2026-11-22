@@ -5,7 +5,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 )
 
 // ItemKind 区分消息、模型输出和历史记录的种类。

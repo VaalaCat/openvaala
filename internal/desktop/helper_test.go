@@ -499,3 +499,88 @@ func TestGetRecentDirectories(t *testing.T) {
 		})
 	}
 }
+
+// TestParseRemoteServerInput 检查连接串解析：支持 web 链接、ws 链接、裸 host:port 及非法 scheme 报错。
+func TestParseRemoteServerInput(t *testing.T) {
+	tests := []struct {
+		name           string
+		rawURL         string
+		fallbackToken  string
+		wantURL        string
+		wantToken      string
+		wantDefault    string
+		wantExtracted  bool
+		wantErrContain string
+	}{
+		{
+			name:          "http web url with hash token",
+			rawURL:        "http://10.0.0.5:8790/web/v1/#token=secret-abc",
+			fallbackToken: "old-token",
+			wantURL:       "ws://10.0.0.5:8790/api/v1/openvaala",
+			wantToken:     "secret-abc",
+			wantDefault:   "10.0.0.5:8790",
+			wantExtracted: true,
+		},
+		{
+			name:          "https web url with hash token",
+			rawURL:        "https://gpu.vaala.dev/web/v1/#token=tok%201",
+			wantURL:       "wss://gpu.vaala.dev/api/v1/openvaala",
+			wantToken:     "tok 1",
+			wantDefault:   "gpu.vaala.dev",
+			wantExtracted: true,
+		},
+		{
+			name:          "ws url with query token",
+			rawURL:        "ws://10.0.0.5:8790/api/v1/openvaala?token=qtok",
+			wantURL:       "ws://10.0.0.5:8790/api/v1/openvaala",
+			wantToken:     "qtok",
+			wantDefault:   "10.0.0.5:8790",
+			wantExtracted: true,
+		},
+		{
+			name:          "wss custom path keeps path and fallback token",
+			rawURL:        "wss://proxy.example.com/custom/ws",
+			fallbackToken: "manual-token",
+			wantURL:       "wss://proxy.example.com/custom/ws",
+			wantToken:     "manual-token",
+			wantDefault:   "proxy.example.com",
+			wantExtracted: false,
+		},
+		{
+			name:          "bare host port defaults to ws",
+			rawURL:        "10.0.0.8:8790",
+			fallbackToken: "t1",
+			wantURL:       "ws://10.0.0.8:8790/api/v1/openvaala",
+			wantToken:     "t1",
+			wantDefault:   "10.0.0.8:8790",
+			wantExtracted: false,
+		},
+		{
+			name:           "empty url rejected",
+			rawURL:         "   ",
+			wantErrContain: "required",
+		},
+		{
+			name:           "unsupported scheme rejected",
+			rawURL:         "ftp://10.0.0.5:21",
+			wantErrContain: "unsupported",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotURL, gotToken, gotDefault, gotExtracted, err := parseRemoteServerInput(tt.rawURL, tt.fallbackToken)
+			if tt.wantErrContain != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrContain) {
+					t.Fatalf("err = %v, want containing %q", err, tt.wantErrContain)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if gotURL != tt.wantURL || gotToken != tt.wantToken || gotDefault != tt.wantDefault || gotExtracted != tt.wantExtracted {
+				t.Fatalf("got (%q, %q, %q, %v), want (%q, %q, %q, %v)", gotURL, gotToken, gotDefault, gotExtracted, tt.wantURL, tt.wantToken, tt.wantDefault, tt.wantExtracted)
+			}
+		})
+	}
+}

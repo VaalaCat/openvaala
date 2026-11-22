@@ -19,7 +19,7 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
@@ -943,8 +943,10 @@ type testConfiguration struct {
 	defaultModel defs.ModelRef
 	defaults     defs.ModelDefaults
 	// agents、models 是写方法和 Reload 返回的定义。
-	agents []*agent.AgentDefinition
-	models []*defs.ModelDefinition
+	agents    []*agent.AgentDefinition
+	models    []*defs.ModelDefinition
+	executors []defs.ExecutorConfig
+	sshHosts  []defs.SSHConfigHost
 	// err 非 nil 时全部方法只返回它。
 	err   error
 	calls testCalls
@@ -1001,6 +1003,48 @@ func (c *testConfiguration) Reload(context.Context) (*runtime.Definitions, error
 	// 1. 登记调用，再取预设定义。
 	c.calls.record("Reload", nil)
 	return c.getDefinitions()
+}
+
+// ListExecutorConfigs 记录查询并返回预设 Executor 配置列表。
+func (c *testConfiguration) ListExecutorConfigs(context.Context) ([]defs.ExecutorConfig, error) {
+	c.calls.record("ListExecutorConfigs", nil)
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.executors, nil
+}
+
+// SetExecutor 记录 Executor 写入并返回预设定义。
+func (c *testConfiguration) SetExecutor(_ context.Context, executor defs.ExecutorConfig) (*runtime.Definitions, error) {
+	c.calls.record("SetExecutor", executor)
+	return c.getDefinitions()
+}
+
+// DeleteExecutor 记录 Executor 删除并返回预设定义。
+func (c *testConfiguration) DeleteExecutor(_ context.Context, executorID string) (*runtime.Definitions, error) {
+	c.calls.record("DeleteExecutor", executorID)
+	return c.getDefinitions()
+}
+
+// TestSSHExecutor 记录测试调用并返回预设目录或错误。
+func (c *testConfiguration) TestSSHExecutor(_ context.Context, sshCfg defs.SSHExecutorConfig, workspaceDirectory string) (string, error) {
+	c.calls.record("TestSSHExecutor", struct {
+		ssh                defs.SSHExecutorConfig
+		workspaceDirectory string
+	}{ssh: sshCfg, workspaceDirectory: workspaceDirectory})
+	if c.err != nil {
+		return "", c.err
+	}
+	return workspaceDirectory, nil
+}
+
+// ListSSHConfigHosts 记录查询并返回预设 SSH 主机列表。
+func (c *testConfiguration) ListSSHConfigHosts(context.Context) ([]defs.SSHConfigHost, error) {
+	c.calls.record("ListSSHConfigHosts", nil)
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.sshHosts, nil
 }
 
 // getDefinitions 返回预设 Agent 和模型，或预设错误。

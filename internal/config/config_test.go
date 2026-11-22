@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
@@ -1451,7 +1451,7 @@ func TestConfigExecutors(t *testing.T) {
 		wantErr       string
 		wantWorkspace string // 以 / 开头时为虚拟或远端路径原样比较，否则相对配置目录
 		wantKind      defs.ExecutorKind
-		wantSSH       *config.SSHExecutorConfig // IdentityFile 相对配置目录
+		wantSSH       *defs.SSHExecutorConfig // IdentityFile 相对配置目录
 	}{
 		{
 			name:          "local_executor_loaded",
@@ -1521,7 +1521,7 @@ func TestConfigExecutors(t *testing.T) {
 			body:          "id: sandbox\nkind: ssh\ndescription: 试验目录\nworkspace_directory: /home/me/project\nssh:\n  address: me@devbox:2222\n  identity_file: ~/key\n",
 			wantKind:      "ssh",
 			wantWorkspace: "/home/me/project",
-			wantSSH: &config.SSHExecutorConfig{
+			wantSSH: &defs.SSHExecutorConfig{
 				Address:      "me@devbox:2222",
 				IdentityFile: "key",
 			},
@@ -1532,7 +1532,7 @@ func TestConfigExecutors(t *testing.T) {
 			body:          "id: sandbox\nkind: ssh\ndescription: 试验目录\nworkspace_directory: /srv\nssh:\n  address: devbox\n",
 			wantKind:      "ssh",
 			wantWorkspace: "/srv",
-			wantSSH:       &config.SSHExecutorConfig{Address: "devbox"},
+			wantSSH:       &defs.SSHExecutorConfig{Address: "devbox"},
 		},
 		{
 			name:          "ssh_relative_identity_file",
@@ -1540,7 +1540,7 @@ func TestConfigExecutors(t *testing.T) {
 			body:          "id: sandbox\nkind: ssh\ndescription: 试验目录\nworkspace_directory: /srv\nssh:\n  address: devbox\n  identity_file: ../key\n",
 			wantKind:      "ssh",
 			wantWorkspace: "/srv",
-			wantSSH: &config.SSHExecutorConfig{
+			wantSSH: &defs.SSHExecutorConfig{
 				Address:      "devbox",
 				IdentityFile: "key",
 			},

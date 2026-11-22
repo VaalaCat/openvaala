@@ -68,27 +68,30 @@ func TestMarkdownNativeRendering(t *testing.T) {
 	}
 }
 
-// TestUserMessageFold 检查四行裁切、自动换行及展开收起的中间帧高度。
+// TestUserMessageFold 检查四行裁切、自动换行、首帧准确折叠及展开收起的中间帧高度。
 func TestUserMessageFold(t *testing.T) {
 	// 1. 在真实消息滚动区比较文本可见区域，不用文本查找判断裁切。
 	for _, tt := range []struct {
-		name  string
-		text  string
-		fold  bool
-		theme string
-		width int
+		name    string
+		text    string
+		fold    bool
+		theme   string
+		palette string
+		width   int
 	}{
-		{"four lines", strings.Repeat("MMMMMMMM\n", 3) + "MMMMMMMM", false, "light", 640},
-		{"six lines", strings.Repeat("MMMMMMMM\n", 5) + "MMMMMMMM", true, "light", 640},
-		{"dark six lines", strings.Repeat("MMMMMMMM\n", 5) + "MMMMMMMM", true, "dark", 640},
-		{"wrapped text", strings.Repeat("长消息自动换行", 25), true, "light", 390},
+		{"four lines", strings.Repeat("MMMMMMMM\n", 3) + "MMMMMMMM", false, "light", "", 640},
+		{"six lines", strings.Repeat("MMMMMMMM\n", 5) + "MMMMMMMM", true, "light", "", 640},
+		{"dark six lines", strings.Repeat("MMMMMMMM\n", 5) + "MMMMMMMM", true, "dark", "", 640},
+		{"stone light six lines", strings.Repeat("MMMMMMMM\n", 5) + "MMMMMMMM", true, "light", "stone", 640},
+		{"stone dark six lines", strings.Repeat("MMMMMMMM\n", 5) + "MMMMMMMM", true, "dark", "stone", 640},
+		{"wrapped text", strings.Repeat("长消息自动换行", 25), true, "light", "", 390},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			d := testDesktop()
 			d.preferences.Theme = tt.theme
+			d.preferences.Palette = tt.palette
 			d.items = []viewItem{{Ordinal: 1, Item: &defs.Item{ID: "user", Kind: defs.ItemMessage, Message: &defs.Message{From: &defs.Address{Kind: defs.IdentityUser}, Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: tt.text}}}}}}}
 			tester := ui.NewTester(func(c *ui.Context) { d.applyAppearance(c); ui.Column(c).Fill().Children(func() { d.itemsView(c) }) }, tt.width, 900)
-			tester.Frame()
 			bounds := func() ui.Rect {
 				t.Helper()
 				r, found := tester.Find(tt.text)
@@ -97,9 +100,18 @@ func TestUserMessageFold(t *testing.T) {
 				}
 				return r
 			}
+			// 首帧即应准确呈现四行高度与展开入口，无需等额外一帧补算。
+			firstFrame := bounds()
+			if math.Abs(float64(firstFrame.H-96)) > 1 {
+				t.Fatalf("first frame preview height=%v want 96", firstFrame.H)
+			}
+			if _, found := tester.Find("展开"); found != tt.fold {
+				t.Fatalf("first frame expand=%v want=%v", found, tt.fold)
+			}
+			tester.Frame()
 			collapsed := bounds()
-			if math.Abs(float64(collapsed.H-80)) > 1 {
-				t.Fatalf("preview height=%v", collapsed.H)
+			if math.Abs(float64(collapsed.H-96)) > 1 {
+				t.Fatalf("preview height=%v want 96", collapsed.H)
 			}
 			if _, found := tester.Find("展开"); found != tt.fold {
 				t.Fatalf("expand=%v want=%v", found, tt.fold)
@@ -107,13 +119,13 @@ func TestUserMessageFold(t *testing.T) {
 			if !tt.fold {
 				return
 			}
-			// 2. 比较第四行的实际像素对比度，展开后渐隐消失。
+			// 2. 比较第四行的实际像素对比度，展开后渐隐消失；卡片底色从文本左侧内边距取样。
 			lineInk := func() float64 {
 				r := bounds()
 				img := tester.Image()
-				background := img.RGBAAt(int(r.X+r.W)-2, int(r.Y)+61)
+				background := img.RGBAAt(int(r.X)-4, int(r.Y)+4)
 				var ink float64
-				for y := int(r.Y) + 60; y < int(r.Y)+80; y++ {
+				for y := int(r.Y) + 72; y < int(r.Y)+96; y++ {
 					for x := int(r.X); x < int(r.X+r.W)-2; x++ {
 						pixel := img.RGBAAt(x, y)
 						ink += math.Abs(float64(pixel.R)-float64(background.R)) + math.Abs(float64(pixel.G)-float64(background.G)) + math.Abs(float64(pixel.B)-float64(background.B))
@@ -150,8 +162,8 @@ func TestUserMessageFold(t *testing.T) {
 			// 3. 渐隐区域仍可拖选；复制消息始终取得完整原文。
 			r := bounds()
 			tester.Press(r.X+1, r.Y+10)
-			tester.Move(r.X+r.W-1, r.Y+70)
-			tester.Release(r.X+r.W-1, r.Y+70)
+			tester.Move(r.X+r.W-1, r.Y+85)
+			tester.Release(r.X+r.W-1, r.Y+85)
 			tester.Command("copy")
 			if tester.Clipboard() == "" {
 				t.Fatal("preview selection did not copy text")
@@ -375,7 +387,7 @@ func TestForkSourceNavigation(t *testing.T) {
 			view := viewItem{Item: &defs.Item{ID: "fork", Kind: defs.ItemSessionFork, SessionFork: fork}}
 			tester := ui.NewTester(func(c *ui.Context) {
 				d.applyAppearance(c)
-				ui.Column(c).Fill().Children(func() { d.itemView(c, view, nil, nil, nil) })
+				ui.Column(c).Fill().Children(func() { d.itemView(c, view, nil, nil, nil, 640) })
 			}, 640, 480)
 			if err := tester.Click(label); err != nil {
 				t.Fatal(err)
@@ -778,6 +790,234 @@ func TestConversationColumn(t *testing.T) {
 			}
 			if math.Abs(float64(rect.X-want)) > 1 {
 				t.Fatalf("body x=%v want %v", rect.X, want)
+			}
+		})
+	}
+}
+
+// TestUserMessageOverflow 检查超长无空格链接或令牌不会把用户卡片文本或操作按钮撑出消息列。
+func TestUserMessageOverflow(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		text  string
+		width int
+	}{
+		{"narrow url", "https://example.com/" + strings.Repeat("segment", 60), 390},
+		{"wide json token", `{"payload":"` + strings.Repeat("x", 400) + `"}`, 900},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.conversation = defs.Conversation{ID: "conversation", RootSessionID: "root"}
+			d.readingTarget = readingTarget{ConversationID: "conversation", SessionID: "root"}
+			d.items = []viewItem{{
+				Ordinal: 1,
+				Item: &defs.Item{
+					ID:     "user",
+					TurnID: "turn",
+					Kind:   defs.ItemMessage,
+					Message: &defs.Message{
+						From:    &defs.Address{Kind: defs.IdentityUser},
+						Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: tt.text}}},
+					},
+				},
+			}}
+			tester := ui.NewTester(func(c *ui.Context) {
+				d.applyAppearance(c)
+				ui.Column(c).Fill().Children(func() { d.itemsView(c) })
+			}, tt.width, 700)
+			maxRight := float32(tt.width) - 16
+			if float32(tt.width)-32 > conversationColumnWidth {
+				maxRight = (float32(tt.width) + conversationColumnWidth) / 2
+			}
+			bodyRect, found := tester.Find(tt.text)
+			if !found {
+				t.Fatal("user message text missing")
+			}
+			if bodyRect.X+bodyRect.W > maxRight+1 {
+				t.Fatalf("body overflowed column: rect=%+v maxRight=%v", bodyRect, maxRight)
+			}
+			for _, action := range []string{"复制消息", "从这里分叉"} {
+				actionRect, ok := tester.Find(action)
+				if !ok {
+					t.Fatalf("action %q missing", action)
+				}
+				if actionRect.X < 0 || actionRect.X+actionRect.W > maxRight+1 {
+					t.Fatalf("action %q overflowed column: rect=%+v maxRight=%v", action, actionRect, maxRight)
+				}
+			}
+		})
+	}
+}
+
+// TestUserMessageLargePerformanceAndFold 检查超大单条用户消息（多千行或无换行单行）在折叠与展开态都能快速渲染并完整复制。
+func TestUserMessageLargePerformanceAndFold(t *testing.T) {
+	multiLine := func() string {
+		var b strings.Builder
+		for i := range 3000 {
+			fmt.Fprintf(&b, "line-%04d: %s\n", i, strings.Repeat("payload ", 4))
+		}
+		return b.String()
+	}()
+	singleLine := "head-marker-" + strings.Repeat("abcdefghij", 12000) + "-tail-marker"
+	for _, tt := range []struct {
+		name string
+		text string
+		head string
+	}{
+		{"three thousand lines", multiLine, "line-0000"},
+		{"single 120KB line", singleLine, "head-marker-"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.items = []viewItem{{
+				Ordinal: 1,
+				Item: &defs.Item{
+					ID:   "large-user",
+					Kind: defs.ItemMessage,
+					Message: &defs.Message{
+						From:    &defs.Address{Kind: defs.IdentityUser},
+						Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: tt.text}}},
+					},
+				},
+			}}
+			tester := ui.NewTester(func(c *ui.Context) {
+				d.applyAppearance(c)
+				ui.Column(c).Fill().Children(func() { d.itemsView(c) })
+			}, 900, 760)
+			if _, found := tester.Find("展开"); !found {
+				t.Fatal("expand button missing on first frame")
+			}
+			preview, _ := getMessagePreviewText(tt.text, userMessagePreviewHardMaxLines, userMessagePreviewMaxRunes)
+			collapsedRect, found := tester.Find(preview)
+			if !found {
+				t.Fatalf("preview missing: texts=%q", tester.Texts())
+			}
+			if math.Abs(float64(collapsedRect.H-96)) > 1 {
+				t.Fatalf("collapsed preview height=%v want 96", collapsedRect.H)
+			}
+			// 展开后走固定高度虚拟列表，不把整篇 120KB 塞进单段排版，也不会把卡片撑成数万像素。
+			if err := tester.Click("展开"); err != nil {
+				t.Fatal(err)
+			}
+			if _, found := tester.Find("收起"); !found {
+				t.Fatal("collapse button missing after expand")
+			}
+			if !tester.HasText(tt.head) {
+				t.Fatalf("expanded virtual reader missing head %q", tt.head)
+			}
+			collapseRect, _ := tester.Find("收起")
+			if collapseRect.Y > 700 {
+				t.Fatalf("expanded large card grew unbounded: collapse button at y=%v", collapseRect.Y)
+			}
+			// 无论折叠还是展开，点击复制消息都拿到完整原文。
+			if err := tester.Click("复制消息"); err != nil {
+				t.Fatal(err)
+			}
+			if tester.Clipboard() != tt.text {
+				t.Fatalf("copied length=%d want=%d", len(tester.Clipboard()), len(tt.text))
+			}
+			if err := tester.Click("收起"); err != nil {
+				t.Fatal(err)
+			}
+			if _, found := tester.Find("展开"); !found {
+				t.Fatal("expand button missing after collapse")
+			}
+		})
+	}
+}
+
+// TestUserMessageContextMaterialFold 检查用户消息里的附带上下文材料独立折叠，不混入正文。
+func TestUserMessageContextMaterialFold(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		typed    string
+		material string
+	}{
+		{"typed and context", "请检查这段日志", "context-secret-payload-line"},
+		{"context only", "", "context-only-payload-line"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			content := []*defs.Content{}
+			if tt.typed != "" {
+				content = append(content, &defs.Content{Kind: defs.ContentText, Text: &defs.TextContent{Text: tt.typed}})
+			}
+			content = append(content, &defs.Content{Kind: defs.ContentText, Text: &defs.TextContent{Text: tt.material, IsContext: true}})
+			d.items = []viewItem{{
+				Ordinal: 1,
+				Item: &defs.Item{
+					ID:      "ctx-user",
+					Kind:    defs.ItemMessage,
+					Message: &defs.Message{From: &defs.Address{Kind: defs.IdentityUser}, Content: content},
+				},
+			}}
+			tester := ui.NewTester(func(c *ui.Context) {
+				d.applyAppearance(c)
+				ui.Column(c).Fill().Children(func() { d.itemsView(c) })
+			}, 700, 600)
+			if tt.typed != "" && !tester.HasText(tt.typed) {
+				t.Fatalf("typed text %q missing", tt.typed)
+			}
+			if !tester.HasText("附带材料") {
+				t.Fatalf("context material disclosure missing: %q", tester.Texts())
+			}
+			if tester.HasText(tt.material) {
+				t.Fatalf("context material visible while collapsed: %q", tester.Texts())
+			}
+			if err := tester.Click("附带材料"); err != nil {
+				t.Fatal(err)
+			}
+			tester.Advance(300 * time.Millisecond)
+			if !tester.HasText(tt.material) {
+				t.Fatalf("context material missing after expand: %q", tester.Texts())
+			}
+		})
+	}
+}
+
+// TestAgentMailWrappedFold 检查无硬换行但自动换行超过 4 行的 Agent 来信也能展开阅读全文。
+func TestAgentMailWrappedFold(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		text       string
+		expandable bool
+	}{
+		{"short mail", "简短进度同步", false},
+		{"wrapped single line", strings.Repeat("这是自动换行后超过四行的子代理来信正文内容。", 18) + "结尾标记", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.items = []viewItem{{
+				Ordinal: 1,
+				Item: &defs.Item{
+					ID:   "mail",
+					Kind: defs.ItemMessage,
+					Message: &defs.Message{
+						From:    &defs.Address{Kind: defs.IdentityAgent, ID: "worker-1"},
+						Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: tt.text}}},
+					},
+				},
+			}}
+			tester := ui.NewTester(func(c *ui.Context) {
+				d.applyAppearance(c)
+				ui.Column(c).Fill().Children(func() { d.itemsView(c) })
+			}, 420, 600)
+			if tt.expandable {
+				if err := tester.Click("来自"); err != nil {
+					t.Fatal(err)
+				}
+				tester.Advance(300 * time.Millisecond)
+				if !d.itemExpanded["mail"] {
+					t.Fatal("wrapped agent mail did not expand")
+				}
+				if !tester.HasText("结尾标记") {
+					t.Fatalf("expanded agent mail missing tail: %q", tester.Texts())
+				}
+			} else {
+				_ = tester.Click("来自")
+				if d.itemExpanded["mail"] {
+					t.Fatal("short agent mail should not expand")
+				}
 			}
 		})
 	}

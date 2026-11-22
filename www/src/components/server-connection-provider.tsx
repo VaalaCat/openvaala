@@ -12,14 +12,19 @@ import { useTranslation } from "react-i18next"
 import { TokenEntryPage } from "@/app/token-entry"
 import { StandalonePage } from "@/components/base/standalone-page"
 import { LatticeLoader } from "@/components/base/lattice-loader"
+import { ServerManagerDialog } from "@/components/server-manager-dialog"
+import { Button } from "@/components/ui/button"
 import { ServerConnection } from "@/lib/api/server-connection"
 import { RunningConversationsSync } from "@/lib/api/running-conversations-sync"
 import { RunningTerminalsSync } from "@/lib/api/running-terminals-sync"
 import {
+  $activeServerURL,
   $servers,
   getPageServerURL,
+  getServerHost,
   saveServerID,
   saveServerToken,
+  setActiveServerURL,
   takeTokenFromHash,
 } from "@/lib/api/servers"
 import { invalidateAfterReconnect } from "@/lib/query/invalidation"
@@ -60,7 +65,7 @@ export function useRunningTerminalsSync(): RunningTerminalsSync {
   return sync
 }
 
-// 页面所在 serve 的连接，只在 ServerConnectionProvider 连上之后的子树里可用
+// 当前活跃 serve 的连接，只在 ServerConnectionProvider 连上之后的子树里可用
 // eslint-disable-next-line react-refresh/only-export-components
 export function useServerConnection(): ServerConnection {
   const connection = useContext(ServerConnectionContext)
@@ -83,7 +88,7 @@ function takePageToken(): void {
   )
 }
 
-// 建立并保持页面所在 serve 的连接；连上之前显示 token 输入页、连接中或版本不一致的提示，连上之后渲染子树
+// 建立并保持当前选定 serve 的连接；连上之前显示 token 输入页、连接中或版本不一致的提示，连上之后渲染子树
 export function ServerConnectionProvider({
   children,
 }: {
@@ -97,30 +102,90 @@ export function ServerConnectionProvider({
     return () => window.removeEventListener("hashchange", takePageToken)
   }, [])
   const servers = useStore($servers)
-  const token = servers.find((server) => server.url === pageURL)?.token
+  const activeServerURL = useStore($activeServerURL)
+  const [managerOpen, setManagerOpen] = useState(false)
+
+  const activeURL = activeServerURL || pageURL
+  const isRemote = activeURL !== pageURL
+  const activeEntry = servers.find((server) => server.url === activeURL)
+  const token = activeEntry?.token
+  const serverLabel = isRemote
+    ? activeEntry?.name || getServerHost(activeURL)
+    : undefined
+
   const connection = useMemo(
     () =>
       token === undefined
         ? undefined
-        : new ServerConnection({ url: pageURL, token }),
-    [pageURL, token]
+        : new ServerConnection({ url: activeURL, token }),
+    [activeURL, token]
   )
-  if (!connection)
-    return (
-      <TokenEntryPage
-        isTokenInvalid={false}
-        onSubmit={(token) => saveServerToken(pageURL, token)}
+
+  const fallbackActions = isRemote ? (
+    <RemoteFallbackActions
+      onSwitchDefault={() => setActiveServerURL("", pageURL)}
+      onManageServers={() => setManagerOpen(true)}
+    />
+  ) : undefined
+
+  return (
+    <>
+      {!connection ? (
+        <TokenEntryPage
+          isTokenInvalid={false}
+          serverLabel={serverLabel}
+          onSubmit={(nextToken) => saveServerToken(activeURL, nextToken)}
+          footer={fallbackActions}
+        />
+      ) : (
+        <ConnectionGate
+          connection={connection}
+          serverLabel={serverLabel}
+          fallbackActions={fallbackActions}
+        >
+          {children}
+        </ConnectionGate>
+      )}
+      <ServerManagerDialog
+        open={managerOpen}
+        onOpenChange={setManagerOpen}
+        pageURL={pageURL}
       />
-    )
-  return <ConnectionGate connection={connection}>{children}</ConnectionGate>
+    </>
+  )
+}
+
+// 远端离线、鉴权失败或版本不兼容时展示在卡片底部的逃生按钮，永不锁死页面
+function RemoteFallbackActions({
+  onSwitchDefault,
+  onManageServers,
+}: {
+  onSwitchDefault: () => void
+  onManageServers: () => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <div className="flex flex-wrap items-center justify-center gap-2 border-t border-border pt-3">
+      <Button size="sm" variant="outline" onClick={onSwitchDefault}>
+        {t("connection.servers.switchDefault")}
+      </Button>
+      <Button size="sm" variant="ghost" onClick={onManageServers}>
+        {t("connection.servers.switchOther")}
+      </Button>
+    </div>
+  )
 }
 
 // 运行连接，重连后让这个 serve 的查询过期，并按连接状态决定显示提示还是子树
 function ConnectionGate({
   connection,
+  serverLabel,
+  fallbackActions,
   children,
 }: {
   connection: ServerConnection
+  serverLabel?: string
+  fallbackActions?: ReactNode
   children: ReactNode
 }) {
   const { t } = useTranslation()
@@ -169,7 +234,9 @@ function ConnectionGate({
     return (
       <TokenEntryPage
         isTokenInvalid
+        serverLabel={serverLabel}
         onSubmit={(token) => saveServerToken(url, token)}
+        footer={fallbackActions}
       />
     )
   if (state === "incompatible")
@@ -177,20 +244,29 @@ function ConnectionGate({
       <StandalonePage
         title={t("connection.incompatible.title")}
         description={t("connection.incompatible.description")}
-      />
+      >
+        {fallbackActions}
+      </StandalonePage>
     )
   if (serverID === undefined) {
-    const host = new URL(url).host
+    const host = getServerHost(url)
     return (
       <StandalonePage
-        title={t("connection.connecting.title")}
+        title={
+          serverLabel
+            ? t("connection.connecting.remoteTitle", { name: serverLabel })
+            : t("connection.connecting.title")
+        }
         description={
           state === "reconnecting"
             ? t("connection.connecting.retrying", { host })
             : undefined
         }
       >
-        <LatticeLoader aria-label={t("common.loading")} />
+        <div className="flex flex-col gap-4">
+          <LatticeLoader aria-label={t("common.loading")} />
+          {fallbackActions}
+        </div>
       </StandalonePage>
     )
   }

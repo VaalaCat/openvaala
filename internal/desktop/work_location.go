@@ -134,7 +134,7 @@ func (d *Desktop) getDefaultExecutorChoices() []conversation.ExecutorDetails {
 func (d *Desktop) newConversationFields(c *ui.Context) {
 	t := kit.GetTheme(c)
 	executors := d.getDefaultExecutorChoices()
-	ui.Column(c).Width(320).Gap(t.Space(4)).Children(func() {
+	ui.Column(c).Width(320).Gap(t.Space(3)).Children(func() {
 		// 1. Agent：有 agent/list 时是可搜索的下拉，否则是带标签的文本框。
 		d.newAgentField(c)
 		// 2. Executor：说明显示在字段下方；换 Executor 后目录属于另一台机器，清空重填。
@@ -349,24 +349,25 @@ func (d *Desktop) openWorkLocation() {
 
 // workLocationDialog 绘制对话的工作位置弹窗：工作位置、MCP 和 Skill 三页；保存时写入 Executor 设置。
 func (d *Desktop) workLocationDialog(c *ui.Context) {
-	// 1. 分段切换在正文顶部、靠正文左线，内容区过高时在弹窗内滚动。
-	t := kit.GetTheme(c)
+	// 1. 分段切换固定在弹窗正文上方，正文滚动由 DialogWith 统一铺满弹窗全宽，不再嵌套手写 ui.Scroll。
 	sections := []kit.SegmentedItem{{Icon: kit.IconFolder, Label: d.t("workspace")}, {Icon: kit.IconServerCog, Label: "MCP"}, {Icon: kit.IconBookOpen, Label: "Skill"}}
-	opt := kit.DialogOpt{Title: d.t("workspace"), ConfirmLabel: d.t("save"), ConfirmDisabled: d.locationSaving}
+	opt := kit.DialogOpt{
+		Title: d.t("workspace"),
+		HeaderExtra: func() {
+			kit.SegmentedWith(c, &d.locationTab, sections, kit.SegmentedOpt{}).Label(d.t("workspace")).AlignSelf(ui.Start)
+		},
+		ConfirmLabel:    d.t("save"),
+		ConfirmDisabled: d.locationSaving,
+	}
 	if kit.DialogWith(c, &d.locationOpen, opt, func() {
-		kit.SegmentedWith(c, &d.locationTab, sections, kit.SegmentedOpt{}).Label(d.t("workspace")).AlignSelf(ui.Start)
-		ui.Scroll(c).Height(320).Children(func() {
-			ui.Column(c).Gap(t.Space(4)).Children(func() {
-				switch d.locationTab {
-				case 0:
-					d.workLocationTab(c)
-				case 1:
-					d.mcpTab(c)
-				default:
-					d.conversationSkillsTab(c)
-				}
-			})
-		})
+		switch d.locationTab {
+		case 0:
+			d.workLocationTab(c)
+		case 1:
+			d.mcpTab(c)
+		default:
+			d.conversationSkillsTab(c)
+		}
 		if d.locationError != nil {
 			d.errorMessageView(c, d.locationError)
 		}
@@ -408,16 +409,26 @@ func (d *Desktop) workLocationTab(c *ui.Context) {
 	directory := d.locationDirectories[d.locationDefault]
 	d.directoryField(c, "location-directory", true, d.locationDefault, &directory)
 	d.locationDirectories[d.locationDefault] = directory
-	// 4. 每个 Executor 一行开关；默认 Executor 始终可用。
-	kit.SettingSection(c, d.t("available.executors"), func() {
-		for _, executor := range executors {
-			kit.SettingRow(c.Key(executor.ID), executor.ID, executor.Description, func() {
-				available := d.locationAvailable[executor.ID] || executor.ID == d.locationDefault
-				if kit.Switch(c, &available, "").Label(executor.ID + " · " + d.t("available")).Disabled(executor.ID == d.locationDefault).Changed() {
-					d.locationAvailable[executor.ID] = available
-				}
-			})
-		}
+	// 4. 每个 Executor 一行开关；在 Elevated 弹窗内直接用无外框的细分隔行，与上方表单字段落同一条左右对齐线。
+	t := kit.GetTheme(c)
+	ui.Column(c).Gap(t.Space(1)).Children(func() {
+		t.TextRole(ui.Text(c, d.t("available.executors")), kit.TextUI).TextColor(t.Colors.Muted)
+		ui.Column(c).Gap(0).Dividers(1, t.Colors.BorderSubtle).Children(func() {
+			for _, executor := range executors {
+				ui.Row(c.Key(executor.ID)).MinHeight(t.Metrics.HeaderHeight).Padding(t.Space(2), 0).Gap(t.Space(3)).AlignItems(ui.Center).Children(func() {
+					ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Children(func() {
+						t.TextRole(ui.Text(c, executor.ID), kit.TextUI)
+						if executor.Description != "" {
+							t.TextRole(ui.Text(c, executor.Description), kit.TextCaption).TextColor(t.Colors.Muted)
+						}
+					})
+					available := d.locationAvailable[executor.ID] || executor.ID == d.locationDefault
+					if kit.Switch(c, &available, "").Label(executor.ID + " · " + d.t("available")).Disabled(executor.ID == d.locationDefault).Changed() {
+						d.locationAvailable[executor.ID] = available
+					}
+				})
+			}
+		})
 	})
 }
 

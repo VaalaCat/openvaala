@@ -1318,3 +1318,215 @@ func TestConfigFilesProviderModelRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigFilesExecutorCRUD 验证 SSH Executor 的新增、修改、删除、非法/内置 ID 拒绝以及校验失败自动回滚。
+func TestConfigFilesExecutorCRUD(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "openvaala", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := config.NewConfigFiles(&config.LoadConfigOpt{Home: home, Path: configPath})
+
+	// 1. 初始列表为空。
+	initial, err := files.ListExecutorConfigs(t.Context())
+	if err != nil || len(initial) != 0 {
+		t.Fatalf("ListExecutorConfigs() = %+v, %v; want empty", initial, err)
+	}
+
+	// 2. 新建 SSH Executor 并验证读回。
+	devBox := defs.ExecutorConfig{
+		ID:                 "dev-box",
+		Kind:               defs.ExecutorKindSSH,
+		Description:        "Remote build box",
+		WorkspaceDirectory: "/home/coder/workspace",
+		SSH: &defs.SSHExecutorConfig{
+			Address: "coder@10.0.0.5:2222",
+		},
+	}
+	if _, err := files.SetExecutor(t.Context(), devBox); err != nil {
+		t.Fatalf("SetExecutor(create) err = %v", err)
+	}
+	listed, err := files.ListExecutorConfigs(t.Context())
+	if err != nil || !reflect.DeepEqual(listed, []defs.ExecutorConfig{devBox}) {
+		t.Fatalf("ListExecutorConfigs() = %+v, %v; want %+v", listed, err, []defs.ExecutorConfig{devBox})
+	}
+
+	// 3. 非法配置（相对路径或缺失私钥）写入失败后自动恢复原文件，不破坏已有配置。
+	badCases := []struct {
+		name    string
+		cfg     defs.ExecutorConfig
+		wantErr string
+	}{
+		{
+			name:    "invalid_id",
+			cfg:     defs.ExecutorConfig{ID: "../evil", Kind: defs.ExecutorKindSSH},
+			wantErr: "invalid executor id",
+		},
+		{
+			name:    "builtin_local_rejected",
+			cfg:     defs.ExecutorConfig{ID: "local", Kind: defs.ExecutorKindSSH},
+			wantErr: "builtin executor local cannot be modified",
+		},
+		{
+			name:    "builtin_openvaala_rejected",
+			cfg:     defs.ExecutorConfig{ID: "openvaala", Kind: defs.ExecutorKindSSH},
+			wantErr: "builtin executor openvaala cannot be modified",
+		},
+		{
+			name:    "builtin_memory_rejected",
+			cfg:     defs.ExecutorConfig{ID: "memory", Kind: defs.ExecutorKindSSH},
+			wantErr: "builtin executor memory cannot be modified",
+		},
+		{
+			name: "relative_workspace_dir_restores_previous",
+			cfg: defs.ExecutorConfig{
+				ID:                 "dev-box",
+				Kind:               defs.ExecutorKindSSH,
+				Description:        "Broken update",
+				WorkspaceDirectory: "relative/path",
+				SSH:                &defs.SSHExecutorConfig{Address: "coder@10.0.0.5"},
+			},
+			wantErr: "absolute remote path",
+		},
+	}
+	for _, tt := range badCases {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := files.SetExecutor(t.Context(), tt.cfg); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("SetExecutor(%s) err = %v, want containing %q", tt.name, err, tt.wantErr)
+			}
+		})
+	}
+	afterBad, err := files.ListExecutorConfigs(t.Context())
+	if err != nil || !reflect.DeepEqual(afterBad, []defs.ExecutorConfig{devBox}) {
+		t.Fatalf("ListExecutorConfigs after failed writes = %+v, %v; want preserved %+v", afterBad, err, devBox)
+	}
+
+	// 4. 修改并删除，以及删除不存在或内置 ID 的报错。
+	devBox.Description = "Updated build box"
+	if _, err := files.SetExecutor(t.Context(), devBox); err != nil {
+		t.Fatalf("SetExecutor(update) err = %v", err)
+	}
+	if _, err := files.DeleteExecutor(t.Context(), "local"); err == nil || !strings.Contains(err.Error(), "builtin executor") {
+		t.Fatalf("DeleteExecutor(local) err = %v", err)
+	}
+	if _, err := files.DeleteExecutor(t.Context(), "missing"); err == nil || !strings.Contains(err.Error(), "is not configured") {
+		t.Fatalf("DeleteExecutor(missing) err = %v", err)
+	}
+	if _, err := files.DeleteExecutor(t.Context(), "dev-box"); err != nil {
+		t.Fatalf("DeleteExecutor(dev-box) err = %v", err)
+	}
+	finalList, err := files.ListExecutorConfigs(t.Context())
+	if err != nil || len(finalList) != 0 {
+		t.Fatalf("ListExecutorConfigs after delete = %+v, %v; want empty", finalList, err)
+	}
+}
+
+// TestConfigFilesTestSSHExecutor 验证 SSH 连通性测试的参数校验与不可达错误，不写入文件。
+func TestConfigFilesTestSSHExecutor(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, ".config", "openvaala", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := config.NewConfigFiles(&config.LoadConfigOpt{Home: home, Path: configPath})
+
+	tests := []struct {
+		name    string
+		sshCfg  defs.SSHExecutorConfig
+		dir     string
+		wantErr string
+	}{
+		{
+			name:    "empty_address",
+			sshCfg:  defs.SSHExecutorConfig{},
+			dir:     "/workspace",
+			wantErr: "ssh address is required",
+		},
+		{
+			name:    "relative_directory",
+			sshCfg:  defs.SSHExecutorConfig{Address: "127.0.0.1:22"},
+			dir:     "workspace",
+			wantErr: "absolute remote path",
+		},
+		{
+			name:    "missing_identity_file",
+			sshCfg:  defs.SSHExecutorConfig{Address: "127.0.0.1:22", IdentityFile: "~/does-not-exist"},
+			dir:     "/workspace",
+			wantErr: "must be an existing file",
+		},
+		{
+			name:    "unreachable_port",
+			sshCfg:  defs.SSHExecutorConfig{Address: "127.0.0.1:1"},
+			dir:     "/workspace",
+			wantErr: "connect",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := files.TestSSHExecutor(t.Context(), tt.sshCfg, tt.dir); err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tt.wantErr)) {
+				t.Fatalf("TestSSHExecutor() err = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestConfigFilesListSSHConfigHosts 验证 ~/.ssh/config 解析与文件缺失弱依赖降级。
+func TestConfigFilesListSSHConfigHosts(t *testing.T) {
+	// 1. 文件不存在时返回空切片且不报错。
+	emptyHome := t.TempDir()
+	filesMissing := config.NewConfigFiles(&config.LoadConfigOpt{Home: emptyHome})
+	hosts, err := filesMissing.ListSSHConfigHosts(t.Context())
+	if err != nil || len(hosts) != 0 {
+		t.Fatalf("missing ssh config = %+v, %v; want empty nil error", hosts, err)
+	}
+
+	// 2. 正常多 Host：跳过通配符、遵循首次出现优先、非 22 端口拼 :port、保留 ~ 私钥路径。
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sshConfig := `
+# Global defaults should be skipped
+Host *
+  ServerAliveInterval 60
+
+Host dev-box *.internal
+  HostName 10.0.0.5
+  User coder
+  Port 2222
+  IdentityFile ~/.ssh/id_ed25519
+  IdentityFile ~/.ssh/id_rsa
+
+Host gpu-node
+  HostName gpu.vaala.dev
+  User root
+  Port 22
+
+Host bare-alias
+  User ubuntu
+`
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(sshConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := config.NewConfigFiles(&config.LoadConfigOpt{Home: home})
+	got, err := files.ListSSHConfigHosts(t.Context())
+	if err != nil {
+		t.Fatalf("ListSSHConfigHosts() err = %v", err)
+	}
+	want := []defs.SSHConfigHost{
+		{Alias: "dev-box", Address: "coder@10.0.0.5:2222", IdentityFile: "~/.ssh/id_ed25519"},
+		{Alias: "gpu-node", Address: "root@gpu.vaala.dev"},
+		{Alias: "bare-alias", Address: "ubuntu@bare-alias"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListSSHConfigHosts() = %+v, want %+v", got, want)
+	}
+}

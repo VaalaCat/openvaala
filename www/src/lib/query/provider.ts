@@ -70,6 +70,7 @@ export function reloadConfigOptions(connection: ServerConnection) {
       invalidateConfiguration(context.client, connection, [
         ...providerSegments,
         "executors",
+        "executorConfigs",
         "workspaceDirectories",
         "hooks",
         "skills",

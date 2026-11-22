@@ -1,15 +1,20 @@
 package config
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 
+	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"gopkg.in/yaml.v3"
 )
@@ -155,6 +160,288 @@ func (f *ConfigFiles) SetDefaultModel(ctx context.Context, ref defs.ModelRef) (*
 		return nil, err
 	}
 	return f.reloadOrRestore(ctx, original)
+}
+
+// isBuiltinExecutorID 检查 ID 是否为保留的内置 Executor。
+func isBuiltinExecutorID(id string) bool {
+	return id == defs.LocalExecutorID || id == BuiltinExecutorID || id == defs.MemoryExecutorID
+}
+
+// ListExecutorConfigs 按 ID 顺序返回 executors/*.yaml 里的原样配置；目录不存在时返回空列表。
+func (f *ConfigFiles) ListExecutorConfigs(_ context.Context) (executors []defs.ExecutorConfig, err error) {
+	// 1. 加载当前配置取得 executors 目录。
+	cfg, err := LoadConfig(&f.opt)
+	if err != nil {
+		return nil, err
+	}
+	paths, err := getDefinitionFiles(cfg.Executors.Directory)
+	if err != nil {
+		return nil, err
+	}
+	// 2. 逐个读取 YAML 原样返回（不展开私钥路径里的 ~），按 ID 排序。
+	executors = make([]defs.ExecutorConfig, 0, len(paths))
+	for _, path := range paths {
+		var item defs.ExecutorConfig
+		if err := readYAML(path, &item); err != nil {
+			return nil, err
+		}
+		executors = append(executors, item)
+	}
+	slices.SortFunc(executors, func(a, b defs.ExecutorConfig) int { return strings.Compare(a.ID, b.ID) })
+	return executors, nil
+}
+
+// SetExecutor 原子写入 executors/<id>.yaml 并重新加载配置；失败时恢复原文件。
+func (f *ConfigFiles) SetExecutor(ctx context.Context, executorCfg defs.ExecutorConfig) (*runtime.Definitions, error) {
+	// 1. 校验 Executor ID 非法或保留，提前拒绝不碰文件。
+	executorCfg.ID = strings.TrimSpace(executorCfg.ID)
+	if !isValidID(executorCfg.ID) {
+		return nil, errors.New("invalid executor id")
+	}
+	if isBuiltinExecutorID(executorCfg.ID) {
+		return nil, fmt.Errorf("builtin executor %s cannot be modified", executorCfg.ID)
+	}
+	if executorCfg.Kind == defs.ExecutorKindSSH {
+		if executorCfg.SSH == nil || strings.TrimSpace(executorCfg.SSH.Address) == "" {
+			return nil, errors.New("ssh address is required")
+		}
+		executorCfg.SSH = &defs.SSHExecutorConfig{
+			Address:      strings.TrimSpace(executorCfg.SSH.Address),
+			IdentityFile: strings.TrimSpace(executorCfg.SSH.IdentityFile),
+		}
+	}
+	executorCfg.Description = strings.TrimSpace(executorCfg.Description)
+	executorCfg.WorkspaceDirectory = strings.TrimSpace(executorCfg.WorkspaceDirectory)
+	// 2. 加载配置、编码 YAML、记录原文件快照后原子写入并热重载，失败自动回滚。
+	cfg, err := LoadConfig(&f.opt)
+	if err != nil {
+		return nil, err
+	}
+	content, err := encodeYAML(&executorCfg)
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(cfg.Executors.Directory, executorCfg.ID+".yaml")
+	original, err := readOriginalFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFileAtomic(path, content); err != nil {
+		return nil, err
+	}
+	return f.reloadOrRestore(ctx, original)
+}
+
+// DeleteExecutor 删除 executors/<id>.yaml 并重新加载配置；文件不存在时返回错误。
+func (f *ConfigFiles) DeleteExecutor(ctx context.Context, executorID string) (*runtime.Definitions, error) {
+	// 1. 校验 ID 且拒绝内置 Executor。
+	executorID = strings.TrimSpace(executorID)
+	if !isValidID(executorID) {
+		return nil, errors.New("invalid executor id")
+	}
+	if isBuiltinExecutorID(executorID) {
+		return nil, fmt.Errorf("builtin executor %s cannot be modified", executorID)
+	}
+	cfg, err := LoadConfig(&f.opt)
+	if err != nil {
+		return nil, err
+	}
+	// 2. 读取快照检查存在性，删除后重新加载，失败自动恢复。
+	path := filepath.Join(cfg.Executors.Directory, executorID+".yaml")
+	original, err := readOriginalFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if !original.existed {
+		return nil, fmt.Errorf("executor %s is not configured", executorID)
+	}
+	if err := os.Remove(path); err != nil {
+		return nil, &Error{
+			Path:   path,
+			Reason: "cannot remove file",
+		}
+	}
+	return f.reloadOrRestore(ctx, original)
+}
+
+// TestSSHExecutor 用临时 SSH 参数拨号并解析工作目录，返回规范后的绝对目录，不写入任何文件。
+func (f *ConfigFiles) TestSSHExecutor(ctx context.Context, sshCfg defs.SSHExecutorConfig, workspaceDirectory string) (resolvedDirectory string, err error) {
+	// 1. 校验地址、远端绝对目录与可选私钥路径。
+	address := strings.TrimSpace(sshCfg.Address)
+	if address == "" {
+		return "", errors.New("ssh address is required")
+	}
+	workspaceDirectory = strings.TrimSpace(workspaceDirectory)
+	if workspaceDirectory == "" || !filepath.IsAbs(workspaceDirectory) {
+		return "", errors.New("ssh executor workspace_directory must be an absolute remote path")
+	}
+	home := f.opt.Home
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	identityFile := strings.TrimSpace(sshCfg.IdentityFile)
+	if identityFile != "" {
+		executorsDir := ""
+		if cfg, loadErr := LoadConfig(&f.opt); loadErr == nil {
+			executorsDir = cfg.Executors.Directory
+		}
+		identityFile = expandPath(identityFile, home, executorsDir)
+		if info, statErr := os.Stat(identityFile); statErr != nil || !info.Mode().IsRegular() {
+			return "", fmt.Errorf("ssh identity_file %s must be an existing file", identityFile)
+		}
+	}
+	// 2. 创建临时 SSHExecutor 校验登录与目录，ResolveWorkspaceDirectory 内部负责关闭工作区。
+	const testExecutorID = "ssh-test"
+	exec := executor.NewSSHExecutor(executor.NewSSHExecutorOpt(&defs.ExecutorDefinition{
+		ID:                 testExecutorID,
+		Kind:               defs.ExecutorKindSSH,
+		WorkspaceDirectory: workspaceDirectory,
+	}, address, identityFile))
+	return conversation.ResolveWorkspaceDirectory(ctx, []executor.Executor{exec}, testExecutorID, workspaceDirectory, workspaceDirectory)
+}
+
+// ListSSHConfigHosts 读取 serve 本机 ~/.ssh/config 里的非通配符 Host 项；文件缺失或不可读时记警告并返回空列表。
+func (f *ConfigFiles) ListSSHConfigHosts(_ context.Context) (hosts []defs.SSHConfigHost, err error) {
+	home := f.opt.Home
+	if home == "" {
+		home, err = os.UserHomeDir()
+		if err != nil {
+			slog.Warn("cannot locate user home for ssh config", "error", err)
+			return []defs.SSHConfigHost{}, nil
+		}
+	}
+	path := filepath.Join(home, ".ssh", "config")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("cannot read ssh config for host suggestions", "path", path, "error", err)
+		}
+		return []defs.SSHConfigHost{}, nil
+	}
+	return parseSSHConfigHosts(string(data)), nil
+}
+
+// parseSSHConfigHosts 按 OpenSSH 首项优先规则解析 ~/.ssh/config，跳过包含通配符或取反的 Host 模式。
+func parseSSHConfigHosts(content string) []defs.SSHConfigHost {
+	type hostEntry struct {
+		alias        string
+		hostName     string
+		user         string
+		port         string
+		identityFile string
+	}
+	var (
+		order   []string
+		entries = map[string]*hostEntry{}
+		active  []*hostEntry
+	)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// 1. 拆分关键字与参数（支持空白或等号分隔）。
+		key, rest := splitSSHConfigDirective(line)
+		if key == "" || rest == "" {
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "match":
+			active = nil
+		case "host":
+			active = nil
+			for _, pattern := range strings.Fields(rest) {
+				alias := strings.Trim(pattern, `"`)
+				if alias == "" || strings.ContainsAny(alias, "*?!") {
+					continue
+				}
+				entry, exists := entries[alias]
+				if !exists {
+					entry = &hostEntry{alias: alias}
+					entries[alias] = entry
+					order = append(order, alias)
+				}
+				active = append(active, entry)
+			}
+		case "hostname":
+			value := unquoteSSHConfigValue(rest)
+			for _, entry := range active {
+				if entry.hostName == "" {
+					entry.hostName = value
+				}
+			}
+		case "user":
+			value := unquoteSSHConfigValue(rest)
+			for _, entry := range active {
+				if entry.user == "" {
+					entry.user = value
+				}
+			}
+		case "port":
+			value := unquoteSSHConfigValue(rest)
+			for _, entry := range active {
+				if entry.port == "" {
+					entry.port = value
+				}
+			}
+		case "identityfile":
+			value := unquoteSSHConfigValue(rest)
+			for _, entry := range active {
+				if entry.identityFile == "" {
+					entry.identityFile = value
+				}
+			}
+		}
+	}
+	// 2. 按首次出现顺序拼出 [user@]host[:port]。
+	result := make([]defs.SSHConfigHost, 0, len(order))
+	for _, alias := range order {
+		entry := entries[alias]
+		host := entry.hostName
+		if host == "" {
+			host = entry.alias
+		}
+		if entry.port != "" && entry.port != "22" {
+			host = net.JoinHostPort(host, entry.port)
+		}
+		address := host
+		if entry.user != "" {
+			address = entry.user + "@" + host
+		}
+		result = append(result, defs.SSHConfigHost{
+			Alias:        entry.alias,
+			Address:      address,
+			IdentityFile: entry.identityFile,
+		})
+	}
+	return result
+}
+
+// splitSSHConfigDirective 把一行 ~/.ssh/config 拆成指令名和参数部分。
+func splitSSHConfigDirective(line string) (key, value string) {
+	sep := strings.IndexAny(line, " \t=")
+	if sep < 0 {
+		return "", ""
+	}
+	key = strings.TrimSpace(line[:sep])
+	rest := strings.TrimSpace(line[sep:])
+	rest = strings.TrimLeft(rest, "=")
+	return key, strings.TrimSpace(rest)
+}
+
+// unquoteSSHConfigValue 去掉行尾注释（引号外）和包裹双引号。
+func unquoteSSHConfigValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '"' {
+		if end := strings.IndexByte(value[1:], '"'); end >= 0 {
+			return value[1 : 1+end]
+		}
+	}
+	if comment := strings.IndexByte(value, '#'); comment >= 0 {
+		value = strings.TrimSpace(value[:comment])
+	}
+	return strings.Trim(value, `"`)
 }
 
 // getDefaultModelEdit 读取配置文件，返回原文件和改了 default_model 之后的内容；默认模型没变时都返回 nil。

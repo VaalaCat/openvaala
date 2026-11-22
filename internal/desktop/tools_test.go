@@ -3,7 +3,9 @@ package desktop
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
@@ -122,6 +124,44 @@ func TestToolDetailLayout(t *testing.T) {
 				if !tester.HasText(want) {
 					t.Fatalf("missing %q in %q", want, tester.Texts())
 				}
+			}
+		})
+	}
+}
+
+// TestToolViewCacheRefresh 检查工具调用参数和结果变化后，折叠摘要、失败状态与展开详情都会同步更新。
+func TestToolViewCacheRefresh(t *testing.T) {
+	for _, tt := range []struct {
+		name            string
+		initialArgs     string
+		updatedArgs     string
+		updatedResult   string
+		wantSummary     string
+		wantDetailValue string
+	}{
+		{"bash command and failure", `{"command":"echo first"}`, `{"command":"echo second"}`, `{"status":"failed","exit_code":1,"output":"boom"}`, "echo second", "boom"},
+		{"read_file path and content", `{"path":"old.go"}`, `{"path":"new.go"}`, `{"content":"package updated"}`, "new.go", "package updated"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			call := &defs.ToolCall{CallID: "call", Name: strings.Split(tt.name, " ")[0], Arguments: tt.initialArgs, Status: defs.ToolCallReady}
+			var result *defs.ToolResult
+			tester := ui.NewTester(func(c *ui.Context) {
+				d.applyAppearance(c)
+				ui.Column(c).Fill().Children(func() { d.toolView(c, call, result, viewItem{Item: &defs.Item{ToolCall: call}}) })
+			}, 800, 600)
+			call.Arguments = tt.updatedArgs
+			result = &defs.ToolResult{CallID: "call", Content: json.RawMessage(tt.updatedResult)}
+			tester.Frame()
+			if !tester.HasText(tt.wantSummary) {
+				t.Fatalf("updated summary %q missing in %q", tt.wantSummary, tester.Texts())
+			}
+			if err := tester.Click(call.Name); err != nil {
+				t.Fatal(err)
+			}
+			tester.Advance(300 * time.Millisecond)
+			if !tester.HasText(tt.wantDetailValue) {
+				t.Fatalf("updated detail %q missing in %q", tt.wantDetailValue, tester.Texts())
 			}
 		})
 	}

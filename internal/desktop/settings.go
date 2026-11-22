@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/VaalaCat/mygo-kit"
-	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
@@ -20,10 +19,10 @@ var settingsPages = []string{"general", "providers", "executors", "hooks", "skil
 // settingControlWidth 是设置行右侧下拉和输入控件的统一宽度。
 const settingControlWidth = 200
 
-// navigate 切换设置页面；未保存 Provider 原文需要确认放弃。
+// navigate 切换设置页面；未保存 Provider 或 Executor 原文需要确认放弃。
 func (d *Desktop) navigate(page string) {
 	// 1. 页面变更前检查编辑草稿。
-	if page != d.page && d.isProviderDirty() {
+	if page != d.page && (d.isProviderDirty() || d.isExecutorDirty()) {
 		d.confirm = confirmation{Kind: "navigate", Page: page}
 		d.confirmOpen = true
 		return
@@ -71,6 +70,8 @@ func (d *Desktop) loadSettingsPage(page string) {
 		d.loadProviders()
 	case "executors":
 		d.loadExecutors()
+		d.loadExecutorConfigs()
+		d.loadSSHConfigHosts()
 	case "hooks", "skills":
 		d.loadReadOnlySettings(page)
 	}
@@ -119,7 +120,7 @@ func (d *Desktop) settingsView(c *ui.Context) {
 	apply, revert := false, false
 	page := kit.SettingPage(c.Key(d.page), d.getSettingsPageTitle(d.page), func() { d.settingsActionsView(c, &apply, &revert) }, func() {
 		if d.settingsError != nil {
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Row(c).Gap(kit.GetTheme(c).Space(2)).AlignItems(ui.Center).Children(func() {
 				d.errorMessageView(c, d.settingsError).Shrink(1)
 				if kit.Button(c, d.t("retry")).Clicked() {
 					d.navigate(d.page)
@@ -135,7 +136,6 @@ func (d *Desktop) settingsView(c *ui.Context) {
 		case "providers":
 			d.providersView(c)
 		case "executors":
-			d.configNoteView(c)
 			d.executorsSettingsView(c)
 		case "hooks":
 			d.configNoteView(c)
@@ -160,14 +160,25 @@ func (d *Desktop) settingsView(c *ui.Context) {
 		}
 	}
 	if revert {
-		d.providerDraft = cloneProviderDraft(d.providerBaseline)
+		if d.page == "providers" {
+			d.providerDraft = cloneProviderDraft(d.providerBaseline)
+		} else if d.page == "executors" {
+			d.executorDraft = cloneExecutorDraft(d.executorBaseline)
+			d.executorTestSuccess = ""
+			d.executorTestError = nil
+			d.executorError = nil
+		}
 	}
 	if apply {
-		d.saveProvider()
+		if d.page == "providers" {
+			d.saveProvider()
+		} else if d.page == "executors" {
+			d.saveExecutor()
+		}
 	}
 }
 
-// settingsActionsView 绘制页头右侧的操作：模型服务页的新增、目录、撤销、应用，以及每页都有的重载配置。
+// settingsActionsView 绘制页头右侧的操作：模型服务页与 Executor 页的新增、撤销、测试、应用，以及每页都有的重载配置。
 func (d *Desktop) settingsActionsView(c *ui.Context, apply, revert *bool) {
 	// 1. 模型服务页：新增服务、服务目录开关；有草稿时再加撤销与应用，应用在可提交时是主按钮。
 	if d.page == "providers" {
@@ -191,7 +202,34 @@ func (d *Desktop) settingsActionsView(c *ui.Context, apply, revert *bool) {
 			}
 		}
 	}
-	// 2. 重载配置在每页都有。
+	// 2. Executor 页：新增 SSH Executor；编辑草稿时提供撤销、测试连接与应用。
+	if d.page == "executors" {
+		if kit.Button(c.Key("add-ssh-executor"), d.t("executor.add.ssh")).Clicked() {
+			d.openExecutor(defs.ExecutorConfig{Kind: defs.ExecutorKindSSH}, "")
+		}
+		if d.executorDraft != nil {
+			if kit.Button(c.Key("executor-revert"), d.t("revert")).Disabled(d.executorSaving).Clicked() {
+				*revert = true
+			}
+			testLabel := d.t("executor.test")
+			if d.executorTesting {
+				testLabel = d.t("executor.testing")
+			}
+			canTest := d.client != nil && !d.clientStopped && !d.executorTesting && d.executorDraft.Address != "" && d.executorDraft.WorkspaceDirectory != ""
+			if kit.Button(c.Key("executor-test"), testLabel).Disabled(!canTest).Clicked() {
+				d.testExecutor()
+			}
+			canApply := d.client != nil && !d.clientStopped && !d.executorSaving && (d.isExecutorDirty() || d.executorDraft.EditingID == "")
+			applyButton := kit.Button
+			if canApply {
+				applyButton = kit.PrimaryButton
+			}
+			if applyButton(c.Key("apply"), d.t("apply")).Disabled(!canApply).Clicked() {
+				*apply = true
+			}
+		}
+	}
+	// 3. 重载配置在每页都有。
 	if kit.Button(c, d.t("reload.configuration")).Disabled(d.client == nil).Clicked() {
 		d.reloadConfiguration()
 	}
@@ -291,7 +329,7 @@ func (d *Desktop) generalSettingsView(c *ui.Context) {
 			kit.Switch(c.Key("notify-on-finish"), &d.preferences.NotifyOnFinish, "").Label(d.t("notify.on.finish"))
 		})
 	})
-	if before != d.preferences {
+	if before.Theme != d.preferences.Theme || before.Palette != d.preferences.Palette || before.BodyFont != d.preferences.BodyFont || before.TitleFont != d.preferences.TitleFont || before.Language != d.preferences.Language || before.NotifyOnFinish != d.preferences.NotifyOnFinish {
 		d.installMenu()
 		if err := d.savePreferences(); err != nil {
 			d.showToast(kit.ToastOpt{Title: d.t("preferences.were.not.saved"), Description: err.Error(), Kind: kit.ToastError})
@@ -330,31 +368,7 @@ func (d *Desktop) settingsItemView(c *ui.Context, key, title, description, sourc
 	})
 }
 
-// executorsSettingsView 列出 Executor：名称、来源徽标、说明，点开看默认目录。
-func (d *Desktop) executorsSettingsView(c *ui.Context) {
-	// 1. local 与 openvaala 是内置的，其余来自 config.yaml。
-	if len(d.executors) == 0 {
-		if d.executorsLoading {
-			kit.InlineHint(c, d.t("loading"), true)
-			return
-		}
-		kit.FieldMessage(c, kit.MessageDescription, d.t("settings.executors.empty"))
-		return
-	}
-	kit.SettingSection(c, d.t("settings.executors"), func() {
-		for _, executor := range d.executors {
-			source := "config.yaml"
-			if executor.ID == defs.LocalExecutorID || executor.ID == config.BuiltinExecutorID || executor.ID == defs.MemoryExecutorID {
-				source = d.t("source.builtin")
-			}
-			d.settingsItemView(c, "executor:"+executor.ID, executor.ID, executor.Description, source, executor, func() {
-				if executor.WorkspaceDirectory != "" {
-					kit.Facts(c, kit.Fact{Label: d.t("workspace.directory"), Value: executor.WorkspaceDirectory})
-				}
-			})
-		}
-	})
-}
+// executorsSettingsView 已移至 executors.go。
 
 // hooksSettingsView 列出 Hook：事件、来源徽标（插件名或 config.yaml）、命令，点开看匹配条件、超时和来源文件。
 func (d *Desktop) hooksSettingsView(c *ui.Context) {
@@ -474,6 +488,8 @@ func (d *Desktop) confirmationView(c *ui.Context) {
 		opt.Title, opt.ConfirmLabel, opt.Danger = fmt.Sprintf(d.t("delete.conversation.confirm"), d.confirm.Name), d.t("delete"), true
 	case "delete-provider":
 		opt.Title, opt.ConfirmLabel, opt.Danger = fmt.Sprintf(d.t("delete.provider.confirm"), d.confirm.ProviderID), d.t("delete"), true
+	case "delete-executor":
+		opt.Title, opt.ConfirmLabel, opt.Danger = fmt.Sprintf(d.t("executor.delete.confirm"), d.confirm.ExecutorID), d.t("delete"), true
 	case "withdraw":
 		opt.Title, opt.ConfirmLabel, opt.Danger = fmt.Sprintf(d.t("withdraw.input.confirm"), d.confirm.Name), d.t("withdraw"), true
 	case "rename":
@@ -509,9 +525,27 @@ func (d *Desktop) submitConfirmation() {
 		d.openProvider(request.Provider, request.ProviderID, request.CatalogID)
 		return
 	}
+	if request.Kind == "select-executor" {
+		d.executorDraft = nil
+		d.executorBaseline = nil
+		d.confirmOpen = false
+		d.openExecutor(request.Executor, request.ExecutorID)
+		return
+	}
+	if request.Kind == "switch-server" {
+		d.providerDraft = nil
+		d.providerBaseline = nil
+		d.executorDraft = nil
+		d.executorBaseline = nil
+		d.confirmOpen = false
+		d.forceSwitchServer(request.ServerID)
+		return
+	}
 	if request.Kind == "navigate" || request.Kind == "navigate-conversation" {
 		d.providerDraft = nil
 		d.providerBaseline = nil
+		d.executorDraft = nil
+		d.executorBaseline = nil
 		d.confirmOpen = false
 		switch {
 		case request.Kind == "navigate":
@@ -541,6 +575,8 @@ func (d *Desktop) submitConfirmation() {
 			err = client.DeleteConversation(d.ctx, &runtimeclient.DeleteConversationRequest{ConversationID: request.Conversation.ID})
 		case "delete-provider":
 			_, err = client.DeleteProvider(d.ctx, request.ProviderID)
+		case "delete-executor":
+			_, err = client.DeleteExecutor(d.ctx, request.ExecutorID)
 		case "withdraw":
 			_, err = client.WithdrawInput(d.ctx, request.Conversation.ID, request.ItemID, false)
 		case "rename":
@@ -564,6 +600,15 @@ func (d *Desktop) submitConfirmation() {
 				d.loadProviders()
 				d.loadModels(d.readingTarget)
 			}
+			if request.Kind == "delete-executor" {
+				d.executorDraft = nil
+				d.executorBaseline = nil
+				d.executorTestSuccess = ""
+				d.executorTestError = nil
+				clear(d.skillCatalogs)
+				d.loadExecutors()
+				d.loadExecutorConfigs()
+			}
 			if request.Kind == "delete-conversation" && d.readingTarget.ConversationID == request.Conversation.ID {
 				d.openConversation(defs.ConversationID(""), "")
 			}
@@ -582,5 +627,7 @@ func (d *Desktop) showConfirmationSuccess(request confirmation) {
 		d.showSuccess(d.t("input.withdrawn"), request.Name)
 	case "delete-provider":
 		d.showSuccess(d.t("provider.deleted"), request.ProviderID)
+	case "delete-executor":
+		d.showSuccess(d.t("executor.deleted"), request.ExecutorID)
 	}
 }

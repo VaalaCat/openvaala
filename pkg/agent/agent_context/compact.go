@@ -7,7 +7,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"

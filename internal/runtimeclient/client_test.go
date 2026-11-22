@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
@@ -1895,6 +1895,51 @@ func TestClientConfigurationMethods(t *testing.T) {
 			wantCalls: []clientTestCall{{method: "ListCatalogProviders"}},
 		},
 		{
+			name:      "list_executor_configs",
+			call:      func(t *testing.T, h *clientHarness) (any, error) { return h.client.ListExecutorConfigs(t.Context()) },
+			want:      []defs.ExecutorConfig{clientTestExecutorConfig},
+			wantCalls: []clientTestCall{{method: "ListExecutorConfigs"}},
+		},
+		{
+			name: "set_executor",
+			call: func(t *testing.T, h *clientHarness) (any, error) {
+				return h.client.SetExecutor(t.Context(), clientTestExecutorConfig)
+			},
+			want: noPendingConversations,
+			wantCalls: []clientTestCall{{
+				method:   "SetExecutor",
+				argument: clientTestExecutorConfig,
+			}},
+		},
+		{
+			name: "delete_executor",
+			call: func(t *testing.T, h *clientHarness) (any, error) {
+				return h.client.DeleteExecutor(t.Context(), clientTestExecutorConfig.ID)
+			},
+			want: noPendingConversations,
+			wantCalls: []clientTestCall{{
+				method:   "DeleteExecutor",
+				argument: clientTestExecutorConfig.ID,
+			}},
+		},
+		{
+			name: "test_ssh_executor",
+			call: func(t *testing.T, h *clientHarness) (any, error) {
+				return h.client.TestSSHExecutor(t.Context(), *clientTestExecutorConfig.SSH, clientTestExecutorConfig.WorkspaceDirectory)
+			},
+			want: clientTestExecutorConfig.WorkspaceDirectory,
+			wantCalls: []clientTestCall{{
+				method:   "TestSSHExecutor",
+				argument: clientTestExecutorConfig.SSH.Address + ":" + clientTestExecutorConfig.WorkspaceDirectory,
+			}},
+		},
+		{
+			name:      "list_ssh_config_hosts",
+			call:      func(t *testing.T, h *clientHarness) (any, error) { return h.client.ListSSHConfigHosts(t.Context()) },
+			want:      []defs.SSHConfigHost{{Alias: "dev-box", Address: "coder@10.0.0.5:2222", IdentityFile: "~/.ssh/id_ed25519"}},
+			wantCalls: []clientTestCall{{method: "ListSSHConfigHosts"}},
+		},
+		{
 			name: "list_catalog_models",
 			call: func(t *testing.T, h *clientHarness) (any, error) {
 				return h.client.ListCatalogModels(t.Context(), "openai")
@@ -2935,6 +2980,51 @@ func (c *clientTestConfiguration) Reload(context.Context) (*runtime.Definitions,
 	// 1. 保存调用，返回初始定义。
 	c.calls.record("Reload", nil)
 	return c.definitions, nil
+}
+
+// ListExecutorConfigs 记录查询并返回预设 Executor 配置。
+func (c *clientTestConfiguration) ListExecutorConfigs(context.Context) ([]defs.ExecutorConfig, error) {
+	c.calls.record("ListExecutorConfigs", nil)
+	return []defs.ExecutorConfig{clientTestExecutorConfig}, nil
+}
+
+// SetExecutor 记录 Executor 写入并返回测试定义。
+func (c *clientTestConfiguration) SetExecutor(_ context.Context, executor defs.ExecutorConfig) (*runtime.Definitions, error) {
+	c.calls.record("SetExecutor", executor)
+	return c.definitions, nil
+}
+
+// DeleteExecutor 记录 Executor 删除并返回测试定义。
+func (c *clientTestConfiguration) DeleteExecutor(_ context.Context, executorID string) (*runtime.Definitions, error) {
+	c.calls.record("DeleteExecutor", executorID)
+	if executorID != clientTestExecutorConfig.ID {
+		return nil, fmt.Errorf("executor %s is not configured", executorID)
+	}
+	return c.definitions, nil
+}
+
+// TestSSHExecutor 记录测试请求并返回传入目录。
+func (c *clientTestConfiguration) TestSSHExecutor(_ context.Context, sshCfg defs.SSHExecutorConfig, workspaceDirectory string) (string, error) {
+	c.calls.record("TestSSHExecutor", sshCfg.Address+":"+workspaceDirectory)
+	return workspaceDirectory, nil
+}
+
+// ListSSHConfigHosts 记录查询并返回预设主机列表。
+func (c *clientTestConfiguration) ListSSHConfigHosts(context.Context) ([]defs.SSHConfigHost, error) {
+	c.calls.record("ListSSHConfigHosts", nil)
+	return []defs.SSHConfigHost{{Alias: "dev-box", Address: "coder@10.0.0.5:2222", IdentityFile: "~/.ssh/id_ed25519"}}, nil
+}
+
+// clientTestExecutorConfig 是 clientTestConfiguration 使用的预设 SSH Executor 配置。
+var clientTestExecutorConfig = defs.ExecutorConfig{
+	ID:                 "dev-box",
+	Kind:               defs.ExecutorKindSSH,
+	Description:        "Remote Linux build box",
+	WorkspaceDirectory: "/home/coder/workspace",
+	SSH: &defs.SSHExecutorConfig{
+		Address:      "coder@10.0.0.5:2222",
+		IdentityFile: "~/.ssh/id_ed25519",
+	},
 }
 
 // clientTestModelCatalog 是测试用的 ModelCatalog：把调用记进 calls；目录里只有 clientTestCatalogProvider，

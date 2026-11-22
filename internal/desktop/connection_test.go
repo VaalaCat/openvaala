@@ -1,13 +1,16 @@
 package desktop
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
+	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/egoist/mygo/ui"
 )
@@ -141,5 +144,75 @@ func TestConnectionStatusBar(t *testing.T) {
 				t.Fatalf("status bar texts %q, want %q only", bar, tt.wantStatus)
 			}
 		})
+	}
+}
+
+// TestDesktopSwitchServer 检查切服取消旧连接、清空旧会话数据、保留按 serverID 隔离的草稿，并在远端失败横幅提供「切回本机」。
+func TestDesktopSwitchServer(t *testing.T) {
+	// 1. 准备带远端档案和本机草稿的桌面状态。
+	d := testDesktop()
+	d.preferencesPath = filepath.Join(t.TempDir(), "preferences.json")
+	d.preferences.RemoteServers = []remoteServer{{
+		ID:    "remote-1",
+		Name:  "公司开发机",
+		URL:   "ws://10.0.0.5:8790/api/v1/openvaala",
+		Token: "tok",
+	}}
+	connCtx, connCancel := context.WithCancel(context.Background())
+	d.clientCtx = connCtx
+	d.clientCancel = connCancel
+	d.conversations = []dao.ConversationListEntry{{Conversation: defs.Conversation{ID: "c1", Title: "旧会话"}}}
+	d.drafts[draftKey{ServerID: "fixture"}] = &conversationDraft{
+		Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: "本机未发送草稿"}}},
+	}
+
+	// 2. 切到远端：旧连接被取消、旧会话列表清空、草稿保留、偏好持久化。
+	d.switchServer("remote-1")
+	if connCtx.Err() != context.Canceled {
+		t.Fatalf("previous client context not canceled: %v", connCtx.Err())
+	}
+	if len(d.conversations) != 0 {
+		t.Fatalf("conversations not cleared: %+v", d.conversations)
+	}
+	if got := draftText(d.drafts[draftKey{ServerID: "fixture"}].Content); got != "本机未发送草稿" {
+		t.Fatalf("local draft lost: %q", got)
+	}
+	if d.preferences.ActiveServer != "remote-1" {
+		t.Fatalf("ActiveServer = %q, want remote-1", d.preferences.ActiveServer)
+	}
+
+	// 3. 远端失败时对话区横幅显示远端名称和「切回本机」，点击后切回本机。
+	d.connectionError = errors.New("dial tcp: connection refused")
+	tester := ui.NewTester(d.view, 1280, 820)
+	tester.SetLocale("zh-Hans")
+	if !tester.HasText("无法连接「公司开发机」") {
+		t.Fatalf("missing remote banner text in %q", tester.Texts())
+	}
+	if !tester.HasText("切回本机") {
+		t.Fatalf("missing switch-to-local button in %q", tester.Texts())
+	}
+	if err := tester.Click("切回本机"); err != nil {
+		t.Fatalf("click switch-to-local: %v", err)
+	}
+	if d.preferences.ActiveServer != localServerID {
+		t.Fatalf("ActiveServer after switch back = %q, want %q", d.preferences.ActiveServer, localServerID)
+	}
+}
+
+// TestServersDialogPasteAndSave 检查「管理服务器」弹窗粘贴 openvaala web 链接时自动拆出 URL 与 Token，并可保存。
+func TestServersDialogPasteAndSave(t *testing.T) {
+	d := testDesktop()
+	d.preferencesPath = filepath.Join(t.TempDir(), "preferences.json")
+	d.openServersDialog()
+	d.openServerForm(nil)
+	d.serverForm.Name = "云端 GPU"
+	d.serverForm.URL = "https://gpu.vaala.dev/web/v1/#token=paste-secret"
+	d.handleServerAddressChanged()
+	if d.serverForm.URL != "wss://gpu.vaala.dev/api/v1/openvaala" || d.serverForm.Token != "paste-secret" || !d.serverForm.TokenAutoFilled {
+		t.Fatalf("form after paste = %+v", d.serverForm)
+	}
+	d.saveServerForm(false)
+	if len(d.preferences.RemoteServers) != 1 || d.preferences.RemoteServers[0].Name != "云端 GPU" || d.preferences.RemoteServers[0].Token != "paste-secret" {
+		t.Fatalf("saved servers = %+v", d.preferences.RemoteServers)
 	}
 }

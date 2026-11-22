@@ -68,6 +68,16 @@ type Configuration interface {
 	SetDefaultModel(ctx context.Context, ref defs.ModelRef) (*runtime.Definitions, error)
 	// Reload 不改任何文件，用启动时的配置路径和 flag 重新加载整份配置。
 	Reload(ctx context.Context) (*runtime.Definitions, error)
+	// ListExecutorConfigs 按 ID 顺序返回 executors/*.yaml 里的原样配置。
+	ListExecutorConfigs(ctx context.Context) (executors []defs.ExecutorConfig, err error)
+	// SetExecutor 原子写入 executors/<id>.yaml 并重新加载配置；失败时恢复原文件。
+	SetExecutor(ctx context.Context, executor defs.ExecutorConfig) (definitions *runtime.Definitions, err error)
+	// DeleteExecutor 删除 executors/<id>.yaml 并重新加载配置；文件不存在时返回错误。
+	DeleteExecutor(ctx context.Context, executorID string) (definitions *runtime.Definitions, err error)
+	// TestSSHExecutor 用临时 SSH 参数拨号并解析工作目录，返回规范后的绝对目录，不写入任何文件。
+	TestSSHExecutor(ctx context.Context, sshCfg defs.SSHExecutorConfig, workspaceDirectory string) (resolvedDirectory string, err error)
+	// ListSSHConfigHosts 读取 serve 本机 ~/.ssh/config 里的非通配符 Host 项；文件缺失或不可读时返回空列表。
+	ListSSHConfigHosts(ctx context.Context) (hosts []defs.SSHConfigHost, err error)
 }
 
 // ModelCatalog 给 /provider 提供可选的模型服务和模型，都是弱依赖：失败时返回错误，由 TUI 改成手动填写。

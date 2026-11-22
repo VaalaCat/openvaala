@@ -108,3 +108,31 @@ func TestWorkspacePreferences(t *testing.T) {
 		})
 	}
 }
+
+// TestRemoteServerPreferences 检查损坏的单条远端服务器记录被跳过、其余合法偏好照常加载，且失效的 ActiveServer 退回默认。
+func TestRemoteServerPreferences(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "preferences.json")
+	content := `{
+		"active_server": "deleted-id",
+		"remote_servers": [
+			{"id": "", "url": "ws://10.0.0.1:8790"},
+			{"id": "local", "url": "ws://10.0.0.2:8790"},
+			{"id": "bad-scheme", "url": "ftp://10.0.0.3:21"},
+			{"id": "dev", "name": "Dev Box", "url": "http://10.0.0.5:8790/web/v1/#token=tok1"}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	d := testDesktop()
+	d.preferencesPath = path
+	if err := d.loadPreferences(); err != nil {
+		t.Fatalf("loadPreferences() err = %v, want nil", err)
+	}
+	if d.preferences.ActiveServer != "" {
+		t.Fatalf("ActiveServer = %q, want empty fallback", d.preferences.ActiveServer)
+	}
+	if len(d.preferences.RemoteServers) != 1 || d.preferences.RemoteServers[0].ID != "dev" || d.preferences.RemoteServers[0].URL != "ws://10.0.0.5:8790/api/v1/openvaala" || d.preferences.RemoteServers[0].Token != "tok1" {
+		t.Fatalf("RemoteServers = %+v", d.preferences.RemoteServers)
+	}
+}

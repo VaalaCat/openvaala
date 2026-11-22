@@ -7,9 +7,18 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/VaalaCat/mygo-kit"
 )
+
+// remoteServer 是原生桌面本地保存的一台远端 Runtime Server 档案。
+type remoteServer struct {
+	ID    string `json:"id"`
+	Name  string `json:"name,omitempty"`
+	URL   string `json:"url"`
+	Token string `json:"token,omitempty"`
+}
 
 type preferences struct {
 	Language  string `json:"language"`
@@ -22,6 +31,9 @@ type preferences struct {
 	Width          int                `json:"width"`
 	Height         int                `json:"height"`
 	Workspace      kit.WorkspaceState `json:"workspace"`
+	// ActiveServer 为空或 "local" 表示连接本机 serve，否则为 RemoteServers 中的服务器 ID。
+	ActiveServer  string         `json:"active_server,omitempty"`
+	RemoteServers []remoteServer `json:"remote_servers,omitempty"`
 }
 
 // 右 Dock 与下 Dock 的面板 ID。
@@ -77,6 +89,34 @@ func (d *Desktop) loadPreferences() error {
 	// 旧版本保存的下 Dock 没有当前面板；补成唯一的终端面板，⌘J 打开时才会触发自动新开终端。
 	if p.Workspace.Bottom.ActivePanel == "" {
 		p.Workspace.Bottom.ActivePanel = panelTerminal
+	}
+	// 2. 远端服务器列表按弱依赖过滤：跳过损坏或重名条目，不因此拒绝整份偏好。
+	if len(p.RemoteServers) > 0 {
+		validServers := make([]remoteServer, 0, len(p.RemoteServers))
+		seenIDs := make(map[string]bool, len(p.RemoteServers))
+		for _, server := range p.RemoteServers {
+			server.ID = strings.TrimSpace(server.ID)
+			server.Name = strings.TrimSpace(server.Name)
+			if server.ID == "" || server.ID == localServerID || seenIDs[server.ID] {
+				continue
+			}
+			parsedURL, parsedToken, _, _, parseErr := parseRemoteServerInput(server.URL, server.Token)
+			if parseErr != nil {
+				continue
+			}
+			seenIDs[server.ID] = true
+			validServers = append(validServers, remoteServer{
+				ID:    server.ID,
+				Name:  server.Name,
+				URL:   parsedURL,
+				Token: parsedToken,
+			})
+		}
+		p.RemoteServers = validServers
+	}
+	p.ActiveServer = strings.TrimSpace(p.ActiveServer)
+	if p.ActiveServer != "" && p.ActiveServer != localServerID && !slices.ContainsFunc(p.RemoteServers, func(s remoteServer) bool { return s.ID == p.ActiveServer }) {
+		p.ActiveServer = ""
 	}
 	d.preferences = p
 	return nil

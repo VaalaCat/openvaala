@@ -35,6 +35,7 @@ const (
 	commandSwitchReasoning      = "switch-reasoning"
 	commandOpenWorkLocation     = "open-work-location"
 	commandReloadConfig         = "reload-config"
+	commandManageServers        = "manage-servers"
 	commandSwitchTheme          = "switch-theme"
 	commandSwitchLanguage       = "switch-language"
 	commandPanelPrefix          = "panel."
@@ -97,6 +98,7 @@ func (d *Desktop) getCommands(c *ui.Context) []kit.Command {
 	// 5. 设置：打开设置、重载配置、切换主题与语言。
 	commands = append(commands,
 		kit.Command{ID: commandSettings, Title: d.t("settings"), Group: settingsGroup, Keys: shortcutHint(",", false), Icon: kit.IconSettings},
+		kit.Command{ID: commandManageServers, Title: d.t("server.manage"), Group: settingsGroup, Icon: kit.IconServerCog},
 		kit.Command{ID: commandReloadConfig, Title: d.t("reload.configuration"), Group: settingsGroup, Icon: kit.IconRefresh, Disabled: d.client == nil},
 		kit.Command{ID: commandSwitchTheme, Title: d.t("command.switch.theme"), Group: settingsGroup, Icon: kit.IconSettings},
 		kit.Command{ID: commandSwitchLanguage, Title: d.t("command.switch.language"), Group: settingsGroup, Icon: kit.IconSettings},
@@ -176,6 +178,8 @@ func (d *Desktop) runCommand(commandID string) {
 	// 5. 设置。
 	case commandReloadConfig:
 		d.reloadConfiguration()
+	case commandManageServers:
+		d.openServersDialog()
 	case commandSwitchTheme:
 		d.cycleTheme()
 	case commandSwitchLanguage:

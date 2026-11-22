@@ -72,7 +72,7 @@ func (d *Desktop) providersView(c *ui.Context) {
 		d.errorMessageView(c, d.providerError)
 	}
 	if showCatalog && d.catalogError != nil {
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Gap(kit.GetTheme(c).Space(2)).AlignItems(ui.Center).Children(func() {
 			d.errorMessageView(c, d.catalogError).Shrink(1)
 			if kit.Button(c, d.t("retry")).Clicked() {
 				d.catalogRequested, d.catalogError = false, nil
@@ -384,7 +384,7 @@ func (d *Desktop) settingInputRow(c *ui.Context, key, title, description string,
 	t := kit.GetTheme(c)
 	kit.SettingRow(c.Key(key), title, description, func() {
 		ui.Column(c).Width(settingInputWidth).Gap(t.Space(1)).Children(func() {
-			input := kit.TextInputWith(c.Key("value"), value, kit.InputOpt{ReadOnly: opt.ReadOnly, Invalid: opt.Error != ""}).Label(title)
+			input := kit.TextInputWith(c.Key("value"), value, kit.InputOpt{ReadOnly: opt.ReadOnly, Invalid: opt.Error != "", Placeholder: opt.Placeholder}).Label(title)
 			if opt.Password {
 				input.Password()
 			}

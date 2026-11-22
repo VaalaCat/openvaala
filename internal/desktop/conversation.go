@@ -624,9 +624,9 @@ func (d *Desktop) loadTurnRecords(target readingTarget, ids []defs.TurnID) {
 
 // conversationView 绘制标题、消息历史与固定在底部的输入区。
 func (d *Desktop) conversationView(c *ui.Context) {
-	// 1. 标题栏左侧是对话标题（根 Session，点击改名）或子 Agent 面包屑，右侧是对话菜单。
+	// 1. 主阅读区保持 Editor 底色，与左右侧栏/Dock 和用户卡片的 Panel 底色拉开层次；标题栏保持 Panel。
 	t := kit.GetTheme(c)
-	ui.Column(c.Key("conversation-main")).Fill().Gap(0).Background(t.Colors.Panel).Children(func() {
+	ui.Column(c.Key("conversation-main")).Fill().Gap(0).Background(t.Colors.Editor).Children(func() {
 		// 标题栏背景铺满，内容与消息列同宽居中：标题文字在列左缘，⋯ 按钮右缘与消息右侧操作图标对齐。
 		ui.Row(c).Height(t.Metrics.HeaderHeight).Shrink(0).Justify(ui.Center).Background(t.Colors.Panel).BorderWidth(0, 0, 1, 0).BorderColor(t.Colors.Border).Children(func() {
 			ui.Row(c).Grow(1).MaxWidth(conversationColumnWidth+2*t.Space(4)).Padding(0, t.Space(4)).Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
@@ -883,7 +883,7 @@ func (d *Desktop) sessionControls(c *ui.Context, composer ui.Element) {
 	}
 	isFolded := composer.Valid() && composer.Bounds().W > 0 && composer.Bounds().W < composerFoldWidth
 	// 3. 顺序固定：上下文圆环、模型、推理强度、工作位置、压缩；输入区太窄时后两项折进「更多」。
-	ui.Row(c.Key("model-controls")).Gap(4).AlignItems(ui.Center).Children(func() {
+	ui.Row(c.Key("model-controls")).Gap(kit.GetTheme(c).Space(1)).AlignItems(ui.Center).Children(func() {
 		if d.readingTarget.ConversationID != "" {
 			d.contextRingView(c, info, ready)
 		}
@@ -1008,7 +1008,7 @@ func (d *Desktop) newConversationPopover(c *ui.Context, anchor, composer ui.Elem
 	t := kit.GetTheme(c)
 	ui.PopoverBase(c, anchor, &d.workLocationPopoverOpen, func(panel ui.Element) {
 		panel.AttachTo(composer, ui.AnchorTopEnd, ui.AnchorBottomEnd).Margin(0, t.Space(3), t.Space(1), 0)
-		panel.Radius(t.Metrics.RadiusLarge).Padding(t.Space(4)).Background(t.Colors.Elevated).Border(1, t.Colors.Border)
+		panel.Radius(t.Metrics.RadiusLarge).Padding(t.Space(3)).Background(t.Colors.Elevated).Border(1, t.Colors.Border)
 		panel.Children(func() { d.newConversationFields(c) })
 	})
 }

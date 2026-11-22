@@ -1,7 +1,9 @@
 package desktop
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -11,46 +13,118 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
-// connect 异步发现服务，启动唯一 Client 和顺序事件读取任务。
+// getActiveServerTarget 返回当前应当连接的远端服务器档案；isLocal 为 true 时连接本机 serve。
+func (d *Desktop) getActiveServerTarget() (target *remoteServer, isLocal bool) {
+	// 1. 命令行 --url 一次性覆盖优先级最高。
+	if d.serverOverride != nil {
+		server := *d.serverOverride
+		return &server, false
+	}
+	// 2. 偏好里显式选中的远端服务器。
+	if d.preferences.ActiveServer != "" && d.preferences.ActiveServer != localServerID {
+		if index := slices.IndexFunc(d.preferences.RemoteServers, func(s remoteServer) bool { return s.ID == d.preferences.ActiveServer }); index >= 0 {
+			server := d.preferences.RemoteServers[index]
+			return &server, false
+		}
+	}
+	// 3. 偏好还没显式选过服务器时，回落到 config.yaml 的 client.url；否则连接本机。
+	if d.preferences.ActiveServer == "" && d.defaultRemote != nil {
+		server := *d.defaultRemote
+		return &server, false
+	}
+	return nil, true
+}
+
+// getActiveServerLabel 返回状态栏和横幅里显示的当前服务器名称。
+func (d *Desktop) getActiveServerLabel() string {
+	target, isLocal := d.getActiveServerTarget()
+	if isLocal {
+		return d.t("server.local")
+	}
+	if target.Name != "" {
+		return target.Name
+	}
+	return getRemoteServerHost(target.URL)
+}
+
+// connect 异步连接当前选定的本机或远端 serve，启动独立上下文的 Client 与事件读取任务。
 func (d *Desktop) connect() {
 	// 1. 发现服务或重连进行中不再重复发起；普通重连使用同一 Client，不再创建连接。
 	if d.connecting {
 		return
 	}
-	d.connecting = true
 	if d.client != nil && !d.clientStopped {
+		d.connecting = true
 		client := d.client
+		connCtx := d.clientCtx
+		if connCtx == nil {
+			connCtx = d.ctx
+		}
+		generation := d.connectGeneration
 		d.tasks.Go(func() {
-			err := client.Reconnect(d.ctx)
+			err := client.Reconnect(connCtx)
 			d.window.Update(func() {
-				if d.closed {
+				if d.closed || d.connectGeneration != generation {
 					return
 				}
 				d.connecting = false
-				if err != nil {
+				if err != nil && !errors.Is(err, connCtx.Err()) {
 					d.connectionError = err
 				}
 			})
 		})
 		return
 	}
-	// 2. 发现服务，在窗口线程发布 Client 后启动两个常驻任务。
+	// 2. 启动参数解析失败时直接暴露错误，不静默切回本机。
+	if d.startTargetError != nil && d.serverOverride == nil && d.preferences.ActiveServer == "" {
+		d.connectionError = d.startTargetError
+		d.connectionState = runtimeclient.ConnectionConnecting
+		return
+	}
+	// 3. 为本次连接建立独立上下文，切服时可立即取消而不影响窗口生命周期。
+	if d.clientCancel != nil {
+		d.clientCancel()
+	}
+	connCtx, connCancel := context.WithCancel(d.ctx)
+	d.clientCtx = connCtx
+	d.clientCancel = connCancel
+	d.connectGeneration++
+	generation := d.connectGeneration
+	d.connecting = true
+	d.connectionError = nil
+	target, isLocal := d.getActiveServerTarget()
 	d.tasks.Go(func() {
-		connection, err := cli.EnsureRuntimeServer(d.ctx, &d.opt.RuntimeServerStart)
+		var (
+			runtimeURL string
+			token      string
+			serverID   string
+			err        error
+		)
+		if isLocal {
+			var connection cli.RuntimeServerConnection
+			connection, err = cli.EnsureRuntimeServer(connCtx, &d.opt.RuntimeServerStart)
+			if err == nil {
+				runtimeURL, token, serverID = connection.URL, connection.Token, connection.ServerID
+			}
+		} else {
+			runtimeURL, token = target.URL, target.Token
+		}
 		var client runtimeclient.Client
 		if err == nil {
-			opt := runtimeclient.NewClientOpt(connection.URL, connection.Token)
+			opt := runtimeclient.NewClientOpt(runtimeURL, token)
 			opt.FailRequestsWhenDisconnected = true
 			opt.DisableSubmitInputRetry = true
 			opt.RPCFrameCapacity = 2000
 			client, err = runtimeclient.NewClient(opt)
 		}
 		d.window.Update(func() {
-			if d.closed {
+			if d.closed || d.connectGeneration != generation {
+				connCancel()
 				return
 			}
 			d.connecting = false
@@ -61,15 +135,15 @@ func (d *Desktop) connect() {
 			d.client = client
 			d.clientStopped = false
 			d.clientNeedsReading = d.readingTarget.ConversationID != ""
-			d.setServerIdentity(connection.ServerID)
+			d.setServerIdentity(serverID)
 			d.tasks.Go(func() {
-				err := client.Run(d.ctx)
+				err := client.Run(connCtx)
 				d.window.Update(func() {
-					if d.closed || d.client != client {
+					if d.closed || d.client != client || d.connectGeneration != generation {
 						return
 					}
 					d.clientStopped = true
-					if err != nil && !errors.Is(err, d.ctx.Err()) {
+					if err != nil && !errors.Is(err, connCtx.Err()) {
 						d.connectionError = err
 					}
 				})
@@ -77,7 +151,7 @@ func (d *Desktop) connect() {
 			d.tasks.Go(func() {
 				for event := range client.Events() {
 					d.window.Update(func() {
-						if !d.closed && d.client == client {
+						if !d.closed && d.client == client && d.connectGeneration == generation {
 							d.handleClientEvent(event)
 						}
 					})
@@ -85,6 +159,144 @@ func (d *Desktop) connect() {
 			})
 		})
 	})
+}
+
+// switchServer 切换到指定服务器（localServerID 表示本机）；若有未保存设置编辑先弹确认框。
+func (d *Desktop) switchServer(serverID string) {
+	// 1. 保护未保存的设置草稿。
+	if d.isProviderDirty() || d.isExecutorDirty() {
+		d.confirm = confirmation{Kind: "switch-server", ServerID: serverID}
+		d.confirmOpen = true
+		return
+	}
+	d.forceSwitchServer(serverID)
+}
+
+// forceSwitchServer 取消旧连接、清空旧服务器业务状态并连接到新目标，同时保留按 serverID 隔离的输入草稿。
+func (d *Desktop) forceSwitchServer(serverID string) {
+	// 1. 停止当前连接并使旧异步回调失效。
+	if d.clientCancel != nil {
+		d.clientCancel()
+		d.clientCancel = nil
+	}
+	d.clientCtx = nil
+	d.connectGeneration++
+	d.serverOverride = nil
+	d.startTargetError = nil
+	// 2. 更新并持久化当前选定的服务器。
+	if serverID == "" || serverID == localServerID {
+		d.preferences.ActiveServer = localServerID
+	} else {
+		d.preferences.ActiveServer = serverID
+	}
+	d.resetServerState()
+	d.savePreferencesWithToast()
+	if d.window != nil {
+		d.connect()
+	}
+}
+
+// resetServerState 清空属于上一台服务器的运行时列表与阅读状态，保留按 serverID 分桶的 d.drafts。
+func (d *Desktop) resetServerState() {
+	// 1. 取消正在进行的阅读拉取并释放当前终端屏幕。
+	if d.cancelReading != nil {
+		d.cancelReading()
+		d.cancelReading = nil
+	}
+	d.closeTerminalStates()
+	// 2. 重置连接状态、会话、配置与面板数据。
+	d.client = nil
+	d.connecting = false
+	d.clientStopped = false
+	d.clientNeedsReading = false
+	d.connectionState = runtimeclient.ConnectionConnecting
+	d.connectionError = nil
+	d.serverID = ""
+	d.conversations = nil
+	d.conversationCursor = dao.RecordCursor[defs.ConversationID]{}
+	d.conversationLoading = false
+	d.conversationError = nil
+	d.conversationRequest++
+	d.conversationHighlight = ""
+	d.runningKnown = false
+	d.runningConversations = nil
+	d.unreadConversations = make(map[defs.ConversationID]bool)
+	d.readingTarget = readingTarget{}
+	d.conversation = defs.Conversation{}
+	d.previousConversation = defs.Conversation{}
+	d.sessionInfos = nil
+	d.items = nil
+	d.toolProgress = nil
+	d.itemCursor = 0
+	d.readingReady = false
+	d.historyLoading = false
+	d.historyError = nil
+	d.pendingInputs = session.SessionPendingInputs{}
+	d.turns = make(map[defs.TurnID]defs.Turn)
+	d.models = runtime.ModelList{}
+	d.modelLoading = false
+	d.modelsLoaded = false
+	d.executors = nil
+	d.executorsLoading = false
+	d.executorConfigs = nil
+	d.executorConfigsLoading = false
+	d.executorConfigsError = nil
+	d.sshConfigHosts = nil
+	d.sshConfigHostsLoaded = false
+	d.sshImportSelected = ""
+	d.executorDraft = nil
+	d.executorBaseline = nil
+	d.executorSaving = false
+	d.executorError = nil
+	d.executorTesting = false
+	d.executorTestSuccess = ""
+	d.executorTestError = nil
+	d.executorTestRequest++
+	d.recentConversations = nil
+	d.recentConversationsRequest++
+	d.directoryError = nil
+	d.directoryRequest++
+	d.directoryListing = directoryListing{}
+	d.agents = nil
+	d.agentsError = nil
+	d.skillCatalogs = make(map[skillCatalogKey]*skillCatalog)
+	d.configuredSkills = nil
+	d.itemExpanded = make(map[string]bool)
+	d.inspectedItem = ""
+	d.inspectedTurn = ""
+	d.contextUsage = nil
+	d.sessionDetails = nil
+	d.contextLoading = false
+	d.sessionDetailsLoading = false
+	d.turnsLoading = false
+	d.detailsError = nil
+	d.turnCursor = dao.RecordCursor[defs.TurnID]{}
+	d.turnPage = nil
+	d.rpcFrames = nil
+	d.rpcRows = nil
+	d.rpcLoading = false
+	d.rpcSelected = 0
+	d.providers = nil
+	d.defaultModel = defs.ModelRef{}
+	d.modelDefaults = defs.ModelDefaults{}
+	d.providerDraft = nil
+	d.providerBaseline = nil
+	d.providerLoading = false
+	d.providerSaving = false
+	d.providerError = nil
+	d.hooks = nil
+	d.mcpServers = nil
+	d.mcpLoading = false
+	d.mcpError = nil
+	d.settingsError = nil
+	d.settingsLoading = false
+	d.settingsRequest++
+	d.terminals = nil
+	d.selectedTerminal = ""
+	d.runningTerminals = nil
+	d.terminalsKnown = false
+	d.openingTerminalRequests = 0
+	d.closingTerminalIDs = nil
 }
 
 // handleClientEvent 按真实事件归属更新连接、列表和当前阅读内容。
@@ -321,12 +533,18 @@ func (d *Desktop) connectionBannerView(c *ui.Context) {
 	}
 	ui.Row(c).Shrink(0).Justify(ui.Center).Padding(t.Space(2), 0, 0, 0).Children(func() {
 		ui.Column(c).Grow(1).MaxWidth(conversationColumnWidth+2*t.Space(4)).Padding(0, t.Space(4)).Children(func() {
+			_, isLocal := d.getActiveServerTarget()
 			kit.Callout(c.Key("connection-banner"), kind, d.getConnectionMessage(), detail, func() {
 				if isRetrying {
 					kit.Spinner(c, kit.IconSizeDefault).Label(d.t("reconnecting"))
 				}
 				if kit.Button(c, d.t("retry")).Disabled(d.connecting).Clicked() {
 					d.connect()
+				}
+				if !isLocal {
+					if kit.Button(c.Key("switch-local"), d.t("server.switch.local")).Clicked() {
+						d.switchServer(localServerID)
+					}
 				}
 			})
 		})
@@ -344,6 +562,19 @@ func (d *Desktop) getConnectionTooltip() string {
 // getConnectionMessage 返回连接问题的本地化原因；没有错误只是在重连时说明正在重连。
 func (d *Desktop) getConnectionMessage() string {
 	err := d.connectionError
+	_, isLocal := d.getActiveServerTarget()
+	if !isLocal {
+		name := d.getActiveServerLabel()
+		switch {
+		case err == nil:
+			return fmt.Sprintf(d.t("connection.banner.remote.reconnecting"), name)
+		case errors.Is(err, runtimeclient.ErrUnauthorized):
+			return fmt.Sprintf(d.t("connection.banner.remote.unauthorized"), name)
+		case errors.Is(err, runtimeclient.ErrConnectionLost), errors.Is(err, runtimeclient.ErrClientStopped):
+			return fmt.Sprintf(d.t("connection.banner.remote.lost"), name)
+		}
+		return fmt.Sprintf(d.t("connection.banner.remote.failed"), name)
+	}
 	switch {
 	case err == nil:
 		return d.t("connection.banner.reconnecting")

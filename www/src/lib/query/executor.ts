@@ -1,12 +1,86 @@
-import { queryOptions } from "@tanstack/react-query"
+import {
+  mutationOptions,
+  queryOptions,
+  type QueryClient,
+} from "@tanstack/react-query"
 import type { ServerConnection } from "../api/server-connection"
-import type { ListDirectoriesParams } from "../api/protocol.gen"
+import type {
+  ExecutorConfig,
+  ListDirectoriesParams,
+  TestSSHExecutorParams,
+} from "../api/protocol.gen"
 
-// 全部 Executor 和它们的默认根目录
+const executorInvalidationSegments = [
+  "executors",
+  "executorConfigs",
+  "workspaceDirectories",
+  "skills",
+]
+
+function invalidateExecutors(
+  queryClient: QueryClient,
+  connection: ServerConnection
+): Promise<void[]> {
+  return Promise.all(
+    executorInvalidationSegments.map((segment) =>
+      queryClient.invalidateQueries({
+        queryKey: [connection.getServerID(), segment],
+      })
+    )
+  )
+}
+
+// 全部 Executor 和它们的默认根目录（运行时列表，含内置 Executor）
 export function executorListOptions(connection: ServerConnection) {
   return queryOptions({
     queryKey: [connection.getServerID(), "executors"],
     queryFn: () => connection.call("executor/list", {}),
+  })
+}
+
+// executors/*.yaml 里的原样 Executor 配置，含 SSH 地址和私钥路径
+export function executorConfigListOptions(connection: ServerConnection) {
+  return queryOptions({
+    queryKey: [connection.getServerID(), "executorConfigs"],
+    queryFn: () => connection.call("executor/config/list", {}),
+  })
+}
+
+// serve 本机 ~/.ssh/config 里的非通配符 Host 列表（弱依赖，失败时当空处理）
+export function sshConfigHostsOptions(connection: ServerConnection) {
+  return queryOptions({
+    queryKey: [connection.getServerID(), "sshConfigHosts"],
+    queryFn: () => connection.call("executor/sshConfigHosts", {}),
+    retry: false,
+  })
+}
+
+// 原子写入 Executor 配置并热重载
+export function setExecutorOptions(connection: ServerConnection) {
+  return mutationOptions({
+    mutationFn: (executor: ExecutorConfig) =>
+      connection.call("executor/set", { executor }),
+    onSuccess: (_result, _variables, _onMutateResult, context) =>
+      invalidateExecutors(context.client, connection),
+  })
+}
+
+// 删除 Executor 配置并热重载
+export function deleteExecutorOptions(connection: ServerConnection) {
+  return mutationOptions({
+    mutationFn: (executorID: string) =>
+      connection.call("executor/delete", { executor_id: executorID }),
+    onSuccess: (_result, _variables, _onMutateResult, context) => {
+      void invalidateExecutors(context.client, connection)
+    },
+  })
+}
+
+// 测试 SSH 连接与远端工作目录，不写入任何文件
+export function testSSHExecutorOptions(connection: ServerConnection) {
+  return mutationOptions({
+    mutationFn: (params: TestSSHExecutorParams) =>
+      connection.call("executor/test", params),
   })
 }
 

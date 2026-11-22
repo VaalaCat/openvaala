@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 )
 
 // TruncateConversationTitle 截取对话标题，最多保留 256 个 Unicode 字符。

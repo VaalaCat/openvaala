@@ -21,21 +21,22 @@ type WebViewDesktop struct {
 	loadError error
 }
 
-// WebViewDesktopOpt 指定 WebUI 使用的本机服务启动参数。
+// WebViewDesktopOpt 指定 WebUI 使用的本机服务启动参数与可选远端目标。
 type WebViewDesktopOpt struct {
 	RuntimeServerStart cli.RuntimeServerStartOpt
+	StartTarget        cli.DesktopStartTarget
 }
 
 // NewWebViewDesktop 校验并保存 WebView 桌面的启动参数。
 func NewWebViewDesktop(opt *WebViewDesktopOpt) (*WebViewDesktop, error) {
-	// 1. 检查并保存本机服务启动配置。
-	if opt == nil || opt.RuntimeServerStart.Executable == "" {
+	// 1. 检查并保存本机服务启动配置；指定远端目标时不要求本机可执行文件。
+	if opt == nil || (opt.RuntimeServerStart.Executable == "" && strings.TrimSpace(opt.StartTarget.URL) == "") {
 		return nil, errors.New("WebView desktop requires a runtime executable")
 	}
 	return &WebViewDesktop{opt: *opt}, nil
 }
 
-// Run 连接本机服务，在主 goroutine 运行 WebView 窗口并等待本进程任务退出。
+// Run 连接目标服务，在主 goroutine 运行 WebView 窗口并等待本进程任务退出。
 func (d *WebViewDesktop) Run(ctx context.Context) error {
 	// 1. 取得 WebView 模式的单实例身份，检查系统浏览器组件。
 	mygo.App.SetName("OpenVaala Web")
@@ -45,12 +46,23 @@ func (d *WebViewDesktop) Run(ctx context.Context) error {
 	if !mygo.WebViewAvailable() {
 		return errors.New("system WebView is unavailable; on Linux install WebKitGTK (libwebkit2gtk-4.1-0), or use `openvaala app --native`")
 	}
-	// 2. 复用或启动本机 serve，检查它提供的 WebUI 页面。
-	connection, err := cli.EnsureRuntimeServer(ctx, &d.opt.RuntimeServerStart)
-	if err != nil {
-		return err
+	// 2. 指定了 --url / client.url 时直接加载远端 WebUI，否则复用或启动本机 serve。
+	var runtimeURL, token string
+	isRemote := strings.TrimSpace(d.opt.StartTarget.URL) != ""
+	if isRemote {
+		parsedURL, parsedToken, _, _, err := parseRemoteServerInput(d.opt.StartTarget.URL, d.opt.StartTarget.Token)
+		if err != nil {
+			return err
+		}
+		runtimeURL, token = parsedURL, parsedToken
+	} else {
+		connection, err := cli.EnsureRuntimeServer(ctx, &d.opt.RuntimeServerStart)
+		if err != nil {
+			return err
+		}
+		runtimeURL, token = connection.URL, connection.Token
 	}
-	address, err := cli.GetWebUIURL(connection.URL, connection.Token)
+	address, err := cli.GetWebUIURL(runtimeURL, token)
 	if err != nil {
 		return err
 	}
@@ -72,10 +84,16 @@ func (d *WebViewDesktop) Run(ctx context.Context) error {
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {
+		if isRemote {
+			return fmt.Errorf("load remote WebUI: %w", err)
+		}
 		return fmt.Errorf("load local WebUI: %w", err)
 	}
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/html") {
+		if isRemote {
+			return fmt.Errorf("the remote runtime server does not provide the WebUI (HTTP %d)", response.StatusCode)
+		}
 		return fmt.Errorf("the local runtime server does not provide the WebUI (HTTP %d); build with script/build-desktop.sh, then run `openvaala serve stop` before reopening the desktop", response.StatusCode)
 	}
 	// 3. 就绪后建立窗口和菜单，仅允许本机页面在窗口内导航。

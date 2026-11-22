@@ -1,6 +1,15 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { getPageServerURL, takeTokenFromHash } from "./servers"
+import {
+  $activeServerURL,
+  $servers,
+  getPageServerURL,
+  parseServerInput,
+  removeServer,
+  setActiveServerURL,
+  takeTokenFromHash,
+  upsertServer,
+} from "./servers"
 
 test("takeTokenFromHash reads the token written by openvaala web", () => {
   const cases: { name: string; hash: string; want: string | undefined }[] = [
@@ -42,4 +51,107 @@ test("getPageServerURL follows the page protocol and host", () => {
   ]
   for (const { name, protocol, host, want } of cases)
     assert.equal(getPageServerURL({ protocol, host }), want, name)
+})
+
+test("parseServerInput normalizes web links, ws links, and bare hosts", () => {
+  const cases = [
+    {
+      name: "http_web_link_with_hash_token",
+      rawURL: "http://10.0.0.5:8790/web/v1/#token=secret-1",
+      fallback: "old",
+      want: {
+        ok: true as const,
+        url: "ws://10.0.0.5:8790/api/v1/openvaala",
+        token: "secret-1",
+        defaultName: "10.0.0.5:8790",
+        extractedToken: true,
+      },
+    },
+    {
+      name: "https_web_link_with_hash_token",
+      rawURL: "https://gpu.vaala.dev/web/v1/#token=t%202",
+      fallback: "",
+      want: {
+        ok: true as const,
+        url: "wss://gpu.vaala.dev/api/v1/openvaala",
+        token: "t 2",
+        defaultName: "gpu.vaala.dev",
+        extractedToken: true,
+      },
+    },
+    {
+      name: "ws_url_with_query_token",
+      rawURL: "ws://10.0.0.5:8790/api/v1/openvaala?token=qtok",
+      fallback: "",
+      want: {
+        ok: true as const,
+        url: "ws://10.0.0.5:8790/api/v1/openvaala",
+        token: "qtok",
+        defaultName: "10.0.0.5:8790",
+        extractedToken: true,
+      },
+    },
+    {
+      name: "bare_host_port_defaults_to_ws",
+      rawURL: "10.0.0.8:8790",
+      fallback: "manual",
+      want: {
+        ok: true as const,
+        url: "ws://10.0.0.8:8790/api/v1/openvaala",
+        token: "manual",
+        defaultName: "10.0.0.8:8790",
+        extractedToken: false,
+      },
+    },
+    {
+      name: "empty_input_rejected",
+      rawURL: "   ",
+      fallback: "",
+      want: { ok: false as const, error: "required" as const },
+    },
+    {
+      name: "unsupported_scheme_rejected",
+      rawURL: "ftp://10.0.0.5:21",
+      fallback: "",
+      want: { ok: false as const, error: "unsupportedScheme" as const },
+    },
+  ]
+  for (const tc of cases)
+    assert.deepEqual(
+      parseServerInput(tc.rawURL, tc.fallback),
+      tc.want,
+      tc.name
+    )
+})
+
+test("upsertServer, setActiveServerURL, and removeServer manage profiles cleanly", () => {
+  const pageURL = "ws://127.0.0.1:8790/api/v1/openvaala"
+  $servers.set([])
+  $activeServerURL.set("")
+
+  upsertServer({
+    url: "ws://10.0.0.5:8790/api/v1/openvaala",
+    token: "tok-1",
+    name: "Dev Box",
+  })
+  assert.equal($servers.get().length, 1)
+  assert.equal($servers.get()[0]?.name, "Dev Box")
+
+  setActiveServerURL("ws://10.0.0.5:8790/api/v1/openvaala", pageURL)
+  assert.equal($activeServerURL.get(), "ws://10.0.0.5:8790/api/v1/openvaala")
+
+  // Editing URL updates active target in place.
+  upsertServer({
+    previousURL: "ws://10.0.0.5:8790/api/v1/openvaala",
+    url: "wss://gpu.vaala.dev/api/v1/openvaala",
+    token: "tok-2",
+    name: "GPU",
+  })
+  assert.equal($activeServerURL.get(), "wss://gpu.vaala.dev/api/v1/openvaala")
+  assert.equal($servers.get()[0]?.url, "wss://gpu.vaala.dev/api/v1/openvaala")
+
+  // Deleting active server falls back to default page server.
+  removeServer("wss://gpu.vaala.dev/api/v1/openvaala")
+  assert.equal($servers.get().length, 0)
+  assert.equal($activeServerURL.get(), "")
 })

@@ -75,27 +75,6 @@ const BuiltinExecutorID = "openvaala"
 // virtualWorkspaceDirectory 是 virtual Executor 没写 workspace_directory 时的虚拟根目录，builtin 也用它。
 const virtualWorkspaceDirectory = "/workspace"
 
-// ExecutorConfig 是 executors/ 下一个文件声明的额外 Executor。
-type ExecutorConfig struct {
-	ID string `yaml:"id"`
-	// Kind 是 local（本机进程内执行）、virtual（go-bash 内存虚拟环境）或 ssh（经 SSH 访问远端机器）。
-	Kind defs.ExecutorKind `yaml:"kind"`
-	// Description 是给模型看的说明，模型据此选 Executor。
-	Description string `yaml:"description"`
-	// WorkspaceDirectory 是内置工具的根目录：local 是本机目录，virtual 是虚拟文件系统里的路径，ssh 是远端绝对路径。
-	WorkspaceDirectory string `yaml:"workspace_directory"`
-	// SSH 是 kind 为 ssh 时的连接参数，其他 kind 不使用。
-	SSH *SSHExecutorConfig `yaml:"ssh,omitempty"`
-}
-
-// SSHExecutorConfig 是 SSH Executor 的连接参数。
-type SSHExecutorConfig struct {
-	// Address 是 [user@]host[:port]。
-	Address string `yaml:"address"`
-	// IdentityFile 是本机私钥路径，加载时展开 ~；为空时依次使用 ssh-agent 与默认私钥。
-	IdentityFile string `yaml:"identity_file,omitempty"`
-}
-
 // ── MCP server 文件配置 ──
 
 // MCPServerConfig 声明一个 MCP server：stdio 在 Executor 的工作目录里启动命令，http、sse 从 Executor 所在机器连接 URL；

@@ -3,7 +3,7 @@ package defs
 import (
 	"fmt"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 )
 
 // Message 是一条消息：发送方、接收方地址和内容。

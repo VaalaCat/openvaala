@@ -57,6 +57,7 @@ func (d *Desktop) applyAppearance(c *ui.Context) {
 			t.Colors.Editor = ui.Hex("#1c1917")
 			t.Colors.Panel = ui.Hex("#292524")
 			t.Colors.Border = ui.Hex("#44403c")
+			t.Colors.BorderSubtle = ui.Hex("#35312e")
 			t.Colors.Text = ui.Hex("#fafaf9")
 			t.Colors.Muted = ui.Hex("#a8a29e")
 			t.Colors.Accent = ui.Hex("#d6d3d1")
@@ -65,6 +66,7 @@ func (d *Desktop) applyAppearance(c *ui.Context) {
 			t.Colors.Editor = ui.Hex("#fafaf9")
 			t.Colors.Panel = ui.Hex("#f5f5f4")
 			t.Colors.Border = ui.Hex("#d6d3d1")
+			t.Colors.BorderSubtle = ui.Hex("#e7e5e4")
 			t.Colors.Text = ui.Hex("#1c1917")
 			t.Colors.Muted = ui.Hex("#78716c")
 			t.Colors.Accent = ui.Hex("#44403c")
@@ -72,7 +74,6 @@ func (d *Desktop) applyAppearance(c *ui.Context) {
 		}
 		t.Colors.Elevated = t.Colors.Panel
 		t.Colors.Input = t.Colors.Editor
-		t.Colors.BorderSubtle = t.Colors.Border
 		t.Colors.Hover = t.Colors.Panel
 		t.Colors.Selected = t.Colors.Border
 	}

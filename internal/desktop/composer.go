@@ -35,8 +35,8 @@ func (d *Desktop) composerView(c *ui.Context) {
 	composer := ui.Column(c.Key("composer")).Shrink(0).Gap(0).Background(t.Colors.Editor).BorderWidth(1, 0, 0, 0).BorderColor(t.Colors.Border)
 	composer.Children(func() {
 		d.pendingInputsView(c)
-		// 2. 输入区背景和上边线铺满中间区，内容列最宽 800 并水平居中；列比文字宽 8，是输入框左右各 4 的内边距。
-		zone := ui.Column(c).Padding(8, 12)
+		// 2. 输入区背景和上边线铺满中间区，内容列最宽 800 并水平居中；外侧横边距 12 加输入框内边距 4，使输入文字与上方消息列 16 基线对齐。
+		zone := ui.Column(c).Padding(t.Space(2), t.Space(3))
 		// 手测：从文件管理器把图片和非图片文件一起拖到输入区。步骤：拖入一张图片和一个 .txt，
 		// 图片出现缩略图，同时弹出「只能添加图片」提示；再从系统剪贴板粘贴一张截图，也应出现缩略图。
 		if files := zone.DroppedFiles(); files != nil {
@@ -44,7 +44,7 @@ func (d *Desktop) composerView(c *ui.Context) {
 		}
 		zone.Children(func() {
 			ui.Row(c).Justify(ui.Center).Children(func() {
-				content := ui.Column(c).Grow(1).MaxWidth(conversationColumnWidth + t.Space(2)).Gap(4)
+				content := ui.Column(c).Grow(1).Shrink(1).MinWidth(0).MaxWidth(conversationColumnWidth + t.Space(2)).Gap(t.Space(1))
 				content.Children(func() {
 					d.attachmentsView(c, draft)
 					input := d.composerInput(c, key, draft, &text)
@@ -79,8 +79,9 @@ func (d *Desktop) attachmentsView(c *ui.Context, draft *conversationDraft) {
 	}
 	height = attachments.Animate("attachment-height", height, 150*time.Millisecond)
 	attachments.Height(height).Children(func() {
+		t := kit.GetTheme(c)
 		ui.ScrollHorizontal(c).Height(40).Children(func() {
-			ui.Row(c).Gap(8).Children(func() {
+			ui.Row(c).Gap(t.Space(2)).Children(func() {
 				for index, part := range draft.Content {
 					if part == nil || part.Image == nil {
 						continue
@@ -99,10 +100,12 @@ func (d *Desktop) attachmentsView(c *ui.Context, draft *conversationDraft) {
 		})
 	})
 	// 2. 上下文材料折叠显示，展开状态按材料指针记在桌面上。
-	for _, part := range draft.Content {
+	for index, part := range draft.Content {
 		if part != nil && part.Text != nil && part.Text.IsContext {
 			open := d.itemExpanded[fmt.Sprintf("material-%p", part)]
-			kit.Disclosure(c, d.t("context.material"), &open, func() { ui.Text(c, part.Text.Text).Selectable() })
+			kit.Disclosure(c.Key(index), d.t("context.material"), &open, func() {
+				d.outputView(c, d.t("context.material"), d.t("copy.output"), part.Text.Text)
+			})
 			d.itemExpanded[fmt.Sprintf("material-%p", part)] = open
 		}
 	}
@@ -110,14 +113,10 @@ func (d *Desktop) attachmentsView(c *ui.Context, draft *conversationDraft) {
 
 // composerInput 绘制消息输入框并处理发送、排队、停止、取回上一条和粘贴图片；text 在输入变化时被改写。
 func (d *Desktop) composerInput(c *ui.Context, key draftKey, draft *conversationDraft, text *string) ui.Element {
-	// 1. 有内容时用等宽字体；为空时用正文字体，占位符不带 Lilex 的字形。
+	// 1. 占位符和输入内容统一使用界面正文字体，避免键入首字时字号和字体跳变。
 	t := kit.GetTheme(c)
-	area := kit.TextArea(c.Key("composer-text"), text).Label(d.t("message")).Placeholder(d.t("message.skill")).Border(0, ui.Transparent).Background(ui.Transparent).Padding(4).FocusRing(false)
-	if *text == "" {
-		t.TextRole(area, kit.TextUI).FixedLineHeight(t.Space(5))
-	} else {
-		t.TextRole(area, kit.TextCode)
-	}
+	area := kit.TextArea(c.Key("composer-text"), text).Label(d.t("message")).Placeholder(d.t("message.skill")).Border(0, ui.Transparent).Background(ui.Transparent).Padding(t.Space(1)).FocusRing(false)
+	t.TextRole(area, kit.TextUI)
 	input := area.Lines(2, 8).Bind(&d.composerHandle)
 	_, d.composerCaret = input.TextAnchorCaret()
 	if d.composerCaretRequested {
@@ -217,7 +216,7 @@ func (d *Desktop) slashCompletionView(c *ui.Context, anchor, input ui.Element, d
 // composerToolbar 绘制输入区底部：添加图片在左，会话控件、排队和发送（或停止）在右。
 func (d *Desktop) composerToolbar(c *ui.Context, composer ui.Element, key draftKey, draft *conversationDraft) {
 	t := kit.GetTheme(c)
-	ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
 		if kit.IconButtonTip(c, kit.IconImagePlus, d.t("add.images")).Clicked() {
 			d.chooseImages(draft)
 		}

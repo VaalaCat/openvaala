@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 )
 
 // ModelRef 是模型目录中一个模型的标识：Provider 文件的 id 加这个文件里的模型 id。

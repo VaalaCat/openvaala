@@ -18,11 +18,11 @@ import (
 
 // itemsView 用消息滚动区虚拟绘制稳定消息；工具调用与结果按 CallID 配对。
 func (d *Desktop) itemsView(c *ui.Context) {
-	// 1. 派生行与配对结果，不复制后端业务状态。
+	// 1. 派生行、配对结果和已完成最终轮次，每帧只扫描一次，不复制后端业务状态。
 	items := slices.Clone(d.items)
 	target := d.readingTarget
 	rows, results := buildMessageRows(items)
-	finalKnown := d.getFinalKnownTurns(items)
+	finalTurns := d.getFinalTurns(items)
 	if d.messageList == nil {
 		d.messageList = &ui.ListState{}
 	}
@@ -32,7 +32,13 @@ func (d *Desktop) itemsView(c *ui.Context) {
 		d.jumpToTurn(listState, rows, items)
 	}
 	// 2. 只在用户滚到顶部后加载一页，列表保持原行锚点。
-	ui.Column(c.Key(target)).Grow(1).Children(func() {
+	listColumn := ui.Column(c.Key(target)).Grow(1).MinWidth(0)
+	listWidth := listColumn.Bounds().W
+	if listWidth <= 0 {
+		listWidth, _ = c.Size()
+	}
+	columnWidth := min(max(0, listWidth-2*kit.GetTheme(c).Space(4)), conversationColumnWidth)
+	listColumn.Children(func() {
 		opt := kit.MessageScrollerOpt{OnReachTop: func() {
 			if d.readingTarget.Request == target.Request && d.itemCursor != 0 && !d.historyLoading {
 				d.loadHistory()
@@ -46,7 +52,7 @@ func (d *Desktop) itemsView(c *ui.Context) {
 			t := kit.GetTheme(c)
 			// 每行是整宽外壳，内容列最宽 800 并水平居中；窄于 800 时由列表的 16 内边距提供左右留白。
 			ui.Row(c.Key(row.Key)).Justify(ui.Center).Children(func() {
-				container := ui.Column(c).Grow(1).MaxWidth(conversationColumnWidth).Gap(t.Space(2))
+				container := ui.Column(c).Grow(1).Shrink(1).MinWidth(0).MaxWidth(conversationColumnWidth).Gap(t.Space(2))
 				view := items[row.Index]
 				// 首次实时到达才渐显；历史与重连快照不设置到达时间。
 				if arrived := view.ArrivedAt; !arrived.IsZero() {
@@ -65,8 +71,8 @@ func (d *Desktop) itemsView(c *ui.Context) {
 					for _, mergedIndex := range row.MergedErrors {
 						merged = append(merged, items[mergedIndex])
 					}
-					d.itemView(c, view, results, merged, finalKnown)
-					d.itemFooter(c, view)
+					d.itemView(c, view, results, merged, finalTurns, columnWidth)
+					d.itemFooter(c, view, finalTurns)
 				})
 			})
 		}).Selectable()
@@ -107,10 +113,10 @@ func (d *Desktop) messageMenuItems(c *ui.Context) []kit.MenuItem {
 }
 
 // itemFooter 在真正最终结果下方显示右对齐的复制和调试图标。
-func (d *Desktop) itemFooter(c *ui.Context, view viewItem) {
+func (d *Desktop) itemFooter(c *ui.Context, view viewItem, finalTurns map[defs.TurnID]bool) {
 	// 1. 只有最终结果占用一行，其它消息不增加高度。
 	t := kit.GetTheme(c)
-	if view.Item.Kind != defs.ItemMessage || !d.isFinalResult(view) {
+	if !d.isFinalResultItem(view, finalTurns) {
 		return
 	}
 	ui.Row(c).Height(t.Space(6)).Gap(0).Justify(ui.End).AlignItems(ui.Center).Children(func() {
@@ -185,7 +191,7 @@ func buildMessageRows(items []viewItem) ([]messageRow, map[string]*defs.ToolResu
 }
 
 // itemView 按十三种业务 Item 绘制原生正文；除正文外都是 ActivityCard 标题行，展开状态各自独立。
-func (d *Desktop) itemView(c *ui.Context, view viewItem, results map[string]*defs.ToolResult, mergedErrors []viewItem, finalKnown map[defs.TurnID]bool) {
+func (d *Desktop) itemView(c *ui.Context, view viewItem, results map[string]*defs.ToolResult, mergedErrors []viewItem, finalTurns map[defs.TurnID]bool, columnWidth float32) {
 	// 1. 内容缺失以局部错误显示，未知类型保留原始数据。
 	item := view.Item
 	key := string(item.ID)
@@ -194,7 +200,7 @@ func (d *Desktop) itemView(c *ui.Context, view viewItem, results map[string]*def
 	}
 	switch item.Kind {
 	case defs.ItemMessage:
-		d.messageView(c, view, key, finalKnown)
+		d.messageView(c, view, key, finalTurns, columnWidth)
 	case defs.ItemReasoning:
 		d.reasoningView(c, view, key)
 	case defs.ItemToolCall:
@@ -277,11 +283,11 @@ func (d *Desktop) activityItem(c *ui.Context, key string, view viewItem, opt kit
 // instructionSource 在 Skill 和目录规则详情顶部显示「路径@Executor」。
 func (d *Desktop) instructionSource(c *ui.Context, path, executor string) {
 	t := kit.GetTheme(c)
-	t.TextRole(ui.Text(c, path+"@"+executor).Selectable(), kit.TextCaption).TextColor(t.Colors.Muted)
+	t.TextRole(ui.Text(c, path+"@"+executor).MinWidth(0).Selectable(), kit.TextCaption).TextColor(t.Colors.Muted)
 }
 
 // messageView 绘制用户卡片、其他 Agent 来信、中途回复折叠条目和助手正文。
-func (d *Desktop) messageView(c *ui.Context, view viewItem, key string, finalKnown map[defs.TurnID]bool) {
+func (d *Desktop) messageView(c *ui.Context, view viewItem, key string, finalTurns map[defs.TurnID]bool, columnWidth float32) {
 	// 1. 内容缺失以局部错误显示。
 	item := view.Item
 	t := kit.GetTheme(c)
@@ -290,15 +296,17 @@ func (d *Desktop) messageView(c *ui.Context, view viewItem, key string, finalKno
 		return
 	}
 	// 2. Turn 完成并确认最终回复后，中途回复折叠成条目。
-	if item.ModelCallID != "" && finalKnown[item.TurnID] && !d.isFinalResult(view) {
+	if item.ModelCallID != "" && finalTurns[item.TurnID] && !d.isFinalResultItem(view, finalTurns) {
 		d.activityItem(c, key, view, kit.ActivityCardOpt{Icon: kit.IconMessageSquare, Title: d.t("intermediate.response")}, nil, func() { d.contentView(c, item.Message.Content, false) })
 		return
 	}
-	// 3. 其他 Agent 的来信：标题加 Session 链接，正文预览最多 4 行，超过 4 行才可展开。
+	// 3. 其他 Agent 的来信：标题加 Session 链接，正文预览最多 4 行，超过 4 行（含自动换行）才可展开。
 	if item.Message.From != nil && item.Message.From.Kind == defs.IdentityAgent && item.ModelCallID == "" {
-		preview := contentText(item.Message.Content)
+		fullText := contentText(item.Message.Content)
+		preview, clipped := getMessagePreviewText(fullText, userMessagePreviewHardMaxLines, userMessagePreviewMaxRunes)
+		long := clipped || isTextExceedingLines(c, preview, max(0, columnWidth-t.Space(6)), t.Typography.Font, t.Typography.BodySize, userMessagePreviewLines)
 		var detail func()
-		if strings.Count(preview, "\n") >= 4 {
+		if long {
 			detail = func() { d.contentView(c, item.Message.Content, view.Streaming) }
 		}
 		open := d.itemExpanded[key]
@@ -306,85 +314,128 @@ func (d *Desktop) messageView(c *ui.Context, view viewItem, key string, finalKno
 		kit.ActivityCard(c, &open, opt, func() { d.inspectButton(c, view, false) }, detail)
 		d.itemExpanded[key] = open
 		if !open {
-			t.TextRole(ui.Text(c, preview).MaxLines(4), kit.TextProse).TextColor(t.Colors.Muted).Margin(0, 0, 0, t.Space(6))
+			t.TextRole(ui.Text(c, preview).MaxLines(userMessagePreviewLines).MinWidth(0), kit.TextProse).TextColor(t.Colors.Muted).Margin(0, 0, 0, t.Space(6))
 		}
 		return
 	}
 	if item.Message.From != nil && item.Message.From.Kind == defs.IdentityUser {
-		d.userMessageView(c, view)
+		d.userMessageView(c, view, columnWidth)
 		return
 	}
 	d.contentView(c, item.Message.Content, view.Streaming)
 }
 
-// userMessageView 绘制用户整宽卡片：原文不按 Markdown 渲染，图片缩略图跟在下面，右上角是悬停出现的「复制消息」和「从这里分叉」。
-func (d *Desktop) userMessageView(c *ui.Context, view viewItem) {
-	// 1. 正文超过 4 行时默认只显示 4 行，展开状态按消息 key 记在桌面上。
+// userMessageView 绘制用户整宽卡片：用户输入与附带材料分开展示，默认折叠为 4 行，右上角是悬停出现的「复制消息」和「从这里分叉」。
+func (d *Desktop) userMessageView(c *ui.Context, view viewItem, columnWidth float32) {
+	// 1. 拆分用户输入正文、附带材料和图片，避免把大段附带上下文混进正文排版。
 	item := view.Item
 	t := kit.GetTheme(c)
 	canFork := item.TurnID != "" && view.Ordinal != 0 && d.readingTarget.SessionID == d.conversation.RootSessionID
-	parts := make([]string, 0, len(item.Message.Content))
+	textParts := make([]string, 0, len(item.Message.Content))
+	contextParts := make([]*defs.TextContent, 0)
+	images := make([]*defs.ImageContent, 0)
 	for _, part := range item.Message.Content {
-		if part != nil && part.Text != nil {
-			parts = append(parts, part.Text.Text)
+		if part == nil {
+			continue
+		}
+		if part.Text != nil {
+			if part.Text.IsContext {
+				contextParts = append(contextParts, part.Text)
+			} else {
+				textParts = append(textParts, part.Text.Text)
+			}
+		}
+		if part.Image != nil {
+			images = append(images, part.Image)
 		}
 	}
-	text := strings.Join(parts, "\n")
+	text := strings.Join(textParts, "\n")
 	key := "user-message:" + string(item.ID)
 	open := d.itemExpanded[key]
-	card := ui.Row(c).Padding(t.Space(1), 0, t.Space(1), t.Space(3)).Gap(t.Space(2)).AlignItems(ui.Start).Radius(t.Metrics.RadiusLarge).Background(t.Colors.Editor).Border(1, t.Colors.Border)
+	// 2. 整宽卡片用 Panel 底色与主画布区分层次；左右 12 内边距留给非滚动区或滚动列表内部，保证滚动条贴卡片右缘且不压字。
+	card := ui.Column(c).MinWidth(0).Clip().Padding(t.Space(3), 0).Gap(t.Space(2)).Radius(t.Metrics.RadiusLarge).Background(t.Colors.Panel).Border(1, t.Colors.BorderSubtle)
+	textWidth := max(0, columnWidth-2*t.Space(3)-2)
 	card.Children(func() {
-		ui.Column(c).Grow(1).Shrink(1).Padding(t.Space(1), 0).Gap(t.Space(2)).Children(func() {
-			// 2. 完整正文按实际宽度排版，裁切框在四行和全文高度之间过渡，最后一行渐隐。
-			long := false
-			if text != "" {
-				previewHeight := 4 * t.Space(5)
-				clip := ui.Column(c.Key("user-message-body")).ClipY().Shrink(0)
+		long := false
+		if text != "" {
+			preview, clipped := getMessagePreviewText(text, userMessagePreviewHardMaxLines, userMessagePreviewMaxRunes)
+			large := isLargeUserMessage(text)
+			if large && open {
+				// 3. 超长正文展开时走铺满卡片全宽的虚拟列表，左右 12 内边距放在列表内部。
+				d.userMessageLargeBodyView(c, text)
+				long = true
+			} else {
+				// 4. 折叠态只排版有限预览，普通长消息展开与收起做高度过渡，最后一行渐隐到卡片底色。
+				lineHeight := t.Space(6)
+				previewHeight := userMessagePreviewLines * lineHeight
+				clip := ui.Column(c.Key("user-message-body")).MinWidth(0).Clip().Shrink(0).Padding(0, t.Space(3))
+				progress := float32(0)
+				if !large {
+					target := float32(0)
+					duration := t.Motion.DisclosureClose
+					if open {
+						target, duration = 1, t.Motion.DisclosureOpen
+					}
+					progress = clip.Animate("user-message-open", target, duration)
+				}
+				displayText := preview
+				if open || progress > 0 {
+					displayText = text
+				}
 				var body ui.Element
 				clip.Children(func() {
-					body = t.TextRole(ui.Text(c, text).Shrink(0), kit.TextCode)
+					body = t.TextRole(ui.Text(c, displayText).MinWidth(0).Shrink(0), kit.TextProse)
 				})
 				fullHeight := body.Bounds().H
-				long = fullHeight > previewHeight
-				if fullHeight == 0 {
+				long = clipped || fullHeight > previewHeight+1
+				if !long && fullHeight == 0 {
+					long = isTextExceedingLines(c, preview, textWidth, t.Typography.Font, t.Typography.BodySize, userMessagePreviewLines)
+				}
+				if fullHeight == 0 && !clipped {
 					c.AnimationFrame()
 				}
-				target := float32(0)
-				duration := t.Motion.DisclosureClose
-				if open {
-					target, duration = 1, t.Motion.DisclosureOpen
-				}
-				progress := clip.Animate("user-message-open", target, duration)
 				if fullHeight > 0 {
-					clip.Height(min(fullHeight, previewHeight) + max(0, fullHeight-previewHeight)*progress)
-				} else if !open {
-					clip.MaxHeight(previewHeight)
+					if (long || progress > 0) && progress < 1 {
+						clip.Height(min(fullHeight, previewHeight) + max(0, fullHeight-previewHeight)*progress)
+					}
+				} else if long && !open {
+					clip.Height(previewHeight)
 				}
 				if long && progress < 1 {
 					clip.DrawOver(func(p *ui.Painter, r ui.Rect) {
-						r.Y += r.H - t.Space(5)
-						r.H = t.Space(5)
-						p.FillGradient(r, ui.LinearGradient{From: t.Colors.Editor.Alpha(0), To: t.Colors.Editor.Alpha(1 - progress), Angle: 180}, 0)
+						r.Y += r.H - lineHeight
+						r.H = lineHeight
+						p.FillGradient(r, ui.LinearGradient{From: t.Colors.Panel.Alpha(0), To: t.Colors.Panel.Alpha(1 - progress), Angle: 180}, 0)
 					})
 				}
 			}
-			for _, part := range item.Message.Content {
-				if part != nil && part.Image != nil {
-					d.imageView(c, part.Image.DataURL, part.Image.Alt, 240)
+		}
+		if long || len(images) > 0 || len(contextParts) > 0 {
+			ui.Column(c).MinWidth(0).Padding(0, t.Space(3)).Gap(t.Space(2)).Children(func() {
+				if long {
+					label := d.t("expand")
+					if open {
+						label = d.t("collapse")
+					}
+					if kit.FlushButton(c, label).AlignSelf(ui.Start).Clicked() {
+						open = !open
+					}
 				}
-			}
-			if long {
-				label := d.t("expand")
-				if open {
-					label = d.t("collapse")
+				for _, img := range images {
+					d.imageView(c, img.DataURL, img.Alt, 240)
 				}
-				if kit.FlushButton(c, label).Clicked() {
-					open = !open
+				for index, ctxPart := range contextParts {
+					ctxKey := fmt.Sprintf("user-context:%s:%d", item.ID, index)
+					ctxOpen := d.itemExpanded[ctxKey]
+					kit.Disclosure(c.Key(ctxKey), d.t("context.material"), &ctxOpen, func() {
+						d.outputView(c, d.t("context.material"), d.t("copy.output"), ctxPart.Text)
+					})
+					d.itemExpanded[ctxKey] = ctxOpen
 				}
-			}
-		})
-		// 3. 两个 28 见方图标按钮，平时透明，悬停或聚焦卡片时出现。
-		actions := ui.Row(c).Shrink(0).AlignItems(ui.Center)
+			})
+		}
+		// 5. 两个 28 见方图标按钮浮在右上角，不占正文右侧留白，平时透明，悬停或聚焦卡片时出现。
+		actions := ui.Row(c).Absolute().Top(t.Space(2)).Right(t.Space(2)).Gap(0).AlignItems(ui.Center).Radius(t.Metrics.Radius).Background(t.Colors.Editor).Border(1, t.Colors.BorderSubtle)
 		if !card.Hovered() && !card.FocusWithin() {
 			actions.Opacity(0)
 		}
@@ -401,6 +452,46 @@ func (d *Desktop) userMessageView(c *ui.Context, view viewItem) {
 		})
 	})
 	d.itemExpanded[key] = open
+}
+
+// userMessageLargeBodyView 用固定高度的全宽虚拟列表分段展示超长用户正文，左右 12 内边距留在列表内部以避开悬浮滚动条。
+func (d *Desktop) userMessageLargeBodyView(c *ui.Context, text string) {
+	// 1. 按消息原文缓存切分结果，每帧只绘制当前视口内的文本块。
+	t := kit.GetTheme(c)
+	lineHeight := t.Space(6)
+	box := ui.Column(c.Key("user-message-large-body")).MinWidth(0).Clip()
+	cache := ui.Local(box, userMessageChunksKey{}, func() userMessageChunksCache { return userMessageChunksCache{} })
+	if cache.Chunks == nil || cache.Text != text {
+		cache.Text = text
+		cache.Chunks = splitUserMessageChunks(text, userMessageChunkMaxRunes)
+	}
+	listState := ui.Local(box, userMessageListKey{}, func() ui.ListState { return ui.ListState{} })
+	box.Height(userMessageMaxExpandedHeight).Children(func() {
+		ui.List(c, listState, len(cache.Chunks), func(index int) {
+			chunk := cache.Chunks[index]
+			if chunk == "" {
+				ui.Box(c).Height(lineHeight)
+				return
+			}
+			t.TextRole(ui.Text(c, chunk).MinWidth(0), kit.TextProse)
+		}).Grow(1).MinHeight(0).MinWidth(0).Padding(0, t.Space(3)).Selectable()
+	})
+}
+
+// isTextExceedingLines 在首帧尚未排版时估算文本在指定宽度下是否超过 maxLines 行？
+func isTextExceedingLines(c *ui.Context, text string, width float32, font string, size float32, maxLines int) bool {
+	if text == "" || width <= 0 {
+		return false
+	}
+	if strings.Count(text, "\n") >= maxLines {
+		return true
+	}
+	_, lineHeight := c.MeasureText(0, ui.Span{Text: "M", Font: font, Size: size})
+	if lineHeight <= 0 {
+		return false
+	}
+	_, totalHeight := c.MeasureText(width, ui.Span{Text: text, Font: font, Size: size})
+	return totalHeight > lineHeight*(float32(maxLines)+0.5)
 }
 
 // reasoningView 绘制思考条目：思考中闪烁，完成或中断后显示对应标题，展开看摘要或原文。
@@ -458,7 +549,7 @@ func (d *Desktop) modelErrorView(c *ui.Context, view viewItem, key string, merge
 				if failure.Code != "" {
 					text = failure.Code + ": " + text
 				}
-				t.TextRole(ui.Text(c, text).Selectable(), kit.TextUI).TextColor(t.Colors.Danger)
+				t.TextRole(ui.Text(c, text).MinWidth(0).Selectable(), kit.TextUI).TextColor(t.Colors.Danger)
 			}
 		}
 	})
@@ -483,7 +574,7 @@ func (d *Desktop) hookRunView(c *ui.Context, view viewItem, key string) {
 		opt.Status, opt.Tone = kit.ActivityFailed, kit.ActivityDanger
 	}
 	d.activityItem(c, key, view, opt, nil, func() {
-		ui.Text(c, value.ExecutorID+" · "+value.SourcePath).Selectable()
+		ui.Text(c, value.ExecutorID+" · "+value.SourcePath).MinWidth(0).Selectable()
 		d.outputView(c, d.t("output"), d.t("copy.output"), value.Handler+"\n"+value.AdditionalContext+"\n"+value.ErrorMessage+"\n"+value.BlockReason)
 		d.jsonView(c, "hook-details", d.t("hook.details"), value)
 	})
@@ -538,7 +629,7 @@ func (d *Desktop) executorsChangeView(c *ui.Context, view viewItem, key string) 
 				if detail != "" {
 					text += ": " + detail
 				}
-				ui.Text(c, text).SingleLine().Selectable()
+				ui.Text(c, text).SingleLine().MinWidth(0).Selectable()
 			}
 		})
 	}
@@ -684,7 +775,7 @@ func (d *Desktop) imagePreviewView(c *ui.Context) {
 			d.imagePreviewOpen = false
 		}
 		kit.ImagePreview(c, d.getImageResource(d.imagePreview, ""), &d.imagePreviewState).Height(height - 180).FillWidth()
-	}).Width(width - 48).Height(height - 48)
+	}).Width(width - 48).MaxWidth(width - 48).Height(height - 48).MaxHeight(height - 48)
 }
 
 // outputView 把原文交给通用虚拟阅读器，title 是内容框标题，保留全文复制。
@@ -700,78 +791,118 @@ func (d *Desktop) outputView(c *ui.Context, title, copyLabel, text string) {
 
 // jsonView 保留原业务值及解析错误，树导航由通用内容组件负责；key 在同一父级内唯一标识这棵树。
 func (d *Desktop) jsonView(c *ui.Context, key any, label string, value any) {
-	// 1. 编码时不转义 HTML 字符，json.RawMessage 用原字节；编码失败时显示错误，原始 JSON 退回输出块。
-	raw, err := marshalJSONView(value)
-	if err != nil {
-		kit.FieldMessage(c, kit.MessageError, err.Error())
-		if content, ok := value.(json.RawMessage); ok {
-			d.outputView(c, d.t("output"), d.t("copy.output"), string(content))
-		}
-		return
-	}
-	// 2. 业务快照变化时更新同一棵 JSON 树，不以展示树代替原数据。
+	// 1. 先按稳定 key 取本地缓存：json.RawMessage 原文没变时直接复用，跳过每帧重复缩进编码。
 	root := ui.Column(c.Key(key))
-	state := ui.Local(root, jsonTreeKey{}, func() *kit.JSONState { state, _ := kit.NewJSONState(raw); return state })
-	previous := ui.Local(root, jsonSourceKey{}, func() string { return string(raw) })
-	if *previous != string(raw) {
-		if err := (*state).Set(raw); err != nil {
-			kit.FieldMessage(c, kit.MessageError, err.Error())
+	state := ui.Local(root, jsonTreeKey{}, func() *kit.JSONState { return nil })
+	previous := ui.Local(root, jsonSourceKey{}, func() string { return "" })
+	previousRaw := ui.Local(root, jsonRawSourceKey{}, func() string { return "" })
+	formatted := *previous
+	if rawMessage, ok := value.(json.RawMessage); ok && *state != nil && string(rawMessage) == *previousRaw {
+		// 命中原始字节缓存，直接绘制已有 JSON 树。
+	} else {
+		// 2. 编码时不转义 HTML 字符，json.RawMessage 用原字节；编码失败时显示错误，原始 JSON 退回输出块。
+		raw, err := marshalJSONView(value)
+		if err != nil {
+			*state = nil
+			*previous, *previousRaw = "", ""
+			root.Children(func() {
+				kit.FieldMessage(c, kit.MessageError, err.Error())
+				if content, ok := value.(json.RawMessage); ok {
+					d.outputView(c, d.t("output"), d.t("copy.output"), string(content))
+				}
+			})
 			return
 		}
-		*previous = string(raw)
+		formatted = string(raw)
+		if *state == nil {
+			created, err := kit.NewJSONState(raw)
+			if err != nil {
+				root.Children(func() { kit.FieldMessage(c, kit.MessageError, err.Error()) })
+				return
+			}
+			*state = created
+		} else if *previous != formatted {
+			if err := (*state).Set(raw); err != nil {
+				root.Children(func() { kit.FieldMessage(c, kit.MessageError, err.Error()) })
+				return
+			}
+		}
+		*previous = formatted
+		if rawMessage, ok := value.(json.RawMessage); ok {
+			*previousRaw = string(rawMessage)
+		} else {
+			*previousRaw = ""
+		}
 	}
 	root.Children(func() {
 		t := kit.GetTheme(c)
-		kit.JSONTree(c, *state, kit.JSONOpt{Title: label, CopyLabel: d.t("copy.json")}).Height(min(float32(strings.Count(string(raw), "\n")+1)*24+t.Space(9), 320))
+		kit.JSONTree(c, *state, kit.JSONOpt{Title: label, CopyLabel: d.t("copy.json")}).Height(min(float32(strings.Count(formatted, "\n")+1)*24+t.Space(9), 320))
 	})
 }
 
-// getFinalKnownTurns 返回已有最终回复的 Turn 集合；每帧只计算一次。
-func (d *Desktop) getFinalKnownTurns(items []viewItem) map[defs.TurnID]bool {
-	known := map[defs.TurnID]bool{}
+// getFinalTurns 返回已完成、历史连续完整且最终调用不含工具的 Turn 集合；每帧只扫描一次。
+func (d *Desktop) getFinalTurns(items []viewItem) map[defs.TurnID]bool {
+	// 1. 按 Turn 收集已落盘序号，并排除流式、未落盘或最终调用含工具的 Turn。
+	ordinalsByTurn := map[defs.TurnID]map[uint64]struct{}{}
+	invalid := map[defs.TurnID]bool{}
+	hasFinalMessage := map[defs.TurnID]bool{}
 	for _, view := range items {
-		if !known[view.Item.TurnID] && d.isFinalResult(view) {
-			known[view.Item.TurnID] = true
-		}
-	}
-	return known
-}
-
-// isFinalResult 此消息是否属于成功、完整且没有工具的最终模型调用？
-func (d *Desktop) isFinalResult(view viewItem) bool {
-	turn, ok := d.turns[view.Item.TurnID]
-	if !ok || turn.Status != defs.TurnStatusCompleted || turn.FinalModelCallID == "" || view.Item.ModelCallID != turn.FinalModelCallID || view.Item.Kind != defs.ItemMessage {
-		return false
-	}
-	ordinals := map[uint64]bool{}
-	for _, item := range d.items {
-		if item.Item.TurnID != turn.ID {
+		turnID := view.Item.TurnID
+		turn, ok := d.turns[turnID]
+		if !ok || turn.Status != defs.TurnStatusCompleted || turn.FinalModelCallID == "" || turn.ItemsRange.FirstOrdinal == 0 {
 			continue
 		}
-		if item.Ordinal == 0 || item.Streaming {
-			return false
+		if view.Ordinal == 0 || view.Streaming || (view.Item.ModelCallID == turn.FinalModelCallID && view.Item.ToolCall != nil) {
+			invalid[turnID] = true
+			continue
 		}
-		ordinals[uint64(item.Ordinal)] = true
-		if item.Item.ModelCallID == turn.FinalModelCallID && item.Item.ToolCall != nil {
-			return false
+		set := ordinalsByTurn[turnID]
+		if set == nil {
+			set = map[uint64]struct{}{}
+			ordinalsByTurn[turnID] = set
+		}
+		set[uint64(view.Ordinal)] = struct{}{}
+		if view.Item.Kind == defs.ItemMessage && view.Item.ModelCallID == turn.FinalModelCallID {
+			hasFinalMessage[turnID] = true
 		}
 	}
-	if turn.ItemsRange.FirstOrdinal == 0 {
+	// 2. 只有区间内序号全部到齐且包含最终消息的 Turn 才标记为已知最终结果。
+	finalTurns := map[defs.TurnID]bool{}
+	for turnID := range hasFinalMessage {
+		if invalid[turnID] {
+			continue
+		}
+		turn := d.turns[turnID]
+		set := ordinalsByTurn[turnID]
+		complete := true
+		for ordinal := turn.ItemsRange.FirstOrdinal; ordinal <= turn.ItemsRange.LastOrdinal; ordinal++ {
+			if _, ok := set[ordinal]; !ok {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			finalTurns[turnID] = true
+		}
+	}
+	return finalTurns
+}
+
+// isFinalResultItem 此消息是否属于已知完整 Turn 的最终模型回复？
+func (d *Desktop) isFinalResultItem(view viewItem, finalTurns map[defs.TurnID]bool) bool {
+	if view.Item.Kind != defs.ItemMessage || !finalTurns[view.Item.TurnID] {
 		return false
 	}
-	for ordinal := turn.ItemsRange.FirstOrdinal; ordinal <= turn.ItemsRange.LastOrdinal; ordinal++ {
-		if !ordinals[ordinal] {
-			return false
-		}
-	}
-	return true
+	turn := d.turns[view.Item.TurnID]
+	return turn.FinalModelCallID != "" && view.Item.ModelCallID == turn.FinalModelCallID
 }
 
 // getFinalResultText 返回 Turn 里所有最终回复的文本，以空行分隔。
 func (d *Desktop) getFinalResultText(turnID defs.TurnID) string {
+	finalTurns := d.getFinalTurns(d.items)
 	parts := []string{}
 	for _, view := range d.items {
-		if view.Item.TurnID == turnID && d.isFinalResult(view) && view.Item.Message != nil {
+		if view.Item.TurnID == turnID && d.isFinalResultItem(view, finalTurns) && view.Item.Message != nil {
 			parts = append(parts, contentText(view.Item.Message.Content))
 		}
 	}

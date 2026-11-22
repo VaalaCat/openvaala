@@ -66,3 +66,20 @@ export function getProviderEditPath(
     new URLSearchParams({ id: providerID }).toString()
   )
 }
+
+// 新增 SSH Executor 页
+export function getExecutorCreatePath(serverID: string): string {
+  return getSettingsPath(serverID, "executors") + "/new"
+}
+
+// 编辑 Executor 页，Executor id 放在 search param 里
+export function getExecutorEditPath(
+  serverID: string,
+  executorID: string
+): string {
+  return (
+    getSettingsPath(serverID, "executors") +
+    "/edit?" +
+    new URLSearchParams({ id: executorID }).toString()
+  )
+}

@@ -111,7 +111,7 @@ func TestSettingsNavigation(t *testing.T) {
 	}{
 		{"general", "通用", "完成时发送系统通知"},
 		{"providers", "模型服务", "重载配置"},
-		{"executors", "Executor", "来自 config.yaml，编辑后点重载配置"},
+		{"executors", "Executor", "新增 SSH"},
 		{"hooks", "Hook", "来自 config.yaml，编辑后点重载配置"},
 		{"skills", "Skill", "来自 config.yaml，编辑后点重载配置"},
 	} {
@@ -290,5 +290,67 @@ func TestSettingsItems(t *testing.T) {
 				t.Fatal("raw data is expanded by default")
 			}
 		})
+	}
+}
+
+// TestExecutorSettingsSSHForm 检查设置 → Executor 页的 SSH 列表、新增表单、~/.ssh/config 导入填充（弱依赖隐藏）与测试结果展示。
+func TestExecutorSettingsSSHForm(t *testing.T) {
+	// 1. 列表同时展示内置只读项和可编辑 SSH 项。
+	d := testDesktop()
+	d.page = "executors"
+	d.executors = []conversation.ExecutorDetails{
+		{ID: defs.LocalExecutorID, Kind: defs.ExecutorKindLocal, WorkspaceDirectory: "/home/coder"},
+		{ID: "dev-box", Kind: defs.ExecutorKindSSH, Description: "Linux 编译机", WorkspaceDirectory: "/home/coder/workspace"},
+	}
+	d.executorConfigs = []defs.ExecutorConfig{{
+		ID:                 "dev-box",
+		Kind:               defs.ExecutorKindSSH,
+		Description:        "Linux 编译机",
+		WorkspaceDirectory: "/home/coder/workspace",
+		SSH: &defs.SSHExecutorConfig{
+			Address:      "coder@10.0.0.5:2222",
+			IdentityFile: "~/.ssh/id_ed25519",
+		},
+	}}
+	tester := ui.NewTester(d.view, 1280, 900)
+	tester.SetLocale("zh-Hans")
+	if !tester.HasText("SSH") || !tester.HasText("新增 SSH") {
+		t.Fatalf("missing SSH badge or add button in %q", tester.Texts())
+	}
+
+	// 2. 点击「新增 SSH」进入表单；~/.ssh/config 为空时隐藏导入行（弱依赖），有主机时展示并可自动填入。
+	if err := tester.Click("新增 SSH"); err != nil {
+		t.Fatalf("click add ssh executor: %v", err)
+	}
+	tester.Frame()
+	if tester.HasText("~/.ssh/config") {
+		t.Fatalf("import row should hide when sshConfigHosts is empty: %q", tester.Texts())
+	}
+	d.sshConfigHosts = []defs.SSHConfigHost{{
+		Alias:        "gpu-box",
+		Address:      "root@gpu.vaala.dev:2222",
+		IdentityFile: "~/.ssh/id_gpu",
+	}}
+	tester.Frame()
+	if !tester.HasText("~/.ssh/config") {
+		t.Fatalf("import row missing when sshConfigHosts present: %q", tester.Texts())
+	}
+	d.applySSHConfigHost("gpu-box")
+	if d.executorDraft.ID != "gpu-box" || d.executorDraft.Address != "root@gpu.vaala.dev:2222" || d.executorDraft.IdentityFile != "~/.ssh/id_gpu" {
+		t.Fatalf("applySSHConfigHost() draft = %+v", d.executorDraft)
+	}
+
+	// 3. 测试通过反馈在表单原位展示；点已有 SSH 项进入编辑态后底部出现删除按钮。
+	d.executorTestSuccess = "/home/coder/workspace"
+	tester.Frame()
+	if !tester.HasText("已连接 · /home/coder/workspace") {
+		t.Fatalf("test success message missing in %q", tester.Texts())
+	}
+	d.executorDraft = nil
+	d.executorBaseline = nil
+	d.openExecutor(d.executorConfigs[0], "dev-box")
+	tester.Frame()
+	if !tester.HasText("删除") {
+		t.Fatalf("delete button missing in edit mode: %q", tester.Texts())
 	}
 }

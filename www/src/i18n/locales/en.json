@@ -75,7 +75,8 @@
     "reconnectPending": "Reconnecting",
     "connecting": {
       "title": "Connecting…",
-      "retrying": "Can’t reach {{host}}. Retrying. Make sure openvaala serve is running."
+      "remoteTitle": "Connecting to \"{{name}}\"…",
+      "retrying": "Can’t reach {{host}}. Retrying."
     },
     "incompatible": {
       "title": "Version mismatch",
@@ -84,6 +85,7 @@
     "tokenEntry": {
       "title": "Enter token",
       "description": "Run openvaala web to get an address that includes the token",
+      "remoteDescription": "Token for \"{{name}}\"",
       "label": "Token",
       "submit": "Connect",
       "invalid": "The token is invalid. Run openvaala web again to get a new address."
@@ -94,6 +96,47 @@
       "reconnecting": "Disconnected, reconnecting",
       "unauthorized": "Invalid token",
       "incompatible": "Version mismatch"
+    },
+    "servers": {
+      "pageDefault": "This page",
+      "current": "Current",
+      "switch": "Switch",
+      "switchDefault": "Default server",
+      "switchOther": "Switch server",
+      "manageAction": "Manage servers…",
+      "manageTitle": "Manage servers",
+      "addTitle": "Add server",
+      "editTitle": "Edit server",
+      "add": "Add server",
+      "edit": "Edit",
+      "delete": "Delete",
+      "deleteConfirm": "Delete",
+      "deleteActiveConfirm": "Delete \"{{name}}\" and switch to default?",
+      "close": "Close",
+      "back": "Back",
+      "saveOnly": "Save",
+      "saveAndSwitch": "Save & switch",
+      "nameLabel": "Name",
+      "namePlaceholder": "Dev Machine",
+      "addressLabel": "Address",
+      "addressPlaceholder": "ws://host:8790 or openvaala web URL",
+      "tokenLabel": "Token",
+      "tokenAutoFilled": "Extracted from URL",
+      "test": "Test",
+      "testing": "Testing…",
+      "testSuccess": "Connected",
+      "testErrors": {
+        "unauthorized": "Invalid token",
+        "incompatible": "Incompatible protocol",
+        "unreachable": "Unreachable",
+        "timeout": "Timed out"
+      },
+      "errors": {
+        "required": "Address is required",
+        "invalid": "Invalid address",
+        "unsupportedScheme": "Use http, https, ws, or wss",
+        "missingHost": "Missing host"
+      }
     }
   },
   "jsonView": {
@@ -684,7 +727,36 @@
     "executors": {
       "empty": "No executors",
       "workspaceDirectory": "Default root {{directory}}",
-      "noWorkspaceDirectory": "No default root"
+      "noWorkspaceDirectory": "No default root",
+      "builtinBadge": "Built-in",
+      "addSSH": "Add SSH",
+      "createTitle": "Add SSH",
+      "importSSHConfigPlaceholder": "Import from ~/.ssh/config",
+      "sshSection": "SSH",
+      "idLabel": "ID",
+      "descriptionLabel": "Description",
+      "descriptionPlaceholder": "Linux build box",
+      "addressLabel": "Address",
+      "identityFileLabel": "Identity file",
+      "identityFilePlaceholder": "~/.ssh/id_ed25519 (optional)",
+      "workspaceDirectoryLabel": "Directory",
+      "revert": "Revert",
+      "test": "Test",
+      "testing": "Testing…",
+      "save": "Save",
+      "testSuccess": "Connected · {{directory}}",
+      "saved": "Saved \"{{id}}\"",
+      "deleted": "Deleted \"{{id}}\"",
+      "deleteAction": "Delete",
+      "deleteConfirmTitle": "Delete \"{{id}}\"?",
+      "deleteConfirmDescription": "Removes executors/{{id}}.yaml and reloads.",
+      "backToList": "Back to Executors",
+      "missingID": "Missing Executor ID",
+      "errors": {
+        "builtinID": "Reserved ID",
+        "invalidID": "Letters, digits, . _ - only",
+        "duplicateID": "ID already exists"
+      }
     },
     "hooks": {
       "empty": "No hooks configured",

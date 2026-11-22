@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
@@ -53,6 +54,11 @@ var openvaalaMethods = map[string]methodHandler{
 	"executor/list":                       newMethodHandler(handleExecutorList),
 	"executor/resolveDirectory":           newMethodHandler(handleExecutorResolveDirectory),
 	"executor/listDirectories":            newMethodHandler(handleExecutorListDirectories),
+	"executor/config/list":                newMethodHandler(handleExecutorConfigList),
+	"executor/set":                        newMethodHandler(handleExecutorSet),
+	"executor/delete":                     newMethodHandler(handleExecutorDelete),
+	"executor/test":                       newMethodHandler(handleExecutorTest),
+	"executor/sshConfigHosts":             newMethodHandler(handleExecutorSSHConfigHosts),
 	"provider/list":                       newMethodHandler(handleProviderList),
 	"provider/set":                        newMethodHandler(handleProviderSet),
 	"provider/delete":                     newMethodHandler(handleProviderDelete),
@@ -570,6 +576,65 @@ func handleExecutorListDirectories(ctx context.Context, connection *serverConnec
 		Directory:     params.Directory,
 		BaseDirectory: params.BaseDirectory,
 	})
+}
+
+const executorTestTimeout = 10 * time.Second
+
+// handleExecutorConfigList 按 ID 顺序返回 executors/*.yaml 里的原样配置。
+func handleExecutorConfigList(ctx context.Context, connection *serverConnection, _ *runtimeprotocol.EmptyParams) (*runtimeprotocol.ListExecutorConfigsResult, error) {
+	executors, err := connection.configuration.ListExecutorConfigs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.ListExecutorConfigsResult{Executors: getNonNilSlice(executors)}, nil
+}
+
+// handleExecutorSet 原子写入 Executor 配置并替换 Runtime 定义。
+func handleExecutorSet(ctx context.Context, connection *serverConnection, params *runtimeprotocol.SetExecutorParams) (*runtime.SetDefinitionsResult, error) {
+	definitions, err := connection.configuration.SetExecutor(ctx, params.Executor)
+	if err != nil {
+		return nil, err
+	}
+	result, err := connection.runtime.SetDefinitions(ctx, definitions)
+	if err != nil {
+		return nil, err
+	}
+	result.PendingConversationIDs = getNonNilSlice(result.PendingConversationIDs)
+	return &result, nil
+}
+
+// handleExecutorDelete 删除 Executor 配置并替换 Runtime 定义。
+func handleExecutorDelete(ctx context.Context, connection *serverConnection, params *runtimeprotocol.DeleteExecutorParams) (*runtime.SetDefinitionsResult, error) {
+	definitions, err := connection.configuration.DeleteExecutor(ctx, params.ExecutorID)
+	if err != nil {
+		return nil, err
+	}
+	result, err := connection.runtime.SetDefinitions(ctx, definitions)
+	if err != nil {
+		return nil, err
+	}
+	result.PendingConversationIDs = getNonNilSlice(result.PendingConversationIDs)
+	return &result, nil
+}
+
+// handleExecutorTest 用带 10 秒超时的上下文测试 SSH 连接与远端工作目录，不写入任何文件。
+func handleExecutorTest(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TestSSHExecutorParams) (*runtimeprotocol.TestSSHExecutorResult, error) {
+	testCtx, cancel := context.WithTimeout(ctx, executorTestTimeout)
+	defer cancel()
+	resolved, err := connection.configuration.TestSSHExecutor(testCtx, params.SSH, params.WorkspaceDirectory)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.TestSSHExecutorResult{ResolvedDirectory: resolved}, nil
+}
+
+// handleExecutorSSHConfigHosts 读取 serve 本机 ~/.ssh/config 里的非通配符 Host 列表。
+func handleExecutorSSHConfigHosts(ctx context.Context, connection *serverConnection, _ *runtimeprotocol.EmptyParams) (*runtimeprotocol.ListSSHConfigHostsResult, error) {
+	hosts, err := connection.configuration.ListSSHConfigHosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.ListSSHConfigHostsResult{Hosts: getNonNilSlice(hosts)}, nil
 }
 
 // handleProviderList 返回 Provider 配置、默认模型和模型默认配置。

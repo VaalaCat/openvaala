@@ -381,6 +381,14 @@ export interface CreateConversationParams {
     without_executors?: boolean;
 }
 
+// From runtimeprotocol/types.go
+/**
+ * DeleteExecutorParams 是 executor/delete 的参数。
+ */
+export interface DeleteExecutorParams {
+    executor_id: string;
+}
+
 // From storage/page.go
 /**
  * Direction 是 Record 与 Log 读取的方向。
@@ -406,6 +414,30 @@ export interface EmptyResult {
  * ExecutionStreamType 是一段执行进度的来源。
  */
 export type ExecutionStreamType = "terminal";
+
+// From defs/executor_config.go
+/**
+ * ExecutorConfig 是 executors/<id>.yaml 声明的额外 Executor 配置。
+ */
+export interface ExecutorConfig {
+    id: string;
+    /**
+     * Kind 是 local（本机进程内执行）、virtual（go-bash 内存虚拟环境）或 ssh（经 SSH 访问远端机器）。
+     */
+    kind: ExecutorKind;
+    /**
+     * Description 是给模型看的说明，模型据此选 Executor。
+     */
+    description?: string;
+    /**
+     * WorkspaceDirectory 是内置工具的根目录：local 是本机目录，virtual 是虚拟文件系统里的路径，ssh 是远端绝对路径。
+     */
+    workspace_directory?: string;
+    /**
+     * SSH 是 kind 为 ssh 时的连接参数，其他 kind 不使用。
+     */
+    ssh?: SSHExecutorConfig;
+}
 
 // From conversation/types.go
 /**
@@ -858,6 +890,14 @@ export interface ListDirectoriesParams {
 
 // From runtimeprotocol/types.go
 /**
+ * ListExecutorConfigsResult 是 executor/config/list 的返回结果。
+ */
+export interface ListExecutorConfigsResult {
+    executors: ExecutorConfig[];
+}
+
+// From runtimeprotocol/types.go
+/**
  * ListExecutorsResult 是 executor/list 的结果：全部 Executor 和它们的默认根目录。
  */
 export interface ListExecutorsResult {
@@ -918,6 +958,14 @@ export interface ListProvidersResult {
     providers: ProviderConfig[];
     default_model: string;
     defaults: ModelDefaults;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * ListSSHConfigHostsResult 是 executor/sshConfigHosts 的返回结果。
+ */
+export interface ListSSHConfigHostsResult {
+    hosts: SSHConfigHost[];
 }
 
 // From runtimeprotocol/types.go
@@ -1104,7 +1152,7 @@ export interface ModelDefinition {
     /**
      * ReasoningContext 是请求要求保留的思考上下文；为空表示请求不发送，服务端按默认处理，只用于 openai-responses 协议。
      */
-    // this is likely an enum in an external package "github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.ReasoningContext"
+    // this is likely an enum in an external package "github.com/VaalaCat/llmkit/ir.ReasoningContext"
     reasoning_context?: string;
     capabilities: ModelCapabilities;
 }
@@ -1394,6 +1442,40 @@ export interface RunningConversationsClosedParams {
     reason: string;
 }
 
+// From defs/executor_config.go
+/**
+ * SSHConfigHost 是从 serve 机器 ~/.ssh/config 解析出的单条非通配符主机项，供客户端快捷填表。
+ */
+export interface SSHConfigHost {
+    /**
+     * Alias 是 Host 段的名字，可直接作为默认 Executor ID。
+     */
+    alias: string;
+    /**
+     * Address 是按 User、HostName、Port 拼好的 [user@]host[:port]。
+     */
+    address: string;
+    /**
+     * IdentityFile 是该 Host 配置的首个私钥路径（原样保留 ~ 便于阅读），未配置时为空。
+     */
+    identity_file?: string;
+}
+
+// From defs/executor_config.go
+/**
+ * SSHExecutorConfig 是 kind 为 ssh 时的连接参数。
+ */
+export interface SSHExecutorConfig {
+    /**
+     * Address 是 [user@]host[:port]。
+     */
+    address: string;
+    /**
+     * IdentityFile 是 serve 所在机器上的私钥路径，加载时展开 ~；为空时依次用 ssh-agent 和默认私钥。
+     */
+    identity_file?: string;
+}
+
 // From runtimeprotocol/types.go
 /**
  * ServerInfo 是服务端名称。
@@ -1666,6 +1748,14 @@ export interface SetDefinitionsResult {
      * PendingConversationIDs 是已准备新配置、等待全部 Session 空闲后自动应用的对话。
      */
     pending_conversation_ids: ConversationID[];
+}
+
+// From runtimeprotocol/types.go
+/**
+ * SetExecutorParams 是 executor/set 的参数。
+ */
+export interface SetExecutorParams {
+    executor: ExecutorConfig;
 }
 
 // From runtimeprotocol/types.go
@@ -1974,6 +2064,23 @@ export interface TerminalsClosedParams {
     reason: string;
 }
 
+// From runtimeprotocol/types.go
+/**
+ * TestSSHExecutorParams 是 executor/test 的参数。
+ */
+export interface TestSSHExecutorParams {
+    ssh: SSHExecutorConfig;
+    workspace_directory: string;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * TestSSHExecutorResult 是 executor/test 的返回结果；失败直接走 JSON-RPC error。
+ */
+export interface TestSSHExecutorResult {
+    resolved_directory: string;
+}
+
 // From defs/message.go
 /**
  * TextContent 是一段文字。
@@ -2014,7 +2121,7 @@ export interface ToolCall {
     /**
      * ProviderData 是模型厂商附在这次调用上的签名等数据；下一次请求原样还给 llmkit，否则 Gemini 等会拒绝或丢失签名。
      */
-    // external type "github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.ProviderData", to include this type the package must be explicitly included in the parsing
+    // external type "github.com/VaalaCat/llmkit/ir.ProviderData", to include this type the package must be explicitly included in the parsing
     provider_data?: unknown;
 }
 
@@ -2116,7 +2223,7 @@ export interface TurnContextUsage {
      * Usage 是服务端上报并已归一化的用量；没有上报时为零值。
      */
     usage?: TokenUsage;
-    // this is likely an enum in an external package "github.com/VaalaCat/ai-gateway/pkg/llmkit/ir.ReasoningContext"
+    // this is likely an enum in an external package "github.com/VaalaCat/llmkit/ir.ReasoningContext"
     reasoning_context?: string;
 }
 
@@ -2239,6 +2346,11 @@ export interface MethodParams {
     "executor/list": EmptyParams;
     "executor/resolveDirectory": ResolveDirectoryParams;
     "executor/listDirectories": ListDirectoriesParams;
+    "executor/config/list": EmptyParams;
+    "executor/set": SetExecutorParams;
+    "executor/delete": DeleteExecutorParams;
+    "executor/test": TestSSHExecutorParams;
+    "executor/sshConfigHosts": EmptyParams;
     "provider/list": EmptyParams;
     "provider/set": SetProviderParams;
     "provider/delete": ProviderIDParams;
@@ -2299,6 +2411,11 @@ export interface MethodResult {
     "executor/list": ListExecutorsResult;
     "executor/resolveDirectory": ResolveDirectoryResult;
     "executor/listDirectories": WorkspaceDirectories;
+    "executor/config/list": ListExecutorConfigsResult;
+    "executor/set": SetDefinitionsResult;
+    "executor/delete": SetDefinitionsResult;
+    "executor/test": TestSSHExecutorResult;
+    "executor/sshConfigHosts": ListSSHConfigHostsResult;
     "provider/list": ListProvidersResult;
     "provider/set": SetDefinitionsResult;
     "provider/delete": SetDefinitionsResult;

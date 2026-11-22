@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VaalaCat/ai-gateway/pkg/llmkit"
+	"github.com/VaalaCat/llmkit"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/agent/agent_context"
 	"github.com/VaalaCat/openvaala/pkg/dao"

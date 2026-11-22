@@ -1,6 +1,6 @@
 package defs
 
-import "github.com/VaalaCat/ai-gateway/pkg/llmkit"
+import "github.com/VaalaCat/llmkit"
 
 // TurnStatus 是一轮执行正在运行还是以什么方式结束。
 type TurnStatus string

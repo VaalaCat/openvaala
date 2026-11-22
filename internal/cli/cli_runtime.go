@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	storagefile "github.com/VaalaCat/openvaala/pkg/storage/file"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
+	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
@@ -33,10 +36,64 @@ const (
 	runtimeServerExecutableChangedNotice = "runtime server was started from a different openvaala executable; run openvaala serve stop to restart it with this one"
 )
 
-// addURLFlag 注册客户端连接 serve 的 --url 参数。
-func addURLFlag(flags *pflag.FlagSet) {
+// AddURLFlag 注册客户端连接 serve 的 --url 参数。
+func AddURLFlag(flags *pflag.FlagSet) {
 	// 1. 注册连接地址参数；缺省时依次使用 client.url 和本机 serve。
 	flags.String("url", "", "connect to a running runtime server (ws://host:port/api/v1/openvaala); default: client.url, then the local runtime server")
+}
+
+// addURLFlag 保留包内调用，转发到 AddURLFlag。
+func addURLFlag(flags *pflag.FlagSet) {
+	AddURLFlag(flags)
+}
+
+// DesktopStartTarget 是桌面端启动时解析出的远端目标；URL 为空时按桌面默认逻辑处理。
+type DesktopStartTarget struct {
+	URL   string
+	Token string
+	// IsOverride 为真表示来自命令行 --url 的一次性覆盖，不写入桌面偏好。
+	IsOverride bool
+}
+
+// ResolveDesktopStartTarget 按 --url > client.url 的优先级解析桌面端启动目标，不拉起本机 serve。
+// 配置加载失败时记录警告：显式传入 --url 仍按该地址连接，未传 --url 时返回空目标。
+func ResolveDesktopStartTarget(command *cobra.Command) DesktopStartTarget {
+	// 1. 先检查命令行 --url。
+	var flagURL string
+	var isOverride bool
+	if flag := command.Flags().Lookup("url"); flag != nil && flag.Changed {
+		flagURL = strings.TrimSpace(flag.Value.String())
+		isOverride = flagURL != ""
+	}
+	// 2. 尽力加载配置以读取 client.url 和 client.token；失败时记警告，不阻止桌面启动。
+	cfg, _, err := LoadConfig(command)
+	if err != nil {
+		slog.Warn("cannot load config for desktop start target", "error", err)
+	}
+	runtimeURL := flagURL
+	if runtimeURL == "" && cfg != nil {
+		runtimeURL = strings.TrimSpace(cfg.Client.URL)
+	}
+	if runtimeURL == "" {
+		return DesktopStartTarget{}
+	}
+	// 3. 令牌解析与 getRuntimeConnection 一致：URL 自带 token 时留空交给 URL，否则用 client.token 或同服连接文件 token。
+	token := ""
+	if !isTokenInURL(runtimeURL) {
+		if cfg != nil {
+			token = cfg.Client.Token
+		}
+		if token == "" {
+			if file, found, fileErr := getRuntimeServerFile(); fileErr == nil && found && isSameRuntimeServer(runtimeURL, file.URL) {
+				token = file.Token
+			}
+		}
+	}
+	return DesktopStartTarget{
+		URL:        runtimeURL,
+		Token:      token,
+		IsOverride: isOverride,
+	}
 }
 
 // getRuntimeConnection 选择客户端命令要连的 serve 地址和令牌；本机需要拉起 serve 时，idleTimeout 是它的空闲退出时间，0 表示常驻。
