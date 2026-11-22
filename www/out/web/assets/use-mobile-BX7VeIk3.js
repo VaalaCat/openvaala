@@ -1,0 +1,1 @@
+import{i as e,s as t}from"./clsx-C5NLMtLp.js";var n=t(e(),1),r=768;function i(){return window.innerWidth<r}function a(){let[e,t]=n.useState(void 0);return n.useEffect(()=>{let e=window.matchMedia(`(max-width: 767px)`),n=()=>{t(window.innerWidth<r)};return e.addEventListener(`change`,n),t(window.innerWidth<r),()=>e.removeEventListener(`change`,n)},[]),!!e}export{a as n,i as t};
