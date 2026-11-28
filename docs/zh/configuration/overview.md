@@ -259,6 +259,7 @@ openvaala serve stop
 - `world.relays` 默认为 `[]`。节点先试直连，再试本域 relay，之后按配置顺序尝试其余 relay，跳过重复项。
 `world.server.domain` 是成员共用的域的名字，不需要拥有真实域名。
 
+- `world.server.public_url` 指定新入网码里的 HTTP 或 HTTPS 基地址。填节点可访问的地址，例如反向代理的 HTTPS 入口。
 - `world.relay_mode` 可选 `off`、`domain`（仅限域成员，需要同服控制面）或 `public`。启用控制面时默认为 `domain`，否则为 `off`。单独运行 relay 时只能选 `public`。`openvaala serve` 和 `openvaala world serve` 均可用 `--relay-mode` 覆盖配置文件，仅对本次启动生效。
 - `world.relay_instances` 列出公开 relay 的全部实例，使用 HTTPS 地址，也接受 HTTP、WS 和 WSS。仅 `public` 模式允许配置，所有实例填写同一份列表。留空时使用单实例；节点和域名片的 `world.relays` 仍填写入口地址。
 - `world.remote_access.enabled` 默认关闭。打开时，若 relay 列表为空，设置页在草稿中填入 `https://open.vaa.la`。保存并重启后即可扫码连接；无需加入 World。`world.remote_access.name` 留空时使用主机名。

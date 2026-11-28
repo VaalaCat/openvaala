@@ -74,6 +74,7 @@ type WorldServerConfig struct {
 	Enabled    bool                  `mapstructure:"enabled" yaml:"enabled" default:"false"`
 	Listen     string                `mapstructure:"listen" yaml:"listen"`
 	Domain     string                `mapstructure:"domain" yaml:"domain"`
+	PublicURL  string                `mapstructure:"public_url" yaml:"public_url,omitempty"`
 	AdminToken string                `mapstructure:"admin_token" yaml:"admin_token"`
 	ACL        []worldserver.ACLRule `mapstructure:"acl" yaml:"acl,omitempty"`
 }

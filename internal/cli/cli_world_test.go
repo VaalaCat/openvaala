@@ -75,6 +75,67 @@ func TestWorldServeListen(t *testing.T) {
 	}
 }
 
+func TestWorldServeJoinTokenPublicURL(t *testing.T) {
+	for _, tc := range []struct {
+		name, publicURL, envURL, want string
+		invalid                       bool
+	}{
+		{name: "default listener"},
+		{name: "configured URL", publicURL: "https://world.example.test/gateway/", want: "https://world.example.test/gateway"},
+		{name: "environment URL", envURL: "https://world.example.test", want: "https://world.example.test"},
+		{name: "invalid URL", publicURL: "wss://world.example.test", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("OPENVAALA_WORLD_SERVER_PUBLIC_URL", tc.envURL)
+			if tc.envURL == "" {
+				if err := os.Unsetenv("OPENVAALA_WORLD_SERVER_PUBLIC_URL"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(home, "config.yaml")
+			const adminToken = "test-admin"
+			file := "world:\n  server:\n    enabled: true\n    domain: example.test\n    admin_token: " + adminToken + "\n"
+			if tc.publicURL != "" {
+				file += fmt.Sprintf("    public_url: %q\n", tc.publicURL)
+			}
+			writeTestFiles(t, map[string]string{path: file})
+			listen := getFreeServeAddress(t)
+			if tc.invalid {
+				_, err := runCLI(t, path, "world", "serve", "--listen", listen)
+				if err == nil || !strings.Contains(err.Error(), "world.server.public_url") {
+					t.Fatalf("world serve error = %v, want public URL validation error", err)
+				}
+				return
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			server := &testServe{cancel: cancel, done: make(chan error, 1)}
+			go func() {
+				_, err := runCLIWithContext(ctx, path, "world", "serve", "--listen", listen)
+				server.done <- err
+			}()
+			t.Cleanup(func() {
+				if err := server.stop(t); err != nil {
+					t.Error(err)
+				}
+			})
+			base := "http://" + listen
+			waitWorldHTTP(t, base+"/world/v1/healthz")
+			var token worldserver.CreateJoinTokenResponse
+			worldCommandResult(t, path, &token, "token", "create", "--server", base, "--admin-token", adminToken, "--owner", "team")
+			got, err := worldserver.ParseJoinCode(token.Token)
+			want := tc.want
+			if want == "" {
+				want = base
+			}
+			if err != nil || got != want {
+				t.Fatalf("join URL = %q, error = %v; want %q", got, err, want)
+			}
+		})
+	}
+}
+
 func TestWorldServeTelemetry(t *testing.T) {
 	for _, tc := range []struct {
 		name, logFile string

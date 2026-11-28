@@ -308,6 +308,7 @@ func newConfiguredWorldServer(cfg config.WorldConfig, address *net.TCPAddr, data
 	}
 	opt := worldserver.NewWorldServerOpt(cfg.Server.Domain, filepath.Join(dataDirectory, "worldserver", "world.db"), token)
 	opt.Channels = world.NewDomainChannels()
+	opt.PublicURL = cfg.Server.PublicURL
 	if address.IP.IsUnspecified() {
 		address = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: address.Port}
 	}

@@ -259,6 +259,7 @@ In **Settings → World**, you can join a World, choose which Agents to advertis
 - `world.relays` defaults to `[]`. Nodes try direct URLs first, then their home relay followed by the configured relays in order, skipping duplicates.
 The `world.server.domain` setting is the name shared by members. It does not require a DNS domain.
 
+- `world.server.public_url` sets the HTTP or HTTPS base URL written into new join codes. Set it to the address nodes can reach, such as the HTTPS address of a reverse proxy.
 - `world.relay_mode` accepts `off`, `domain` (members only, requires the local control plane), or `public`. It defaults to `domain` with the control plane enabled and `off` otherwise. A standalone relay requires `public`. On both `openvaala serve` and `openvaala world serve`, `--relay-mode` overrides the file for that run.
 - `world.relay_instances` lists the HTTPS addresses (also accepts HTTP, WS and WSS) of the instances of a public relay. Configure the same list on each instance. An empty list enables single-instance operation. Nodes and domain cards continue to use the entry address in `world.relays`.
 - `world.remote_access.enabled` defaults to false. When you enable it with an empty relay list, Settings adds `https://open.vaa.la` to the draft. Save and restart, then scan the code to connect. World membership is optional. `world.remote_access.name` defaults to the hostname.

@@ -76,6 +76,7 @@ type WorldServerOpt struct {
 	Channels       DomainChannels
 	Entries        PeerEntries
 	LocalRelayURL  string
+	PublicURL      string
 	RelayInstances []string
 	RelayMode      string
 	Domain         string
@@ -831,7 +832,10 @@ func (s *worldServerImpl) CreateJoinToken(ctx context.Context, req CreateJoinTok
 		return CreateJoinTokenResponse{}, err
 	}
 	base := s.opt.LocalRelayURL
-	if len(s.opt.Entries.DirectURLs) > 0 {
+	switch {
+	case s.opt.PublicURL != "":
+		base = s.opt.PublicURL
+	case len(s.opt.Entries.DirectURLs) > 0:
 		base = strings.TrimSuffix(strings.TrimRight(s.opt.Entries.DirectURLs[0], "/"), "/world/v1/direct")
 		if strings.HasPrefix(base, "ws") {
 			base = "http" + strings.TrimPrefix(base, "ws")

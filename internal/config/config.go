@@ -433,6 +433,11 @@ func (cfg *Config) Validate() error {
 	if cfg.World.Server.Enabled && strings.TrimSpace(cfg.World.Server.Domain) == "" {
 		return errors.New("world.server.domain must not be empty")
 	}
+	if publicURL := cfg.World.Server.PublicURL; publicURL != "" {
+		if _, err := worldserver.ParseWorldBaseURL(publicURL, false); err != nil {
+			return errors.New("world.server.public_url must be an HTTP or HTTPS base URL")
+		}
+	}
 	if len(cfg.World.RelayInstances) > 0 && cfg.World.GetRelayMode() != "public" {
 		return errors.New("world.relay_instances requires world.relay_mode public")
 	}
