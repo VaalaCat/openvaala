@@ -465,22 +465,22 @@ test("mobile_server_moves_to_sidebar_and_title_yields", async ({
         )
         positions.push(title.getBoundingClientRect().x)
         servers.push(
-          [...document.querySelectorAll('button[aria-label="已连接"]')].map(
-            (node) => {
-              let opacity = 1
-              for (
-                let parent: Element | null = node;
-                parent;
-                parent = parent.parentElement
-              )
-                opacity *= Number(getComputedStyle(parent).opacity)
-              return {
-                x: node.getBoundingClientRect().x,
-                opacity,
-                inert: !!node.closest("[inert]"),
-              }
+          [
+            ...document.querySelectorAll('button[aria-label="本页 · 已连接"]'),
+          ].map((node) => {
+            let opacity = 1
+            for (
+              let parent: Element | null = node;
+              parent;
+              parent = parent.parentElement
+            )
+              opacity *= Number(getComputedStyle(parent).opacity)
+            return {
+              x: node.getBoundingClientRect().x,
+              opacity,
+              inert: !!node.closest("[inert]"),
             }
-          )
+          })
         )
       }
       return { positions, servers }
@@ -501,17 +501,17 @@ test("mobile_server_moves_to_sidebar_and_title_yields", async ({
       expect(x).toBeLessThanOrEqual(56 + 0.1)
     }
     await expect(
-      sidebar.getByRole("button", { name: "已连接", exact: true })
+      sidebar.getByRole("button", { name: "本页 · 已连接", exact: true })
     ).toBeVisible()
     await expect(
-      page.getByRole("button", { name: "已连接", exact: true })
+      page.getByRole("button", { name: "本页 · 已连接", exact: true })
     ).toHaveCount(1)
 
     // 2. 关闭抽屉后入口恢复到顶栏，不留下额外可访问的连接按钮。
     await page.keyboard.press("Escape")
     await expect(sidebar).toHaveCount(0)
     await expect(
-      page.getByRole("button", { name: "已连接", exact: true })
+      page.getByRole("button", { name: "本页 · 已连接", exact: true })
     ).toHaveCount(1)
     await expect.poll(getTitleX).toBeCloseTo(positions[0], 0)
   }

@@ -1441,19 +1441,18 @@ test("tool_count_rolls_and_resizes_only_when_real_count_changes", async ({
     name: "read_file",
     arguments: JSON.stringify({ path: "readme.txt" }),
   }
-  // 1. 一次调用 9 个工具，随后每次再调用 1 个工具，计数从 9 跨位数变到 10，再到 11。
+  // 1. 等页面观察到 9 和 10 后才放行对应的工具，避免加载慢时合并成一次计数更新。
+  const ninth = fixture.createCommandGate("tool-count-nine")
+  const tenth = fixture.createCommandGate("tool-count-ten")
   await fixture.replies(
-    { tools: Array.from({ length: 9 }, () => readReadme) },
     {
-      tool: readReadme.name,
-      arguments: readReadme.arguments,
-      toolDelayMs: 1200,
+      tools: [
+        ...Array.from({ length: 8 }, () => readReadme),
+        { name: "bash", arguments: JSON.stringify({ command: ninth.wait }) },
+      ],
     },
-    {
-      tool: readReadme.name,
-      arguments: readReadme.arguments,
-      toolDelayMs: 1200,
-    },
+    { tool: "bash", arguments: JSON.stringify({ command: tenth.wait }) },
+    { tool: readReadme.name, arguments: readReadme.arguments },
     { text: "十一次工具计数完成" }
   )
   await fixture.openApp(page)
@@ -1473,10 +1472,11 @@ test("tool_count_rolls_and_resizes_only_when_real_count_changes", async ({
   const label = number.locator("[data-rotating-text-label]")
 
   // 2. 9 变 10 时数字滚动、宽度变宽；系统改为减少动画后，10 变 11 仍滚动。
-  await expect
-    .poll(() => label.textContent(), { intervals: [50] })
-    .toBe("执行 10 次工具")
+  await expect(label).toHaveText("执行 9 次工具")
+  await ninth.release()
+  await expect(label).toHaveText("执行 10 次工具")
   await page.emulateMedia({ reducedMotion: "reduce" })
+  await tenth.release()
   await expect(label).toHaveText("执行 11 次工具")
   await expect(
     turn.getByText("十一次工具计数完成", { exact: true })

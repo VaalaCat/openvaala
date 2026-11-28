@@ -71,6 +71,8 @@ type acpSession struct {
 	// isConversationDropped Client 是否已经放弃这个对话（重新同步时 serve 拒绝打开）？之后的 prompt 先重新打开，
 	// executor 设置改完再重新打开。
 	isConversationDropped bool
+	// isServerConnected 这个会话的 Client 是否已经连上过 serve？还没连上就进入重连时会话结束。
+	isServerConnected bool
 	// streamingItems 是本轮生成中的 Item 的显示记录，按 ItemIndex 登记；Turn 开始时清空。
 	streamingItems map[int]*acpStreamingItem
 	// displayedItems 是本轮已经显示过的 Item 和它的显示记录：重复交付时据此只补发缺少的部分。
@@ -385,10 +387,13 @@ func (s *acpSession) handleRequest(ctx context.Context, request acpMessage) {
 
 // handleClientEvent 处理一条 Client 事件：更新编辑器显示、回复 prompt 或处理 MCP 转发。
 func (s *acpSession) handleClientEvent(ctx context.Context, event runtimeclient.ClientEvent) error {
-	// 1. 按事件类型分别处理，Client 开始重连时返回 ErrConnectionLost；Turn 开始时清空本轮显示记录。
+	// 1. 按事件类型分别处理；还没连上就进入重连时返回 ErrConnectionLost，已经连上后等重连后的结束事件。Turn 开始时清空本轮显示记录。
 	switch event := event.(type) {
 	case *runtimeclient.ConnectionChanged:
-		if event.State == runtimeclient.ConnectionReconnecting {
+		if event.State == runtimeclient.ConnectionConnected {
+			s.isServerConnected = true
+		}
+		if event.State == runtimeclient.ConnectionReconnecting && !s.isServerConnected {
 			return runtimeclient.ErrConnectionLost
 		}
 	case *runtimeclient.ClientMCPConnectRequested:

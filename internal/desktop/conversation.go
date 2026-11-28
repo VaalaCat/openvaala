@@ -691,10 +691,12 @@ func (d *Desktop) isProviderMissing() bool {
 	return d.connectionState == runtimeclient.ConnectionConnected && d.modelsLoaded && len(d.models.Models) == 0
 }
 
-// openProviderOnboarding 打开设置里的模型服务页，并直接展开服务目录。
+// openProviderOnboarding 打开设置里的模型服务页和新增表单。
 func (d *Desktop) openProviderOnboarding() {
-	d.catalogOpen = true
 	d.navigate("providers")
+	if d.page == "providers" {
+		d.openProvider(defs.ProviderConfig{Protocol: "openai_chat"}, "", "")
+	}
 }
 
 // isReadingChildSession 当前阅读的是不是子 Agent 的 Session？

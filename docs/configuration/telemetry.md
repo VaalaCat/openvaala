@@ -8,7 +8,7 @@ This page explains where OpenVaala writes its logs and how to send traces, metri
 # config.yaml
 telemetry:
   log_level: info                       # debug, info, warn or error
-  log_file: ""                          # empty = ~/.local/state/openvaala/openvaala.log
+  log_file: ""                          # empty uses openvaala.log in the runtime state directory
   otlp_endpoint: http://127.0.0.1:4318  # empty = no export
   otlp_headers:
     Authorization: Bearer <token>
@@ -16,7 +16,7 @@ telemetry:
 ```
 
 - `log_level` — the lowest level written everywhere: the log file, the terminal and OTLP. Default `info`.
-- `log_file` — the log file path. A relative path is resolved against the directory of `config.yaml`. Default `~/.local/state/openvaala/openvaala.log`.
+- `log_file` — the log file path. A relative path is resolved against the directory of `config.yaml`. If omitted, logs go to `openvaala.log` in the configured data directory, or to `~/.local/state/openvaala/openvaala.log` with the default layout.
 - `otlp_endpoint` — the base URL of an OTLP/HTTP receiver, such as `http://127.0.0.1:4318`. OpenVaala appends `/v1/traces`, `/v1/metrics` and `/v1/logs` itself, so do not include a signal path. Must be `http` or `https`.
 - `otlp_headers` — headers sent with every export, typically for authentication. Only settable in the file; names are lower-cased.
 - `capture_content` — whether traces include conversation content: system instructions, messages, model output, tool arguments and results. Default `true`, and only in effect when `otlp_endpoint` is set. Logs and metrics never contain conversation content.

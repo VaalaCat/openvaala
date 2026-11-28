@@ -882,7 +882,7 @@ test("completed_turn_collapses_each_progress_item_and_copies_only_final_result",
 test("single_reasoning_always_has_a_group", async ({ page, fixture }) => {
   // 1. 同一对话里先后发出一次完成、一次中断的纯推理回复，都生成单成员聚合。
   await fixture.replies(
-    { reasoning: "一条真实推理的正文", finishDelayMs: 2000 },
+    { reasoning: "一条真实推理的正文", hold: true },
     { reasoning: "一条真实推理的正文", hold: true }
   )
   await fixture.openApp(page)
@@ -923,6 +923,7 @@ test("single_reasoning_always_has_a_group", async ({ page, fixture }) => {
   // 3. 正常结束：动作文字消失，推理记录改为「思考完成」，聚合不带成功标记。
   const completedTurn = messages.locator("[data-turn-id]").nth(0)
   const completed = await openRunningReasoning(completedTurn)
+  await fixture.finishHeldReply()
   await expect(
     completedTurn.locator('[data-turn-status="completed"]')
   ).toBeVisible()
@@ -1549,7 +1550,7 @@ test("history_pagination_recovers_after_connection_error_without_reloading_page"
 
   // 2. 重连后继续上翻，连接错误不留下隐形的分页锁。
   await expect(
-    page.getByRole("button", { name: "已连接", exact: true })
+    page.getByRole("button", { name: "本页 · 已连接", exact: true })
   ).toBeVisible({ timeout: 20_000 })
   await expect(
     page.getByRole("button", { name: "发送", exact: true })

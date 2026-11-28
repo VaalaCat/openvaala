@@ -240,24 +240,27 @@ func TestACPCommandProcess(t *testing.T) {
 			},
 		},
 		{
-			name: "serve_stop_fails_prompt",
+			name: "serve_stop_keeps_process",
 			run: func(t *testing.T, test *acpProcessTest) {
 				editor := startACPProcess(t, test.binary, test.configPath)
 				editor.wire.initialize(t)
 				id := editor.wire.newSession(t, t.TempDir())
-				promptID := editor.wire.prompt(t, id, "hold")
+				editor.wire.prompt(t, id, "hold")
 				test.model.next(t).reply <- acpModelReply{
 					text: "partial",
 					hold: true,
 				}
 				waitACPAgentChunk(t, editor.wire)
 				requireACPServeStop(t, test, "stopped\n")
-				result := editor.wire.response(t, promptID)
-				if result.Error == nil || result.Error.Code != -32603 || result.Error.Message != "connection to runtime server lost" {
-					t.Fatalf("prompt = %+v, want -32603 connection to runtime server lost", result)
+				select {
+				case err := <-editor.done:
+					editor.isExited, editor.exitErr = true, err
+					t.Fatalf("acp exited after serve stopped: %v\n%s", err, editor.getStderr())
+				case <-time.After(300 * time.Millisecond):
 				}
-				if err := editor.wait(t, 10*time.Second); err == nil {
-					t.Fatal("acp exited with status 0 after losing the runtime server")
+				// 关闭编辑器输入后进程正常退出，serve 不再被重新拉起。
+				if err := editor.close(t); err != nil {
+					t.Fatalf("acp exited with %v after serve stopped\n%s", err, editor.getStderr())
 				}
 				requireACPServeReachable(t, test, false)
 			},

@@ -109,8 +109,8 @@ func readCodexFlags(flags *pflag.FlagSet, args *AppArgs) (err error) {
 			return err
 		}
 	}
-	if flag := flags.Lookup("listen"); flag != nil {
-		args.AppServerListen = flag.Value.String()
+	if flags.Lookup("stdio") != nil {
+		args.AppServerListen = flags.Lookup("listen").Value.String()
 		args.IsAppServerStdio, err = flags.GetBool("stdio")
 	}
 	return err
@@ -273,13 +273,9 @@ func getAppServerListen(args *AppArgs) (appServerListen, error) {
 		// 路径为空时用连接文件同目录的 app-server.sock，相对路径按当前目录展开。
 		path := strings.TrimPrefix(listen, "unix://")
 		if path == "" {
-			serverFilePath, err := getRuntimeServerFilePath()
-			if err != nil {
-				return appServerListen{}, err
-			}
 			return appServerListen{
 				Kind:       appServerListenUnix,
-				SocketPath: filepath.Join(filepath.Dir(serverFilePath), "app-server.sock"),
+				SocketPath: filepath.Join(args.Config.GetStateDirectory(), "app-server.sock"),
 			}, nil
 		}
 		path, err := filepath.Abs(path)

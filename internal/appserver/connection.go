@@ -111,10 +111,10 @@ func (c *appServerConnection) Run(ctx context.Context) (err error) {
 			case changed.State == runtimeclient.ConnectionConnected && !isConnected:
 				isConnected = true
 				serverConnected <- changed.ServerID
-			case changed.State == runtimeclient.ConnectionReconnecting:
-				// 首次失败附上拨号原因，仍可通过 errors.Is 识别 ErrConnectionLost。
+			case changed.State == runtimeclient.ConnectionReconnecting && !isConnected:
+				// 还没连上时结束整条连接；已经连上后的断开由 Client 按原地址重连。
 				cause := runtimeclient.ErrConnectionLost
-				if !isConnected && changed.Err != nil {
+				if changed.Err != nil {
 					cause = fmt.Errorf("%w: %v", runtimeclient.ErrConnectionLost, changed.Err)
 				}
 				c.stopConnection(cause)
@@ -416,13 +416,15 @@ func (c *appServerConnection) handleRequest(ctx context.Context, request codexMe
 
 // getInitializeResult 返回版本、配置目录和平台信息。
 func (c *appServerConnection) getInitializeResult() codexInitializeResult {
+	const codexCompatibilityVersion = "0.171.0"
+
 	// 1. 区分 Windows 与 Unix，填写握手结果。
 	platformFamily := "unix"
 	if goruntime.GOOS == "windows" {
 		platformFamily = "windows"
 	}
 	return codexInitializeResult{
-		UserAgent:      fmt.Sprintf("openvaala/%s (%s; %s)", c.version, goruntime.GOOS, goruntime.GOARCH),
+		UserAgent:      fmt.Sprintf("openvaala/%s (%s; %s; build %s)", codexCompatibilityVersion, goruntime.GOOS, goruntime.GOARCH, c.version),
 		CodexHome:      c.configDirectory,
 		PlatformFamily: platformFamily,
 		PlatformOs:     goruntime.GOOS,

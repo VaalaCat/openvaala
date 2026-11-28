@@ -47,6 +47,7 @@ const e2eTimeout = 30 * time.Second
 
 // TestCodexHandshake 检查两种传输下的握手、启动查询和连接错误。
 func TestCodexHandshake(t *testing.T) {
+	t.Parallel()
 	// 1. 编译程序，分别在 stdio 和 Unix socket 两种传输下运行。
 	binary := buildOpenVaala(t)
 	for _, mode := range []string{"stdio", "unix"} {
@@ -534,6 +535,7 @@ func TestCodexListen(t *testing.T) {
 
 // TestCodexPathMappings 检查对话目录的客户端与服务端路径换算。
 func TestCodexPathMappings(t *testing.T) {
+	t.Parallel()
 	// 1. 配置 Unix 与 Windows 两组前缀，准备共用模型和连接。
 	binary := buildOpenVaala(t)
 	model := newE2EModel(t)
@@ -725,7 +727,7 @@ func TestCodexPathMappings(t *testing.T) {
 				remoteWorkspace := t.TempDir()
 				// writeE2EConfig 的 server 段在文件末尾，接着写的缩进行属于 server 段。
 				appendE2EConfig(t, remoteConfig, fmt.Sprintf("  workspace_directory: %q\n", remoteWorkspace))
-				remoteURL := startE2EServe(t, f.binary, remoteConfig)
+				_, remoteURL := startE2EServe(t, f.binary, remoteConfig)
 				appServer, stdout := startE2EProcess(t, f.binary, f.config, []string{"app-server", "--url", remoteURL}, true)
 				wire := newStdioWire(t, appServer, stdout)
 				wire.call(t, "initialize", codexClientInfo, nil)
@@ -813,13 +815,13 @@ func getE2EConversationDirectory(t *testing.T, config, threadID string) string {
 	return record.ExecutorSettings.WorkspaceDirectories[defs.LocalExecutorID]
 }
 
-// startE2EServe 启动服务并返回带 token 的连接地址。
-func startE2EServe(t *testing.T, binary, config string) string {
+// startE2EServe 等服务就绪，返回进程和带 token 的连接地址。
+func startE2EServe(t *testing.T, binary, config string) (*e2eProcess, string) {
 	t.Helper()
 	// 1. 启动 serve 并等待它写出可用的连接地址。
 	process, _ := startE2EProcess(t, binary, config, []string{"serve"}, false)
 	server := process.waitServeHealthy(t, getE2EServerConnectionPath(config), nil, http.DefaultClient, 50*time.Millisecond)
-	return server.URL + "?token=" + url.QueryEscape(server.Token)
+	return process, server.URL + "?token=" + url.QueryEscape(server.Token)
 }
 
 type e2eServerConnection struct {
@@ -876,6 +878,7 @@ func (s *e2eProcess) waitServeHealthy(t *testing.T, path string, previousFile os
 
 // TestCodexCommand 检查 codex 命令的参数转发、信号与退出结果。
 func TestCodexCommand(t *testing.T) {
+	t.Parallel()
 	// 1. 编译程序；各用例写一个记录 PID 和参数的假 codex，运行 openvaala codex 后按 stop 让它结束。
 	binary := buildOpenVaala(t)
 	tests := []struct {
@@ -1060,6 +1063,7 @@ func TestCodexCommand(t *testing.T) {
 
 // TestCodexTurn 检查一轮输入、模型输出、工具调用和中断。
 func TestCodexTurn(t *testing.T) {
+	t.Parallel()
 	// 1. 编译程序，分别在 stdio 和 Unix 传输上运行。
 	binary := buildOpenVaala(t)
 	for _, mode := range []string{"stdio", "unix"} {
@@ -1915,6 +1919,7 @@ func getModelToolNames(body map[string]any) []string {
 
 // TestCodexResume 检查恢复、运行中接入、重配、压缩和断线。
 func TestCodexResume(t *testing.T) {
+	t.Parallel()
 	// 1. 编译程序，分别在 stdio 和 Unix 传输上运行各用例。
 	binary := buildOpenVaala(t)
 	for _, mode := range []string{"stdio", "unix"} {
@@ -2488,6 +2493,7 @@ type codexWireLoadedList struct {
 
 // TestCodexHistory 检查 Thread、Turn 和 Item 的历史查询与分页。
 func TestCodexHistory(t *testing.T) {
+	t.Parallel()
 	// 1. 编译程序，分别在 stdio 和 Unix 传输上运行各用例。
 	binary := buildOpenVaala(t)
 	for _, mode := range []string{"stdio", "unix"} {
@@ -3308,6 +3314,7 @@ func getEntryIDs(entries []codexWireItemEntry) []string {
 
 // TestCodexConversationManagement 检查分叉、归档、删除和对应列表。
 func TestCodexConversationManagement(t *testing.T) {
+	t.Parallel()
 	// 1. 编译程序，分别在 stdio 和 Unix 传输上运行各用例。
 	binary := buildOpenVaala(t)
 	for _, mode := range []string{"stdio", "unix"} {
@@ -3651,6 +3658,7 @@ func readE2ERootSessionLog(t *testing.T, config, conversationID string) []*defs.
 
 // TestCodexSubAgents 检查子 Thread 的发现、通知、历史和只读操作。
 func TestCodexSubAgents(t *testing.T) {
+	t.Parallel()
 	// 1. 编译程序，分别在 stdio 和 Unix 传输上跑一遍子 Agent 剧本，再逐用例检查它留下的结果。
 	binary := buildOpenVaala(t)
 	for _, mode := range []string{"stdio", "unix"} {
@@ -4682,11 +4690,11 @@ func getFreeAddress(t *testing.T) string {
 
 // getE2EEnvironment 返回使用临时 HOME 的子进程环境。
 func getE2EEnvironment(home string) []string {
-	// 1. 替换 HOME，移除 OPENVAALA_*、XDG_*、CODEX_HOME 和 PASEO_HOME。
-	environment := []string{"HOME=" + home}
+	// 子进程的输出和退出码由测试同步收集，race 检查结束后可以立即退出。
+	environment := []string{"HOME=" + home, "GORACE=" + strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0")}
 	for _, entry := range os.Environ() {
 		name, _, _ := strings.Cut(entry, "=")
-		if name == "HOME" || name == "CODEX_HOME" || name == "PASEO_HOME" || strings.HasPrefix(name, "OPENVAALA_") || strings.HasPrefix(name, "XDG_") {
+		if name == "HOME" || name == "GORACE" || name == "CODEX_HOME" || name == "PASEO_HOME" || strings.HasPrefix(name, "OPENVAALA_") || strings.HasPrefix(name, "XDG_") {
 			continue
 		}
 		environment = append(environment, entry)

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -67,18 +66,23 @@ func (f *desktopCommandFlags) runAppCommand(command *cobra.Command, _ []string) 
 	if err != nil {
 		return err
 	}
-	startTarget := cli.ResolveDesktopStartTarget(command)
+	startTarget, cfg := cli.ResolveDesktopStartTarget(command)
 	// 2. 两种界面均支持远端目标，未指定时复用或启动常驻的本机 serve。
 	runtimeServerStart := cli.RuntimeServerStartOpt{
+		Config:      cfg,
 		Executable:  executable,
 		ConfigFlags: configFlags,
 		IdleTimeout: 0,
 	}
 	if f.Native {
+		var headers map[string]string
+		if cfg != nil {
+			headers = cfg.GetHTTPHeaders()
+		}
 		app, err := desktop.NewDesktop(&desktop.DesktopOpt{
 			RuntimeServerStart: runtimeServerStart,
 			StartTarget:        startTarget,
-			HTTPHeaders:        getDesktopHTTPHeaders(command),
+			HTTPHeaders:        headers,
 		})
 		if err != nil {
 			return err
@@ -93,15 +97,4 @@ func (f *desktopCommandFlags) runAppCommand(command *cobra.Command, _ []string) 
 		return err
 	}
 	return app.Run(command.Context())
-}
-
-// getDesktopHTTPHeaders 读取配置里的 http.headers，给原生界面下载图片时使用；配置加载失败时记录警告并返回 nil。
-func getDesktopHTTPHeaders(command *cobra.Command) map[string]string {
-	// 1. 加载失败不阻止窗口打开，由窗口里的连接错误提示报告本机服务的问题。
-	cfg, _, err := cli.LoadConfig(command)
-	if err != nil {
-		slog.Warn("cannot load config for desktop image downloads; sending no http.headers", "error", err)
-		return nil
-	}
-	return cfg.GetHTTPHeaders()
 }

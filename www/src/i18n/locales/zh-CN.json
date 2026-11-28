@@ -5,6 +5,9 @@
     "breadcrumb": "当前位置",
     "dangerZone": "危险操作",
     "actions": {
+      "scrollToBottom": "回到底部",
+      "expandMessage": "展开消息",
+      "collapseMessage": "收起消息",
       "cancel": "取消",
       "clearFilters": "清除筛选",
       "clearSearch": "清除搜索",
@@ -158,7 +161,6 @@
     "messages": "消息",
     "empty": "还没有消息",
     "loadingEarlier": "正在加载更早的消息",
-    "scrollToBottom": "回到底部",
     "pending": {
       "title": "待处理",
       "steer": "补充",
@@ -203,8 +205,6 @@
       "copy": "复制消息",
       "from": "来自",
       "context": "附带材料",
-      "expand": "展开消息",
-      "collapse": "收起消息",
       "subagent": {
         "failed": "失败",
         "interrupted": "已中断",

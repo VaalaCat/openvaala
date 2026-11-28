@@ -52,9 +52,6 @@ func (d *Desktop) navigate(page string) {
 	if page == "" && d.sidebarDrawerOpenedBySettings {
 		d.closeSidebarDrawer()
 	}
-	if page == "" {
-		d.catalogOpen = false
-	}
 	d.page = page
 	d.settingsRequest++
 	d.settingsLoading = false
@@ -118,7 +115,11 @@ func (d *Desktop) closeSidebarDrawer() {
 func (d *Desktop) settingsView(c *ui.Context) {
 	// 1. 页头的应用与撤销只记录意图，等本页字段处理完本帧输入后再执行。
 	apply, revert := false, false
-	page := kit.SettingPage(c.Key(d.page), d.getSettingsPageTitle(d.page), func() { d.settingsActionsView(c, &apply, &revert) }, func() {
+	pageKey := d.page
+	if d.page == "providers" && d.providerDraft != nil && d.providerDraft.EditingID == "" {
+		pageKey = "providers:new"
+	}
+	page := kit.SettingPage(c.Key(pageKey), d.getSettingsPageTitle(d.page), func() { d.settingsActionsView(c, &apply, &revert) }, func() {
 		if d.settingsError != nil {
 			ui.Row(c).Gap(kit.GetTheme(c).Space(2)).AlignItems(ui.Center).Children(func() {
 				d.errorMessageView(c, d.settingsError).Shrink(1)
@@ -180,13 +181,10 @@ func (d *Desktop) settingsView(c *ui.Context) {
 
 // settingsActionsView 绘制页头右侧的操作：模型服务页与 Executor 页的新增、撤销、测试、应用，以及每页都有的重载配置。
 func (d *Desktop) settingsActionsView(c *ui.Context, apply, revert *bool) {
-	// 1. 模型服务页：新增服务、服务目录开关；有草稿时再加撤销与应用，应用在可提交时是主按钮。
+	// 1. 模型服务页：新增服务；有草稿时再加撤销与应用，应用在可提交时是主按钮。
 	if d.page == "providers" {
 		if kit.Button(c, d.t("add.provider")).Clicked() {
 			d.openProvider(defs.ProviderConfig{Protocol: "openai_chat"}, "", "")
-		}
-		if kit.Button(c, d.t("provider.catalog")).Clicked() {
-			d.catalogOpen = !d.catalogOpen
 		}
 		if d.providerDraft != nil {
 			if kit.Button(c, d.t("revert")).Disabled(d.providerSaving).Clicked() {

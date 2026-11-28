@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -38,7 +39,7 @@ func newConversationConfig(ctx context.Context, conversationID defs.Conversation
 	return config, nil
 }
 
-// assembleConversationConfig 装配执行环境和 Skill，校验 Agent 和模型，确认各 Session 用的 Agent 都在目录里。
+// assembleConversationConfig 装配执行环境、Skill 和附加工具，校验对话配置与已有 Session 的 Agent。
 func assembleConversationConfig(ctx context.Context, conversationID defs.ConversationID, config *conversationConfig, storedSettings defs.ExecutorSettings,
 	opt *ConversationOpt, sessionRecords []defs.Session) error {
 	// 1. 校验定义；需要 Executor 的对话继续装配执行环境和 Skill。
@@ -50,17 +51,36 @@ func assembleConversationConfig(ctx context.Context, conversationID defs.Convers
 			return err
 		}
 	}
-	// 2. 校验 Agent 和模型，确认每个 Session 用的 Agent 都在目录里。
-	agentDefinitions, models, err := validateConversationConfig(ctx, config.definitions, config.skills, config.environments)
+	// 2. 按对话加载一次附加工具，连同已有工具、Agent 和模型一起校验。
+	var extraTools []executor.Tool
+	if provider := config.definitions.ExtraTools; provider != nil {
+		tools, err := provider.GetTools(ctx, conversationID)
+		if err != nil {
+			return fmt.Errorf("get extra tools: %w", err)
+		}
+		for _, tool := range tools {
+			value := reflect.ValueOf(tool)
+			switch value.Kind() {
+			case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+				if value.IsNil() {
+					return errors.New("extra tool is missing")
+				}
+			}
+		}
+		extraTools = slices.Clone(tools)
+	}
+	agentDefinitions, models, err := validateConversationConfig(ctx, config.definitions, config.skills, config.environments, extraTools...)
 	if err != nil {
 		return err
 	}
+	// 3. 确认每个 Session 用的 Agent 都在目录里，保存已校验的配置。
 	for _, sessionRecord := range sessionRecords {
 		if _, found := agentDefinitions[sessionRecord.AgentName]; !found {
 			return newAgentNotConfiguredError(sessionRecord)
 		}
 	}
 	config.agentDefinitions, config.models = agentDefinitions, models
+	config.extraTools = extraTools
 	return nil
 }
 

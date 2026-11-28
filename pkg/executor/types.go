@@ -48,7 +48,7 @@ func (*ExecutionProgressEvent) executorEvent() {}
 // ExecutionFinishedEvent 由 ToolExecutor 在一次调用结束、进度转发完毕后发送；每个调用发送一次，被取消也会发送。
 type ExecutionFinishedEvent struct {
 	// Result 是这次调用的最终结果；工具不存在、参数错误、执行失败和取消都写在 Result.Error 里。
-	// Result.Executor 由 ToolExecutor 填入实际执行环境的 ID；协作工具为空。
+	// Result.Executor 由 ToolExecutor 填入实际执行环境的 ID；Agent 侧工具为空。
 	Result *defs.ToolResult
 	// AgentsInstructions 是工具这次调用读到的目录规则，每条的 Executor 字段已填为实际执行环境的 ID。
 	AgentsInstructions []*defs.AgentsInstruction
@@ -83,16 +83,16 @@ type toolRoutes struct {
 // toolRoute 是工具表里的一个工具名：定义取自第一个提供方。
 type toolRoute struct {
 	definition *defs.ToolDefinition
-	// providers 按环境顺序排列；协作工具只有一个提供方。
+	// providers 按环境顺序排列；Agent 侧工具只有一个提供方。
 	providers []toolProvider
 }
 
 // toolProvider 是一个工具名的一处提供方：在哪个环境、由哪个工具对象执行。
 type toolProvider struct {
-	// environment 是提供工具的执行环境；协作工具为 nil。
+	// environment 是提供工具的执行环境；Agent 侧工具为 nil。
 	environment ExecutionEnvironment
 	tool        Tool
-	// executorID 是工具在日志和遥测里的环境 ID，协作工具为空。
+	// executorID 是工具在日志和遥测里的环境 ID，Agent 侧工具为空。
 	executorID string
 }
 

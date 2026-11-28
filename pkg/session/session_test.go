@@ -3824,6 +3824,57 @@ func TestSessionDurableInput(t *testing.T) {
 	}
 }
 
+// checkpointDeletion 在测试读到最终待办通知后才允许删除，以验证发布发生在清理之前。
+type checkpointDeletion struct {
+	dao.Mutation
+	release chan struct{}
+	err     error
+}
+
+func (m checkpointDeletion) DeleteSessionCheckpoints(ctx context.Context, cid defs.ConversationID, sid defs.SessionID) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.release:
+	}
+	if m.err != nil {
+		return m.err
+	}
+	return m.Mutation.DeleteSessionCheckpoints(ctx, cid, sid)
+}
+
+func TestSessionPendingInputsBeforeCheckpointDeletion(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		deleteErr error
+	}{
+		{"deleted", nil},
+		{"delete failed", errors.New("checkpoint deletion failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSessionHarness(t)
+			deletion := checkpointDeletion{h.mutation, make(chan struct{}), tc.deleteErr}
+			h.start(t, deletion, true)
+			h.submit(t, session.SessionInputModeNormal, "finish")
+			h.waitModelStarted(t)
+			h.model.replies <- modelReply{text: "done"}
+			h.nextTurnFinished(t)
+			update, ok := h.nextEvent(t).(*session.SessionPendingInputsUpdated)
+			close(deletion.release)
+			if !ok || update.PendingInputs.SteerTurnID != "" || len(update.PendingInputs.Inputs) != 0 {
+				t.Fatalf("final pending inputs = %+v", update)
+			}
+			if tc.deleteErr != nil {
+				if err := h.waitRunStopped(t); !errors.Is(err, tc.deleteErr) {
+					t.Fatalf("Run = %v", err)
+				}
+			} else if _, err := h.session.GetStatus(t.Context()); err != nil {
+				t.Fatalf("session after checkpoint deletion = %v", err)
+			}
+		})
+	}
+}
+
 // failingCheckpointMutation 让 Session checkpoint 追加失败。
 type failingCheckpointMutation struct{ dao.Mutation }
 

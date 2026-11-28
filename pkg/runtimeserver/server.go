@@ -7,13 +7,10 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
-	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"net/http"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,24 +24,26 @@ import (
 	"github.com/google/uuid"
 )
 
-// RuntimeServer 是 Runtime 外层的网络协议宿主：监听配置的地址，校验 token，把 WebSocket 连接上的
-// JSON-RPC 请求转换为 Runtime 公开调用。
+// RuntimeServer 把 Runtime 公开方法暴露为 HTTP 和 WebSocket 路由，管理已升级连接和空闲退出。
 type RuntimeServer interface {
-	// Run 监听并服务直到 ctx 结束、收到 shutdown 请求或空闲超时；返回前停止接受新连接，并关闭、等待全部已升级连接。只能调用一次。
-	// 监听或服务失败时返回该错误；ctx 结束时返回 ctx.Err()；收到 shutdown 请求或空闲超时时返回 nil。
+	// RegisterRoutes 把健康检查、协议、关闭和页面路由注册到调用方的路由器。
+	RegisterRoutes(router gin.IRouter)
+	// Run 在 ctx 结束、收到关闭请求或空闲超时时取消并等待所有连接，然后返回 ctx.Err()。只能调用一次。
 	Run(ctx context.Context) error
 }
 
-// runtimeServerImpl 保存路由引擎、已升级的 WebSocket 连接任务和连接计数。
+// runtimeServerImpl 保存 WebSocket 连接任务和空闲退出状态。
 type runtimeServerImpl struct {
-	opt    RuntimeServerOpt
-	engine *gin.Engine
+	opt RuntimeServerOpt
 
-	// started 是 Run 只能调用一次的令牌；runCtx 是 Run 的生命周期，在开始服务前写入，已升级连接从它派生。
-	started chan struct{}
-	runCtx  context.Context
-	// connections 是已升级连接的处理任务：接管连接前登记、连接结束时注销；Run 在 http.Server.Shutdown 之后等待。
-	connections sync.WaitGroup
+	// started 是否已经调用过 Run？
+	started atomic.Bool
+	// connectionsReady 在 Run 发布连接上下文后关闭，等待中的握手可以继续。
+	connectionsReady chan struct{}
+	// connectionsMu 让开始握手时的登记和停止时的封口互斥。
+	connectionsMu sync.Mutex
+	runCtx        context.Context
+	connections   sync.WaitGroup
 	// openConnectionCount 是当前正在服务的 WebSocket 连接数，握手中的也算；由 serveConnection 更新，空闲检查读取。
 	openConnectionCount atomic.Int64
 	// lastConnectionClosedAt 是最后一个连接结束的时间，还没有连接结束过时是 Run 开始的时间；由 serveConnection 更新，空闲检查读取。
@@ -91,17 +90,13 @@ type ModelCatalog interface {
 	FetchProviderModels(ctx context.Context, provider defs.ProviderConfig) (map[string]*defs.ProviderModelConfig, error)
 }
 
-// RuntimeServerOpt 保存 Runtime、模型配置、模型目录、监听位置与 token，构造后只读。
+// RuntimeServerOpt 保存 Runtime、模型配置、模型目录与 token，构造后只读。
 type RuntimeServerOpt struct {
 	Runtime runtime.Runtime
 	// Configuration 读写 serve 本机的模型配置，必须非 nil。
 	Configuration Configuration
 	// ModelCatalog 提供引导用的模型服务和模型，必须非 nil。
 	ModelCatalog ModelCatalog
-	// Listen 是 TCP 监听地址，例如 0.0.0.0:8790；Listener 非 nil 时忽略。
-	Listen string
-	// Listener 是调用方已建立的监听器；非 nil 时优先使用它，Run 返回前关闭。调用方可先写出实际地址再启动服务。
-	Listener net.Listener
 	// Token 是全部协议路由共用的访问令牌。
 	Token string
 	// ServerID 标识这台机器上的 serve，重启后保持不变，initialize 原样返回；客户端据此判断连上的是不是本机的 serve。
@@ -114,104 +109,69 @@ type RuntimeServerOpt struct {
 	IdleTimeout time.Duration
 }
 
-// NewRuntimeServerOpt 保存 Runtime、监听地址和访问令牌。
-func NewRuntimeServerOpt(rt runtime.Runtime, listen, token string) *RuntimeServerOpt {
-	// 1. 填入 Runtime、TCP 地址和 token。
+// NewRuntimeServerOpt 保存 Runtime 和访问令牌。
+func NewRuntimeServerOpt(rt runtime.Runtime, token string) *RuntimeServerOpt {
+	// 1. 填入 Runtime 和 token。
 	return &RuntimeServerOpt{
 		Runtime: rt,
-		Listen:  listen,
 		Token:   token,
 	}
 }
 
-// NewRuntimeServer 校验服务配置，注册健康检查、协议、关闭和页面路由。
+// NewRuntimeServer 校验服务配置并创建运行所需的通知通道。
 func NewRuntimeServer(opt *RuntimeServerOpt) (RuntimeServer, error) {
-	// 1. 检查 Runtime、配置服务、模型目录、监听位置和 token。
-	if opt == nil || opt.Runtime == nil || opt.Configuration == nil || opt.ModelCatalog == nil ||
-		(opt.Listen == "" && opt.Listener == nil) || opt.Token == "" {
-		return nil, errors.New("runtime server requires a runtime, a configuration, a model catalog, a listen address or listener, and a token")
+	// 1. 检查 Runtime、配置服务、模型目录和 token。
+	if opt == nil || opt.Runtime == nil || opt.Configuration == nil || opt.ModelCatalog == nil || opt.Token == "" {
+		return nil, errors.New("runtime server requires a runtime, a configuration, a model catalog, and a token")
 	}
-	// 2. 切换 Gin 发布模式，创建路由引擎和运行通知通道。
-	gin.SetMode(gin.ReleaseMode)
-	s := &runtimeServerImpl{
-		opt:     *opt,
-		engine:  gin.New(),
-		started: make(chan struct{}, 1),
-		// 最多暂存一个关闭信号。
+	// 2. 创建连接就绪和关闭请求通道，最多暂存一个关闭请求。
+	return &runtimeServerImpl{
+		opt:               *opt,
+		connectionsReady:  make(chan struct{}),
 		shutdownRequested: make(chan struct{}, 1),
-	}
-	// 3. 注册健康检查，并给协议与关闭路由添加 token 校验。
-	api := s.engine.Group("/api/v1")
-	api.GET("/healthz", handleHealthz)
-	protocols := api.Group("", s.requireToken)
-	protocols.GET("/openvaala", s.handleOpenVaalaUpgrade)
-	protocols.POST("/shutdown", s.handleShutdown)
-	// 4. 注册页面路由，不校验 token；根路径跳转到页面，浏览器会把地址里的 #token 带过去。
-	s.engine.GET("/web/v1/*filepath", s.handleWebUI)
-	s.engine.GET("/", func(c *gin.Context) {
-		c.Redirect(http.StatusFound, "/web/v1/")
-	})
-	return s, nil
+	}, nil
 }
 
-// Run 监听地址并运行 HTTP 与 WebSocket 服务，等到停止条件后关闭 HTTP 服务，再取消并等待全部已升级连接。
+func (s *runtimeServerImpl) RegisterRoutes(router gin.IRouter) {
+	// 1. 注册健康检查，并给协议与关闭路由添加 token 校验。
+	api := router.Group("/api/v1")
+	api.GET("/healthz", handleHealthz)
+	protocols := api.Group("", NewTokenMiddleware(s.opt.Token, s.handleTokenRejection))
+	protocols.GET("/openvaala", s.handleOpenVaalaUpgrade)
+	protocols.POST("/shutdown", s.handleShutdown)
+	RegisterWebRoutes(router, s.opt.WebUI, "/web/v1/")
+}
+
+// RegisterWebRoutes 将内嵌前端及其入口挂载到调用方的路由器。
+func RegisterWebRoutes(router gin.IRouter, assets fs.FS, landing string) {
+	router.GET("/web/v1/*filepath", func(c *gin.Context) { handleWebUI(c, assets) })
+	router.GET("/", func(c *gin.Context) { c.Redirect(http.StatusFound, landing) })
+}
+
 func (s *runtimeServerImpl) Run(ctx context.Context) error {
-	// 1. 拒绝重复运行，绑定遥测。
-	select {
-	case s.started <- struct{}{}:
-	default:
+	// 1. 拒绝重复运行，发布连接上下文和空闲计时起点。
+	if !s.started.CompareAndSwap(false, true) {
 		return errors.New("RuntimeServer Run can only be called once")
 	}
 	ctx = telemetry.ContextWithTelemetry(ctx, s.opt.Telemetry)
-	logger := telemetry.GetLogger(ctx)
-	// 2. 使用传入的监听器，未传入时监听配置地址。
-	listener := s.opt.Listener
-	if listener == nil {
-		var err error
-		if listener, err = net.Listen("tcp", s.opt.Listen); err != nil {
-			return fmt.Errorf("listen %s: %w", s.opt.Listen, err)
-		}
-	}
-	// 3. 记录实际监听地址，创建带监听地址遥测的连接上下文和 HTTP 服务。
-	host, port, _ := net.SplitHostPort(listener.Addr().String())
-	portNumber, _ := strconv.Atoi(port)
-	logger.Info("runtime server listening", "server.address", host, "server.port", portNumber)
-	runCtx, stopConnections := context.WithCancel(telemetry.ContextWithAttrs(ctx, telemetry.ServerAddress(host), telemetry.ServerPort(portNumber)))
-	defer stopConnections()
+	runCtx, stopConnections := context.WithCancel(ctx)
 	s.runCtx = runCtx
-	server := &http.Server{
-		Handler:           s.engine,
-		ReadHeaderTimeout: 10 * time.Second,
-		// HTTP 错误写入遥测日志。
-		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
-	}
-	// 4. 记录空闲计时起点并启动 HTTP 服务。
 	startedAt := time.Now()
 	s.lastConnectionClosedAt.Store(&startedAt)
-	serveErrs := make(chan error, 1)
-	go func() {
-		serveErrs <- server.Serve(listener)
-	}()
+	close(s.connectionsReady)
 
-	// 5. 等待取消、关闭请求、空闲超时或服务错误；没有服务错误时关闭 HTTP 服务：停止接受新连接，等待还没升级的请求。
-	serveErr := s.waitUntilStopped(ctx, serveErrs)
-	if serveErr == nil {
-		serveErr = server.Shutdown(context.WithoutCancel(ctx))
-		if err := <-serveErrs; !errors.Is(err, http.ErrServerClosed) {
-			serveErr = errors.Join(serveErr, err)
-		}
-	}
-	// 6. 取消全部升级连接并等待结束，返回服务错误或上下文错误；主动关闭和空闲超时返回 nil。
+	// 2. 等待停止条件，停止登记新连接，再取消并等待已登记的连接。
+	s.waitUntilStopped(ctx)
+	s.connectionsMu.Lock()
+	s.runCtx = nil
+	s.connectionsMu.Unlock()
 	stopConnections()
 	s.connections.Wait()
-	if serveErr != nil {
-		return serveErr
-	}
 	return ctx.Err()
 }
 
-// waitUntilStopped 等到 ctx 结束、收到关闭请求、空闲超时或 HTTP 服务出错；只有服务出错时返回错误。
-func (s *runtimeServerImpl) waitUntilStopped(ctx context.Context, serveErrs <-chan error) error {
+// waitUntilStopped 等到 ctx 结束、收到关闭请求或空闲超时。
+func (s *runtimeServerImpl) waitUntilStopped(ctx context.Context) {
 	// 1. 空闲超时大于零时启动周期检查。
 	var idleChecks <-chan time.Time
 	if s.opt.IdleTimeout > 0 {
@@ -219,19 +179,17 @@ func (s *runtimeServerImpl) waitUntilStopped(ctx context.Context, serveErrs <-ch
 		defer ticker.Stop()
 		idleChecks = ticker.C
 	}
-	// 2. 等待上下文结束、关闭请求、空闲超时或服务错误；服务失败返回错误，其余停止条件返回 nil。
+	// 2. 等待上下文结束、关闭请求或空闲超时。
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
-		case err := <-serveErrs:
-			return err
+			return
 		case <-s.shutdownRequested:
-			return nil
+			return
 		case <-idleChecks:
 			if s.isRuntimeIdle(ctx) {
 				telemetry.GetLogger(ctx).Info("runtime server is idle, shutting down", "idle_timeout", s.opt.IdleTimeout.String())
-				return nil
+				return
 			}
 		}
 	}
@@ -257,9 +215,9 @@ func (s *runtimeServerImpl) handleShutdown(c *gin.Context) {
 const webUINotBuiltText = "web UI is not built into this binary; build with script/build.sh"
 
 // handleWebUI 返回页面静态文件；找不到且路径不带 "." 时返回 index.html，交给前端路由。
-func (s *runtimeServerImpl) handleWebUI(c *gin.Context) {
+func handleWebUI(c *gin.Context, assets fs.FS) {
 	// 1. 没有打包页面时返回 404 和构建提示。
-	if s.opt.WebUI == nil {
+	if assets == nil {
 		c.String(http.StatusNotFound, webUINotBuiltText)
 		return
 	}
@@ -268,11 +226,11 @@ func (s *runtimeServerImpl) handleWebUI(c *gin.Context) {
 	if name == "" {
 		name = "index.html"
 	}
-	content, err := fs.ReadFile(s.opt.WebUI, name)
+	content, err := fs.ReadFile(assets, name)
 	// 3. 找不到且路径不带 "." 时读取 index.html。
 	if err != nil && !strings.Contains(name, ".") {
 		name = "index.html"
-		content, err = fs.ReadFile(s.opt.WebUI, name)
+		content, err = fs.ReadFile(assets, name)
 	}
 	// 4. 仍然读不到返回 404。
 	if err != nil {
@@ -304,22 +262,33 @@ func (s *runtimeServerImpl) isRuntimeIdle(ctx context.Context) bool {
 	return isIdle
 }
 
-// requireToken 校验请求的访问令牌。
-func (s *runtimeServerImpl) requireToken(c *gin.Context) {
-	// 1. 优先读取 Bearer token，未提供时读取查询参数 token。
-	token, found := strings.CutPrefix(c.GetHeader("Authorization"), "Bearer ")
-	if !found {
-		token = c.Query("token")
+// NewTokenMiddleware 校验访问令牌，拒绝时调用可选的 onReject 并返回 HTTP 401。
+func NewTokenMiddleware(token string, onReject func(c *gin.Context)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 1. 优先读取 Bearer token，未提供时读取查询参数 token。
+		requestToken, found := strings.CutPrefix(c.GetHeader("Authorization"), "Bearer ")
+		if !found {
+			requestToken = c.Query("token")
+		}
+		// 2. 令牌为空或不匹配时通知调用方并中止，匹配时继续。
+		if token == "" || subtle.ConstantTimeCompare([]byte(requestToken), []byte(token)) != 1 {
+			if onReject != nil {
+				onReject(c)
+			}
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+		c.Next()
 	}
-	// 2. 令牌不匹配时记录拒绝日志，返回 HTTP 401 并中止；匹配时继续。
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.opt.Token)) != 1 {
-		peerAddress, peerPort := getPeerAddress(c.Request.RemoteAddr)
-		telemetry.GetLogger(telemetry.ContextWithAttrs(s.runCtx, telemetry.NetworkPeerAddress(peerAddress), telemetry.NetworkPeerPort(peerPort))).
-			Warn("connection rejected", "reason", "invalid token")
-		c.AbortWithStatus(http.StatusUnauthorized)
-		return
-	}
-	c.Next()
+}
+
+// handleTokenRejection 记录拒绝访问的原因和 TCP 对端地址。
+func (s *runtimeServerImpl) handleTokenRejection(c *gin.Context) {
+	// 1. 使用请求上下文记录日志，握手尚未开始时也能记录。
+	ctx := telemetry.ContextWithTelemetry(c.Request.Context(), s.opt.Telemetry)
+	peerAddress, peerPort := getPeerAddress(c.Request.RemoteAddr)
+	ctx = telemetry.ContextWithAttrs(ctx, telemetry.NetworkPeerAddress(peerAddress), telemetry.NetworkPeerPort(peerPort))
+	telemetry.GetLogger(ctx).Warn("connection rejected", "reason", "invalid token")
 }
 
 // handleOpenVaalaUpgrade 使用 OpenVaala 方法表接管 WebSocket 连接。
@@ -330,27 +299,41 @@ func (s *runtimeServerImpl) handleOpenVaalaUpgrade(c *gin.Context) {
 
 // serveConnection 登记连接任务，升级 WebSocket 并处理到连接结束。
 func (s *runtimeServerImpl) serveConnection(c *gin.Context, methods map[string]methodHandler) {
-	// 1. 升级前登记任务和连接数，握手中的连接也计入；结束时记录断开时间并移除计数。
+	// 1. 等待连接上下文发布；请求先结束时直接返回。
+	select {
+	case <-s.connectionsReady:
+	case <-c.Request.Context().Done():
+		return
+	}
+	// 2. 升级前登记任务和连接数，服务停止时拒绝新连接。
+	s.connectionsMu.Lock()
+	runCtx := s.runCtx
+	if runCtx == nil || runCtx.Err() != nil {
+		s.connectionsMu.Unlock()
+		c.Status(http.StatusServiceUnavailable)
+		return
+	}
 	s.connections.Add(1)
-	defer s.connections.Done()
 	s.openConnectionCount.Add(1)
+	s.connectionsMu.Unlock()
+	defer s.connections.Done()
 	defer func() {
 		closedAt := time.Now()
 		s.lastConnectionClosedAt.Store(&closedAt)
 		s.openConnectionCount.Add(-1)
 	}()
-	// 2. 创建带连接 ID 和对端地址的上下文。
+	// 3. 创建带连接 ID 和对端地址的上下文。
 	peerAddress, peerPort := getPeerAddress(c.Request.RemoteAddr)
-	ctx := telemetry.ContextWithAttrs(s.runCtx, telemetry.ConnectionID(uuid.NewString()),
+	ctx := telemetry.ContextWithAttrs(runCtx, telemetry.ConnectionID(uuid.NewString()),
 		telemetry.NetworkPeerAddress(peerAddress), telemetry.NetworkPeerPort(peerPort))
 	logger := telemetry.GetLogger(ctx)
-	// 3. 接受 WebSocket 升级，不校验 Origin，其他地址的 Web UI 也能连。
+	// 4. 接受 WebSocket 升级，不校验 Origin，其他地址的 Web UI 也能连。
 	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		logger.Warn("websocket upgrade failed", "error", err)
 		return
 	}
-	// 4. 运行连接，结束后更新遥测并按正常或异常原因记录日志。
+	// 5. 运行连接，结束后更新遥测并按正常或异常原因记录日志。
 	logger.Info("connection opened")
 	telemetry.AddActiveConnections(ctx, 1)
 	closeReason := newServerConnection(conn, &s.opt, methods).Run(ctx)

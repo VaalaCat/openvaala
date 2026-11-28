@@ -472,6 +472,7 @@ test(
   async ({ page, fixture }) => {
     // 1. 保存配色和双字体，切换页面和刷新后仍使用已选外观。
     await fixture.openApp(page)
+    const newConversationPath = new URL(page.url()).pathname
     await page.getByRole("link", { name: "设置", exact: true }).click()
     await page.getByRole("tab", { name: "外观", exact: true }).click()
     await page
@@ -557,7 +558,10 @@ test(
       page.getByRole("heading", { name: "外观", exact: true })
     ).toHaveCSS("font-family", '"JetBrains Mono Variable", monospace')
     await fixture.replies({ text: "```text\nappearance_code_42\n```" })
-    await page.getByRole("link", { name: "新对话", exact: true }).click()
+    await page
+      .getByRole("link", { name: "新对话", exact: true })
+      .and(page.locator(`a[href="${newConversationPath}"]`))
+      .click()
     await startConversation(page, "字体隔离验证")
     await expect(
       getMessages(page).getByText("appearance_code_42", { exact: true })

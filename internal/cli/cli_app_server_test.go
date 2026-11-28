@@ -156,6 +156,16 @@ func TestAppServerFlags(t *testing.T) {
 			},
 		},
 		{
+			name: "default_socket_follows_data_directory",
+			args: []string{"app-server", "--data-dir", "~/instance", "--listen", "unix://"},
+			want: func(home, _ string) appServerListen {
+				return appServerListen{
+					Kind:       appServerListenUnix,
+					SocketPath: filepath.Join(home, "instance", "app-server.sock"),
+				}
+			},
+		},
+		{
 			name: "relative_socket_path_made_absolute",
 			args: []string{"app-server", "--listen", "unix://sockets/codex.sock"},
 			want: func(_, directory string) appServerListen {

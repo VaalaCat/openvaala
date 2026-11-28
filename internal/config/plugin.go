@@ -251,7 +251,7 @@ func InstallPlugin(ctx context.Context, opt *LoadConfigOpt, request *InstallPlug
 	if err != nil {
 		return "", false, err
 	}
-	cfg, _, err := loadConfigSettings(opt)
+	cfg, _, err := LoadConfigSettings(opt)
 	if err != nil {
 		return "", false, err
 	}
@@ -298,7 +298,7 @@ func InstallPlugin(ctx context.Context, opt *LoadConfigOpt, request *InstallPlug
 // UpdatePlugins 按安装记录更新插件，返回更新成功的插件名。
 func UpdatePlugins(ctx context.Context, opt *LoadConfigOpt, names []string) ([]string, error) {
 	// 1. 加载应用设置；没给名字时更新所有带安装记录的插件。
-	cfg, _, err := loadConfigSettings(opt)
+	cfg, _, err := LoadConfigSettings(opt)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +324,7 @@ func UpdatePlugins(ctx context.Context, opt *LoadConfigOpt, names []string) ([]s
 // UninstallPlugin 卸载插件，并把它从 plugins.disabled 里去掉。
 func UninstallPlugin(opt *LoadConfigOpt, name string) error {
 	// 1. 加载应用设置，找到插件，准备好去掉禁用名单里这个名字后的配置内容。
-	cfg, path, err := loadConfigSettings(opt)
+	cfg, path, err := LoadConfigSettings(opt)
 	if err != nil {
 		return err
 	}
@@ -373,7 +373,7 @@ func UninstallPlugin(opt *LoadConfigOpt, name string) error {
 // SetPluginDisabled 修改插件的禁用状态，返回配置有没有变化。
 func SetPluginDisabled(opt *LoadConfigOpt, name string, isDisabled bool) (bool, error) {
 	// 1. 只加载应用设置，检查插件已安装，读取原配置文件。
-	cfg, path, err := loadConfigSettings(opt)
+	cfg, path, err := LoadConfigSettings(opt)
 	if err != nil {
 		return false, err
 	}
@@ -408,7 +408,7 @@ func SetPluginDisabled(opt *LoadConfigOpt, name string, isDisabled bool) (bool, 
 // ListPlugins 按名字顺序列出插件目录里的条目和安装信息。
 func ListPlugins(opt *LoadConfigOpt) ([]PluginListEntry, error) {
 	// 1. 加载应用设置并读取插件目录，目录不存在时返回空列表。
-	cfg, _, err := loadConfigSettings(opt)
+	cfg, _, err := LoadConfigSettings(opt)
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,7 @@
 package conversation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	"github.com/VaalaCat/openvaala/pkg/utils/jsonutil"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
+	schemavalidator "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // getHookStartSource 返回 Session 这次启动后第一个普通 Turn 触发 SessionStart 用的来源。
@@ -163,6 +165,7 @@ func validateConversationConfig(
 	definitions *ConversationDefinitions,
 	skills []*skill.Skill,
 	environments []executor.ExecutionEnvironment,
+	extraTools ...executor.Tool,
 ) (map[string]*agent.AgentDefinition, map[defs.ModelRef]*defs.ModelDefinition, error) {
 	// 1. 校验各模型带有连接参数，建立模型引用索引。
 	models := make(map[defs.ModelRef]*defs.ModelDefinition, len(definitions.Models))
@@ -186,12 +189,12 @@ func validateConversationConfig(
 		}
 		agentDefinitions[definition.Name] = definition
 	}
-	// 3. 创建协作工具，和执行环境的内置工具放在一起校验工具定义，MCP 工具不参与。
+	// 3. 合并协作工具与附加工具，校验工具定义和重名；执行环境自带的内置工具参与重名校验，MCP 工具不参与。
 	collaborationTools, err := newCollaborationTools(nil, defs.Session{}, definitions, nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	toolExecutorOpt := executor.NewToolExecutorOpt(nil, collaborationTools...)
+	toolExecutorOpt := executor.NewToolExecutorOpt(nil, append(collaborationTools, extraTools...)...)
 	toolExecutorOpt.MCPServerIDs = defs.OptionalStringList{}
 	toolExecutor, err := executor.NewToolExecutor(toolExecutorOpt)
 	if err != nil {
@@ -200,8 +203,18 @@ func validateConversationConfig(
 	if _, err := toolExecutor.GetToolsForEnvironments(ctx, environments, getDefaultExecutorID(environments)); err != nil {
 		return nil, nil, err
 	}
-	// 4. 有执行环境时，校验各 Agent 选的工具名和 Skill 名都存在。
+	// 4. 校验附加工具的 schema，并补查与 Session 启动时才创建的命令工具是否重名。
 	executorToolNames := getExecutorToolNames(environments)
+	for _, tool := range extraTools {
+		definition := tool.GetDefinition()
+		if slices.Contains(executorToolNames, definition.Name) {
+			return nil, nil, fmt.Errorf("command tool %q conflicts with an agent tool", definition.Name)
+		}
+		if err := validateExtraToolSchema(definition.InputSchema); err != nil {
+			return nil, nil, fmt.Errorf("tool %q schema: %w", definition.Name, err)
+		}
+	}
+	// 5. 有执行环境时，校验各 Agent 选的工具名和 Skill 名都存在。
 	if len(environments) > 0 {
 		for _, definition := range definitions.Agents {
 			for _, toolName := range definition.ToolNames {
@@ -217,6 +230,23 @@ func validateConversationConfig(
 		}
 	}
 	return agentDefinitions, models, nil
+}
+
+// validateExtraToolSchema 校验模型将收到的工具参数 schema。
+func validateExtraToolSchema(inputSchema json.RawMessage) error {
+	// 1. 用工具自身的 schema 和库内置的元 schema 编译，不读取外部资源。
+	document, err := schemavalidator.UnmarshalJSON(bytes.NewReader(inputSchema))
+	if err != nil {
+		return err
+	}
+	compiler := schemavalidator.NewCompiler()
+	compiler.UseLoader(nil)
+	const schemaURL = "urn:openvaala:tool-arguments"
+	if err := compiler.AddResource(schemaURL, document); err != nil {
+		return err
+	}
+	_, err = compiler.Compile(schemaURL)
+	return err
 }
 
 // getAgentDefaultModels 返回以 Agent 名为键、默认模型为值的索引。
@@ -339,8 +369,8 @@ func getSkillNames(skills []*skill.Skill) []string {
 	return names
 }
 
-// getSessionToolNames 返回 Agent 可用的内置工具、已连接 MCP 工具和协作工具名。
-func getSessionToolNames(environments []executor.ExecutionEnvironment, definition *agent.AgentDefinition, collaborationTools []executor.Tool) []string {
+// getSessionToolNames 返回 Agent 可用的内置工具、已连接 MCP 工具和 Agent 侧工具名。
+func getSessionToolNames(environments []executor.ExecutionEnvironment, definition *agent.AgentDefinition, agentTools []executor.Tool) []string {
 	// 1. 汇总各环境上 Agent 可见的工具并去掉重名。
 	var names []string
 	for _, environment := range environments {
@@ -350,8 +380,8 @@ func getSessionToolNames(environments []executor.ExecutionEnvironment, definitio
 			}
 		}
 	}
-	// 2. 追加协作工具名。
-	for _, tool := range collaborationTools {
+	// 2. 追加 Agent 侧工具名。
+	for _, tool := range agentTools {
 		names = append(names, tool.GetDefinition().Name)
 	}
 	return names

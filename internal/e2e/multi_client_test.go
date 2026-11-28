@@ -23,6 +23,7 @@ import (
 
 // TestMultiClient 检查四种客户端跟随同一对话时收到的内容一致。
 func TestMultiClient(t *testing.T) {
+	t.Parallel()
 	// 1. 创建共用服务和模型，轮流使用 Codex Unix、Codex stdio、runtimeclient 和 ACP 发起请求。
 	binary := buildOpenVaala(t)
 	model := newE2EModel(t)
@@ -286,6 +287,8 @@ func TestMultiClientSlowReader(t *testing.T) {
 			logPath := getE2ELogPath(config)
 			var written strings.Builder
 			var starterMessages codexTurnMessages
+			// 用短词填满分片，让背压取决于字节量，避免在轮末为数千个连续的 x 做分词。
+			padding := strings.Repeat(" payload", slowReaderPartBytes/len(" payload")+1)
 			parts, received := 0, 0
 			// 2. 分批输出长回复，直到日志出现慢订阅被移除。
 			for countLogMessages(t, logPath, "subscriber removed") == 0 {
@@ -295,7 +298,7 @@ func TestMultiClientSlowReader(t *testing.T) {
 				// 每批输出后等发起方收齐增量，再发送下一批。
 				for range slowReaderBatchParts {
 					part := fmt.Sprintf("<%06d>", parts)
-					part += strings.Repeat("x", slowReaderPartBytes-len(part))
+					part += padding[:slowReaderPartBytes-len(part)]
 					writeModelStream(t, stream, part)
 					written.WriteString(part)
 					parts++

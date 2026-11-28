@@ -23,7 +23,9 @@ import (
 // 写方法写完都重新加载整份配置：加载失败时把文件恢复成写之前的样子（新建的删掉）并返回加载错误；
 // 成功时返回新的整份定义（见 GetRuntimeDefinitions）。没有加锁，两处同时写时后写的可能覆盖先写的。
 type ConfigFiles struct {
-	opt LoadConfigOpt
+	// DataDirectory 保存运行中服务的数据目录，重载时继续使用。
+	DataDirectory string
+	opt           LoadConfigOpt
 }
 
 // NewConfigFiles 创建 ConfigFiles，保存一份配置加载参数。
@@ -501,6 +503,9 @@ func (f *ConfigFiles) Reload(ctx context.Context) (*runtime.Definitions, error) 
 	cfg, err := LoadConfig(&f.opt)
 	if err != nil {
 		return nil, err
+	}
+	if f.DataDirectory != "" {
+		cfg.DataDirectory = f.DataDirectory
 	}
 	return cfg.GetRuntimeDefinitions(ctx)
 }

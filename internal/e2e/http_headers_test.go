@@ -22,9 +22,7 @@ func TestHTTPHeaders(t *testing.T) {
 	}
 	appendE2EConfig(t, f.config, "http:\n  headers:\n    X-Team: infra\n")
 	appendE2EConfig(t, filepath.Join(filepath.Dir(f.config), "models", "local.yaml"), "headers:\n  X-Title: MyTool\n")
-	startE2EServe(t, f.binary, f.config)
-	stopServeOnCleanup(t, f.binary, f.config)
-	f.connectControl(t)
+	f.startServe(t)
 
 	// 2. 根 Agent 委派 review 子 Agent：根 Agent 先收到 spawn_agent 的请求，随后根 Agent 的后续请求和子 Agent 的请求并发到达。
 	observer := f.openNewConversation(t)

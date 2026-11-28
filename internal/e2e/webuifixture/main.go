@@ -123,6 +123,7 @@ func run(binary string, out string) error {
 	mux.HandleFunc("POST /v1/chat/completions", model.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", model.handleListModels)
 	mux.HandleFunc("POST /replies", model.handleAppendReplies)
+	mux.HandleFunc("POST /replies/finish", model.handleFinishHeldReply)
 	mux.HandleFunc("POST /replies/reset", model.handleResetReplies)
 	mux.HandleFunc("POST /models", model.handleSetModels)
 	mux.HandleFunc("POST /restart", fixture.handleRestart)

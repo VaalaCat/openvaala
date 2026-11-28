@@ -188,3 +188,20 @@ func getUnhandedTurnInputs(inputs *defs.SessionTurnInputs, rows []dao.LoggedItem
 	}
 	return remaining, nil
 }
+
+// isAgentInputGroup 该输入组是否来自 Agent？
+func isAgentInputGroup(group defs.SessionInputGroup) bool {
+	// 1. 按输入消息发送方判断。
+	from := group.Items[0].Message.From
+	return from != nil && from.Kind == defs.IdentityAgent
+}
+
+// cloneInputBatch 复制一批输入组及其中的 Item。
+func cloneInputBatch(batch defs.SessionInputBatch) defs.SessionInputBatch {
+	// 1. 逐组复制 Item，保留原输入 ID。
+	cloned := slices.Clone(batch)
+	for index := range cloned {
+		cloned[index].Items = cloneInputItems(cloned[index].Items)
+	}
+	return cloned
+}

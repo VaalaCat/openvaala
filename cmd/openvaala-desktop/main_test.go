@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,47 @@ import (
 	"github.com/VaalaCat/openvaala/internal/cli"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 )
+
+func TestDesktopDiscoversRunningServeWithInvalidDefinitions(t *testing.T) {
+	for _, directory := range []string{"models", "agents"} {
+		t.Run(directory, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/v1/healthz" {
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			runtimeURL := "ws://" + strings.TrimPrefix(server.URL, "http://") + "/api/v1/openvaala"
+			for name, content := range map[string]string{
+				"config.yaml":                  "data_dir: instance\n",
+				directory + "/broken.yaml":     "broken: [\n",
+				"instance/runtime-server.yaml": "url: " + runtimeURL + "\ntoken: existing\n",
+			} {
+				path := filepath.Join(root, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			command := newDesktopCommand()
+			if err := command.ParseFlags([]string{"--config-file", filepath.Join(root, "config.yaml")}); err != nil {
+				t.Fatal(err)
+			}
+			target, cfg := cli.ResolveDesktopStartTarget(command)
+			if target.URL != "" {
+				t.Fatalf("expected local target, got %+v", target)
+			}
+			connection, err := cli.EnsureRuntimeServer(t.Context(), &cli.RuntimeServerStartOpt{Config: cfg})
+			if err != nil || connection.URL != runtimeURL || connection.Token != "existing" {
+				t.Fatalf("local connection = %+v, error = %v", connection, err)
+			}
+		})
+	}
+}
 
 // TestDesktopCommand 验证桌面命令树保留 CLI 帮助、版本和参数错误，不加载窗口或配置。
 func TestDesktopCommand(t *testing.T) {
@@ -150,7 +193,7 @@ func TestDesktopStartTargetResolution(t *testing.T) {
 			if err := command.ParseFlags(tt.args); err != nil {
 				t.Fatal(err)
 			}
-			got := cli.ResolveDesktopStartTarget(command)
+			got, _ := cli.ResolveDesktopStartTarget(command)
 			if got != tt.want {
 				t.Fatalf("ResolveDesktopStartTarget() = %+v, want %+v", got, tt.want)
 			}
@@ -205,14 +248,18 @@ func TestGetDesktopHTTPHeaders(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			got := getDesktopHTTPHeaders(command)
+			_, cfg := cli.ResolveDesktopStartTarget(command)
+			var got map[string]string
+			if cfg != nil {
+				got = cfg.GetHTTPHeaders()
+			}
 
 			if tt.wantTeam == "" {
 				if got != nil {
-					t.Fatalf("getDesktopHTTPHeaders() = %v, want nil", got)
+					t.Fatalf("desktop headers = %v, want nil", got)
 				}
 			} else if _, hasDefault := got["User-Agent"]; got["X-Team"] != tt.wantTeam || !hasDefault {
-				t.Fatalf("getDesktopHTTPHeaders() = %v, want X-Team %q merged with the built-in defaults", got, tt.wantTeam)
+				t.Fatalf("desktop headers = %v, want X-Team %q merged with the built-in defaults", got, tt.wantTeam)
 			}
 			if warned := strings.Count(logs.String(), "level=WARN"); tt.wantWarned && warned != 1 || !tt.wantWarned && warned != 0 {
 				t.Fatalf("warnings = %d, want warned %v: %s", warned, tt.wantWarned, logs.String())

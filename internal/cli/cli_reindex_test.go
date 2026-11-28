@@ -19,8 +19,9 @@ func TestReindex(t *testing.T) {
 	tests := []struct {
 		name string
 		// setup 准备数据目录，返回 reindex 之后应该能查到的对话，以及应该被跳过并写进 stderr 的对话。
-		setup      func(t *testing.T, dataDirectory string) (indexed, skipped []defs.ConversationID)
-		wantStdout string
+		setup               func(t *testing.T, dataDirectory string) (indexed, skipped []defs.ConversationID)
+		wantStdout          string
+		customDataDirectory bool
 		// wantErr 非空时 reindex 必须返回含它的错误，并且不改动 metadata.db。
 		wantErr string
 	}{
@@ -31,6 +32,16 @@ func TestReindex(t *testing.T) {
 		},
 		{
 			name: "rebuilds_copied_conversation",
+			setup: func(t *testing.T, dataDirectory string) (indexed, skipped []defs.ConversationID) {
+				id := writeReindexConversation(t, dataDirectory)
+				removeMetadataIndex(t, dataDirectory)
+				return []defs.ConversationID{id}, nil
+			},
+			wantStdout: "rebuilt 1 conversations\n",
+		},
+		{
+			name:                "rebuilds_in_custom_data_directory",
+			customDataDirectory: true,
 			setup: func(t *testing.T, dataDirectory string) (indexed, skipped []defs.ConversationID) {
 				id := writeReindexConversation(t, dataDirectory)
 				removeMetadataIndex(t, dataDirectory)
@@ -78,6 +89,11 @@ func TestReindex(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
 			dataDirectory := filepath.Join(home, ".local", "share", "openvaala")
+			arguments := []string{"reindex"}
+			if tt.customDataDirectory {
+				dataDirectory = filepath.Join(home, "custom-data")
+				arguments = append(arguments, "--data-dir", dataDirectory)
+			}
 			indexed, skipped := tt.setup(t, dataDirectory)
 			databaseBefore, _ := os.ReadFile(filepath.Join(dataDirectory, "metadata.db"))
 
@@ -86,7 +102,7 @@ func TestReindex(t *testing.T) {
 				Stdout: &stdout,
 				Stderr: &stderr,
 			})
-			command.SetArgs([]string{"reindex"})
+			command.SetArgs(arguments)
 			err := command.ExecuteContext(t.Context())
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {

@@ -27,6 +27,7 @@ Run `openvaala <command> --help` for the same information in the terminal.
 These work with every command, before or after the command name:
 
 - `--config-file <path>` — the configuration file. Default: `OPENVAALA_CONFIG`, then `~/.config/openvaala/config.yaml`.
+- `--data-dir <dir>` — override the local data and runtime state directory.
 - `--agents-dir <dir>` — the agent definition directory, overriding `agents.directory`.
 - `--models-dir <dir>` — the provider definition directory, overriding `models.directory`.
 - `--agent <name>` — the root agent, overriding `run.agent_name`.
@@ -59,6 +60,8 @@ openvaala serve
 ```
 
 Runs the runtime server in the foreground: it owns all conversations and serves the WebSocket API at `/api/v1/openvaala` and the web UI at `/web/v1/` on `server.listen`. Only one runtime server can use the data directory at a time. It prints its address and logs to the terminal; stop it with Ctrl+C or `openvaala serve stop`.
+
+Use `openvaala serve --listen <host:port>` to override `OPENVAALA_SERVER_LISTEN` and `server.listen` for this invocation.
 
 ### serve stop
 

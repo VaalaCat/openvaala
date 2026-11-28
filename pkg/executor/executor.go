@@ -15,6 +15,12 @@ type ExecutorProvider interface {
 	GetExecutors(ctx context.Context, conversationID defs.ConversationID) (executors []Executor, err error)
 }
 
+// ToolProvider 供外围扩展按对话注入不绑执行环境的 Agent 侧工具。
+type ToolProvider interface {
+	// GetTools 返回本对话可用的附加工具，列表不含 nil；可能被并发调用，返回的工具由同一套配置下的 Session 共用。
+	GetTools(ctx context.Context, conversationID defs.ConversationID) (tools []Tool, err error)
+}
+
 // Executor 是一个能干活的地方，负责打开自己的工作区。可以并发调用。
 type Executor interface {
 	// GetDefinition 返回 Executor 的定义，不返回 nil。

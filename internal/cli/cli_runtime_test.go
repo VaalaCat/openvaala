@@ -8,7 +8,9 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -505,7 +507,8 @@ func TestEnsureRuntimeServer(t *testing.T) {
 	// 1. 编译程序并列出启动场景。
 	binary := buildTestBinary(t)
 	tests := []struct {
-		name string
+		name          string
+		dataDirectory string
 		// run 在临时 HOME 下执行场景：args 指向编出来的二进制和空闲端口 listen；结束后统一执行 serve stop。
 		run func(t *testing.T, args *RuntimeServerStartOpt, listen string)
 	}{
@@ -529,6 +532,38 @@ func TestEnsureRuntimeServer(t *testing.T) {
 				_ = response.Body.Close()
 				if response.StatusCode != http.StatusOK {
 					t.Fatalf("healthz status = %d, want 200", response.StatusCode)
+				}
+			},
+		},
+		{
+			name:          "starts_and_discovers_serve_in_custom_data_directory",
+			dataDirectory: "instance",
+			run: func(t *testing.T, args *RuntimeServerStartOpt, listen string) {
+				file, err := EnsureRuntimeServer(t.Context(), args)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantURL := "ws://" + listen + "/api/v1/openvaala"
+				if file.URL != wantURL {
+					t.Fatalf("url = %q, want %q", file.URL, wantURL)
+				}
+				for _, name := range []string{"runtime-server.yaml", "metadata.db", "runtime.lock", "openvaala.log"} {
+					if _, err := os.Stat(filepath.Join(args.Config.GetDataDirectory(), name)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := os.Stat(getTestRuntimeServerFilePath(t)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("default connection file stat = %v, want not exist", err)
+				}
+				configPath := strings.TrimPrefix(args.ConfigFlags[0], "--config-file=")
+				for _, operation := range []struct{ command, output string }{
+					{"reload", "configuration reloaded\n"},
+					{"stop", "stopped\n"},
+				} {
+					output, err := runCLI(t, configPath, "--data-dir=instance", "serve", operation.command)
+					if err != nil || output != operation.output {
+						t.Fatalf("serve %s = %q, %v, want %q", operation.command, output, err, operation.output)
+					}
 				}
 			},
 		},
@@ -608,8 +643,8 @@ func TestEnsureRuntimeServer(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = occupied.Close() })
-				dataDirectory, err := ensureDataDirectory()
-				if err != nil {
+				dataDirectory := args.Config.GetDataDirectory()
+				if err := ensureDataDirectory(dataDirectory); err != nil {
 					t.Fatal(err)
 				}
 				unlock, err := lockDataDirectory(dataDirectory)
@@ -645,7 +680,19 @@ func TestEnsureRuntimeServer(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			listen := getFreeServeAddress(t)
 			configPath := newServeConfig(t, "http://127.0.0.1:1", listen, "")
-			cfg, err := config.LoadConfig(&config.LoadConfigOpt{Path: configPath})
+			argv := []string{"--config-file=" + configPath}
+			if tt.dataDirectory != "" {
+				argv = append(argv, "--data-dir="+tt.dataDirectory)
+			}
+			command := NewCLI(&CLIOpt{Stdout: io.Discard, Stderr: io.Discard})
+			if err := command.ParseFlags(argv); err != nil {
+				t.Fatal(err)
+			}
+			cfg, _, err := LoadConfig(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configFlags, err := GetConfigFlags(command.Flags())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -653,15 +700,16 @@ func TestEnsureRuntimeServer(t *testing.T) {
 			t.Cleanup(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				defer cancel()
-				if _, err := runCLIWithContext(ctx, configPath, "serve", "stop"); err != nil {
+				if _, err := runCLIWithContext(ctx, configPath, append(argv[1:], "serve", "stop")...); err != nil {
 					t.Errorf("serve stop: %v", err)
 				}
 			})
 			tt.run(t, &RuntimeServerStartOpt{
+				Config:      cfg,
 				LogFile:     cfg.Telemetry.LogFile,
 				IdleTimeout: runtimeServerIdleTimeout,
 				Executable:  binary,
-				ConfigFlags: []string{"--config-file=" + configPath},
+				ConfigFlags: configFlags,
 			}, listen)
 		})
 	}
@@ -1015,7 +1063,7 @@ func TestGetRuntimeConnection(t *testing.T) {
 				t.Fatalf("getRuntimeConnection() = %+v, want %+v", got, tt.want)
 			}
 			if tt.file == nil && !tt.unreadableFile {
-				if _, found, err := getRuntimeServerFile(); err != nil || found {
+				if _, found, err := getRuntimeServerFile(getTestRuntimeServerFilePath(t)); err != nil || found {
 					t.Fatalf("runtime server file found = %v, err = %v, want no serve to be started", found, err)
 				}
 			}
@@ -1097,8 +1145,12 @@ func TestEnsureRuntimeServerTimeout(t *testing.T) {
 	for _, logFile := range []string{"", "/tmp/openvaala-test.log"} {
 		t.Run(map[bool]string{true: "without_log", false: "with_log"}[logFile == ""], func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			directory, err := ensureDataDirectory()
+			cfg, err := config.LoadConfig(&config.LoadConfigOpt{})
 			if err != nil {
+				t.Fatal(err)
+			}
+			directory := cfg.GetDataDirectory()
+			if err := ensureDataDirectory(directory); err != nil {
 				t.Fatal(err)
 			}
 			unlock, err := lockDataDirectory(directory)
@@ -1111,7 +1163,7 @@ func TestEnsureRuntimeServerTimeout(t *testing.T) {
 				t.Fatal(err)
 			}
 			// 2. 竞争启动进程立即结束但锁仍在，等待期限后返回明确诊断文本。
-			_, err = EnsureRuntimeServer(t.Context(), &RuntimeServerStartOpt{Executable: executable, LogFile: logFile})
+			_, err = EnsureRuntimeServer(t.Context(), &RuntimeServerStartOpt{Config: cfg, Executable: executable, LogFile: logFile})
 			want := "run `openvaala serve` to see the error"
 			if logFile != "" {
 				want = "see " + logFile

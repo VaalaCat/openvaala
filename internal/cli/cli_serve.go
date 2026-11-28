@@ -22,7 +22,9 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
+	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/www"
+	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -49,6 +51,7 @@ func newServeCommand() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE:  BuildCLIHandler(runServeCommand),
 	}
+	command.Flags().String("listen", "", "Runtime Server listen address (host:port)")
 	command.Flags().Duration("idle-timeout", 0, "exit after this long without connections or running turns (0 keeps running)")
 	_ = command.Flags().MarkHidden("idle-timeout")
 	// 2. 注册 stop 和 reload 子命令。
@@ -81,12 +84,12 @@ func runServeCommand(ctx context.Context, args *AppArgs) (err error) {
 	// 2. 绑定监听地址并取得数据目录锁。
 	listener, err := net.Listen("tcp", args.Config.Server.Listen)
 	if err != nil {
-		return newServeListenError(ctx, args.Config.Server.Listen, err)
+		return newServeListenError(ctx, args.Config.Server.Listen, getRuntimeServerFilePath(args.Config), err)
 	}
 	// 返回时关闭监听器，忽略重复关闭的错误。
 	defer func() { _ = listener.Close() }()
-	dataDirectory, err := ensureDataDirectory()
-	if err != nil {
+	dataDirectory := args.Config.GetDataDirectory()
+	if err := ensureDataDirectory(dataDirectory); err != nil {
 		return err
 	}
 	unlock, err := lockDataDirectory(dataDirectory)
@@ -120,11 +123,12 @@ func runServeCommand(ctx context.Context, args *AppArgs) (err error) {
 	if err != nil {
 		return err
 	}
-	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, args.Config.Server.Listen, token)
-	serverOpt.Listener = listener
+	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, token)
 	serverOpt.ServerID = serverID
 	serverOpt.Telemetry = tel
-	serverOpt.Configuration = config.NewConfigFiles(args.ConfigOpt)
+	files := config.NewConfigFiles(args.ConfigOpt)
+	files.DataDirectory = dataDirectory
+	serverOpt.Configuration = files
 	serverOpt.ModelCatalog = modelCatalog
 	serverOpt.WebUI = www.GetAssets()
 	serverOpt.IdleTimeout = args.IdleTimeout
@@ -139,38 +143,84 @@ func runServeCommand(ctx context.Context, args *AppArgs) (err error) {
 		err = errors.Join(err, stopRuntime())
 	}()
 
-	// 6. 输出监听信息并运行 Server；收到 shutdown 请求、空闲超时或被中断时正常返回。
-	fmt.Fprintf(args.Stdout, "serving OpenVaala on %s, WebSocket path /api/v1/openvaala\n", args.Config.Server.Listen)
-	if err := server.Run(ctx); !errors.Is(err, context.Canceled) {
-		return err
+	// 6. 将 Runtime 路由挂到 HTTP 服务，连接遥测使用实际监听地址。
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	server.RegisterRoutes(engine)
+	address := listener.Addr().(*net.TCPAddr)
+	serverCtx := telemetry.ContextWithTelemetry(ctx, tel)
+	serverCtx = telemetry.ContextWithAttrs(serverCtx, telemetry.ServerAddress(address.IP.String()), telemetry.ServerPort(address.Port))
+	runCtx, stopServer := context.WithCancel(context.WithoutCancel(serverCtx))
+	logger := telemetry.GetLogger(serverCtx)
+	httpServer := &http.Server{
+		Handler:           engine,
+		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
+		BaseContext:       func(net.Listener) context.Context { return runCtx },
 	}
-	return nil
+
+	// 7. 启动 Runtime Server 和 HTTP 服务，等待取消或任一服务结束。
+	logger.Info("runtime server listening")
+	fmt.Fprintf(args.Stdout, "serving OpenVaala on %s, WebSocket path /api/v1/openvaala\n", args.Config.Server.Listen)
+	serverDone, httpDone := make(chan struct{}), make(chan struct{})
+	var serverErr, httpErr error
+	go func() {
+		defer close(serverDone)
+		serverErr = server.Run(runCtx)
+	}()
+	go func() {
+		defer close(httpDone)
+		httpErr = httpServer.Serve(listener)
+	}()
+	select {
+	case <-ctx.Done():
+	case <-serverDone:
+	case <-httpDone:
+	}
+
+	// 8. 取消请求上下文唤醒长连接与 Runtime Server，再限期排空 HTTP 服务，最后由 defer 停止 Runtime。
+	stopServer()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelShutdown()
+	shutdownErr := httpServer.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		shutdownErr = errors.Join(shutdownErr, httpServer.Close())
+	}
+	<-httpDone
+	<-serverDone
+	if errors.Is(httpErr, http.ErrServerClosed) {
+		httpErr = nil
+	}
+	if errors.Is(serverErr, context.Canceled) {
+		serverErr = nil
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		serverErr = errors.Join(serverErr, ctx.Err())
+	}
+	return errors.Join(shutdownErr, httpErr, serverErr)
 }
 
 // newServeListenError 生成监听失败的错误；本机已有 serve 在运行时提示先 serve stop。
-func newServeListenError(ctx context.Context, listen string, listenErr error) error {
+func newServeListenError(ctx context.Context, listen, runtimeServerFilePath string, listenErr error) error {
 	// 1. 取出监听错误里的原因，前面加上监听地址。
 	if opErr, ok := errors.AsType[*net.OpError](listenErr); ok {
 		listenErr = opErr.Err
 	}
 	err := fmt.Errorf("listen %s: %w", listen, listenErr)
 	// 2. 本机连接文件指向的 serve 能访问时补上 serve stop 提示。
-	if _, isReachable, readErr := getReachableRuntimeServerFile(ctx); readErr != nil || !isReachable {
+	if _, isReachable, readErr := getReachableRuntimeServerFile(ctx, runtimeServerFilePath); readErr != nil || !isReachable {
 		return err
 	}
 	return fmt.Errorf("%w; a runtime server is already running, run openvaala serve stop first", err)
 }
 
 // writeRuntimeServerFile 确定令牌和 server_id，写入本机连接文件 runtime-server.yaml，返回这两项。
-func writeRuntimeServerFile(config *config.Config, listener net.Listener) (token, serverID string, err error) {
+func writeRuntimeServerFile(cfg *config.Config, listener net.Listener) (token, serverID string, err error) {
 	// 1. 定位连接文件并读取已有内容；文件缺失或损坏时使用空记录。
-	path, err := getRuntimeServerFilePath()
-	if err != nil {
-		return "", "", err
-	}
-	existing, _, _ := getRuntimeServerFile()
+	path := getRuntimeServerFilePath(cfg)
+	existing, _, _ := getRuntimeServerFile(path)
 	// 2. 令牌依次用配置的 server.token 和文件里已有的，server_id 沿用文件里的；都没有时生成随机值。
-	token = cmp.Or(config.Server.Token, existing.Token)
+	token = cmp.Or(cfg.Server.Token, existing.Token)
 	if token == "" {
 		if token, err = newRandomHex(32); err != nil {
 			return "", "", err
@@ -262,7 +312,7 @@ func isRuntimeServerReachable(ctx context.Context, file RuntimeServerConnection)
 // runServeStopCommand 请求本机 serve 停止，等它真正停下后输出 stopped。
 func runServeStopCommand(ctx context.Context, args *AppArgs) error {
 	// 1. 读取连接文件；不存在时输出未运行提示。
-	file, found, err := getRuntimeServerFile()
+	file, found, err := getRuntimeServerFile(getRuntimeServerFilePath(args.Config))
 	if err != nil {
 		return err
 	}
@@ -270,10 +320,6 @@ func runServeStopCommand(ctx context.Context, args *AppArgs) error {
 		return writeText(args.Stdout, noRuntimeServerText)
 	}
 	// 2. 定位数据目录，向 shutdown 地址发送带令牌的 POST 请求；连接被拒绝时输出未运行提示。
-	dataDirectory, err := ensureDataDirectory()
-	if err != nil {
-		return err
-	}
 	shutdownURL, err := getRuntimeServerHTTPURL(file.URL, "/api/v1/shutdown")
 	if err != nil {
 		return err
@@ -295,6 +341,7 @@ func runServeStopCommand(ctx context.Context, args *AppArgs) error {
 	}
 
 	// 4. 每秒检查一次 serve 是否已停止，最多等 10 秒。
+	dataDirectory := args.Config.GetDataDirectory()
 	deadline := time.Now().Add(runtimeServerStopTimeout)
 	for !isRuntimeServerStopped(ctx, file, dataDirectory) {
 		if !time.Now().Before(deadline) {
@@ -316,7 +363,7 @@ func runServeStopCommand(ctx context.Context, args *AppArgs) error {
 // runServeReloadCommand 请求本机 serve 重新加载配置，输出结果和还在用旧配置的对话。
 func runServeReloadCommand(ctx context.Context, args *AppArgs, notRunningText string) error {
 	// 1. 读取本机连接文件，serve 不能访问时输出 notRunningText。
-	file, isReachable, err := getReachableRuntimeServerFile(ctx)
+	file, isReachable, err := getReachableRuntimeServerFile(ctx, getRuntimeServerFilePath(args.Config))
 	if err != nil {
 		return err
 	}

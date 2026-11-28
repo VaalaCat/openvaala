@@ -1640,6 +1640,161 @@ func TestConversationAgentTools(t *testing.T) {
 	}
 }
 
+// TestConversationExtraTools 检查附加工具的模型可见性、执行和重载结果与 Session 详情一致。
+func TestConversationExtraTools(t *testing.T) {
+	// 1. 分别覆盖未注入、注入后执行和重载后替换的场景。
+	for _, tt := range []struct {
+		name      string
+		toolNames []string
+	}{
+		{name: "nil_provider", toolNames: []string{""}},
+		{name: "provided_tool", toolNames: []string{"conversation_info"}},
+		{name: "reload_replaces_tools", toolNames: []string{"old_conversation_info", "new_conversation_info"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openConversationDAO(t)
+			model := newConversationModel(t)
+			opt := conversationOpt(store, model)
+			conversationID := defs.NewConversationID()
+			var h *conversationHarness
+			for index, toolName := range tt.toolNames {
+				// 2. 装配配置，只选择 read_file 作为环境工具；后续配置通过 SetDefinitions 生效。
+				definitions := conversationDefinitions(model)
+				definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
+				definitions.Agents[0].ToolNames = []string{"read_file"}
+				var calls atomic.Int32
+				if toolName != "" {
+					definitions.ExtraTools = conversationToolProviderFunc(func(_ context.Context, id defs.ConversationID) ([]executor.Tool, error) {
+						calls.Add(1)
+						return []executor.Tool{&conversationExtraTestTool{conversationID: id, definition: defs.ToolDefinition{
+							Name: toolName, InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+						}}}, nil
+					})
+				}
+				if index == 0 {
+					opt.Definitions = definitions
+					c, err := CreateConversation(t.Context(), conversationID, "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+					if err != nil {
+						t.Fatal(err)
+					}
+					h = startTestConversation(t, store, model, c)
+				} else if pending, err := h.c.SetDefinitions(t.Context(), definitions); err != nil || pending {
+					t.Fatalf("SetDefinitions() = %v, %v; want applied", pending, err)
+				}
+
+				// 3. 核对模型与详情所用的工具，调用附加工具并读取它在装配时收到的对话 ID。
+				itemID := h.input(t, session.SessionInputModeNormal, "list your tools")
+				request := receiveModelRequest(t, model)
+				details, err := h.c.GetSessionDetails(t.Context(), h.c.GetRootSessionID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantTools := append([]string{"read_file"}, collaborationToolNames...)
+				if toolName != "" {
+					wantTools = append(wantTools, toolName)
+				}
+				slices.Sort(wantTools)
+				if got := slices.Sorted(slices.Values(requestToolNames(request))); !slices.Equal(got, wantTools) {
+					t.Fatalf("model tools = %v; want %v", got, wantTools)
+				}
+				if got := slices.Sorted(slices.Values(details.Tools)); !slices.Equal(got, wantTools) {
+					t.Fatalf("Session details tools = %v; want %v", got, wantTools)
+				}
+				if toolName != "" {
+					for _, value := range request.body["tools"].([]any) {
+						function := value.(map[string]any)["function"].(map[string]any)
+						if function["name"] == toolName {
+							properties := function["parameters"].(map[string]any)["properties"].(map[string]any)
+							if _, found := properties["executor"]; found {
+								t.Fatalf("%s has an executor parameter", toolName)
+							}
+						}
+					}
+					callID := "get-" + toolName
+					request.reply <- modelResponse{calls: []llmkit.ToolCall{{ID: callID, Name: toolName, Arguments: `{}`}}}
+					request = receiveModelRequest(t, model)
+					var got defs.ConversationID
+					decodeRequestToolResult(t, request, callID, &got)
+					if got != conversationID {
+						t.Fatalf("tool received ConversationID %s; want %s", got, conversationID)
+					}
+				}
+				request.reply <- modelResponse{text: "done"}
+				if finished, _ := h.waitTurnFinished(t, itemID); finished.Status != defs.TurnStatusCompleted || finished.Err != nil {
+					t.Fatalf("Turn finished with %v, %v", finished.Status, finished.Err)
+				}
+				if toolName != "" && calls.Load() != 1 {
+					t.Fatalf("GetTools() called %d times for %s; want 1", calls.Load(), toolName)
+				}
+			}
+		})
+	}
+}
+
+// TestConversationRejectsInvalidExtraTools 检查重新打开对话时拒绝无效或重名的附加工具。
+func TestConversationRejectsInvalidExtraTools(t *testing.T) {
+	// 1. 按工具名和 schema 准备装配错误；空工具名表示 provider 返回 nil 工具。
+	const schema = `{"type":"object"}`
+	for _, tt := range []struct {
+		name, toolName, schema, wantError string
+		typedNil                          bool
+	}{
+		{name: "nil_tool", wantError: "tool is missing"},
+		{name: "typed_nil_tool", typedNil: true, wantError: "tool is missing"},
+		{name: "invalid_schema", toolName: "conversation_info", schema: "{", wantError: "valid JSON input schema"},
+		{name: "invalid_schema_type", toolName: "conversation_info", schema: `{"type":"not-a-type"}`, wantError: `tool "conversation_info" schema`},
+		{name: "collaboration_conflict", toolName: "spawn_agent", schema: schema, wantError: `duplicate tool "spawn_agent"`},
+		{name: "environment_conflict", toolName: "read_file", schema: schema, wantError: `tool "read_file" conflicts with an agent tool`},
+		{name: "command_conflict", toolName: "bash", schema: schema, wantError: `tool "bash" conflicts with an agent tool`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openConversationDAO(t)
+			opt := conversationOpt(store, newConversationModel(t))
+			opt.Definitions.Executors = newTestExecutorProvider(newTestExecutors("local"))
+			c, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 2. 用带附加工具的定义重新打开对话，校验错误在启动 Session 前返回。
+			definitions := *opt.Definitions
+			definitions.ExtraTools = conversationToolProviderFunc(func(_ context.Context, id defs.ConversationID) ([]executor.Tool, error) {
+				var tool executor.Tool
+				if tt.typedNil {
+					tool = (*conversationExtraTestTool)(nil)
+				} else if tt.toolName != "" {
+					tool = &conversationExtraTestTool{conversationID: id, definition: defs.ToolDefinition{
+						Name: tt.toolName, InputSchema: json.RawMessage(tt.schema),
+					}}
+				}
+				return []executor.Tool{tool}, nil
+			})
+			opt.Definitions = &definitions
+			if loaded, err := reopenTestConversation(t, c, opt); loaded != nil || err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("reopen Conversation = %v, %v; want error containing %q", loaded, err, tt.wantError)
+			}
+		})
+	}
+}
+
+type conversationToolProviderFunc func(context.Context, defs.ConversationID) ([]executor.Tool, error)
+
+func (f conversationToolProviderFunc) GetTools(ctx context.Context, id defs.ConversationID) ([]executor.Tool, error) {
+	return f(ctx, id)
+}
+
+type conversationExtraTestTool struct {
+	conversationID defs.ConversationID
+	definition     defs.ToolDefinition
+}
+
+func (t *conversationExtraTestTool) GetDefinition() *defs.ToolDefinition {
+	return t.definition.Clone()
+}
+
+func (t *conversationExtraTestTool) Execute(_ context.Context, call *defs.Item, _ chan<- *executor.ExecutionProgressEvent) *executor.ToolExecutionResult {
+	return encodeToolResult(call.ToolCall.CallID, t.conversationID, nil)
+}
+
 // TestConversationAgentToolAndSkillNames 检查 Agent 用了未知工具或 Skill 时建对话失败，没有执行环境时不校验这两项。
 func TestConversationAgentToolAndSkillNames(t *testing.T) {
 	// 1. 准备未知工具、未知 Skill 和没有执行环境的情况。

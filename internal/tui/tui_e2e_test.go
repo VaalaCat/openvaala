@@ -30,6 +30,7 @@ import (
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
+	"github.com/gin-gonic/gin"
 )
 
 // TestTUIEndToEnd 检查真实服务连接上的界面输入、工具与对话管理。
@@ -867,22 +868,27 @@ func newE2EHarness(t *testing.T, agentName string, startupNotice string, configu
 	runtimeDone := make(chan error, 1)
 	go func() { runtimeDone <- rt.Run(runtimeCtx) }()
 	t.Cleanup(func() { stopRuntime(); <-runtimeDone })
-	// 5. 启动 Runtime Server，登记取消并等待退出。
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serverOpt.Runtime, serverOpt.Listener, serverOpt.Token, serverOpt.Telemetry = rt, listener, "e2e-token", pipeline.Telemetry
+	// 5. 将 Runtime 路由挂到 HTTP 服务，登记清理时先关闭 HTTP，再停止连接。
+	serverOpt.Runtime, serverOpt.Token, serverOpt.Telemetry = rt, "e2e-token", pipeline.Telemetry
 	server, err := runtimeserver.NewRuntimeServer(serverOpt)
 	if err != nil {
 		t.Fatal(err)
 	}
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	server.RegisterRoutes(engine)
+	httpServer := httptest.NewUnstartedServer(engine)
 	serverCtx, stopServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Run(serverCtx) }()
-	t.Cleanup(func() { stopServer(); <-serverDone })
+	httpServer.Start()
+	t.Cleanup(func() {
+		httpServer.Close()
+		stopServer()
+		<-serverDone
+	})
 	// 6. 通过可切断代理启动客户端，再创建界面并等待连接成功。
-	proxy := newE2EProxy(t, listener.Addr().String())
+	proxy := newE2EProxy(t, httpServer.Listener.Addr().String())
 	clientOpt := runtimeclient.NewClientOpt("ws://"+proxy.address+"/api/v1/openvaala", "e2e-token")
 	clientOpt.Telemetry = pipeline.Telemetry
 	client, err := runtimeclient.NewClient(clientOpt)

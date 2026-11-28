@@ -92,6 +92,8 @@ type connectionThread struct {
 	syncedSessionInfo runtime.SessionRuntimeInfo
 	// isConversationDropped Client 是否已经放弃这个对话（重新同步被 serve 拒绝）？之后的 turn/start 先重新打开。
 	isConversationDropped bool
+	// isServerConnected 这个 Thread 的 Client 是否已经连上过 serve？还没连上就进入重连时 Thread 结束。
+	isServerConnected bool
 	// selectedModel 是跟随的 Session 当前所选的模型。
 	selectedModel defs.ModelSelection
 	// activeTurnID 是客户端看到的进行中的 Turn：已经发了它的 turn/started、还没发 turn/completed，没有时为空。
@@ -684,10 +686,13 @@ func (t *connectionThread) handleThreadResumeRequested(ctx context.Context, requ
 
 // handleClientEvent 处理 Client 事件，更新记录并发送 Codex 通知。
 func (t *connectionThread) handleClientEvent(ctx context.Context, event runtimeclient.ClientEvent) error {
-	// 1. 按事件类型分派，Client 开始重连时返回 ErrConnectionLost。
+	// 1. 按事件类型分派；还没连上就进入重连时返回 ErrConnectionLost，已经连上后等重连后的结束事件。
 	switch event := event.(type) {
 	case *runtimeclient.ConnectionChanged:
-		if event.State == runtimeclient.ConnectionReconnecting {
+		if event.State == runtimeclient.ConnectionConnected {
+			t.isServerConnected = true
+		}
+		if event.State == runtimeclient.ConnectionReconnecting && !t.isServerConnected {
 			return runtimeclient.ErrConnectionLost
 		}
 	case *runtimeclient.ConversationSynced:

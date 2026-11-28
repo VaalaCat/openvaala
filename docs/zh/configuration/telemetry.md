@@ -8,7 +8,7 @@
 # config.yaml
 telemetry:
   log_level: info                       # debug、info、warn 或 error
-  log_file: ""                          # 为空时是 ~/.local/state/openvaala/openvaala.log
+  log_file: ""                          # 为空时使用运行状态目录下的 openvaala.log
   otlp_endpoint: http://127.0.0.1:4318  # 为空时不导出
   otlp_headers:
     Authorization: Bearer <token>
@@ -16,7 +16,7 @@ telemetry:
 ```
 
 - `log_level`：所有地方（日志文件、终端和 OTLP）写入的最低级别。默认 `info`。
-- `log_file`：日志文件路径。相对路径以 `config.yaml` 所在目录为基准。默认 `~/.local/state/openvaala/openvaala.log`。
+- `log_file`：日志文件路径。相对路径以 `config.yaml` 所在目录为基准。留空时写入指定数据目录中的 `openvaala.log`。默认布局下写入 `~/.local/state/openvaala/openvaala.log`。
 - `otlp_endpoint`：OTLP/HTTP 接收端的基础地址，例如 `http://127.0.0.1:4318`。OpenVaala 会自己接上 `/v1/traces`、`/v1/metrics` 和 `/v1/logs`，所以不要带信号路径。必须是 `http` 或 `https`。
 - `otlp_headers`：每次导出都附带的请求头，一般用于认证。只能在配置文件里设置；名字会统一转成小写。
 - `capture_content`：trace 里是否包含对话内容：系统指令、消息、模型输出、工具参数和结果。默认 `true`，只在设置了 `otlp_endpoint` 时生效。日志和指标从不包含对话内容。

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,91 @@ import (
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v3"
 )
+
+func TestDataDirectory(t *testing.T) {
+	for _, tt := range []struct {
+		name, file, env, flag, logFile string
+		wantData, wantState, wantLog   string
+	}{
+		{name: "default", wantData: "home/.local/share/openvaala", wantState: "home/.local/state/openvaala", wantLog: "home/.local/state/openvaala/openvaala.log"},
+		{name: "absolute", file: "ABS", wantData: "absolute", wantState: "absolute", wantLog: "absolute/openvaala.log"},
+		{name: "relative", file: "instance", wantData: "config/instance", wantState: "config/instance", wantLog: "config/instance/openvaala.log"},
+		{name: "home_relative", file: "~/instance", wantData: "home/instance", wantState: "home/instance", wantLog: "home/instance/openvaala.log"},
+		{name: "environment", file: "instance", env: "env-data", wantData: "config/env-data", wantState: "config/env-data", wantLog: "config/env-data/openvaala.log"},
+		{name: "flag", file: "instance", env: "env-data", flag: "flag-data", wantData: "config/flag-data", wantState: "config/flag-data", wantLog: "config/flag-data/openvaala.log"},
+		{name: "explicit_log", file: "instance", logFile: "logs/server.log", wantData: "config/instance", wantState: "config/instance", wantLog: "config/logs/server.log"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			configDirectory := filepath.Join(root, "config")
+			if err := os.MkdirAll(configDirectory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("OPENVAALA_DATA_DIR", tt.env)
+			if tt.env == "" {
+				if err := os.Unsetenv("OPENVAALA_DATA_DIR"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dataDirectory := tt.file
+			if dataDirectory == "ABS" {
+				dataDirectory = filepath.Join(root, "absolute")
+			}
+			configPath := filepath.Join(configDirectory, "config.yaml")
+			content := "data_dir: " + strconv.Quote(dataDirectory) + "\ntelemetry:\n  log_file: " + strconv.Quote(tt.logFile) + "\n"
+			if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			flags := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			flags.String("data-dir", "", "")
+			if tt.flag != "" {
+				if err := flags.Set("data-dir", tt.flag); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := config.LoadConfig(&config.LoadConfigOpt{Home: home, Path: configPath, Flags: flags})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantData := filepath.Join(root, tt.wantData)
+			if got := cfg.GetDataDirectory(); got != wantData {
+				t.Fatalf("data directory = %q, want %q", got, wantData)
+			}
+			if want := filepath.Join(root, tt.wantState); cfg.GetStateDirectory() != want {
+				t.Fatalf("state directory = %q, want %q", cfg.GetStateDirectory(), want)
+			}
+			if want := filepath.Join(root, tt.wantLog); cfg.Telemetry.LogFile != want {
+				t.Fatalf("telemetry.log_file = %q, want %q", cfg.Telemetry.LogFile, want)
+			}
+			definitions, err := cfg.GetRuntimeDefinitions(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			executors, err := definitions.Executors.GetExecutors(t.Context(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			memory := slices.IndexFunc(executors, func(item executor.Executor) bool {
+				return item.GetDefinition().ID == defs.MemoryExecutorID
+			})
+			if memory < 0 {
+				t.Fatal("memory executor missing")
+			}
+			work, err := executors[memory].NewWorkspace(t.Context(), &executor.NewWorkspaceRequest{MemoryProjectName: "projects/test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer work.Close()
+			if err := work.CreateDirectory(t.Context(), "/user"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(wantData, "memory", "user")); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 // TestLoadConfigPrecedence 验证 flag 覆盖环境变量、环境变量覆盖文件，相对目录按配置文件所在目录展开。
 func TestLoadConfigPrecedence(t *testing.T) {

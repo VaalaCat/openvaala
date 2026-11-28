@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"reflect"
 	"slices"
@@ -30,6 +31,7 @@ func TestProviderIdentityEditing(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			d := testDesktop()
 			d.client = providerSaveForbidden{}
+			d.catalogRequested = true
 			d.page = "providers"
 			d.providers = []defs.ProviderConfig{{ID: "existing"}}
 			d.providerDraft = providerToDraft(defs.ProviderConfig{ID: "existing", Protocol: "openai_chat"})
@@ -421,7 +423,7 @@ func TestProviderUnsavedNavigation(t *testing.T) {
 	}
 }
 
-// TestProvidersPage 检查模型服务页：列表为空时服务目录直接展开；有服务时行上显示协议、模型数量和默认标记，目录默认收起，「服务目录」展开它；协议显示可读名称。
+// TestProvidersPage 检查空配置的提示和已有服务的列表信息。
 func TestProvidersPage(t *testing.T) {
 	catalog := []defs.CatalogProvider{{ID: "compat", Name: "Compat Gateway", Protocol: "openai_chat", BaseURL: "https://compat.example/v1"}}
 	for _, tt := range []struct {
@@ -430,15 +432,11 @@ func TestProvidersPage(t *testing.T) {
 		want    []string
 		missing []string
 	}{
-		{"empty list expands the catalog", func(d *Desktop) {}, []string{"还没有模型服务，从服务目录选一个，或新增服务", "Compat Gateway", "OpenAI Chat"}, nil},
+		{"empty list", func(d *Desktop) {}, []string{"还没有模型服务，请新增服务"}, []string{"Compat Gateway"}},
 		{"list rows", func(d *Desktop) {
 			d.providers = []defs.ProviderConfig{{ID: "local", Protocol: "claude", BaseURL: "http://local/v1", Models: map[string]*defs.ProviderModelConfig{"a": {}, "b": {}}}}
 			d.defaultModel = defs.ModelRef{ProviderID: "local", ModelID: "a"}
 		}, []string{"local", "默认", "2 个模型", "Claude", "全局默认模型"}, []string{"Compat Gateway"}},
-		{"catalog opened by the header button", func(d *Desktop) {
-			d.providers = []defs.ProviderConfig{{ID: "local", Protocol: "openai_responses"}}
-			d.catalogOpen = true
-		}, []string{"local", "OpenAI Responses", "Compat Gateway"}, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			d := testDesktop()
@@ -456,6 +454,49 @@ func TestProvidersPage(t *testing.T) {
 				if tester.HasText(text) {
 					t.Fatalf("unexpected %q in %q", text, tester.Texts())
 				}
+			}
+		})
+	}
+}
+
+// TestProviderPresetForm 检查新增表单首屏和选择预设后的连接字段。
+func TestProviderPresetForm(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		existing int
+		preset   defs.CatalogProvider
+	}{
+		{name: "empty configuration", preset: defs.CatalogProvider{ID: "compat", Name: "Compat Gateway", Protocol: "openai_responses", BaseURL: "https://compat.example/v1"}},
+		{name: "many existing providers", existing: 24, preset: defs.CatalogProvider{ID: "claude-preset", Name: "Claude Preset", Protocol: "claude", BaseURL: "https://claude.example"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			d.page = "providers"
+			d.catalogProviders, d.catalogRequested = []defs.CatalogProvider{tt.preset}, true
+			for i := range tt.existing {
+				d.providers = append(d.providers, defs.ProviderConfig{ID: fmt.Sprintf("existing-%d", i), Protocol: "openai_chat"})
+			}
+			tester := ui.NewTester(d.view, 1280, 800)
+			tester.SetLocale("zh-Hans")
+			if err := tester.Click("新增服务"); err != nil {
+				t.Fatal(err)
+			}
+			for _, label := range []string{"Provider ID", "Base URL", "API key", "从预设填充"} {
+				if bounds, found := tester.Find(label); !found || bounds.W <= 0 || bounds.H <= 0 || bounds.Y+bounds.H > 772 {
+					t.Fatalf("%q is not on the first screen: %+v", label, bounds)
+				}
+			}
+			if tester.HasText(tt.preset.Name) {
+				t.Fatalf("preset %q is visible before opening the select", tt.preset.Name)
+			}
+			for _, label := range []string{"选择服务", tt.preset.Name} {
+				if err := tester.Click(label); err != nil {
+					t.Fatal(err)
+				}
+			}
+			draft := d.providerDraft
+			if draft.ID != tt.preset.ID || draft.Protocol != tt.preset.Protocol || draft.BaseURL != tt.preset.BaseURL {
+				t.Fatalf("preset fields = %q, %q, %q, want %+v", draft.ID, draft.Protocol, draft.BaseURL, tt.preset)
 			}
 		})
 	}

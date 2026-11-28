@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -32,9 +31,10 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	"github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
 )
 
-// TestNewRuntimeServer 检查服务配置的必需依赖和监听器选择。
+// TestNewRuntimeServer 检查服务配置的必需依赖。
 func TestNewRuntimeServer(t *testing.T) {
 	// 1. 创建存储和 Runtime，列出服务配置的校验场景。
 	store := openServerStore(t)
@@ -43,8 +43,8 @@ func TestNewRuntimeServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	configuration, modelCatalog := newTestConfiguration(), newTestModelCatalog()
-	newOpt := func(listen, token string) *runtimeserver.RuntimeServerOpt {
-		opt := runtimeserver.NewRuntimeServerOpt(rt, listen, token)
+	newOpt := func(token string) *runtimeserver.RuntimeServerOpt {
+		opt := runtimeserver.NewRuntimeServerOpt(rt, token)
 		opt.Configuration, opt.ModelCatalog = configuration, modelCatalog
 		return opt
 	}
@@ -62,42 +62,27 @@ func TestNewRuntimeServer(t *testing.T) {
 		},
 		{
 			name:    "empty_token",
-			opt:     newOpt("127.0.0.1:0", ""),
-			wantErr: true,
-		},
-		{
-			name:    "empty_listen",
-			opt:     newOpt("", testToken),
+			opt:     newOpt(""),
 			wantErr: true,
 		},
 		{
 			name:      "missing_configuration",
-			opt:       newOpt("127.0.0.1:0", testToken),
+			opt:       newOpt(testToken),
 			configure: func(opt *runtimeserver.RuntimeServerOpt) { opt.Configuration = nil },
 			wantErr:   true,
 		},
 		{
 			name:      "missing_model_catalog",
-			opt:       newOpt("127.0.0.1:0", testToken),
+			opt:       newOpt(testToken),
 			configure: func(opt *runtimeserver.RuntimeServerOpt) { opt.ModelCatalog = nil },
 			wantErr:   true,
 		},
 		{
 			name: "valid",
-			opt:  newOpt("127.0.0.1:0", testToken),
-		},
-		{
-			name: "listener_without_listen",
-			opt: &runtimeserver.RuntimeServerOpt{
-				Runtime:       rt,
-				Configuration: configuration,
-				ModelCatalog:  modelCatalog,
-				Listener:      newTestListener(t),
-				Token:         testToken,
-			},
+			opt:  newOpt(testToken),
 		},
 	}
-	// 2. 逐项创建 Server，检查必需依赖、token、监听地址及传入监听器的配置结果。
+	// 2. 逐项创建 Server，检查必需依赖和 token 的配置结果。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.configure != nil {
@@ -105,6 +90,58 @@ func TestNewRuntimeServer(t *testing.T) {
 			}
 			if _, err := runtimeserver.NewRuntimeServer(tt.opt); (err != nil) != tt.wantErr {
 				t.Fatalf("NewRuntimeServer() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRuntimeServerRegisterRoutes 检查自定义路由和 Runtime 路由可以共用路由引擎与鉴权中间件。
+func TestRuntimeServerRegisterRoutes(t *testing.T) {
+	// 1. 在同一个引擎挂载自定义路由和 Runtime 路由。
+	rt, err := runtime.NewRuntime(newTestRuntimeOpt(openServerStore(t), newServerModel(t), t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opt := runtimeserver.NewRuntimeServerOpt(rt, testToken)
+	opt.Configuration, opt.ModelCatalog = newTestConfiguration(), newTestModelCatalog()
+	opt.WebUI = fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("web UI")}}
+	server, err := runtimeserver.NewRuntimeServer(opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.GET("/api/v1/custom/public", func(c *gin.Context) { c.String(http.StatusOK, "public") })
+	server.RegisterRoutes(engine)
+	engine.GET("/api/v1/custom/private", runtimeserver.NewTokenMiddleware(testToken, nil), func(c *gin.Context) {
+		c.String(http.StatusOK, "private")
+	})
+
+	// 2. 在 Run 启动前访问各路由，检查匿名访问和鉴权分别生效。
+	for _, tt := range []struct {
+		name       string
+		path       string
+		bearer     string
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "custom_public", path: "/api/v1/custom/public", wantStatus: http.StatusOK, wantBody: "public"},
+		{name: "custom_private_without_token", path: "/api/v1/custom/private", wantStatus: http.StatusUnauthorized},
+		{name: "custom_private_with_token", path: "/api/v1/custom/private", bearer: testToken, wantStatus: http.StatusOK, wantBody: "private"},
+		{name: "custom_private_bearer_takes_precedence", path: "/api/v1/custom/private?token=" + testToken, bearer: "wrong", wantStatus: http.StatusUnauthorized},
+		{name: "runtime_healthz", path: "/api/v1/healthz", wantStatus: http.StatusOK},
+		{name: "runtime_webui", path: "/web/v1/", wantStatus: http.StatusOK, wantBody: "web UI"},
+		{name: "runtime_websocket_without_token", path: "/api/v1/openvaala", wantStatus: http.StatusUnauthorized},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			if tt.bearer != "" {
+				request.Header.Set("Authorization", "Bearer "+tt.bearer)
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			if response.Code != tt.wantStatus || response.Body.String() != tt.wantBody {
+				t.Fatalf("GET %s = %d %q, want %d %q", tt.path, response.Code, response.Body.String(), tt.wantStatus, tt.wantBody)
 			}
 		})
 	}
@@ -266,9 +303,9 @@ func TestRuntimeServerWebUI(t *testing.T) {
 	}
 }
 
-// TestRuntimeServerRun 检查健康检查、大帧、监听失败和连接关闭。
+// TestRuntimeServerRun 检查健康检查、大帧和连接关闭。
 func TestRuntimeServerRun(t *testing.T) {
-	// 1. 列出健康检查、大帧、监听失败和连接关闭的测试场景。
+	// 1. 列出健康检查、大帧和连接关闭的测试场景。
 	tests := []struct {
 		name string
 		run  func(t *testing.T, h *serverHarness)
@@ -316,39 +353,8 @@ func TestRuntimeServerRun(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "listen_failure_returns_error",
-			run: func(t *testing.T, h *serverHarness) {
-				rt, err := runtime.NewRuntime(newTestRuntimeOpt(h.store, h.model, h.defaultDirectory))
-				if err != nil {
-					t.Fatal(err)
-				}
-				opt := runtimeserver.NewRuntimeServerOpt(rt, h.address, testToken)
-				opt.Configuration, opt.ModelCatalog = newTestConfiguration(), newTestModelCatalog()
-				server, err := runtimeserver.NewRuntimeServer(opt)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := server.Run(t.Context()); err == nil || errors.Is(err, context.Canceled) {
-					t.Fatalf("Run() on a used address = %v, want listen error", err)
-				}
-			},
-		},
-		{
-			name: "provided_listener",
-			run: func(t *testing.T, h *serverHarness) {
-				runProvidedListener(t, h, "")
-			},
-		},
-		{
-			// Listen 指向已被占用的地址：若 Run 没有优先使用 Listener，会以监听错误结束。
-			name: "listener_wins_over_listen",
-			run: func(t *testing.T, h *serverHarness) {
-				runProvidedListener(t, h, h.address)
-			},
-		},
 	}
-	// 2. 启动服务并访问 HTTP 与 WebSocket，检查健康响应、大帧、监听失败和取消时连接关闭。
+	// 2. 启动服务并访问 HTTP 与 WebSocket，检查健康响应、大帧和取消时连接关闭。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.run(t, startTestServer(t))
@@ -484,31 +490,14 @@ func requireExit(t *testing.T, h *serverHarness, timeout time.Duration) {
 	}
 }
 
-// TestRuntimeServerTelemetry 检查监听和连接日志、对端地址与连接计数。
+// TestRuntimeServerTelemetry 检查连接日志、对端地址与连接计数。
 func TestRuntimeServerTelemetry(t *testing.T) {
-	// 1. 准备请求头里伪造的客户端地址 spoofedAddress（日志必须记录 TCP 对端而不是它），列出监听、拒绝连接、升级失败和连接开关的遥测场景。
+	// 1. 准备请求头里伪造的客户端地址 spoofedAddress（日志必须记录 TCP 对端而不是它），列出拒绝连接、升级失败和连接开关的遥测场景。
 	const spoofedAddress = "203.0.113.9"
 	tests := []struct {
 		name string
 		run  func(t *testing.T, h *serverHarness, p *telemetrytest.Pipeline)
 	}{
-		{
-			name: "listening_log",
-			run: func(t *testing.T, h *serverHarness, p *telemetrytest.Pipeline) {
-				record := p.WaitLogRecords(t, "runtime server listening", 1)[0]
-				host, port, err := net.SplitHostPort(h.address)
-				if err != nil {
-					t.Fatal(err)
-				}
-				wantPort, err := strconv.Atoi(port)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if record["level"] != "INFO" || record["server.address"] != host || record["server.port"] != float64(wantPort) {
-					t.Fatalf("log = %v, want INFO with server.address %s and server.port %d", record, host, wantPort)
-				}
-			},
-		},
 		{
 			name: "rejected_connection_logs_reason_without_token",
 			run: func(t *testing.T, h *serverHarness, p *telemetrytest.Pipeline) {
@@ -642,48 +631,6 @@ func TestRuntimeServerTelemetry(t *testing.T) {
 			p := telemetrytest.NewPipeline(t)
 			tt.run(t, startTestServerWithTelemetry(t, p.Telemetry), p)
 		})
-	}
-}
-
-// runProvidedListener 使用传入监听器运行服务，检查取消后监听器关闭。
-func runProvidedListener(t *testing.T, h *serverHarness, listen string) {
-	t.Helper()
-	// 1. 创建 Runtime、测试监听器和 Server。
-	rt, err := runtime.NewRuntime(newTestRuntimeOpt(h.store, h.model, h.defaultDirectory))
-	if err != nil {
-		t.Fatal(err)
-	}
-	listener := newTestListener(t)
-	server, err := runtimeserver.NewRuntimeServer(&runtimeserver.RuntimeServerOpt{
-		Runtime:       rt,
-		Configuration: newTestConfiguration(),
-		ModelCatalog:  newTestModelCatalog(),
-		Listen:        listen,
-		Listener:      listener,
-		Token:         testToken,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 2. 启动服务并等待健康检查就绪。
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- server.Run(ctx) }()
-	other := &serverHarness{
-		store:            h.store,
-		model:            h.model,
-		defaultDirectory: h.defaultDirectory,
-		address:          listener.Addr().String(),
-		cancel:           cancel,
-		done:             done,
-	}
-	other.waitReady(t)
-	// 3. 取消服务，检查返回 context.Canceled 且监听器 Accept 返回 net.ErrClosed。
-	if err := other.stop(t); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() = %v, want context.Canceled", err)
-	}
-	if _, err := listener.Accept(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Accept() after Run = %v, want net.ErrClosed", err)
 	}
 }
 
@@ -1195,18 +1142,6 @@ func (m *serverModel) requireNoRequest(t *testing.T) {
 	}
 }
 
-// newTestListener 在本机随机端口创建监听器。
-func newTestListener(t *testing.T) net.Listener {
-	t.Helper()
-	// 1. 监听空闲端口，登记测试结束时关闭并返回监听器。
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	return listener
-}
-
 // serverHarness 运行一个真实 Runtime 与监听本机空闲端口的 RuntimeServer；测试结束时先停 Server 再停 Runtime。
 type serverHarness struct {
 	store *serverStore
@@ -1216,6 +1151,7 @@ type serverHarness struct {
 	// defaultDirectory 是 local Executor 的默认根目录（serve 的工作目录），其中 .agents/skills 下有一个以目录名为名的 Skill。
 	defaultDirectory string
 	address          string
+	httpServer       *httptest.Server
 	cancel           context.CancelFunc
 	// done 收 Server Run 的返回值；runErr 是第一次读到的返回值。
 	done   chan error
@@ -1246,20 +1182,15 @@ func startTestServerWithIdleTimeout(t *testing.T, tel *telemetry.Telemetry, idle
 	t.Setenv("HOME", t.TempDir())
 	defaultDirectory := t.TempDir()
 	writeTestSkill(t, filepath.Join(defaultDirectory, ".agents", "skills"), filepath.Base(defaultDirectory))
-	// 2. 创建并启动 Runtime，绑定测试遥测。
+	// 2. 创建 Runtime，绑定测试遥测。
 	runtimeOpt := newTestRuntimeOpt(store, model, defaultDirectory)
 	runtimeOpt.Telemetry = tel
 	rt, err := runtime.NewRuntime(runtimeOpt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtimeCtx, stopRuntime := context.WithCancel(context.Background())
-	runtimeDone := make(chan error, 1)
-	go func() { runtimeDone <- rt.Run(runtimeCtx) }()
-
-	// 3. 分配地址，应用服务配置后创建并启动 Server。
-	address := getFreeAddress(t)
-	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, address, testToken)
+	// 3. 应用测试配置，将 Runtime 路由挂到独立的 HTTP 服务。
+	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, testToken)
 	serverOpt.Configuration, serverOpt.ModelCatalog = newTestConfiguration(), newTestModelCatalog()
 	serverOpt.Telemetry = tel
 	serverOpt.IdleTimeout = idleTimeout
@@ -1270,33 +1201,45 @@ func startTestServerWithIdleTimeout(t *testing.T, tel *telemetry.Telemetry, idle
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverCtx, cancel := context.WithCancel(context.Background())
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	server.RegisterRoutes(engine)
+	httpServer := httptest.NewUnstartedServer(engine)
+	address := httpServer.Listener.Addr().(*net.TCPAddr)
+	ctx := telemetry.ContextWithAttrs(context.Background(), telemetry.ServerAddress(address.IP.String()), telemetry.ServerPort(address.Port))
+	serverCtx, cancel := context.WithCancel(ctx)
+	httpServer.Config.BaseContext = func(net.Listener) context.Context { return serverCtx }
 	h := &serverHarness{
 		store:            store,
 		model:            model,
 		runtime:          rt,
 		defaultDirectory: defaultDirectory,
-		address:          address,
+		address:          address.String(),
+		httpServer:       httpServer,
 		cancel:           cancel,
 		done:             make(chan error, 1),
 	}
+	// 4. 启动 Runtime、连接生命周期和 HTTP 服务，测试结束时按相反顺序关闭。
+	runtimeCtx, stopRuntime := context.WithCancel(context.Background())
+	runtimeDone := make(chan error, 1)
+	go func() { runtimeDone <- rt.Run(runtimeCtx) }()
 	go func() { h.done <- server.Run(serverCtx) }()
-	// 4. 登记先停止 Server 再停止 Runtime 的收尾，等待健康检查就绪后返回。
+	httpServer.Start()
 	t.Cleanup(func() {
 		h.stop(t)
 		stopRuntime()
 		<-runtimeDone
 	})
-	h.waitReady(t)
 	return h
 }
 
 // stop 停止测试 Server 并等待结束。
 func (h *serverHarness) stop(t *testing.T) error {
 	t.Helper()
-	// 1. 首次调用取消服务并等待最多 10 秒，记录结束状态和错误；重复调用返回首次结果。
+	// 1. 关闭 HTTP 服务，再取消并等待连接；重复调用返回首次结果。
+	h.httpServer.Close()
+	h.cancel()
 	if !h.ended {
-		h.cancel()
 		select {
 		case h.runErr = <-h.done:
 		case <-time.After(10 * time.Second):
@@ -1322,26 +1265,6 @@ func (h *serverHarness) waitExit(t *testing.T, timeout time.Duration) (exited bo
 	return true, h.runErr
 }
 
-// waitReady 等待 Server 健康检查成功。
-func (h *serverHarness) waitReady(t *testing.T) {
-	t.Helper()
-	// 1. 在 5 秒内轮询 healthz，返回 200 后结束等待。
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		response, err := http.Get("http://" + h.address + "/api/v1/healthz")
-		if err == nil {
-			_ = response.Body.Close()
-			if response.StatusCode == http.StatusOK {
-				return
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("server at %s is not ready: %v", h.address, err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 // dial 使用查询参数 token 连接 OpenVaala 协议。
 func (h *serverHarness) dial(t *testing.T) *testClient {
 	t.Helper()
@@ -1360,21 +1283,6 @@ func (h *serverHarness) dialWith(t *testing.T, path string, header http.Header) 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	return websocket.Dial(ctx, "ws://"+h.address+path, &websocket.DialOptions{HTTPHeader: header})
-}
-
-// getFreeAddress 取得本机当前空闲 TCP 地址。
-func getFreeAddress(t *testing.T) string {
-	t.Helper()
-	// 1. 随机端口监听，取出地址后关闭监听器。
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return address
 }
 
 // testClient 是测试用 JSON-RPC 客户端：后台读取全部帧，带 id 的进入 responses，通知进入 notifications。

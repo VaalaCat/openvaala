@@ -260,7 +260,7 @@ function MobileServerConnectionControl() {
 // 正在看对话时，新对话入口带上这个对话的工作位置作为新对话页的预填。
 function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
   const { t } = useTranslation()
-  const { setOpenMobile, isMobile, openMobile } = useSidebar()
+  const { setOpenMobile, isMobile, openMobile, toggleSidebar } = useSidebar()
   const connection = useServerConnection()
   const { pathname, search } = useLocation()
   const viewedConversation = useQuery({
@@ -291,6 +291,7 @@ function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
                 <ServerConnectionControl
                   key="sidebar-server"
                   layoutId={isMobile ? "server-connection" : undefined}
+                  showTooltip={!isMobile}
                 />
               )}
             </AnimatePresence>
@@ -360,6 +361,7 @@ function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
       </SidebarFooter>
       <Tooltip>
         <TooltipTrigger
+          onClick={toggleSidebar}
           render={
             <SidebarRail
               aria-label={t("common.actions.toggleSidebar")}

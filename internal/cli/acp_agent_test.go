@@ -19,12 +19,12 @@ import (
 	"time"
 
 	"github.com/VaalaCat/openvaala/internal/config"
-	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	acp "github.com/coder/acp-go-sdk"
+	"github.com/gin-gonic/gin"
 )
 
 // acpWire 是测试扮演的编辑器：通过真实的 stdio 管道收发 JSON-RPC 消息，按顺序记录收到的 session/update 通知。
@@ -38,6 +38,8 @@ type acpWire struct {
 	isPaused       bool
 	// stop 关闭 stdin、等 acpAgent 正常结束；startACPHost 的通道随后再停掉它连接的 Runtime Server 与 Runtime。
 	stop func()
+	// hostDone 在 acpAgent.Run 返回时收到它的结果，容量为 1；测试可以直接读取，waitHost 随后再取。
+	hostDone chan error
 	// stopServer 只停掉 Runtime Server，模拟 serve 退出。
 	stopServer func()
 	// waitHost 等 acpAgent.Run 返回并返回它的结果；测试取走结果后由测试自己断言，stop 不再检查。
@@ -303,20 +305,14 @@ func (l acpTestListener) Accept() (net.Conn, error) {
 // startACPTestServer 在进程内运行测试 Runtime 和 Runtime Server。
 func startACPTestServer(t *testing.T, cfg *config.Config, configureServer func(opt *runtimeserver.RuntimeServerOpt)) *acpTestServer {
 	t.Helper()
-	// 1. 创建内存遥测、Runtime 和随机端口的监听器。
+	// 1. 创建内存遥测和 Runtime。
 	pipeline := telemetrytest.NewPipeline(t)
 	rt, closeDAO, err := newRuntime(t.Context(), cfg, pipeline.Telemetry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		_ = closeDAO()
-		t.Fatal(err)
-	}
 	// 2. 配置并创建 Runtime Server，configureServer 不为 nil 时让测试改配置。
-	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, "", acpTestToken)
-	serverOpt.Listener = acpTestListener{listener}
+	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, acpTestToken)
 	serverOpt.ServerID = acpTestServerID
 	serverOpt.Configuration, serverOpt.ModelCatalog = acpTestConfiguration{}, acpTestModelCatalog{}
 	serverOpt.Telemetry = pipeline.Telemetry
@@ -325,19 +321,27 @@ func startACPTestServer(t *testing.T, cfg *config.Config, configureServer func(o
 	}
 	server, err := runtimeserver.NewRuntimeServer(serverOpt)
 	if err != nil {
-		_ = errors.Join(listener.Close(), closeDAO())
+		_ = closeDAO()
 		t.Fatal(err)
 	}
-	// 3. 分别运行 Runtime 和 Server，记下连接信息。
+	// 3. 将 Runtime 路由挂到 HTTP 服务，并保留测试用的 TCP 发送缓冲设置。
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	server.RegisterRoutes(engine)
+	httpServer := httptest.NewUnstartedServer(engine)
+	httpServer.Listener = acpTestListener{httpServer.Listener}
+
+	// 4. 启动 Runtime、连接生命周期和 HTTP 服务，记下连接信息。
 	runtimeCtx, stopRuntime := context.WithCancel(context.Background())
 	runtimeDone := make(chan error, 1)
 	go func() { runtimeDone <- rt.Run(runtimeCtx) }()
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Run(serverCtx) }()
+	httpServer.Start()
 	testServer := &acpTestServer{
 		connection: runtimeConnection{
-			URL:           "ws://" + listener.Addr().String() + "/api/v1/openvaala",
+			URL:           "ws://" + httpServer.Listener.Addr().String() + "/api/v1/openvaala",
 			Token:         acpTestToken,
 			Source:        runtimeConnectionSourceLocal,
 			LocalServerID: acpTestServerID,
@@ -345,13 +349,14 @@ func startACPTestServer(t *testing.T, cfg *config.Config, configureServer func(o
 		pipeline: pipeline,
 		runtime:  rt,
 	}
-	// 4. 准备可重复调用的停止函数（依次停 Server、Runtime、关闭存储），测试结束时自动调用。
+	// 5. 依次关闭 HTTP 服务、连接、Runtime 和存储，测试结束时自动执行。
 	isServerStopped, isStopped := false, false
 	testServer.stopServer = func() {
 		if isServerStopped {
 			return
 		}
 		isServerStopped = true
+		httpServer.Close()
 		cancelServer()
 		if err := <-serverDone; !errors.Is(err, context.Canceled) {
 			t.Errorf("runtime server stopped: %v", err)
@@ -425,6 +430,7 @@ func startACPAgent(t *testing.T, cfg *config.Config, server *acpTestServer) *acp
 	go func() { done <- host.Run(ctx) }()
 	// 2. 创建测试编辑器，准备 waitHost（最多等 10 秒 Run 返回）和 stop（关闭 stdin、等 Run 正常返回），测试结束时自动 stop。
 	wire := newACPWire(t, clientInput, clientOutput)
+	wire.hostDone = done
 	wire.pipeline, wire.runtime, wire.stopServer = server.pipeline, server.runtime, server.stopServer
 	isHostStopped := false
 	var hostErr error
@@ -821,31 +827,29 @@ func TestACPListAndDirectories(t *testing.T) {
 	}
 }
 
-// TestACPTransportStopsTasks 检查 stdin 结束、stdout 写失败、写阻塞时取消、单行超长和 serve 断开时 acpAgent 都会退出；serve 断开时等待中的 prompt 收到连接丢失错误。
+// TestACPTransportStopsTasks 检查 stdin 结束、stdout 写失败、写阻塞时取消、单行超长时 acpAgent 退出；serve 断开后进程留下。
 func TestACPTransportStopsTasks(t *testing.T) {
 	// 1. 逐场景启动 acpAgent 并触发传输结束，检查 Run 带着原因返回。
-	for _, scenario := range []string{"eof", "write_failure", "cancel_blocked_writer", "oversized_line", "server_stopped_fails_prompt"} {
+	for _, scenario := range []string{"eof", "write_failure", "cancel_blocked_writer", "oversized_line", "server_stopped_keeps_host"} {
 		t.Run(scenario, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			model := newACPModel(t)
 			cfg, _ := newACPConfig(t, model.server.URL)
-			if scenario == "server_stopped_fails_prompt" {
+			if scenario == "server_stopped_keeps_host" {
 				wire := startACPHost(t, cfg)
 				wire.initialize(t)
 				id := wire.newSession(t, t.TempDir())
-				promptID := wire.prompt(t, id, "hold")
+				wire.prompt(t, id, "hold")
 				model.next(t).reply <- acpModelReply{
 					text: "partial",
 					hold: true,
 				}
 				waitACPAgentChunk(t, wire)
 				wire.stopServer()
-				result := wire.response(t, promptID)
-				if result.Error == nil || result.Error.Code != -32603 || result.Error.Message != "connection to runtime server lost" {
-					t.Fatalf("prompt = %+v, want -32603 connection to runtime server lost", result)
-				}
-				if err := wire.waitHost(t); !errors.Is(err, runtimeclient.ErrConnectionLost) {
-					t.Fatalf("host stopped: %v, want %v", err, runtimeclient.ErrConnectionLost)
+				select {
+				case err := <-wire.hostDone:
+					t.Fatalf("host stopped after the server stopped: %v", err)
+				case <-time.After(300 * time.Millisecond):
 				}
 				return
 			}

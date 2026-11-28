@@ -310,3 +310,13 @@ type turnFinished struct {
 	contextUsage *defs.TurnContextUsage
 	err          error
 }
+
+// ── SessionInbox 配置 ──
+
+// SessionInboxOpt 指定会话身份和 DAO。
+type SessionInboxOpt struct {
+	ConversationID defs.ConversationID
+	SessionID      defs.SessionID
+	Query          dao.Query
+	Mutation       dao.Mutation
+}

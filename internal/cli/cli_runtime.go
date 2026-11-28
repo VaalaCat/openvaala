@@ -57,7 +57,7 @@ type DesktopStartTarget struct {
 
 // ResolveDesktopStartTarget 按 --url > client.url 的优先级解析桌面端启动目标，不拉起本机 serve。
 // 配置加载失败时记录警告：显式传入 --url 仍按该地址连接，未传 --url 时返回空目标。
-func ResolveDesktopStartTarget(command *cobra.Command) DesktopStartTarget {
+func ResolveDesktopStartTarget(command *cobra.Command) (DesktopStartTarget, *config.Config) {
 	// 1. 先检查命令行 --url。
 	var flagURL string
 	var isOverride bool
@@ -65,8 +65,12 @@ func ResolveDesktopStartTarget(command *cobra.Command) DesktopStartTarget {
 		flagURL = strings.TrimSpace(flag.Value.String())
 		isOverride = flagURL != ""
 	}
-	// 2. 尽力加载配置以读取 client.url 和 client.token；失败时记警告，不阻止桌面启动。
-	cfg, _, err := LoadConfig(command)
+	// 2. 读取本机服务配置；失败时记警告，仍可打开显式指定的远端地址。
+	opt, err := getConfigOpt(command)
+	var cfg *config.Config
+	if err == nil {
+		cfg, _, err = config.LoadConfigSettings(opt)
+	}
 	if err != nil {
 		slog.Warn("cannot load config for desktop start target", "error", err)
 	}
@@ -75,7 +79,7 @@ func ResolveDesktopStartTarget(command *cobra.Command) DesktopStartTarget {
 		runtimeURL = strings.TrimSpace(cfg.Client.URL)
 	}
 	if runtimeURL == "" {
-		return DesktopStartTarget{}
+		return DesktopStartTarget{}, cfg
 	}
 	// 3. 令牌解析与 getRuntimeConnection 一致：URL 自带 token 时留空交给 URL，否则用 client.token 或同服连接文件 token。
 	token := ""
@@ -83,8 +87,8 @@ func ResolveDesktopStartTarget(command *cobra.Command) DesktopStartTarget {
 		if cfg != nil {
 			token = cfg.Client.Token
 		}
-		if token == "" {
-			if file, found, fileErr := getRuntimeServerFile(); fileErr == nil && found && isSameRuntimeServer(runtimeURL, file.URL) {
+		if token == "" && cfg != nil {
+			if file, found, fileErr := getRuntimeServerFile(getRuntimeServerFilePath(cfg)); fileErr == nil && found && isSameRuntimeServer(runtimeURL, file.URL) {
 				token = file.Token
 			}
 		}
@@ -93,7 +97,7 @@ func ResolveDesktopStartTarget(command *cobra.Command) DesktopStartTarget {
 		URL:        runtimeURL,
 		Token:      token,
 		IsOverride: isOverride,
-	}
+	}, cfg
 }
 
 // getRuntimeConnection 选择客户端命令要连的 serve 地址和令牌；本机需要拉起 serve 时，idleTimeout 是它的空闲退出时间，0 表示常驻。
@@ -104,7 +108,7 @@ func getRuntimeConnection(ctx context.Context, args *AppArgs, idleTimeout time.D
 		source, runtimeURL = runtimeConnectionSourceConfig, args.Config.Client.URL
 	}
 	if runtimeURL == "" {
-		file, err := EnsureRuntimeServer(ctx, &RuntimeServerStartOpt{Executable: args.Executable, ConfigFlags: args.ConfigFlags, IdleTimeout: idleTimeout, LogFile: args.Config.Telemetry.LogFile})
+		file, err := EnsureRuntimeServer(ctx, &RuntimeServerStartOpt{Config: args.Config, Executable: args.Executable, ConfigFlags: args.ConfigFlags, IdleTimeout: idleTimeout, LogFile: args.Config.Telemetry.LogFile})
 		if err != nil {
 			return runtimeConnection{}, err
 		}
@@ -117,7 +121,7 @@ func getRuntimeConnection(ctx context.Context, args *AppArgs, idleTimeout time.D
 		}, nil
 	}
 	// 2. 有显式地址时直接使用它；读取本机连接文件拿 server_id，读取失败时记录警告，连接按远端处理。
-	file, found, err := getRuntimeServerFile()
+	file, found, err := getRuntimeServerFile(getRuntimeServerFilePath(args.Config))
 	if err != nil {
 		telemetry.GetLogger(ctx).Warn("cannot read the runtime server file; treating the runtime server as a remote one", "error", err)
 	}
@@ -138,6 +142,7 @@ func getRuntimeConnection(ctx context.Context, args *AppArgs, idleTimeout time.D
 
 // RuntimeServerStartOpt 保存自动启动本机 serve 使用的程序、参数、空闲时长和日志位置。
 type RuntimeServerStartOpt struct {
+	Config      *config.Config
 	Executable  string
 	ConfigFlags []string
 	IdleTimeout time.Duration
@@ -150,7 +155,11 @@ func EnsureRuntimeServer(ctx context.Context, opt *RuntimeServerStartOpt) (conne
 	if opt == nil {
 		return RuntimeServerConnection{}, errors.New("runtime server startup options are required")
 	}
-	file, isReachable, err := getReachableRuntimeServerFile(ctx)
+	if opt.Config == nil {
+		return RuntimeServerConnection{}, errors.New("cannot start a runtime server without loaded configuration")
+	}
+	path := getRuntimeServerFilePath(opt.Config)
+	file, isReachable, err := getReachableRuntimeServerFile(ctx, path)
 	if err != nil {
 		return RuntimeServerConnection{}, err
 	}
@@ -175,14 +184,14 @@ func EnsureRuntimeServer(ctx context.Context, opt *RuntimeServerStartOpt) (conne
 			hasExited = true
 		case <-time.After(runtimeServerStartPollInterval):
 		}
-		file, isReachable, err := getReachableRuntimeServerFile(ctx)
+		file, isReachable, err := getReachableRuntimeServerFile(ctx, path)
 		if err != nil {
 			return RuntimeServerConnection{}, err
 		}
 		if isReachable {
 			return file, nil
 		}
-		if hasExited && !isDataDirectoryLocked() {
+		if hasExited && !isDataDirectoryLocked(opt.Config.GetDataDirectory()) {
 			status := "exit status 0"
 			if exitErr != nil {
 				status = exitErr.Error()
@@ -199,9 +208,9 @@ func EnsureRuntimeServer(ctx context.Context, opt *RuntimeServerStartOpt) (conne
 }
 
 // getReachableRuntimeServerFile 读取本机连接文件，返回文件内容和它指向的 serve 能否访问。
-func getReachableRuntimeServerFile(ctx context.Context) (file RuntimeServerConnection, isReachable bool, err error) {
+func getReachableRuntimeServerFile(ctx context.Context, path string) (file RuntimeServerConnection, isReachable bool, err error) {
 	// 1. 读取连接文件；读取或解析失败时返回错误，文件不存在或 serve 无法访问时返回 false。
-	file, found, err := getRuntimeServerFile()
+	file, found, err := getRuntimeServerFile(path)
 	if err != nil || !found {
 		return RuntimeServerConnection{}, false, err
 	}
@@ -279,8 +288,8 @@ func newRuntime(ctx context.Context, cfg *config.Config, tel *telemetry.Telemetr
 		return nil, nil, err
 	}
 	// 2. 创建数据目录并打开存储。
-	dataDirectory, err := ensureDataDirectory()
-	if err != nil {
+	dataDirectory := cfg.GetDataDirectory()
+	if err := ensureDataDirectory(dataDirectory); err != nil {
 		return nil, nil, err
 	}
 	storageOpt, closeStorage, err := openStorage(dataDirectory)
@@ -299,18 +308,13 @@ func newRuntime(ctx context.Context, cfg *config.Config, tel *telemetry.Telemetr
 	return rt, closeStorage, nil
 }
 
-// ensureDataDirectory 创建并返回本机数据目录。
-func ensureDataDirectory() (string, error) {
-	// 1. 读取用户主目录，以 0700 创建 ~/.local/share/openvaala。
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("locate user directory: %w", err)
-	}
-	dataDirectory := config.GetDataDirectory(home)
+// ensureDataDirectory 创建本机数据目录。
+func ensureDataDirectory(dataDirectory string) error {
+	// 1. 以 0700 创建数据目录。
 	if err := os.MkdirAll(dataDirectory, 0700); err != nil {
-		return "", fmt.Errorf("create data directory: %w", err)
+		return fmt.Errorf("create data directory: %w", err)
 	}
-	return dataDirectory, nil
+	return nil
 }
 
 // lockDataDirectory 独占锁定数据目录，返回释放锁的函数。
@@ -333,10 +337,9 @@ func lockDataDirectory(dataDirectory string) (unlock func() error, err error) {
 }
 
 // isDataDirectoryLocked 是否有其他进程持有数据目录锁？
-func isDataDirectoryLocked() bool {
+func isDataDirectoryLocked(dataDirectory string) bool {
 	// 1. 定位并创建数据目录；失败时返回 false。
-	dataDirectory, err := ensureDataDirectory()
-	if err != nil {
+	if err := ensureDataDirectory(dataDirectory); err != nil {
 		return false
 	}
 	// 2. 尝试取得锁；失败时返回 true，成功时释放锁并返回 false。

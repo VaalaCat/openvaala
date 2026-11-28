@@ -8,7 +8,7 @@ export function getIsMobile(): boolean {
 }
 
 export function useIsMobile() {
-  const [isMobile, setIsMobile] = React.useState<boolean | undefined>(undefined)
+  const [isMobile, setIsMobile] = React.useState(getIsMobile)
 
   React.useEffect(() => {
     const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`)
@@ -20,5 +20,5 @@ export function useIsMobile() {
     return () => mql.removeEventListener("change", onChange)
   }, [])
 
-  return !!isMobile
+  return isMobile
 }

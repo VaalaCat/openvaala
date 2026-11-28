@@ -85,12 +85,20 @@ async function deleteFromList(
     .click()
 }
 
+// 侧栏里的对话也可能名为「新对话」，新建入口指向当前服务器的首页。
+function getNewConversationLink(page: Page): Locator {
+  const path = new URL(page.url()).pathname.split("/c/")[0]
+  return page
+    .getByRole("link", { name: "新对话", exact: true })
+    .and(page.locator(`a[href="${path}"]`))
+}
+
 // 从左侧「新对话」入口进入新对话页，发出第一条消息
 async function startAnotherConversation(
   page: Page,
   text: string
 ): Promise<void> {
-  await page.getByRole("link", { name: "新对话", exact: true }).click()
+  await getNewConversationLink(page).click()
   await startConversation(page, text)
 }
 
@@ -530,7 +538,7 @@ test.describe("desktop", () => {
     const conversationURL = page.url()
     await splitRight(page, getAreas(page).first())
     await expect(getAreas(page)).toHaveCount(2)
-    await page.getByRole("link", { name: "新对话", exact: true }).click()
+    await getNewConversationLink(page).click()
     await expect(
       page.getByRole("heading", { name: "新对话", level: 1 })
     ).toBeVisible()

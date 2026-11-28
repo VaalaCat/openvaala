@@ -172,7 +172,6 @@ type Desktop struct {
 	providerLoading               bool
 	providerSaving                bool
 	providerError                 error
-	catalogOpen                   bool
 	catalogRequested              bool
 	catalogError                  error
 	modelsFetching                bool
@@ -489,7 +488,7 @@ func (d *Desktop) statusLeftView(c *ui.Context) {
 	}
 	// 3. 可点击的服务器状态触发器：显示「● 本机 · 已连接 ▾」，点击弹出快捷切换菜单。
 	serverLabel := d.getActiveServerLabel()
-	trigger := ui.ButtonBase(c.Key("server-status-menu")).Shrink(1).Height(t.Metrics.CompactHeight).Padding(0, t.Space(2)).Gap(t.Space(1) + 2).AlignItems(ui.Center).Radius(t.Metrics.Radius).Label(d.t("server.switch.menu"))
+	trigger := ui.ButtonBase(c.Key("server-status-menu")).Shrink(1).Height(t.Metrics.CompactHeight).Padding(0, t.Space(2)).Gap(t.Space(1) + 2).AlignItems(ui.Center).Radius(t.Metrics.Radius).Label(d.t("server.switch.menu") + " · " + serverLabel + " · " + label)
 	trigger.Draw(func(p *ui.Painter, r ui.Rect) {
 		if trigger.Hovered() || trigger.Pressed() {
 			p.Fill(r, t.Colors.Hover, t.Metrics.Radius)

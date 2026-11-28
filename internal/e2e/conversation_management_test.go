@@ -26,6 +26,7 @@ import (
 
 // TestConversationManagement 检查分叉、回退、归档和删除后的对话历史及索引。
 func TestConversationManagement(t *testing.T) {
+	t.Parallel()
 	// 1. 构建程序，逐项运行回退、子 Agent、归档和删除场景。
 	binary := buildOpenVaala(t)
 	for _, test := range []struct {
@@ -275,7 +276,7 @@ func TestConversationManagement(t *testing.T) {
 		{
 			name: "idle_stop_waits_for_background_command",
 			run: func(t *testing.T, f *conversationManagementFixture) {
-				// 1. 对话里启动一条 5 秒的后台命令，然后退订。
+				// 1. 后台命令等测试写入 release 文件再退出。
 				f.startServeWithIdleStop(t)
 				observer := f.openNewConversation(t)
 				observer.startTurn(t, "启动后台命令")
@@ -285,15 +286,19 @@ func TestConversationManagement(t *testing.T) {
 				if err != nil {
 					t.Fatalf("pid tool result: %v", err)
 				}
-				request.reply <- e2eModelReply{tool: "bash", arguments: `{"command":"sleep 5","wait_seconds":0}`}
+				request.reply <- e2eModelReply{tool: "bash", arguments: `{"command":"until [ -f release ]; do sleep 0.05; done","wait_seconds":0}`}
 				f.model.next(t).reply <- e2eModelReply{text: "done"}
 				readTurnFinished(t, observer, defs.TurnStatusCompleted)
 				observer.stop()
 
 				// 2. 空闲时长过去两倍后命令仍在跑，对话没有停止；命令结束后才停止。
-				time.Sleep(2500 * time.Millisecond)
+				time.Sleep(2 * testConversationIdleTimeout)
 				if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err != nil {
 					t.Fatalf("MCP server %d is gone while a background command is running: %v", pid, err)
+				}
+				release := filepath.Join(observer.conversation.ExecutorSettings.WorkspaceDirectories[defs.LocalExecutorID], "release")
+				if err := os.WriteFile(release, nil, 0600); err != nil {
+					t.Fatal(err)
 				}
 				waitProcessGone(t, pid)
 			},
@@ -306,6 +311,7 @@ func TestConversationManagement(t *testing.T) {
 // conversationManagementFixture 是 TestConversationManagement 一个用例的环境：临时 HOME 里直接运行的 serve、假模型和不打开对话的控制 Client。
 type conversationManagementFixture struct {
 	binary, config string
+	serve          *e2eProcess
 	model          *e2eModel
 	control        runtimeclient.Client
 	stopControl    func()
@@ -321,14 +327,13 @@ func newConversationManagementFixture(t *testing.T, binary string) *conversation
 		config: writeE2EConfig(t, model.server.URL),
 		model:  model,
 	}
-	startE2EServe(t, binary, f.config)
-	// 清理时先断开控制 Client，再停止服务。
-	stopServeOnCleanup(t, binary, f.config)
-	f.connectControl(t)
+	f.startServe(t)
 	return f
 }
 
-// startServeWithIdleStop 配置 1 秒的 server.conversation_idle_timeout 和一个 stdio MCP server，并重启服务。
+const testConversationIdleTimeout = 250 * time.Millisecond
+
+// startServeWithIdleStop 配置对话空闲时长和一个 stdio MCP server，并重启服务。
 func (f *conversationManagementFixture) startServeWithIdleStop(t *testing.T) {
 	t.Helper()
 	// 1. 在配置里写入空闲时长，写入假 MCP server 的定义。
@@ -337,7 +342,7 @@ func (f *conversationManagementFixture) startServeWithIdleStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(f.config, []byte(strings.Replace(string(config), "server:\n", "server:\n  conversation_idle_timeout: 1s\n", 1)), 0600); err != nil {
+	if err := os.WriteFile(f.config, []byte(strings.Replace(string(config), "server:\n", "server:\n  conversation_idle_timeout: "+testConversationIdleTimeout.String()+"\n", 1)), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(directory, "mcp_servers"), 0700); err != nil {
@@ -385,14 +390,14 @@ func (f *conversationManagementFixture) stopServe(t *testing.T) {
 	t.Helper()
 	// 1. 先停止 Client，再等服务退出并释放数据目录锁。
 	f.stopControl()
-	stopServe(t, f.binary, f.config)
+	f.serve.stop(t)
 }
 
 // startServe 重启服务并连接新的控制 Client。
 func (f *conversationManagementFixture) startServe(t *testing.T) {
 	t.Helper()
 	// 1. 启动服务后重新建立控制连接。
-	startE2EServe(t, f.binary, f.config)
+	f.serve, _ = startE2EServe(t, f.binary, f.config)
 	f.connectControl(t)
 }
 

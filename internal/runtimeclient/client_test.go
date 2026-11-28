@@ -46,6 +46,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -2784,16 +2785,11 @@ func startClientHarness(t *testing.T, token string, configure ...func(*runtimese
 	runtimeDone := make(chan error, 1)
 	go func() { runtimeDone <- rt.Run(runtimeCtx) }()
 
-	// 3. 创建 Server，应用测试配置并运行。
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// 3. 应用测试配置，将 Runtime 路由挂到 HTTP 服务并启动。
 	configurationCalls := make(clientTestCalls, 16)
 	serverOpt := &runtimeserver.RuntimeServerOpt{
-		Runtime:  rt,
-		Listener: listener,
-		Token:    clientTestToken,
+		Runtime: rt,
+		Token:   clientTestToken,
 		Configuration: &clientTestConfiguration{
 			definitions: opt.Definitions,
 			calls:       configurationCalls,
@@ -2807,12 +2803,17 @@ func startClientHarness(t *testing.T, token string, configure ...func(*runtimese
 	if err != nil {
 		t.Fatal(err)
 	}
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	server.RegisterRoutes(engine)
+	httpServer := httptest.NewUnstartedServer(engine)
 	serverCtx, stopServer := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Run(serverCtx) }()
+	httpServer.Start()
 
 	// 4. 创建可切断代理和遥测管道，启动 Client。
-	proxy := newCuttableProxy(t, listener.Addr().String())
+	proxy := newCuttableProxy(t, httpServer.Listener.Addr().String())
 	pipeline := telemetrytest.NewPipeline(t)
 	clientOpt := runtimeclient.NewClientOpt("ws://"+proxy.address+"/api/v1/openvaala", token)
 	clientOpt.Telemetry = pipeline.Telemetry
@@ -2835,11 +2836,12 @@ func startClientHarness(t *testing.T, token string, configure ...func(*runtimese
 		configurationCalls: configurationCalls,
 	}
 	go func() { h.done <- client.Run(clientCtx) }()
-	// 5. 登记清理：取消并排空客户端事件，依次停止并等待 Server、Runtime。
+	// 5. 取消并排空客户端事件，依次关闭 HTTP 服务、连接和 Runtime。
 	t.Cleanup(func() {
 		cancel()
 		for range client.Events() {
 		}
+		httpServer.Close()
 		stopServer()
 		<-serverDone
 		stopRuntime()

@@ -16,6 +16,7 @@ import (
 // CLIFlags 保存 Cobra 直接解析的参数；是否显式传入由 Cobra 的 Changed 状态判断。
 type CLIFlags struct {
 	ConfigFilePath  string
+	DataDirectory   string
 	AgentsDirectory string
 	ModelsDirectory string
 	AgentName       string

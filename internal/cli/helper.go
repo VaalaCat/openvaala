@@ -525,22 +525,14 @@ func getACPReasoningText(summary, content []string) string {
 }
 
 // getRuntimeServerFilePath 返回本机 serve 连接文件的路径。
-func getRuntimeServerFilePath() (string, error) {
-	// 1. 读取用户主目录，拼接 .local/state/openvaala/runtime-server.yaml。
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("locate user directory: %w", err)
-	}
-	return filepath.Join(home, ".local", "state", "openvaala", "runtime-server.yaml"), nil
+func getRuntimeServerFilePath(cfg *config.Config) string {
+	// 1. 连接文件跟随配置确定的运行状态目录。
+	return filepath.Join(cfg.GetStateDirectory(), "runtime-server.yaml")
 }
 
 // getRuntimeServerFile 读取并解析本机连接文件 runtime-server.yaml。
-func getRuntimeServerFile() (file RuntimeServerConnection, found bool, err error) {
-	// 1. 定位并读取连接文件，不存在时 found 为 false，其他读取失败返回错误。
-	path, err := getRuntimeServerFilePath()
-	if err != nil {
-		return RuntimeServerConnection{}, false, err
-	}
+func getRuntimeServerFile(path string) (file RuntimeServerConnection, found bool, err error) {
+	// 1. 读取连接文件，不存在时 found 为 false，其他读取失败返回错误。
 	payload, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return RuntimeServerConnection{}, false, nil
@@ -594,11 +586,11 @@ func getCurrentExecutable() (path string, modifiedAt time.Time, err error) {
 	return path, info.ModTime(), nil
 }
 
-// GetConfigFlags 收集显式传入的 --config-file、--agents-dir、--models-dir 和 --agent，写成 --name=value。
+// GetConfigFlags 收集显式传入的全局配置参数，写成 --name=value。
 func GetConfigFlags(flags *pflag.FlagSet) ([]string, error) {
 	// 1. 跳过没传的参数；只有配置文件转成绝对路径，目录参数保留原值。
 	var configFlags []string
-	for _, name := range []string{"config-file", "agents-dir", "models-dir", "agent"} {
+	for _, name := range []string{"config-file", "data-dir", "agents-dir", "models-dir", "agent"} {
 		flag := flags.Lookup(name)
 		if flag == nil || !flag.Changed {
 			continue
@@ -668,6 +660,8 @@ func newCodexAppLaunchCommand(ctx context.Context, args *AppArgs, applicationPat
 		switch name {
 		case "--config-file":
 			environment["OPENVAALA_CONFIG"] = args.ConfigPath
+		case "--data-dir":
+			environment["OPENVAALA_DATA_DIR"] = args.Config.DataDirectory
 		case "--agents-dir":
 			environment["OPENVAALA_AGENTS_DIRECTORY"] = args.Config.Agents.Directory
 		case "--models-dir":

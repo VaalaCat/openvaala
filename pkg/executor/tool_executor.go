@@ -21,7 +21,7 @@ import (
 type ToolExecutor interface {
 	// GetTools 建出本轮工具表并存下，返回交给模型的工具定义；多个环境提供的工具带 executor 参数。返回内容由调用方持有。
 	GetTools(ctx context.Context) ([]*defs.ToolDefinition, error)
-	// GetToolsForEnvironments 按环境管理器返回的轮次开场列表和默认 ID 建表；列表为空时只提供协作工具。
+	// GetToolsForEnvironments 按环境管理器返回的轮次开场列表和默认 ID 建表；列表为空时只提供 Agent 侧工具。
 	GetToolsForEnvironments(ctx context.Context, environments []ExecutionEnvironment, defaultID string) ([]*defs.ToolDefinition, error)
 	// PrepareCalls 为整批调用选择提供方并运行 PreToolUse hook，发送准备阶段的 *ExecutionHookRunEvent 与已结束调用的 *ExecutionFinishedEvent，
 	// 返回与输入同顺序、同数量的准备结果；不关闭 events。
@@ -44,7 +44,7 @@ type ToolExecutorOpt struct {
 	EnvironmentsManager ExecutionEnvironmentsManager
 	// SessionTools 是本 Session 为各稳定环境构造的工具，键是环境 ID；和环境自带的工具一样参与 ToolNames 过滤、executor 参数和 hook。
 	SessionTools map[string][]Tool
-	// AgentTools 是协作工具，不带 executor 参数，不受 ToolNames 过滤。
+	// AgentTools 是不绑执行环境的 Agent 侧工具（含对话协作工具与外部附加工具），不带 executor 参数，不受 ToolNames 过滤。
 	AgentTools []Tool
 	// ToolNames 是内置工具和 Session 工具的可用名单；为空时全部可用。MCP 工具不受它过滤。
 	ToolNames []string
@@ -56,7 +56,7 @@ type ToolExecutorOpt struct {
 	Session defs.Session
 }
 
-// NewToolExecutorOpt 保存环境管理器和协作工具。
+// NewToolExecutorOpt 保存环境管理器和 Agent 侧工具。
 func NewToolExecutorOpt(manager ExecutionEnvironmentsManager, agentTools ...Tool) *ToolExecutorOpt {
 	return &ToolExecutorOpt{
 		EnvironmentsManager: manager,
@@ -162,7 +162,7 @@ func (e *toolExecutorImpl) Run(ctx context.Context, call *PreparedToolCall, even
 	e.executeCall(ctx, call, events)
 }
 
-// buildToolRoutes 汇总协作工具、环境工具和 MCP 工具，建立本轮工具表。
+// buildToolRoutes 汇总 Agent 侧工具、环境工具和 MCP 工具，建立本轮工具表。
 func (e *toolExecutorImpl) buildToolRoutes(ctx context.Context, environments []ExecutionEnvironment, defaultID string) (*toolRoutes, error) {
 	// 1. 并发读取各环境选中的 MCP 工具。显式选择 MCP server 时只读取稳定环境的 MCP 工具。
 	type environmentMCPTools struct {
@@ -181,7 +181,7 @@ func (e *toolExecutorImpl) buildToolRoutes(ctx context.Context, environments []E
 	}
 	tasks.Wait()
 
-	// 2. 先登记协作工具，随后按环境顺序合并各环境提供的工具。
+	// 2. 先登记 Agent 侧工具，随后按环境顺序合并各环境提供的工具。
 	routes := &toolRoutes{
 		environments: slices.Clone(environments),
 		defaultID:    defaultID,
@@ -254,7 +254,7 @@ func (r *toolRoutes) addEnvironmentTool(ctx context.Context, provider toolProvid
 		})
 		return nil
 	}
-	// 2. 与协作工具重名时报错；环境间同名但 schema 不同时记 Warn 后跳过。
+	// 2. 与 Agent 侧工具重名时报错；环境间同名但 schema 不同时记 Warn 后跳过。
 	if route.providers[0].environment == nil {
 		return fmt.Errorf("executor %q tool %q conflicts with an agent tool", environmentID, definition.Name)
 	}
@@ -268,7 +268,7 @@ func (r *toolRoutes) addEnvironmentTool(ctx context.Context, provider toolProvid
 	return nil
 }
 
-// getDefinitions 按稳定环境工具、协作工具、纯动态环境工具的顺序返回定义副本。
+// getDefinitions 按稳定环境工具、Agent 侧工具、纯动态环境工具的顺序返回定义副本。
 func (r *toolRoutes) getDefinitions() ([]*defs.ToolDefinition, error) {
 	var staticTools, agentTools, dynamicTools []*defs.ToolDefinition
 	for _, route := range r.routes {
@@ -297,7 +297,7 @@ func (r *toolRoutes) getDefinitions() ([]*defs.ToolDefinition, error) {
 
 // routeCall 按工具名和 executor 选择提供方，返回调用或分发错误。
 func (r *toolRoutes) routeCall(call *defs.Item) (toolProvider, *defs.Item, *defs.ToolResult) {
-	// 1. 协作工具或声明自有 executor 参数的单来源工具直接转发。
+	// 1. Agent 侧工具或声明自有 executor 参数的单来源工具直接转发。
 	callID := call.ToolCall.CallID
 	route := r.findRoute(call.ToolCall.Name)
 	if route == nil {
@@ -343,7 +343,7 @@ func (r *toolRoutes) routeCall(call *defs.Item) (toolProvider, *defs.Item, *defs
 	return provider, routedCall, nil
 }
 
-// getHookEnvironment 选择能执行命令的提供方环境，协作工具使用默认稳定环境。
+// getHookEnvironment 选择能执行命令的提供方环境，Agent 侧工具使用默认稳定环境。
 func (e *toolExecutorImpl) getHookEnvironment(provider toolProvider) ExecutionEnvironment {
 	environment := provider.environment
 	if environment == nil && e.opt.EnvironmentsManager != nil {
@@ -468,7 +468,7 @@ func (e *toolExecutorImpl) executeCall(ctx context.Context, prepared *PreparedTo
 	}
 	recorder.End(getToolErrorCode(result.Result))
 
-	// 3. 给结果和目录规则填入实际环境 ID，协作工具留空；没有 hook 时直接发送完成事件。
+	// 3. 给结果和目录规则填入实际环境 ID，Agent 侧工具留空；没有 hook 时直接发送完成事件。
 	environmentID := ""
 	if prepared.provider.environment != nil {
 		environmentID = prepared.provider.environment.GetID()

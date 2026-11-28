@@ -514,10 +514,7 @@ test(
       await editor.getByLabel("上下文窗口", { exact: true }).fill("32K")
       await editor.getByLabel("显示名", { exact: true }).fill("Busy local")
       await editor.getByRole("button", { name: "应用", exact: true }).click()
-      await expectToast(
-        editor,
-        "1 个对话正在执行，没换上新配置；等它们空闲后再重新加载配置才会生效"
-      )
+      await expectToast(editor, "1 个对话将在空闲后自动应用新配置")
     } finally {
       await page.getByRole("button", { name: "中断", exact: true }).click()
       await editor.close()

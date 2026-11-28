@@ -1,5 +1,6 @@
 import { lazy, Suspense, type ComponentType } from "react"
-import { Navigate, Route, Routes } from "react-router"
+import { Navigate, Outlet, Route, Routes } from "react-router"
+import { ServerConnectionProvider } from "@/components/server-connection-provider"
 import { AppLayout } from "@/components/app-layout"
 
 // 按需加载页面模块，取其中名为 name 的导出
@@ -64,31 +65,41 @@ const SkillSettingsPage = lazyPage(
   "SkillSettingsPage"
 )
 
+function RuntimeRoutes() {
+  return (
+    <ServerConnectionProvider>
+      <Outlet />
+    </ServerConnectionProvider>
+  )
+}
+
 export function AppRouter() {
   return (
     // 入口页不在 AppLayout 里，它的模块加载由这一层兜住
     <Suspense fallback={null}>
       <Routes>
-        <Route path="/" element={<IndexPage />} />
-        <Route path="/s/:serverID" element={<AppLayout />}>
-          <Route index element={<NewConversationPage />} />
-          <Route path="c/:conversationID" element={<WorkspacePage />}>
-            <Route index element={null} />
-            <Route path="sessions/:sessionID" element={null} />
-          </Route>
-          <Route path="settings">
-            <Route index element={<Navigate to="general" replace />} />
-            <Route path="general" element={<GeneralSettingsPage />} />
-            <Route path="appearance" element={<AppearanceSettingsPage />} />
-            <Route path="archived" element={<ArchivedConversationsPage />} />
-            <Route path="providers" element={<ProviderListPage />} />
-            <Route path="providers/new" element={<ProviderCreatePage />} />
-            <Route path="providers/edit" element={<ProviderEditPage />} />
-            <Route path="executors" element={<ExecutorSettingsPage />} />
-            <Route path="executors/new" element={<ExecutorCreatePage />} />
-            <Route path="executors/edit" element={<ExecutorEditPage />} />
-            <Route path="hooks" element={<HookSettingsPage />} />
-            <Route path="skills" element={<SkillSettingsPage />} />
+        <Route element={<RuntimeRoutes />}>
+          <Route path="/" element={<IndexPage />} />
+          <Route path="/s/:serverID" element={<AppLayout />}>
+            <Route index element={<NewConversationPage />} />
+            <Route path="c/:conversationID" element={<WorkspacePage />}>
+              <Route index element={null} />
+              <Route path="sessions/:sessionID" element={null} />
+            </Route>
+            <Route path="settings">
+              <Route index element={<Navigate to="general" replace />} />
+              <Route path="general" element={<GeneralSettingsPage />} />
+              <Route path="appearance" element={<AppearanceSettingsPage />} />
+              <Route path="archived" element={<ArchivedConversationsPage />} />
+              <Route path="providers" element={<ProviderListPage />} />
+              <Route path="providers/new" element={<ProviderCreatePage />} />
+              <Route path="providers/edit" element={<ProviderEditPage />} />
+              <Route path="executors" element={<ExecutorSettingsPage />} />
+              <Route path="executors/new" element={<ExecutorCreatePage />} />
+              <Route path="executors/edit" element={<ExecutorEditPage />} />
+              <Route path="hooks" element={<HookSettingsPage />} />
+              <Route path="skills" element={<SkillSettingsPage />} />
+            </Route>
           </Route>
         </Route>
         {/* 不认识的地址回到入口页 */}

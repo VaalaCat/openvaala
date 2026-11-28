@@ -70,6 +70,7 @@
 - 无效外部输入、乱序或重复通知、持久化损坏以及 Model、Tool、Executor、网络错误必须返回普通错误或
   `RepairRequired`；通过公开 API 和单线程状态机绝对不可达的内部状态可以直接 panic。
 - 测试优先覆盖公开表现、真实主链、E2E 和 race；只在独立算法或关键状态规则上增加定向单元测试。
+- 运行完整 Go E2E 用 `go test -race -count=1 ./internal/e2e`，16 核 Linux 上有构建缓存时约 5–6 分钟。
 - 产品包的定向测试必须放入被测业务文件对应的 `<business>_test.go`；不要按场景、缺陷、fixture、review 或开发阶段
   随意拆分测试文件。公共测试 fixture 放入其主要业务归属的测试文件，包内其他测试直接复用。新建测试文件前先
   确认存在对应业务文件，否则并入已有测试文件。跨模块 E2E、外部 contract、平台兼容和 package boundary guard

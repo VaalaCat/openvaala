@@ -5,7 +5,6 @@ import { createBrowserRouter, RouterProvider } from "react-router"
 import { AppRouter } from "./router"
 import { AppToaster } from "./components/base/app-toaster"
 import { RouteLoadError } from "./components/route-load-error"
-import { ServerConnectionProvider } from "./components/server-connection-provider"
 import { initializeAppearance } from "./lib/appearance/preferences"
 import { createQueryClient } from "./lib/query/client"
 import { initializeI18n } from "./i18n"
@@ -32,9 +31,7 @@ const router = createBrowserRouter(
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <ServerConnectionProvider>
-        <RouterProvider router={router} />
-      </ServerConnectionProvider>
+      <RouterProvider router={router} />
     </QueryClientProvider>
     <AppToaster />
   </StrictMode>

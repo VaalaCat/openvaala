@@ -151,11 +151,7 @@ func runCodexCommand(ctx context.Context, args *AppArgs) (err error) {
 	}
 	writeRuntimeServerNotice(ctx, args.Stderr, connection)
 	// 4. 创建本进程专用的 codex-<pid>.sock 监听器。
-	serverFilePath, err := getRuntimeServerFilePath()
-	if err != nil {
-		return err
-	}
-	socketPath := filepath.Join(filepath.Dir(serverFilePath), fmt.Sprintf("codex-%d.sock", os.Getpid()))
+	socketPath := filepath.Join(args.Config.GetStateDirectory(), fmt.Sprintf("codex-%d.sock", os.Getpid()))
 	listener, err := listenAppServerSocket(socketPath)
 	if err != nil {
 		return err

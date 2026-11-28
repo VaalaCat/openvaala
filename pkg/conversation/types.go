@@ -56,6 +56,8 @@ type ConversationDefinitions struct {
 	Hooks []*hook.HookDefinition
 	// Executors 决定本对话能用哪些 Executor，不能为 nil，由 Runtime 保证；对话按自己的 Executor 设置从中选出可用的建执行环境。
 	Executors executor.ExecutorProvider
+	// ExtraTools 按对话提供不绑执行环境的附加 Agent 侧工具；nil 时不追加。
+	ExtraTools executor.ToolProvider
 	// Skills 是所有对话共用的 skill；和项目目录、主目录里的 skill 同名时，项目目录的优先，其次是这里的，主目录的最后。
 	Skills []*skill.Skill
 }
@@ -154,6 +156,8 @@ type conversationConfig struct {
 	environments []executor.ExecutionEnvironment
 	// executors 是装配时 GetExecutors 返回的列表，Session 详情从这里取种类。
 	executors []executor.Executor
+	// extraTools 是装配时加载的附加 Agent 侧工具，这套配置下的全部 Session 共用。
+	extraTools []executor.Tool
 	// workspaces 是这套配置建的全部工作区，只属于本对话；停掉这套执行环境后关闭，没换上就被丢弃的配置由丢弃方关闭。
 	workspaces []workspace.Workspace
 	// skills 是项目目录、definitions.Skills、主目录三段按顺序去重后的 skill，按名字排序；各 Agent 按 SkillNames 选择。

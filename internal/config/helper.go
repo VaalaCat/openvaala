@@ -185,10 +185,10 @@ func joinWindowsPath(base string, segments []string) string {
 }
 
 // getTelemetryLogFile 确定日志文件路径。
-func getTelemetryLogFile(path, home, base string) string {
-	// 1. 未配置时使用 ~/.local/state/openvaala/openvaala.log，否则按配置文件位置展开。
+func getTelemetryLogFile(path, home, base, stateDirectory string) string {
+	// 1. 未配置时使用运行状态目录下的 openvaala.log，否则按配置文件位置展开。
 	if path == "" {
-		return filepath.Join(home, ".local", "state", "openvaala", "openvaala.log")
+		return filepath.Join(stateDirectory, "openvaala.log")
 	}
 	return expandPath(path, home, base)
 }

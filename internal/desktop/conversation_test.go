@@ -464,8 +464,8 @@ func TestNewConversationEmptyState(t *testing.T) {
 		if err := tester.Click("添加模型服务"); err != nil {
 			t.Fatal(err)
 		}
-		if d.page != "providers" || !d.catalogOpen {
-			t.Fatalf("page=%q catalogOpen=%v", d.page, d.catalogOpen)
+		if d.page != "providers" || !tester.HasText("从预设填充") || !tester.HasText("Provider ID") {
+			t.Fatalf("onboarding did not open the provider form: %q", tester.Texts())
 		}
 	})
 }

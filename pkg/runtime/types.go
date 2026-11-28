@@ -105,6 +105,8 @@ type Definitions struct {
 	Hooks []*hook.HookDefinition
 	// Executors 决定每个对话能用哪些 Executor，reload 时和其他定义一起替换；nil 时没有 Executor。
 	Executors executor.ExecutorProvider
+	// ExtraTools 按对话提供不绑执行环境的附加 Agent 侧工具；nil 时不追加。
+	ExtraTools executor.ToolProvider
 	// Skills 是所有对话共用的 skill：skills.directory、builtin、各插件，按这个顺序去重。
 	Skills []*skill.Skill
 }

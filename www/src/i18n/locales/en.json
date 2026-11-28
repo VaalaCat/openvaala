@@ -5,6 +5,9 @@
     "breadcrumb": "Current location",
     "dangerZone": "Danger zone",
     "actions": {
+      "scrollToBottom": "Back to bottom",
+      "expandMessage": "Expand message",
+      "collapseMessage": "Collapse message",
       "cancel": "Cancel",
       "clearFilters": "Clear filters",
       "clearSearch": "Clear search",
@@ -159,7 +162,6 @@
     "messages": "Messages",
     "empty": "No messages yet",
     "loadingEarlier": "Loading earlier messages",
-    "scrollToBottom": "Back to bottom",
     "pending": {
       "title": "Pending",
       "steer": "Steer",
@@ -204,8 +206,6 @@
       "copy": "Copy message",
       "from": "From",
       "context": "Attached context",
-      "expand": "Expand message",
-      "collapse": "Collapse message",
       "subagent": {
         "failed": "failed",
         "interrupted": "interrupted",

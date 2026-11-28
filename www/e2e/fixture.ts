@@ -34,7 +34,7 @@ interface FixtureState {
 }
 
 // 假模型的一次回复：依次吐出推理、文字（chunkDelayMs 大于 0 时逐字吐，字间隔这么久）和一次工具调用；
-// hold 时写完后不结束，直到这次请求被取消；status 非零时返回带 error 原文的 HTTP 错误
+// hold 时写完后不结束，直到测试放行或这次请求被取消；status 非零时返回带 error 原文的 HTTP 错误
 export interface ModelReply {
   text?: string
   reasoning?: string
@@ -69,6 +69,11 @@ export class WebUIFixture {
   // 把回复按顺序追加到假模型的队列末尾；队列空时模型回 ok
   async replies(...replies: ModelReply[]): Promise<void> {
     await this.post("/replies", { replies })
+  }
+
+  // 让当前挂起的回复正常结束。
+  async finishHeldReply(): Promise<void> {
+    await this.post("/replies/finish", {})
   }
 
   // 清空假模型还没被取走的回复
@@ -486,6 +491,7 @@ export async function openTurnRaw(turn: Locator): Promise<Locator> {
 export async function controlConnection(page: Page) {
   let isHeld = false
   let live: WebSocketRoute | undefined
+  const control = page.getByRole("button", { name: /^本页 · / })
   await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
     // 断开期间的重连尝试立即失败，页面按退避继续重试。
     if (isHeld) {
@@ -500,28 +506,24 @@ export async function controlConnection(page: Page) {
     async disconnect(): Promise<void> {
       isHeld = true
       await live!.close()
-      await expect(
-        page.getByRole("button", { name: "重连", exact: true })
-      ).toBeVisible()
+      await expect(control).toHaveAccessibleName("本页 · 已断开，正在重连")
     },
     // 允许重连：页面按退避自己连上，不碰页面，键盘焦点留在原处
     async allowReconnect(): Promise<void> {
       isHeld = false
-      await expect(
-        page.getByRole("button", { name: "已连接", exact: true })
-      ).toBeVisible({ timeout: 20_000 })
+      await expect(control).toHaveAccessibleName("本页 · 已连接", {
+        timeout: 20_000,
+      })
     },
     // 允许重连并点「重连」跳过退避立即重试，等页面回到已连接；点击会把键盘焦点交给按钮
     async reconnect(): Promise<void> {
+      await control.click()
+      const reconnect = page.getByRole("button", { name: "重连", exact: true })
+      await expect(reconnect).toBeVisible()
       isHeld = false
-      // 退避等待刚好结束时页面已经自己连上，按钮不在了。
-      await page
-        .getByRole("button", { name: "重连", exact: true })
-        .click({ timeout: 3000 })
-        .catch(() => undefined)
-      await expect(
-        page.getByRole("button", { name: "已连接", exact: true })
-      ).toBeVisible()
+      await reconnect.click()
+      await expect(control).toHaveAccessibleName("本页 · 已连接")
+      await page.keyboard.press("Escape")
     },
   }
 }

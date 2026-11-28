@@ -699,7 +699,9 @@ func TestDesktopGUIStartupAndCancel(t *testing.T) {
 			process, a, window := startDesktopGUI(t, binary, config)
 			text := "native retained " + scenario
 			if scenario == "cold_input" {
-				a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "text" && n.Label == "连接中…" })
+				a.waitNode(t, window, func(n desktopAutomationNode) bool {
+					return n.Role == "button" && fmt.Sprint(n.Key) == "server-status-menu" && n.Label == "切换服务器 · 本机 · 连接中…"
+				})
 				a.setText(t, window, "composer-text", text)
 				if err := pausedServe.command.Process.Signal(syscall.SIGCONT); err != nil {
 					t.Fatal(err)
@@ -1376,6 +1378,8 @@ func TestDesktopGUIAppearance(t *testing.T) {
 				a.capture(t, window, appearance.theme+"-sidebar-sheet")
 				a.call(t, "input", map[string]any{"window": window, "events": []map[string]any{{"type": "key", "key": "Escape"}}}, nil)
 			}
+			// 面板折叠后先等布局稳定，再取输入框节点，避免操作上一帧的节点。
+			a.call(t, "idle", map[string]any{"window": window, "timeout": 5000}, nil)
 			a.setText(t, window, "composer-text", "窄窗口中文草稿")
 			a.capture(t, window, appearance.theme+"-focused-composer")
 			a.setText(t, window, "composer-text", "")
@@ -2089,7 +2093,7 @@ func TestDesktopGUIAlignment(t *testing.T) {
 	a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "button" && n.Label == "复制结果" })
 	a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "button" && n.Label == "从这里分叉" })
 	a.capture(t, window, "alignment")
-	// 2. 标题栏 ⋯、活动行调试按钮、用户消息分叉按钮、最终回复脚注按钮：右缘差不超过 1px。
+	// 2. 两个调试按钮与标题栏右缘对齐；用户卡片的分叉按钮留在卡片右上角的内缩操作条。
 	rightEdges := map[string][]float64{}
 	var titleMenu *desktopAutomationNode
 	nodes := a.getNodes(t, window)
@@ -2110,16 +2114,20 @@ func TestDesktopGUIAlignment(t *testing.T) {
 		t.Fatal("title menu button missing")
 	}
 	reference := titleMenu.Bounds.X + titleMenu.Bounds.Width
-	// 最终回复脚注的两个 20 见方按钮是「复制结果」「调试信息」，「调试信息」在最右；用户消息卡片的最右按钮是「从这里分叉」。
+	// 用户卡片右缘与标题栏共用消息列；操作条内缩 8px，卡片和操作条各有 1px 边框。
 	for _, label := range []string{"调试信息", "从这里分叉"} {
 		if len(rightEdges[label]) < 1 {
 			t.Fatalf("no %q button in the conversation column: %v", label, rightEdges)
 		}
 	}
 	for label, edges := range rightEdges {
+		want := reference
+		if label == "从这里分叉" {
+			want -= 8 + 1 + 1
+		}
 		for _, edge := range edges {
-			if math.Abs(edge-reference) > 1 {
-				t.Errorf("%q right edge %.1f differs from the title menu edge %.1f by more than 1px: %v", label, edge, reference, rightEdges)
+			if math.Abs(edge-want) > 1 {
+				t.Errorf("%q right edge %.1f, want %.1f: %v", label, edge, want, rightEdges)
 			}
 		}
 	}
@@ -3036,12 +3044,17 @@ func TestDesktopGUISettingsPages(t *testing.T) {
 	for _, page := range []struct{ nav, content string }{
 		{"通用", "完成时发送系统通知"},
 		{"模型服务", "全局默认模型"},
-		{"Executor", "来自 config.yaml，编辑后点重载配置"},
+		{"Executor", "sandbox"},
 		{"Hook", "来自 config.yaml，编辑后点重载配置"},
 		{"Skill", "只显示这个 Agent 可用的 Skill"},
 	} {
 		a.press(t, window, page.nav)
 		a.waitLabel(t, window, page.content)
+		if page.nav == "Executor" {
+			a.waitNode(t, window, func(n desktopAutomationNode) bool {
+				return n.Role == "button" && fmt.Sprint(n.Key) == "add-ssh-executor" && !slices.Contains(n.States, "disabled")
+			})
+		}
 		a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "button" && n.Label == "重载配置" })
 		a.capture(t, window, "settings-"+page.nav)
 	}
@@ -3086,8 +3099,7 @@ func TestDesktopGUISettingsPages(t *testing.T) {
 	}
 }
 
-// TestDesktopGUIOnboarding 检查没有任何模型服务时：对话区引导添加，按钮打开模型服务页并展开服务目录；
-// 发送失败显示中文提示和同一个入口；从目录加一个服务、添加模型并应用后引导消失。
+// TestDesktopGUIOnboarding 检查没有模型服务时的添加表单、预设填充及保存后的对话入口。
 func TestDesktopGUIOnboarding(t *testing.T) {
 	binary := requireDesktopDisplay(t)
 	config := writeE2EConfigWithoutModels(t)
@@ -3112,16 +3124,26 @@ func TestDesktopGUIOnboarding(t *testing.T) {
 		t.Fatal("the raw RPC error is shown")
 	}
 	a.capture(t, window, "onboarding-send-failed")
-	// 3. 按钮打开模型服务页，服务目录已展开。
+	// 3. 引导直接打开新增表单，选择预设前目录项保持收起。
 	a.press(t, window, "添加模型服务")
-	a.waitLabel(t, window, "还没有模型服务，从服务目录选一个，或新增服务")
-	a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "button" && n.Label == "Compat Gateway" })
-	a.capture(t, window, "onboarding-catalog")
-	// 4. 选目录里的服务，加一个模型，应用；回到对话后引导消失。
-	a.press(t, window, "Compat Gateway")
-	a.waitNode(t, window, func(n desktopAutomationNode) bool {
-		return n.Role == "textField" && n.Label == "Provider ID" && n.Value == "compat"
+	a.waitLabel(t, window, "Provider ID")
+	preset := a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Role == "popUpButton" && n.Label == "从预设填充" && !slices.Contains(n.States, "disabled")
 	})
+	a.capture(t, window, "onboarding-provider-form")
+	a.call(t, "act", map[string]any{"window": window, "id": preset.ID, "action": "press"}, nil)
+	option := a.waitLabel(t, window, "Compat Gateway")
+	a.call(t, "act", map[string]any{"window": window, "id": option.ID, "action": "press"}, nil)
+	// 4. 核对预设填充的字段，再添加模型并应用。
+	for _, field := range []struct{ role, label, value string }{
+		{"textField", "Provider ID", "compat"},
+		{"popUpButton", "协议", "openai_chat"},
+		{"textField", "Base URL", "https://compat.example/v1"},
+	} {
+		a.waitNode(t, window, func(n desktopAutomationNode) bool {
+			return n.Role == field.role && n.Label == field.label && n.Value == field.value
+		})
+	}
 	a.setText(t, window, "manual-model", "plain")
 	a.press(t, window, "添加模型")
 	a.press(t, window, "应用")
@@ -3167,9 +3189,10 @@ func TestDesktopGUIConnectionBanner(t *testing.T) {
 	}) {
 		t.Fatal("banner has no localized reason")
 	}
-	// 状态栏只显示连接状态：有短状态文字，「重试」只有横幅里的一个，状态栏里没有错误原文。
+	// 状态栏的服务器按钮读出连接状态；「重试」只有横幅里的一个，状态栏里没有错误原文。
 	a.waitNode(t, window, func(n desktopAutomationNode) bool {
-		return n.Role == "text" && (n.Label == "正在重连…" || n.Label == "连接失败") && n.Bounds.Y > 500
+		return n.Role == "button" && fmt.Sprint(n.Key) == "server-status-menu" &&
+			(n.Label == "切换服务器 · 本机 · 正在重连…" || n.Label == "切换服务器 · 本机 · 连接失败")
 	})
 	retries := 0
 	for _, n := range a.getNodes(t, window) {
@@ -3197,7 +3220,7 @@ func TestDesktopGUIConnectionBanner(t *testing.T) {
 		}
 	}
 	waitBannerGone("automatic reconnect")
-	a.waitLabel(t, window, "已连接")
+	a.waitLabel(t, window, "切换服务器 · 本机 · 已连接")
 	a.capture(t, window, "connection-recovered")
 	// 4. 再停一次服务，横幅出现后重新启动并点一次「重试」；客户端自己的重连可能更早完成，两者都应让横幅消失。
 	stopServe(t, binary, config)
@@ -3210,7 +3233,7 @@ func TestDesktopGUIConnectionBanner(t *testing.T) {
 		}
 	}
 	waitBannerGone("manual retry")
-	a.waitLabel(t, window, "已连接")
+	a.waitLabel(t, window, "切换服务器 · 本机 · 已连接")
 }
 
 // TestDesktopGUICommandPalette 检查命令面板：标题不带冒号，输入过滤后 Enter 执行第一项；命令很多时列表可滚动，最后一项能滚进可见区。

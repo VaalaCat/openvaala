@@ -43,6 +43,7 @@ func NewCLI(opt *CLIOpt) *cobra.Command {
 	// 2. 注册配置、Codex 和连接参数。
 	bindings := root.PersistentFlags()
 	bindings.StringVar(&flags.ConfigFilePath, "config-file", "", "configuration file (OPENVAALA_CONFIG or ~/.config/openvaala/config.yaml)")
+	bindings.StringVar(&flags.DataDirectory, "data-dir", "", "directory for local data and runtime state")
 	bindings.StringVar(&flags.AgentsDirectory, "agents-dir", "", "Agent definition directory")
 	bindings.StringVar(&flags.ModelsDirectory, "models-dir", "", "Provider definition directory")
 	bindings.StringVar(&flags.AgentName, "agent", "", "Agent definition name")
@@ -148,8 +149,15 @@ func getConfigOpt(command *cobra.Command) (*config.LoadConfigOpt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &config.LoadConfigOpt{
+	opt := &config.LoadConfigOpt{
 		Path:  path,
 		Flags: command.Flags(),
-	}, nil
+	}
+	if command.Name() == "serve" {
+		if flag := command.Flags().Lookup("listen"); flag != nil && flag.Changed {
+			listen := flag.Value.String()
+			opt.ServerListen = &listen
+		}
+	}
+	return opt, nil
 }

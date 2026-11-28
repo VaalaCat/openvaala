@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/spf13/cobra"
 )
@@ -16,20 +17,27 @@ func newReindexCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "reindex",
 		Short: "Rebuild metadata.db from the conversation directories",
-		Long: "Rebuild ~/.local/share/openvaala/metadata.db from every conversation's metadata.jsonl.\n" +
+		Long: "Rebuild metadata.db in the data directory from every conversation's metadata.jsonl.\n" +
 			"Run it after copying conversation directories in, while no other openvaala process uses the data directory.",
 		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			return runReindexCommand(command.Context(), command.OutOrStdout(), command.ErrOrStderr())
+			opt, err := getConfigOpt(command)
+			if err != nil {
+				return err
+			}
+			cfg, _, err := config.LoadConfigSettings(opt)
+			if err != nil {
+				return fmt.Errorf("failed to load config: %w", err)
+			}
+			return runReindexCommand(command.Context(), cfg.GetDataDirectory(), command.OutOrStdout(), command.ErrOrStderr())
 		},
 	}
 }
 
 // runReindexCommand 锁定数据目录，重建元数据索引并输出处理结果。
-func runReindexCommand(ctx context.Context, stdout, stderr io.Writer) (err error) {
+func runReindexCommand(ctx context.Context, dataDirectory string, stdout, stderr io.Writer) (err error) {
 	// 1. 创建数据目录并取得独占锁；serve 或另一个 reindex 占着锁时返回错误。
-	dataDirectory, err := ensureDataDirectory()
-	if err != nil {
+	if err := ensureDataDirectory(dataDirectory); err != nil {
 		return err
 	}
 	unlock, err := lockDataDirectory(dataDirectory)

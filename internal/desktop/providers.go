@@ -62,24 +62,14 @@ func (d *Desktop) loadProviders() {
 
 // providersView 绘制模型服务页：服务列表、服务目录、默认模型和编辑表单。
 func (d *Desktop) providersView(c *ui.Context) {
-	// 1. 列表为空时服务目录直接展开，是页面的主内容；服务目录只在需要显示时才读取。
-	isEmpty := len(d.providers) == 0 && d.providerError == nil && !d.providerLoading
-	showCatalog := d.catalogOpen || isEmpty
-	if showCatalog && !d.catalogRequested {
-		d.loadCatalogProviders()
-	}
+	// 1. 新增表单置顶，目录只在新增时读取。
+	creating := d.providerDraft != nil && d.providerDraft.EditingID == ""
 	if d.providerError != nil {
 		d.errorMessageView(c, d.providerError)
 	}
-	if showCatalog && d.catalogError != nil {
-		ui.Row(c).Gap(kit.GetTheme(c).Space(2)).AlignItems(ui.Center).Children(func() {
-			d.errorMessageView(c, d.catalogError).Shrink(1)
-			if kit.Button(c, d.t("retry")).Clicked() {
-				d.catalogRequested, d.catalogError = false, nil
-			}
-		})
-	}
-	if isEmpty {
+	if creating {
+		d.providerFormView(c)
+	} else if len(d.providers) == 0 && d.providerError == nil && !d.providerLoading && d.providerDraft == nil {
 		kit.FieldMessage(c, kit.MessageDescription, d.t("providers.empty"))
 	}
 	// 2. 服务列表：服务名、基础地址，行尾是默认标记、模型数量和协议徽标。
@@ -103,18 +93,6 @@ func (d *Desktop) providersView(c *ui.Context) {
 			}
 		})
 	}
-	if showCatalog && len(d.catalogProviders) > 0 {
-		kit.SettingSection(c, d.t("provider.catalog"), func() {
-			for _, provider := range d.catalogProviders {
-				row := kit.ListRow(c.Key("catalog:"+provider.ID), kit.ListRowOpt{Title: provider.Name, Description: provider.BaseURL, Trailing: func() {
-					kit.Badge(c, getProtocolLabel(provider.Protocol), kit.BadgeNeutral)
-				}}).FillWidth().Label(provider.Name)
-				if row.Clicked() {
-					d.openProvider(defs.ProviderConfig{ID: provider.ID, Protocol: provider.Protocol, BaseURL: provider.BaseURL}, "", provider.ID)
-				}
-			}
-		})
-	}
 	// 3. 全局默认模型。
 	defaults := []string{}
 	for _, provider := range d.providers {
@@ -133,7 +111,7 @@ func (d *Desktop) providersView(c *ui.Context) {
 			})
 		})
 	}
-	if d.providerDraft != nil {
+	if d.providerDraft != nil && !creating {
 		d.providerFormView(c)
 	}
 }
@@ -175,9 +153,14 @@ func (d *Desktop) providerFormView(c *ui.Context) {
 		protocolLabels[index] = getProtocolLabel(protocol)
 	}
 	kit.SettingSection(c.Key("provider-basic"), title, func() {
+		if draft.EditingID == "" {
+			d.providerPresetView(c)
+		}
 		d.settingInputRow(c, "provider-id", "Provider ID", "", &draft.ID, settingInputOpt{ReadOnly: draft.EditingID != "", Error: draft.IDError})
 		kit.SettingRow(c, d.t("protocol"), "", func() {
-			d.settingSelectView(c, "provider-protocol", d.t("protocol"), &draft.Protocol, kit.SelectOpt{Options: selectOptions(protocols, protocolLabels)})
+			kit.Select(c.Key("provider-protocol"), &draft.Protocol, kit.SelectOpt{
+				Options: selectOptions(protocols, protocolLabels), Label: d.t("protocol"), Bordered: true,
+			}).Width(settingInputWidth)
 		})
 		d.settingInputRow(c, "provider-base-url", "Base URL", "", &draft.BaseURL, settingInputOpt{})
 		d.settingInputRow(c, "provider-api-key", "API key", "", &draft.APIKey, settingInputOpt{Password: true})
@@ -201,6 +184,43 @@ func (d *Desktop) providerFormView(c *ui.Context) {
 			d.confirmOpen = true
 		}
 	}
+}
+
+// providerPresetView 在新增表单中显示可搜索的服务预设。
+func (d *Desktop) providerPresetView(c *ui.Context) {
+	if !d.catalogRequested {
+		d.loadCatalogProviders()
+	}
+	label := d.t("provider.preset")
+	if d.catalogError != nil {
+		kit.SettingRow(c, label, d.catalogError.Error(), func() {
+			if kit.Button(c, d.t("retry")).Clicked() {
+				d.catalogError = nil
+				d.loadCatalogProviders()
+			}
+		})
+		return
+	}
+
+	options := make([]kit.SelectOption, 0, len(d.catalogProviders))
+	for _, provider := range d.catalogProviders {
+		options = append(options, kit.SelectOption{Value: provider.ID, Label: provider.Name, Description: provider.ID})
+	}
+	selected := d.selectedCatalog
+	kit.SettingRow(c, label, "", func() {
+		if !kit.Select(c.Key("provider-preset"), &selected, kit.SelectOpt{
+			Options: options, Label: label, Placeholder: d.t("provider.preset.placeholder"),
+			Disabled: len(options) == 0 || d.providerSaving, Searchable: true, Bordered: true,
+		}).Width(settingInputWidth).Changed() {
+			return
+		}
+		for _, provider := range d.catalogProviders {
+			if provider.ID == selected {
+				d.openProvider(defs.ProviderConfig{ID: provider.ID, Protocol: provider.Protocol, BaseURL: provider.BaseURL}, "", provider.ID)
+				break
+			}
+		}
+	})
 }
 
 // providerHeadersView 绘制表单的请求头部分：每行是名称、值和删除按钮，末尾是添加按钮和变量说明。

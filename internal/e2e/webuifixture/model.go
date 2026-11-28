@@ -9,7 +9,7 @@ import (
 )
 
 // modelReply 是假模型的一次回复：依次写出推理、文字和一次工具调用；ChunkDelayMs 大于 0 时文字逐字吐出，
-// 每个字之间等这么久；Hold 时写完后挂起，直到请求被取消（例如 Turn 被中断）；Status 非零时返回 HTTP 错误。
+// 每个字之间等这么久；Hold 时写完后挂起，直到测试放行或请求被取消；Status 非零时返回 HTTP 错误。
 type modelReply struct {
 	Text            string          `json:"text,omitempty"`
 	Reasoning       string          `json:"reasoning,omitempty"`
@@ -37,6 +37,8 @@ type modelToolCall struct {
 type fakeModel struct {
 	// replies 是排好的回复，按 FIFO 交给之后的模型请求。
 	replies chan modelReply
+	// finishHeldReply 由测试放行当前挂起的回复，使其正常结束。
+	finishHeldReply chan struct{}
 	// modelIDs 是 GET /v1/models 列出的模型 id。
 	modelIDs atomic.Pointer[[]string]
 	// toolCalls 为每次工具调用生成不同的 call id。
@@ -46,7 +48,7 @@ type fakeModel struct {
 // newFakeModel 创建回复队列为空、模型列表为空的假模型。
 func newFakeModel() *fakeModel {
 	// 1. 队列容量远大于一次测试会排的回复数，追加时不会阻塞。
-	model := &fakeModel{replies: make(chan modelReply, 1024)}
+	model := &fakeModel{replies: make(chan modelReply, 1024), finishHeldReply: make(chan struct{})}
 	model.modelIDs.Store(&[]string{})
 	return model
 }
@@ -89,7 +91,7 @@ func (m *fakeModel) handleChatCompletions(w http.ResponseWriter, r *http.Request
 	} else if reply.Text != "" {
 		writeDelta(w, map[string]any{"content": reply.Text})
 	}
-	// 3. 写工具调用，延迟时先刷新思考；Hold 时等请求取消。
+	// 3. 写工具调用，延迟时先刷新思考；Hold 时等测试放行或请求取消。
 	if reply.ToolDelayMs > 0 {
 		flusher.Flush()
 		select {
@@ -135,8 +137,11 @@ func (m *fakeModel) handleChatCompletions(w http.ResponseWriter, r *http.Request
 	}
 	if reply.Hold {
 		flusher.Flush()
-		<-r.Context().Done()
-		return
+		select {
+		case <-m.finishHeldReply:
+		case <-r.Context().Done():
+			return
+		}
 	}
 	// 4. 写结束原因、用量和流结束标记。
 	fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
@@ -168,6 +173,15 @@ func (m *fakeModel) handleAppendReplies(w http.ResponseWriter, r *http.Request) 
 		m.replies <- reply
 	}
 	writeJSON(w, map[string]any{})
+}
+
+// handleFinishHeldReply 允许正在等待的模型回复发送正常结束标记。
+func (m *fakeModel) handleFinishHeldReply(w http.ResponseWriter, r *http.Request) {
+	select {
+	case m.finishHeldReply <- struct{}{}:
+		writeJSON(w, map[string]any{})
+	case <-r.Context().Done():
+	}
 }
 
 // handleResetReplies 清空还没被取走的回复；已经在回的请求不受影响。

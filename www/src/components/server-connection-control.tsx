@@ -51,10 +51,12 @@ const connectionStatuses = {
 export function ServerConnectionControl({
   className,
   layoutId,
+  showTooltip = true,
   ref,
 }: {
   className?: string
   layoutId?: string
+  showTooltip?: boolean
   ref?: Ref<HTMLDivElement>
 }) {
   const { t } = useTranslation()
@@ -97,7 +99,7 @@ export function ServerConnectionControl({
         aria-hidden={!isPresent || undefined}
       >
         <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
-          <Tooltip disabled={!isPresent || popoverOpen}>
+          <Tooltip disabled={!showTooltip || !isPresent || popoverOpen}>
             <TooltipTrigger
               delay={600}
               closeOnClick

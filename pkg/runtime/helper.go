@@ -47,6 +47,7 @@ func newRuntimeDefinitions(source *Definitions) *runtimeDefinitions {
 			MCPServers: slices.Clone(source.MCPServers),
 			Hooks:      slices.Clone(source.Hooks),
 			Executors:  executors,
+			ExtraTools: source.ExtraTools,
 			Skills:     slices.Clone(source.Skills),
 		},
 		modelsByRef:        make(map[defs.ModelRef]*defs.ModelDefinition, len(source.Models)),

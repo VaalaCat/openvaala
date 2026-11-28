@@ -27,6 +27,7 @@ openvaala help [command]           显示帮助
 这些参数对每个命令都有效，写在命令名前后都行：
 
 - `--config-file <path>`：配置文件。默认先看 `OPENVAALA_CONFIG`，再用 `~/.config/openvaala/config.yaml`。
+- `--data-dir <dir>`：覆盖本机数据与运行状态目录。
 - `--agents-dir <dir>`：Agent 定义目录，覆盖 `agents.directory`。
 - `--models-dir <dir>`：Provider 定义目录，覆盖 `models.directory`。
 - `--agent <name>`：根 Agent，覆盖 `run.agent_name`。
@@ -59,6 +60,8 @@ openvaala serve
 ```
 
 在前台运行 Runtime 服务：它拥有所有对话，在 `server.listen` 上提供 `/api/v1/openvaala` 的 WebSocket API 和 `/web/v1/` 的 Web 界面。同一时间只能有一个 Runtime 服务使用数据目录。它会在终端里打印地址和日志；用 Ctrl+C 或 `openvaala serve stop` 停止它。
+
+用 `openvaala serve --listen <host:port>` 为本次启动覆盖 `OPENVAALA_SERVER_LISTEN` 和 `server.listen`。
 
 ### serve stop
 

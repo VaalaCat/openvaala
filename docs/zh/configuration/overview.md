@@ -45,11 +45,14 @@ OpenVaala 还会在配置目录以外的几个地方写文件：
 | 用户缓存目录下的 `openvaala/models-dev.json`（Linux 是 `~/.cache`，macOS 是 `~/Library/Caches`） | 添加 Provider 时用的模型目录。 |
 | 每个 Executor 所在机器上的 `~/.cache/openvaala/hooks/`、`~/.cache/openvaala/plugins/` | 拷过去运行的 hook 脚本和插件文件。见 [Hook](extensions.md#hook)。 |
 
+通过 `data_dir`、`OPENVAALA_DATA_DIR` 或全局参数 `--data-dir`，可以把对话数据、记忆、本机服务连接文件、socket 和默认日志放在同一目录。三种来源的相对路径都以 `config.yaml` 所在目录为基准。显式设置的 `telemetry.log_file` 仍然优先。`serve`、本机客户端、`serve stop`、`serve reload` 和 `reindex` 应使用同一数据目录。
+
 ## 完整的 config.yaml
 
 所有字段都可以不写。下面的例子列出每个字段和它的默认值，注释另有说明的除外：
 
 ```yaml
+data_dir: ""                # 为空时使用默认数据与运行状态目录
 agents:
   directory: agents          # Agent 定义
 models:
@@ -92,7 +95,7 @@ http:
   headers: {}                # 发往外部服务的额外请求头，叠加在三条内置默认之上（见下文）
 telemetry:
   log_level: info
-  log_file: ""               # 为空时是 ~/.local/state/openvaala/openvaala.log
+  log_file: ""               # 为空时使用运行状态目录下的 openvaala.log
   otlp_endpoint: ""          # 例如 http://127.0.0.1:4318；为空时不导出
   otlp_headers: {}
   capture_content: true
@@ -203,7 +206,7 @@ OPENVAALA_CLIENT_URL=ws://10.0.0.5:8790/api/v1/openvaala openvaala
 OPENVAALA_MODELS_DEFAULT_MODEL=openai/gpt-5 openvaala
 ```
 
-设置按这个顺序生效，后面的覆盖前面的：内置默认值、`config.yaml`、环境变量、命令行参数（`--agents-dir`、`--models-dir`、`--agent`）。映射和对象列表（`telemetry.otlp_headers`、`http.headers` 和 `client.path_mappings`）只能在配置文件里设置。
+设置按这个顺序生效，后面的覆盖前面的：内置默认值、`config.yaml`、环境变量、命令行参数（`--data-dir`、`--agents-dir`、`--models-dir`、`--agent`、`serve --listen`）。映射和对象列表（`telemetry.otlp_headers`、`http.headers` 和 `client.path_mappings`）只能在配置文件里设置。
 
 `OPENVAALA_CONFIG` 用来指定配置文件本身；设置了就不能为空。
 

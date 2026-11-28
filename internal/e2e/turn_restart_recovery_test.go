@@ -28,6 +28,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	storagefile "github.com/VaalaCat/openvaala/pkg/storage/file"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
+	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -706,8 +707,7 @@ func runRestartInterruptServer(t *testing.T, configPath string) {
 	}
 	defer listener.Close()
 	const token = "turn-restart-e2e"
-	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, cfg.Server.Listen, token)
-	serverOpt.Listener = listener
+	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, token)
 	serverOpt.ServerID = "turn-restart-e2e"
 	serverOpt.Configuration = config.NewConfigFiles(loadOpt)
 	serverOpt.ModelCatalog, err = modelcatalog.NewCatalog(modelcatalog.NewCatalogOpt(filepath.Join(home, "models-dev.json")))
@@ -728,12 +728,35 @@ func runRestartInterruptServer(t *testing.T, configPath string) {
 	}
 
 	// 3. 运行 Runtime 和 Server；父测试在屏障处强杀子进程。
-	ctx, cancel := context.WithCancel(t.Context())
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	server.RegisterRoutes(engine)
+	httpServer := &http.Server{Handler: engine, ReadHeaderTimeout: 10 * time.Second}
+	runtimeCtx, stopRuntime := context.WithCancel(t.Context())
 	runtimeDone := make(chan error, 1)
-	go func() { runtimeDone <- rt.Run(ctx) }()
-	serverErr := server.Run(ctx)
-	cancel()
-	t.Fatalf("interrupt barrier service exited before kill: server=%v runtime=%v", serverErr, <-runtimeDone)
+	go func() { runtimeDone <- rt.Run(runtimeCtx) }()
+	serverCtx, stopServer := context.WithCancel(t.Context())
+	serverDone, httpDone := make(chan struct{}), make(chan struct{})
+	var serverErr, httpErr error
+	go func() {
+		defer close(serverDone)
+		serverErr = server.Run(serverCtx)
+	}()
+	go func() {
+		defer close(httpDone)
+		httpErr = httpServer.Serve(listener)
+	}()
+	select {
+	case <-serverDone:
+	case <-httpDone:
+	}
+	// 4. 服务提前退出时关闭 HTTP 和连接，再停止 Runtime 并报告错误。
+	_ = httpServer.Shutdown(context.WithoutCancel(t.Context()))
+	stopServer()
+	<-serverDone
+	<-httpDone
+	stopRuntime()
+	t.Fatalf("interrupt barrier service exited before kill: server=%v http=%v runtime=%v", serverErr, httpErr, <-runtimeDone)
 }
 
 // restartInterruptLogStorage 在写入 interrupted Turn 的 metadata 前停住测试子进程。

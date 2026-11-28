@@ -23,6 +23,50 @@ import (
 
 const serveTestToken = "serve-token"
 
+func TestServeListenPrecedence(t *testing.T) {
+	for _, tt := range []struct {
+		name, file, env, flag, want string
+	}{
+		{name: "default", want: "127.0.0.1:8790"},
+		{name: "file", file: "127.0.0.1:8801", want: "127.0.0.1:8801"},
+		{name: "environment", file: "127.0.0.1:8801", env: "127.0.0.1:8802", want: "127.0.0.1:8802"},
+		{name: "flag", file: "127.0.0.1:8801", env: "127.0.0.1:8802", flag: "127.0.0.1:8803", want: "127.0.0.1:8803"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			if tt.env != "" {
+				t.Setenv("OPENVAALA_SERVER_LISTEN", tt.env)
+			}
+			path := filepath.Join(home, "config.yaml")
+			content := "{}\n"
+			if tt.file != "" {
+				content = "server:\n  listen: " + tt.file + "\n"
+			}
+			writeTestFiles(t, map[string]string{path: content})
+			root := NewCLI(&CLIOpt{Stdout: io.Discard, Stderr: io.Discard})
+			arguments := []string{"--config-file", path, "serve"}
+			if tt.flag != "" {
+				arguments = append(arguments, "--listen", tt.flag)
+			}
+			serve, _, err := root.Find([]string{"serve"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			serve.RunE = BuildCLIHandler(func(_ context.Context, args *AppArgs) error {
+				if got := args.Config.Server.Listen; got != tt.want {
+					t.Fatalf("server.listen = %q, want %q", got, tt.want)
+				}
+				return nil
+			})
+			root.SetArgs(arguments)
+			if err := root.ExecuteContext(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 // TestServe 检查 serve 启停、连接文件、令牌、重新加载和空闲退出。
 func TestServe(t *testing.T) {
 	// 1. 列出服务运行和错误场景。
@@ -377,8 +421,8 @@ func TestServe(t *testing.T) {
 				}
 				requireServeStop(t, configPath, "stopped\n", "")
 				// 收到 stopped 后尝试取得数据目录锁。
-				dataDirectory, err := ensureDataDirectory()
-				if err != nil {
+				dataDirectory := filepath.Join(os.Getenv("HOME"), ".local", "share", "openvaala")
+				if err := ensureDataDirectory(dataDirectory); err != nil {
 					t.Fatal(err)
 				}
 				unlock, err := lockDataDirectory(dataDirectory)
@@ -849,11 +893,11 @@ func holdFakeStoppingServe(t *testing.T) (unlock func() error) {
 		Token: "fake-token",
 	})
 	// 2. 取得数据目录锁，登记测试结束时释放并返回解锁函数。
-	dataDirectory, err := ensureDataDirectory()
-	if err != nil {
+	dataDirectory := filepath.Join(os.Getenv("HOME"), ".local", "share", "openvaala")
+	if err := ensureDataDirectory(dataDirectory); err != nil {
 		t.Fatal(err)
 	}
-	unlock, err = lockDataDirectory(dataDirectory)
+	unlock, err := lockDataDirectory(dataDirectory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,19 +942,15 @@ func appendConfigText(t *testing.T, configPath, text string) {
 // getTestRuntimeServerFilePath 读取本机连接文件路径。
 func getTestRuntimeServerFilePath(t *testing.T) string {
 	t.Helper()
-	// 1. 调用路径查询并检查错误，失败时结束测试。
-	path, err := getRuntimeServerFilePath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return path
+	// 1. 默认布局的连接文件位于用户状态目录。
+	return filepath.Join(os.Getenv("HOME"), ".local", "state", "openvaala", "runtime-server.yaml")
 }
 
 // getTestRuntimeServerFile 读取本机连接文件。
 func getTestRuntimeServerFile(t *testing.T) RuntimeServerConnection {
 	t.Helper()
 	// 1. 读取并检查连接文件存在且解析成功，不存在或解析失败时结束测试。
-	file, found, err := getRuntimeServerFile()
+	file, found, err := getRuntimeServerFile(getTestRuntimeServerFilePath(t))
 	if err != nil || !found {
 		t.Fatalf("runtime server file found = %v, err = %v", found, err)
 	}

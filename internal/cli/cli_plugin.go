@@ -212,14 +212,19 @@ func runPluginList(command *cobra.Command, _ []string) error {
 	return nil
 }
 
-// newPluginAppArgs 为 plugin 命令准备 AppArgs：只有配置选项和输出流，不加载配置。
+// newPluginAppArgs 读取插件目录及本机服务发现所需的应用设置。
 func newPluginAppArgs(command *cobra.Command) (*AppArgs, error) {
-	// 1. 读取配置选项，带上标准输出和标准错误。
+	// 1. 读取应用设置，保留配置选项和输出流。
 	opt, err := getConfigOpt(command)
 	if err != nil {
 		return nil, err
 	}
+	cfg, _, err := config.LoadConfigSettings(opt)
+	if err != nil {
+		return nil, err
+	}
 	return &AppArgs{
+		Config:    cfg,
 		ConfigOpt: opt,
 		Stdout:    command.OutOrStdout(),
 		Stderr:    command.ErrOrStderr(),

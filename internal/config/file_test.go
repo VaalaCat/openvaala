@@ -23,6 +23,63 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/skill"
 )
 
+func TestReloadKeepsServeMemoryDirectory(t *testing.T) {
+	for _, tc := range []struct{ initial, reloaded string }{
+		{initial: "A", reloaded: "B"},
+		{initial: "", reloaded: "B"},
+	} {
+		t.Run("from_"+tc.initial+"_to_"+tc.reloaded, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "config.yaml")
+			writeDataDirectory := func(directory string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("data_dir: \""+directory+"\"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeDataDirectory(tc.initial)
+			opt := &config.LoadConfigOpt{Home: home, Path: path}
+			cfg, err := config.LoadConfig(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			files := config.NewConfigFiles(opt)
+			files.DataDirectory = cfg.GetDataDirectory()
+			writeDataDirectory(tc.reloaded)
+			definitions, err := files.Reload(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			executors, err := definitions.Executors.GetExecutors(t.Context(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			index := slices.IndexFunc(executors, func(e executor.Executor) bool {
+				return e.GetDefinition().ID == defs.MemoryExecutorID
+			})
+			if index == -1 {
+				t.Fatal("missing memory executor")
+			}
+			work, err := executors[index].NewWorkspace(t.Context(), &executor.NewWorkspaceRequest{MemoryProjectName: "projects/test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer work.Close()
+			if err := work.CreateDirectory(t.Context(), "/user"); err != nil {
+				t.Fatal(err)
+			}
+			oldMemory := filepath.Join(cfg.GetDataDirectory(), "memory", "user")
+			if _, err := os.Stat(oldMemory); err != nil {
+				t.Fatalf("expected memory directory %s: %v", oldMemory, err)
+			}
+			newMemory := filepath.Join(home, tc.reloaded, "memory")
+			if _, err := os.Stat(newMemory); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("reloaded configuration used %s: %v", newMemory, err)
+			}
+		})
+	}
+}
+
 // TestInitConfigConcurrentAndPreservesExisting 验证并发调用 InitConfig 只建一份 0600 的配置文件，已有文件不被改动，不留临时文件。
 func TestInitConfigConcurrentAndPreservesExisting(t *testing.T) {
 	// 1. 准备没有配置文件和已有配置文件两种情况，各并发调用 8 次。

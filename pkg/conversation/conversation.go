@@ -814,7 +814,7 @@ func (c *conversationImpl) GetSessionDetails(_ context.Context, sessionID defs.S
 	if !found {
 		return SessionDetails{}, newAgentNotConfiguredError(record)
 	}
-	// 2. 创建协作工具，汇总 Executor、Skill 和模型可见的工具名（含已连接的 MCP 工具）。
+	// 2. 合并协作工具和附加工具，汇总 Executor、Skill 和模型可见的工具名（含已连接的 MCP 工具）。
 	collaborationTools, err := newCollaborationTools(c, record, config.definitions, definition)
 	if err != nil {
 		return SessionDetails{}, err
@@ -825,7 +825,7 @@ func (c *conversationImpl) GetSessionDetails(_ context.Context, sessionID defs.S
 		Session:        record,
 		Executors:      newExecutorDetails(config.environments, config.executors),
 		Skills:         getSkillNames(skill.GetSkillsByNames(definition.SkillNames, config.skills)),
-		Tools:          getSessionToolNames(environments, definition, collaborationTools),
+		Tools:          getSessionToolNames(environments, definition, append(collaborationTools, config.extraTools...)),
 	}
 	// 3. 所选模型存在时填写公开模型信息和压缩模型，否则两者留空。
 	if model, _, found := defs.GetSelectedModel(config.models, record.Model, definition.Model); found {
@@ -892,7 +892,7 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 		definition.Instructions += "\n" + prompt.FormatMemoryInstructions()
 	}
 	definition.Instructions += "\n" + prompt.FormatSessionIdentity(record)
-	// 3. 创建协作工具和 Session 配置，读取日志最新序号并确定 SessionStart hook 的来源。
+	// 3. 合并协作工具和附加工具，创建 Session 配置并按日志最新序号确定 SessionStart hook 的来源。
 	collaborationTools, err := newCollaborationTools(c, record, config.definitions, &definition)
 	if err != nil {
 		return nil, err
@@ -900,7 +900,7 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 	opt := session.NewSessionOpt(record, c.opt.Query, c.opt.Mutation, c.modelClient, &definition)
 	opt.Models = config.models
 	opt.Environments = config.environments
-	opt.AgentTools = collaborationTools
+	opt.AgentTools = append(collaborationTools, config.extraTools...)
 	opt.EnvironmentsManager = c.environmentsManager
 	opt.Skills = skills
 	opt.Hooks = config.hooks

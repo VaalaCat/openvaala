@@ -84,10 +84,10 @@ func (a *acpAgent) Run(ctx context.Context) (err error) {
 			case changed.State == runtimeclient.ConnectionConnected && !isConnected:
 				isConnected = true
 				serverConnected <- changed.ServerID
-			case changed.State == runtimeclient.ConnectionReconnecting:
-				// 首次连接失败时附带拨号错误；连上后断开时只返回 ErrConnectionLost。
+			case changed.State == runtimeclient.ConnectionReconnecting && !isConnected:
+				// 还没连上时结束；已经连上后的断开由 Client 按原地址重连。
 				cause := runtimeclient.ErrConnectionLost
-				if !isConnected && changed.Err != nil {
+				if changed.Err != nil {
 					cause = fmt.Errorf("%w: %v", runtimeclient.ErrConnectionLost, changed.Err)
 				}
 				stopAgent(cause)

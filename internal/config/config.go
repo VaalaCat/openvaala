@@ -34,7 +34,9 @@ import (
 
 // Config 是加载好的应用设置，以及校验过的 Agent、模型、Executor、MCP server、hook 和插件定义；加载后只读，可以并发查询。
 type Config struct {
-	Agents *struct {
+	// DataDirectory 覆盖本机数据和运行状态的根目录。
+	DataDirectory string `mapstructure:"data_dir" yaml:"data_dir,omitempty" flag:"data-dir"`
+	Agents        *struct {
 		Directory string `mapstructure:"directory" yaml:"directory" default:"agents" flag:"agents-dir"`
 	} `mapstructure:"agents" yaml:"agents"`
 	Models *struct {
@@ -93,7 +95,7 @@ type Config struct {
 	Telemetry *struct {
 		// LogLevel 是日志最低级别：debug、info、warn 或 error，同时作用于日志文件、stderr 与 OTLP。
 		LogLevel string `mapstructure:"log_level" yaml:"log_level" default:"info"`
-		// LogFile 是日志文件路径；为空时为 ~/.local/state/openvaala/openvaala.log，相对路径按配置文件所在目录展开。
+		// LogFile 是日志文件路径；为空时使用运行状态目录下的 openvaala.log，相对路径按配置文件所在目录展开。
 		LogFile string `mapstructure:"log_file" yaml:"log_file"`
 		// OTLPEndpoint 是 OTLP HTTP 的基础地址，例如 http://127.0.0.1:4318；各信号路径 /v1/traces、/v1/metrics、/v1/logs
 		// 会自动追加在其后，不要自带信号路径；为空时不导出 trace、指标与日志。
@@ -176,22 +178,19 @@ type LoadConfigOpt struct {
 	Path string
 	// Flags 是命令行 flag，显式设置的值覆盖文件和环境变量。
 	Flags *pflag.FlagSet
+	// ServerListen 是 serve --listen 显式指定的监听地址。
+	ServerListen *string
 }
 
 // LoadConfig 加载应用设置，再加载各类运行定义。
 func LoadConfig(opt *LoadConfigOpt) (*Config, error) {
 	// 1. 按默认值、文件、环境变量、显式 flag 逐级覆盖设置。
-	cfg, _, err := loadConfigSettings(opt)
+	cfg, _, err := LoadConfigSettings(opt)
 	if err != nil {
 		return nil, err
 	}
-	// 2. 取得主目录（没传时和加载设置一样取系统用户目录），加载 Agent、模型、Executor、MCP、hook 和插件定义。
-	home := opt.Home
-	if home == "" {
-		home, _ = os.UserHomeDir()
-	}
-	cfg.home = home
-	if err := cfg.loadDefinitions(home); err != nil {
+	// 2. 加载 Agent、模型、Executor、MCP、hook 和插件定义。
+	if err := cfg.loadDefinitions(cfg.home); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -203,8 +202,20 @@ func GetDataDirectory(home string) string {
 	return filepath.Join(home, ".local", "share", "openvaala")
 }
 
-// loadConfigSettings 解析并校验应用设置，返回设置和配置文件的绝对路径。
-func loadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
+// GetDataDirectory 返回配置解析后的本机数据目录。
+func (cfg *Config) GetDataDirectory() string {
+	// 1. 显式配置优先，缺省时使用用户数据目录。
+	return cmp.Or(cfg.DataDirectory, GetDataDirectory(cfg.home))
+}
+
+// GetStateDirectory 返回连接文件和默认日志所在的目录。
+func (cfg *Config) GetStateDirectory() string {
+	// 1. 显式指定数据目录时，运行状态与数据保存在一起。
+	return cmp.Or(cfg.DataDirectory, filepath.Join(cfg.home, ".local", "state", "openvaala"))
+}
+
+// LoadConfigSettings 解析并校验应用设置，返回设置和配置文件的绝对路径。
+func LoadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 	// 1. 检查加载参数，缺少主目录时取系统用户目录，再确定配置路径。
 	if opt == nil {
 		return nil, "", errors.New("configuration options are required")
@@ -214,11 +225,9 @@ func loadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("cannot locate user directory: %w", err)
 		}
-		opt = &LoadConfigOpt{
-			Home:  home,
-			Path:  opt.Path,
-			Flags: opt.Flags,
-		}
+		resolved := *opt
+		resolved.Home = home
+		opt = &resolved
 	}
 	path, explicit, err := GetConfigPath(opt.Home, opt.Path)
 	if err != nil {
@@ -262,6 +271,9 @@ func loadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 	}
 
 	// 4. 解出最终设置并校验，通过后把 http.headers 合并进内置默认 header；默认值和环境变量里的字符串转成布尔和整数，转不了时报类型错误。
+	if opt.ServerListen != nil {
+		settings.Set("server.listen", *opt.ServerListen)
+	}
 	cfg := &Config{}
 	if err := settings.UnmarshalExact(cfg,
 		func(decoder *mapstructure.DecoderConfig) {
@@ -285,6 +297,10 @@ func loadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 	}
 	cfg.httpHeaders = httpclient.MergeHeaders(defaultHTTPHeaders, userHeaders)
 	// 5. 按配置文件位置展开实体目录和日志路径。
+	cfg.home = opt.Home
+	if cfg.DataDirectory != "" {
+		cfg.DataDirectory = expandPath(cfg.DataDirectory, opt.Home, filepath.Dir(path))
+	}
 	cfg.Agents.Directory = expandPath(cfg.Agents.Directory, opt.Home, filepath.Dir(path))
 	cfg.Models.Directory = expandPath(cfg.Models.Directory, opt.Home, filepath.Dir(path))
 	cfg.Skills.Directory = expandPath(cfg.Skills.Directory, opt.Home, filepath.Dir(path))
@@ -292,7 +308,7 @@ func loadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 	cfg.MCPServers.Directory = expandPath(cfg.MCPServers.Directory, opt.Home, filepath.Dir(path))
 	cfg.Hooks.Directory = expandPath(cfg.Hooks.Directory, opt.Home, filepath.Dir(path))
 	cfg.Plugins.Directory = expandPath(cfg.Plugins.Directory, opt.Home, filepath.Dir(path))
-	cfg.Telemetry.LogFile = getTelemetryLogFile(cfg.Telemetry.LogFile, opt.Home, filepath.Dir(path))
+	cfg.Telemetry.LogFile = getTelemetryLogFile(cfg.Telemetry.LogFile, opt.Home, filepath.Dir(path), cfg.GetStateDirectory())
 	// 6. 展开 server.workspace_directory 的 ~，展开后不是绝对路径时报错。
 	if cfg.Server.WorkspaceDirectory != "" {
 		cfg.Server.WorkspaceDirectory = expandPath(cfg.Server.WorkspaceDirectory, opt.Home, "")
@@ -712,7 +728,7 @@ func (cfg *Config) newMemoryExecutor() executor.Executor {
 		ID:          defs.MemoryExecutorID,
 		Kind:        defs.ExecutorKindMemory,
 		Description: prompt.MemoryExecutorDescription,
-	}, filepath.Join(GetDataDirectory(cfg.home), "memory")))
+	}, filepath.Join(cfg.GetDataDirectory(), "memory")))
 }
 
 // loadSharedSkills 依次加载 skills/ 目录、内置目录和插件目录里的 skill，所有对话共用；同名的以先扫描到的为准。

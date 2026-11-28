@@ -45,11 +45,14 @@ OpenVaala also writes to a few locations outside the configuration directory:
 | `openvaala/models-dev.json` in your user cache directory (`~/.cache` on Linux, `~/Library/Caches` on macOS) | The model catalog used by provider setup. |
 | `~/.cache/openvaala/hooks/`, `~/.cache/openvaala/plugins/` on each executor's machine | Hook scripts and plugin files copied there to run. See [Hooks](extensions.md#hooks). |
 
+Set `data_dir`, `OPENVAALA_DATA_DIR`, or the global `--data-dir` to put conversation data, memory, the local server connection file, sockets, and the default log in one directory. Relative paths from all three sources resolve next to `config.yaml`. An explicit `telemetry.log_file` still takes precedence. Use the same data directory for `serve`, local clients, `serve stop`, `serve reload`, and `reindex`.
+
 ## A complete config.yaml
 
 Every field is optional. This example shows each one with its default value, except where a comment says otherwise:
 
 ```yaml
+data_dir: ""                # empty uses the default data and state directories
 agents:
   directory: agents          # agent definitions
 models:
@@ -92,7 +95,7 @@ http:
   headers: {}                # extra request headers for outside requests, on top of three built-in ones (see below)
 telemetry:
   log_level: info
-  log_file: ""               # empty = ~/.local/state/openvaala/openvaala.log
+  log_file: ""               # empty uses openvaala.log in the runtime state directory
   otlp_endpoint: ""          # e.g. http://127.0.0.1:4318; empty = no export
   otlp_headers: {}
   capture_content: true
@@ -203,7 +206,7 @@ OPENVAALA_CLIENT_URL=ws://10.0.0.5:8790/api/v1/openvaala openvaala
 OPENVAALA_MODELS_DEFAULT_MODEL=openai/gpt-5 openvaala
 ```
 
-Settings are applied in this order, later ones winning: built-in defaults, `config.yaml`, environment variables, then command-line flags (`--agents-dir`, `--models-dir`, `--agent`). Maps and lists of objects — `telemetry.otlp_headers`, `http.headers` and `client.path_mappings` — can only be set in the file.
+Settings are applied in this order, later ones winning: built-in defaults, `config.yaml`, environment variables, then command-line flags (`--data-dir`, `--agents-dir`, `--models-dir`, `--agent`, `serve --listen`). Maps and lists of objects — `telemetry.otlp_headers`, `http.headers` and `client.path_mappings` — can only be set in the file.
 
 `OPENVAALA_CONFIG` selects the configuration file itself; when it is set it must not be empty.
 
