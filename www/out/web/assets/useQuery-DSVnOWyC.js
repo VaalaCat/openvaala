@@ -1,0 +1,1 @@
+import{i as e,r as t}from"./request-error-BpREJrQj.js";function n(n,r){return t(n,e,r)}export{n as t};

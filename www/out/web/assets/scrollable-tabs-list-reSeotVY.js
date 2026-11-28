@@ -1,0 +1,1 @@
+import{r as e}from"./clsx-C5NLMtLp.js";import{r as t}from"./tabs-ChExkqmv.js";var n=e();function r(e){return(0,n.jsx)(`div`,{className:`min-w-0 overflow-x-auto overflow-y-hidden pb-1`,onFocus:e=>e.target.scrollIntoView({block:`nearest`,inline:`nearest`}),children:(0,n.jsx)(t,{...e})})}export{r as t};

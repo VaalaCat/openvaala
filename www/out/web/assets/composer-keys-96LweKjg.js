@@ -1,0 +1,1 @@
+function e(e){return e.key===`Enter`&&!e.shiftKey&&!e.isComposing&&e.keyCode!==229&&!e.isTouchPrimary}function t(e,t){let n=t,r=t;for(;n>0&&!/\s/.test(e[n-1]);)n--;for(;r<e.length&&!/\s/.test(e[r]);)r++;if(n!==t&&e[n]===`/`)return{start:n,end:r,prefix:e.slice(n+1,t)}}function n(e){return/^\/btw(\s|$)/.test(e)?e.slice(4).trim():void 0}export{t as n,e as r,n as t};
