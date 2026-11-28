@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN" data-page-role="runtime">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OpenVaala</title>
+    <script>
+      // 白屏时等同源页面重新可达，再为这个历史条目刷新一次。
+      async function recoverPageModules() {
+        if (document.querySelector("#root main") || history.state?.retriedModules) return
+        history.replaceState({ ...history.state, retriedModules: true }, "")
+        for (let delay = 1000; ; delay = Math.min(delay * 2, 10000)) {
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          if (document.querySelector("#root main")) return
+          const reachable = await fetch(location.pathname, {
+            cache: "no-store",
+          }).then((response) => response.ok, () => false)
+          if (reachable) {
+            if (!document.querySelector("#root main")) location.reload()
+            return
+          }
+        }
+      }
+      addEventListener("error", (event) => {
+        if (event.target instanceof HTMLScriptElement && event.target.type === "module")
+          recoverPageModules()
+      }, true)
+    </script>
+    <script type="module" crossorigin src="/web/v1/assets/index-BZcmkLbb.js"></script>
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/clsx-C5NLMtLp.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/paths-B5FyowMi.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/notify-C7aAcv4p.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/request-error-BpREJrQj.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/useInfiniteQuery-pBB1yibM.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/useQuery-DSVnOWyC.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/work-location-CuJzw2vQ.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/infiniteQueryOptions-Dfvzj6n2.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/mutationOptions-Dfvzj6n2.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/conversation-B4lTsEVO.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/terminal-session-DPIsSQEJ.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/relative-time-N8-5bpKL.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/ellipsis-DL_3zU09.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/pencil-B93dXgNx.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/alert-dialog-L-OtfgFK.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/configuration-change-dialog-DV_xsfqP.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/conversation-actions-BmVb6E5p.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/chevron-right-C75xuidn.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/list-search-B4MnxuLu.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/users-Cef5EPKx.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/LayoutGroup-Bff9Ey6B.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/AnimatePresence-B3TxMpOa.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/use-mobile-BgbWdksh.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/skeleton-BSQARnC1.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/page-layout-CLP9_l9q.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/infinite-list-Cs606L2o.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/list-empty-BW-RsGQy.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/message-bubble-helpers-DOU23KXX.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/world-xXff1gV6.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/region-BjECuWZR-wEKcg1Cv.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/preload-helper-SuSd5vB7.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/react-D8tiUBUl.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/bot-YSfewPDZ.js">
+    <link rel="modulepreload" crossorigin href="/web/v1/assets/contact-list-5K2eY90c.js">
+    <link rel="stylesheet" crossorigin href="/web/v1/assets/index-DxMkauCG.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
