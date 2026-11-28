@@ -12,6 +12,20 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 )
 
+// ── Agent 设置 ──
+
+// AgentPreset 保存新增 ACP Agent 时可填充的配置。
+type AgentPreset struct {
+	Name                    string                    `json:"name"`
+	DisplayName             string                    `json:"display_name"`
+	Description             string                    `json:"description"`
+	Command                 string                    `json:"command"`
+	Args                    []string                  `json:"args,omitempty"`
+	Env                     map[string]string         `json:"env,omitempty"`
+	EphemeralParamOverwrite map[string]map[string]any `json:"ephemeral_param_overwrite,omitempty"`
+	Icon                    string                    `json:"icon"`
+}
+
 // ── Agent 输出事件 ──
 
 // AgentEventType 区分 Item、工具进度、上下文测量、模型调用和 hook 运行事件。
@@ -228,6 +242,8 @@ type AgentInputResult struct {
 type AgentDefinition struct {
 	// Name 是角色名，对应 Session.AgentName。
 	Name string
+	// Type 是角色的执行类型；空值按原生 Agent 处理。
+	Type defs.AgentType
 	// Description 说明这个角色适合处理的任务。
 	Description string
 	// Instructions 是这个角色的系统指令。
@@ -244,6 +260,8 @@ type AgentDefinition struct {
 	MCPServerIDs defs.OptionalStringList
 	// MaxSteps 是本轮普通生成的步数上限，不含摘要或重试；0 表示不限。最后一步禁用工具并要求模型总结进度。
 	MaxSteps int
+	// ACP 保存外部 ACP Agent 的启动命令。
+	ACP *defs.ACPCommand
 }
 
 // ── Agent 任务标识与状态 ──

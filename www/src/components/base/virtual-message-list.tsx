@@ -67,6 +67,7 @@ interface VirtualMessageListProps<Row> {
   }
   resetKey: unknown
   scrollToBottomKey?: string
+  fadeInRows?: boolean
   alignBottom?: boolean
 }
 
@@ -81,6 +82,7 @@ export function VirtualMessageList<Row>({
   earlier,
   resetKey,
   scrollToBottomKey,
+  fadeInRows = false,
   alignBottom = false,
 }: VirtualMessageListProps<Row>) {
   const { t } = useTranslation()
@@ -435,7 +437,11 @@ export function VirtualMessageList<Row>({
               >
                 <div
                   ref={rowListRef}
-                  className={cn("relative w-full", alignBottom && "mt-auto")}
+                  className={cn(
+                    "relative w-full",
+                    alignBottom && "mt-auto",
+                    fadeInRows && "animate-in duration-150 ease-out fade-in"
+                  )}
                   style={{ height: virtualizer.getTotalSize() }}
                 >
                   {virtualRows.map((virtualRow) => {

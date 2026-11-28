@@ -176,16 +176,9 @@ func NewSession(opt *SessionOpt) (Session, error) {
 		return nil, err
 	}
 	// 2. 为每个有工作区、能跑命令的执行环境创建命令工具。
-	sessionTools := make(map[string][]executor.Tool, len(sessionOpt.Environments))
-	for _, environment := range sessionOpt.Environments {
-		if environment.GetWorkspace() == nil || !environment.IsCommandSupported() {
-			continue
-		}
-		commandTools, err := tools.NewCommandTools(tools.NewCommandToolsOpt(environment.GetID(), environment.GetWorkspace(), terminalManager))
-		if err != nil {
-			return nil, err
-		}
-		sessionTools[environment.GetID()] = commandTools
+	sessionTools, err := tools.NewSessionCommandTools(sessionOpt.Environments, terminalManager)
+	if err != nil {
+		return nil, err
 	}
 	// 3. 按 Agent 的工具名单、MCP 选择和 hook 创建工具表，初始化请求通道和 InputID 去重记录。
 	toolExecutorOpt := executor.NewToolExecutorOpt(sessionOpt.EnvironmentsManager, sessionOpt.AgentTools...)
@@ -341,14 +334,7 @@ func (s *sessionImpl) runEventLoop(ctx context.Context, events chan<- SessionEve
 // HandleInput 校验并提交输入，返回实际接收的 ItemID。
 func (s *sessionImpl) HandleInput(ctx context.Context, input *SessionInput) (defs.ItemID, error) {
 	// 1. 校验消息、还没分配 TurnID 和 ModelCallID、输入模式。
-	if input == nil || input.Item == nil || input.Item.ID == "" || input.Item.TurnID != "" || input.Item.ModelCallID != "" {
-		return "", errors.New("session input requires an unassigned item")
-	}
-	if input.Mode != SessionInputModeNormal && input.Mode != SessionInputModeSteer && input.Mode != SessionInputModeIdleOnly &&
-		input.Mode != SessionInputModeInterrupt {
-		return "", errors.New("invalid session input mode")
-	}
-	if err := input.Item.ValidateInputMessage(); err != nil {
+	if err := validateSessionInput(input); err != nil {
 		return "", err
 	}
 	// 2. 复制输入并提交请求，等待事件循环回复接收结果。
@@ -389,6 +375,11 @@ func (s *sessionImpl) GetStatus(ctx context.Context) (SessionStatus, error) {
 func (s *sessionImpl) IsTerminalBusy() bool {
 	// 1. 询问本 Session 的后台命令管理。
 	return s.terminalManager.IsBusy()
+}
+
+// GetTerminalManager 返回本 Session 的后台命令集合。
+func (s *sessionImpl) GetTerminalManager() terminal.TerminalManager {
+	return s.terminalManager
 }
 
 // InterruptTurn 请求取消活动 Turn，返回它的 TurnID，不等取消完成。
@@ -475,24 +466,11 @@ func (s *sessionImpl) SelectModel(ctx context.Context, model defs.ModelSelection
 
 // AppendContextItems 校验 Item 并提交给事件循环，暂存到下一个非压缩 Turn。
 func (s *sessionImpl) AppendContextItems(ctx context.Context, items []*defs.Item) (err error) {
-	// 1. 校验每个 Item：ID 不为空，还没分配 TurnID 和 ModelCallID，种类和载荷能写入日志并转成模型消息；任一不过整批拒绝。
-	for _, item := range items {
-		if item == nil || item.ID == "" || item.TurnID != "" || item.ModelCallID != "" {
-			return errors.New("context item requires an unassigned item")
-		}
-		if err := item.ValidateContextItem(); err != nil {
-			return err
-		}
+	if err := ValidateContextItems(items); err != nil {
+		return err
 	}
-	// 2. 复制 Item 并提交请求，等待事件循环回复是否收下。
 	reply := make(chan error, 1)
-	request := appendContextItemsRequested{
-		items: make([]*defs.Item, 0, len(items)),
-		reply: reply,
-	}
-	for _, item := range items {
-		request.items = append(request.items, item.Clone())
-	}
+	request := appendContextItemsRequested{items: defs.CloneItems(items), reply: reply}
 	if err := s.sendRequest(ctx, request); err != nil {
 		return err
 	}

@@ -1,14 +1,17 @@
 package runtimeclient
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
@@ -106,4 +109,21 @@ func newTerminalsChanged(result *runtimeprotocol.TerminalListResult, err error) 
 		return &TerminalsChanged{Err: err}
 	}
 	return &TerminalsChanged{IsKnown: true, Terminals: result.Terminals}
+}
+
+// GetExternalModelRef 返回后端实际上报的模型，未上报时保留空值。
+func GetExternalModelRef(agentName string, options *defs.ExternalOptions) defs.ModelRef {
+	if options == nil || options.Model == nil || options.Model.CurrentValue == "" {
+		return defs.ModelRef{}
+	}
+	return defs.ModelRef{ProviderID: agentName, ModelID: options.Model.CurrentValue}
+}
+
+// IsExternalModelProvider 判断模型引用的 Provider 是否为已配置的外部 Agent？探测还没完成时也能判断。
+func IsExternalModelProvider(ctx context.Context, client Client, providerID string) (bool, error) {
+	agents, err := client.ListAgents(ctx)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(agents, func(agent runtime.AgentInfo) bool { return agent.Type.IsExternal() && agent.Name == providerID }), nil
 }

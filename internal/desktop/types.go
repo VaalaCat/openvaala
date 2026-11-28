@@ -9,6 +9,7 @@ import (
 	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	"github.com/egoist/mygo/ui"
@@ -28,11 +29,20 @@ type draftKey struct {
 }
 type conversationDraft struct {
 	Content []*defs.Content
+	Files   map[*defs.Content]*draftFile
 	Pending bool
 	Error   string
 	// NeedsProvider 为真时 Error 是「还没有模型服务」，输入区在它旁边给出「添加模型服务」入口。
 	NeedsProvider bool
 }
+
+// draftFile 保存仍在读取、等待上传或上传失败的草稿附件。
+type draftFile struct {
+	data    []byte
+	loading bool
+	err     error
+}
+
 type viewItem struct {
 	Item      *defs.Item
 	Ordinal   storage.Ordinal
@@ -72,14 +82,14 @@ type executorDraft struct {
 
 // serverFormDraft 保存「管理服务器」弹窗里新增或编辑远端服务器的表单原文与解析反馈。
 type serverFormDraft struct {
-	EditingID       string
-	Name            string
-	URL             string
-	Token           string
-	ShowToken       bool
-	ParsedURL       string
-	TokenAutoFilled bool
-	URLError        string
+	EditingID   string
+	Name        string
+	URL         string
+	Token       string
+	ShowToken   bool
+	ParsedURL   string
+	IsWorldLink bool
+	URLError    string
 }
 
 // ---- Composer 技能补全 ----
@@ -148,12 +158,6 @@ func (e *imageHTTPError) Error() string { return fmt.Sprintf("image HTTP %d", e.
 // errUnsupportedImageURL 表示图片地址不是 HTTP(S) 或 data URL。
 var errUnsupportedImageURL = errors.New("unsupported image URL")
 
-// errNotImage 表示添加的文件不是图片。
-var errNotImage = errors.New("not an image")
-
-// errImageTooLarge 表示添加的图片文件超过 10 MiB。
-var errImageTooLarge = errors.New("image exceeds 10 MiB")
-
 // errInvalidImageDataURL 表示 data URL 缺少数据部分。
 var errInvalidImageDataURL = errors.New("invalid image data URL")
 
@@ -165,19 +169,38 @@ type settingInputOpt struct {
 	Error, Placeholder string
 }
 
+// keyValueDraft 保存一行输入原文，名称和值都可以在编辑中留空。
+type keyValueDraft struct{ Name, Value string }
+
+type keyValueSectionOpt struct {
+	nameWidth, valueWidth                    float32
+	addLabel, addTitle, addHint, removeLabel string
+	removeIcon                               *ui.SVG
+}
+
+// ---- Agent 设置 ----
+
+type agentSettingsRow struct {
+	info    runtime.AgentInfo
+	command string
+}
+
+type agentSettingsDraft struct {
+	definition                                                     defs.AgentConfig
+	editingName, kind, command, args, tools, skills, mcp, maxSteps string
+	env                                                            []*keyValueDraft
+}
+
 // ---- Provider 编辑原文 ----
 
 type providerDraft struct {
 	ID, Protocol, BaseURL, APIKey       string
 	EditingID, DefaultModelKey, IDError string
 	Endpoints                           map[string]string
-	Headers                             []*providerHeaderDraft
+	Headers                             []*keyValueDraft
 	Models                              []*providerModelDraft
 	RemovedModels                       map[string]*providerModelDraft
 }
-
-// providerHeaderDraft 是服务编辑表单里的一行请求头：名称和值都是输入原文，编辑过程中允许名称为空。
-type providerHeaderDraft struct{ Name, Value string }
 
 type providerModelDraft struct {
 	Description                                                                                                                                              string
@@ -213,7 +236,7 @@ type sessionCrumb struct {
 	Name      string
 }
 
-// readingRequested 由主线程切换目标时交付，读取任务顺序执行订阅与首屏查询。
+// readingRequested 由主线程切换目标时交付，读取任务顺序打开订阅。
 type readingRequested struct {
 	Context context.Context
 	Target  readingTarget

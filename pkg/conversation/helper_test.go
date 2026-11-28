@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
-	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
@@ -114,8 +113,8 @@ func TestEncodeToolResult(t *testing.T) {
 	}
 }
 
-// TestTransformHistoryItems 检查历史副本去掉了内嵌图片和加密推理，原 Item 不变。
-func TestTransformHistoryItems(t *testing.T) {
+// TestTransformHistoryItem 检查历史副本去掉了内嵌图片和加密推理，原 Item 不变。
+func TestTransformHistoryItem(t *testing.T) {
 	// 1. 准备消息图片、工具图片和加密推理样本，保留图片 Alt。
 	const dataURL = "data:image/png;base64,AAAA"
 	tests := []struct {
@@ -222,12 +221,12 @@ func TestTransformHistoryItems(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			original := tt.item.Clone()
-			got := transformHistoryItems([]dao.LoggedItem{{Item: tt.item}})
-			if len(got) != 1 || !reflect.DeepEqual(got[0], tt.want) {
-				t.Fatalf("transformHistoryItems() = %+v, want %+v", got, tt.want)
+			got := transformHistoryItem(tt.item)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("transformHistoryItem() = %+v, want %+v", got, tt.want)
 			}
 			if !reflect.DeepEqual(tt.item, original) {
-				t.Fatalf("transformHistoryItems changed the logged item: %+v, want %+v", tt.item, original)
+				t.Fatalf("transformHistoryItem changed the logged item: %+v, want %+v", tt.item, original)
 			}
 		})
 	}
@@ -373,7 +372,7 @@ func TestValidateConversationConfigCandidateTools(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			model := newConversationModel(t)
 			tool, err := newCollaborationTool(&executor.BaseToolOpt{Name: tt.toolName, Description: "Test tool"},
-				func(context.Context, *defs.Item, *listAgentsParam) *executor.ToolExecutionResult { return nil })
+				func(context.Context, *defs.Item, *ListAgentsParam) *executor.ToolExecutionResult { return nil })
 			if err != nil {
 				t.Fatal(err)
 			}

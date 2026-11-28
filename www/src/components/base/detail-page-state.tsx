@@ -1,5 +1,5 @@
 import type { ReactNode } from "react"
-import { Link } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { useTranslation } from "react-i18next"
 import { isNotFoundError } from "@/lib/rpc-error"
 import { PageLayout, type PageNavigation } from "@/components/base/page-layout"
@@ -70,9 +70,9 @@ export function DetailPageState<T>({
             {"to" in notFoundReturn ? (
               <Button
                 className="text-ui"
-                nativeButton={false}
                 variant="outline"
-                render={<Link to={notFoundReturn.to} />}
+                role="button"
+                render={<NavigationButton to={notFoundReturn.to} />}
               >
                 {notFoundReturn.label}
               </Button>

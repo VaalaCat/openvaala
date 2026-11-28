@@ -7,8 +7,13 @@ import { AppToaster } from "./components/base/app-toaster"
 import { RouteLoadError } from "./components/route-load-error"
 import { initializeAppearance } from "./lib/appearance/preferences"
 import { createQueryClient } from "./lib/query/client"
-import { initializeI18n } from "./i18n"
+import { notifyPageUpdated } from "./lib/notify"
+import { isModuleLoadError } from "./lib/route-error"
+import { i18n, initializeI18n } from "./i18n"
 import "./index.css"
+
+// index.html 在入口模块下载前就已注册白屏恢复函数。
+declare function recoverPageModules(): void
 
 // iOS 在渲染输入控件前设置聚焦缩放上限，其他平台保留默认 viewport。
 if (
@@ -23,6 +28,12 @@ if (
 
 initializeAppearance()
 await initializeI18n()
+window.addEventListener("vite:preloadError", (event) => {
+  if (!isModuleLoadError(event.payload)) return
+  event.preventDefault()
+  if (document.querySelector("#root main")) notifyPageUpdated(i18n.t)
+  else recoverPageModules()
+})
 const queryClient = createQueryClient()
 const router = createBrowserRouter(
   [{ path: "*", element: <AppRouter />, errorElement: <RouteLoadError /> }],

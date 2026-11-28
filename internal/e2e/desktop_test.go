@@ -27,7 +27,10 @@ import (
 
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	ovruntime "github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
+	"github.com/VaalaCat/openvaala/pkg/world"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 	"gopkg.in/yaml.v3"
 )
 
@@ -148,7 +151,7 @@ func TestDesktopCLIProtocols(t *testing.T) {
 				}()
 				ctx, cancel := context.WithTimeout(t.Context(), e2eTimeout)
 				defer cancel()
-				models, err := client.ListModels(ctx, "assistant")
+				models, err := client.ListModels(ctx, &ovruntime.ListModelsRequest{AgentName: "assistant"})
 				if err != nil || len(models.Models) != 2 {
 					t.Fatalf("serve model list = %+v, %v", models, err)
 				}
@@ -375,7 +378,12 @@ func TestDesktopGUIChat(t *testing.T) {
 // startDesktopGUI 启动独立 HOME 的原生桌面，等待唯一内容窗口和自动化连接。
 func startDesktopGUI(t *testing.T, binary, config string, arguments ...string) (*e2eProcess, *desktopAutomation, int) {
 	t.Helper()
-	// 1. socket 使用短的私有临时目录，不超过 Unix socket 地址长度。
+	return launchDesktopGUI(t, binary, config, append(slices.Clone(arguments), "--native")...)
+}
+
+func launchDesktopGUI(t *testing.T, binary, config string, arguments ...string) (*e2eProcess, *desktopAutomation, int) {
+	t.Helper()
+	// 自动化 socket 使用短的私有临时目录。
 	directory, err := os.MkdirTemp("", "ov-desktop-e2e-")
 	if err != nil {
 		t.Fatal(err)
@@ -386,7 +394,7 @@ func startDesktopGUI(t *testing.T, binary, config string, arguments ...string) (
 	t.Setenv("MYGO_AUTOMATION", socketPath)
 	t.Setenv("GSETTINGS_BACKEND", "memory")
 	stopServeOnCleanup(t, binary, config)
-	process, _ := startE2EProcess(t, binary, config, append(slices.Clone(arguments), "--native"), false)
+	process, _ := startE2EProcess(t, binary, config, arguments, false)
 	automation := connectDesktopAutomation(t, process, socketPath)
 	// 失败验收也通过真实确认按钮放弃本测试草稿，再由共用进程夹具检查退出码。
 	t.Cleanup(func() {
@@ -661,6 +669,7 @@ func (a *desktopAutomation) press(t *testing.T, window int, label string) {
 
 // TestDesktopGUIStartupAndCancel 检查连接前草稿保留，以及取消退出后仍能实际发送消息。
 func TestDesktopGUIStartupAndCancel(t *testing.T) {
+	hostname, _ := os.Hostname()
 	// 1. 两条路径均运行真实桌面和后台，只从控件输入与模型请求观察结果。
 	if runtime.GOOS == "linux" && os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
 		t.Skip("run with xvfb-run or a graphical session")
@@ -700,7 +709,7 @@ func TestDesktopGUIStartupAndCancel(t *testing.T) {
 			text := "native retained " + scenario
 			if scenario == "cold_input" {
 				a.waitNode(t, window, func(n desktopAutomationNode) bool {
-					return n.Role == "button" && fmt.Sprint(n.Key) == "server-status-menu" && n.Label == "切换服务器 · 本机 · 连接中…"
+					return n.Role == "button" && fmt.Sprint(n.Key) == "server-status-menu" && n.Label == "切换服务器 · "+hostname+" · 连接中…"
 				})
 				a.setText(t, window, "composer-text", text)
 				if err := pausedServe.command.Process.Signal(syscall.SIGCONT); err != nil {
@@ -2587,7 +2596,7 @@ func TestDesktopGUIComposerToolbar(t *testing.T) {
 			var controls []desktopAutomationNode
 			for _, node := range a.getNodes(t, window) {
 				switch {
-				case node.Role == "button" && (node.Label == "添加图片" || node.Label == "发送" || node.Label == "更多"):
+				case node.Role == "button" && (node.Label == "添加附件" || node.Label == "发送" || node.Label == "更多"):
 				case node.Role == "popUpButton" && (fmt.Sprint(node.Key) == "model" || fmt.Sprint(node.Key) == "reasoning"):
 				case node.Role == "button" && fmt.Sprint(node.Key) == "work-location":
 				case node.Role == "menuButton" && node.Label == "更多":
@@ -3159,6 +3168,7 @@ func TestDesktopGUIOnboarding(t *testing.T) {
 
 // TestDesktopGUIConnectionBanner 检查服务停止后对话区顶部的横幅：本地化原因加「重试」；服务重新启动后重试恢复，横幅消失。
 func TestDesktopGUIConnectionBanner(t *testing.T) {
+	hostname, _ := os.Hostname()
 	binary := requireDesktopDisplay(t)
 	model := newE2EModel(t)
 	config := writeDesktopE2EConfig(t, model.server.URL)
@@ -3177,6 +3187,35 @@ func TestDesktopGUIConnectionBanner(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	a.press(t, window, "切换服务器 · "+hostname+" · 已连接")
+	a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Role == "menuItemRadio" && n.Label == hostname && strings.HasPrefix(n.Description, "127.0.0.1:") && slices.Contains(n.States, "checked")
+	})
+	a.waitLabel(t, window, "管理服务器…")
+	a.pressKey(t, window, "Down")
+	a.pressKey(t, window, "Enter")
+	a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "dialog" && n.Label == "管理服务器" })
+	a.press(t, window, "+ 添加服务器")
+	a.waitLabel(t, window, "地址")
+	a.waitNodeAbsent(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "server-token-input" })
+	link, err := world.FormatRemoteAccessURL("https://relay.test", world.RemoteAccessTarget{Name: "工作站", Token: "desktop-fixture", PublicKey: make([]byte, 32), Entries: worldserver.PeerEntries{Relays: []string{"https://relay.test"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := a.waitNode(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "server-url-input" })
+	a.call(t, "act", map[string]any{"window": window, "id": address.ID, "action": "setValue", "text": link}, nil)
+	a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return fmt.Sprint(n.Key) == "server-name-input" && n.Value == "工作站"
+	})
+	a.waitNodeAbsent(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "server-token-input" })
+	a.setText(t, window, "server-url-input", "localhost:8790")
+	a.waitNode(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "server-token-input" && n.Value == "" })
+	testButton := a.waitNode(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "test-server-connection" })
+	saveButton := a.waitNode(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "server-save-switch" })
+	if testButton.Bounds.Y != saveButton.Bounds.Y || testButton.Bounds.X+testButton.Bounds.Width >= saveButton.Bounds.X {
+		t.Fatalf("expected the connection test to the left of save, got %+v and %+v", testButton.Bounds, saveButton.Bounds)
+	}
+	a.pressKey(t, window, "Escape")
 	a.capture(t, window, "connection-cold-start-connected")
 	// 2. 停掉本机服务：横幅出现，原因是中文，带「重试」。
 	stopServe(t, binary, config)
@@ -3192,7 +3231,7 @@ func TestDesktopGUIConnectionBanner(t *testing.T) {
 	// 状态栏的服务器按钮读出连接状态；「重试」只有横幅里的一个，状态栏里没有错误原文。
 	a.waitNode(t, window, func(n desktopAutomationNode) bool {
 		return n.Role == "button" && fmt.Sprint(n.Key) == "server-status-menu" &&
-			(n.Label == "切换服务器 · 本机 · 正在重连…" || n.Label == "切换服务器 · 本机 · 连接失败")
+			(n.Label == "切换服务器 · "+hostname+" · 正在重连…" || n.Label == "切换服务器 · "+hostname+" · 连接失败")
 	})
 	retries := 0
 	for _, n := range a.getNodes(t, window) {
@@ -3206,6 +3245,18 @@ func TestDesktopGUIConnectionBanner(t *testing.T) {
 	if retries != 1 {
 		t.Fatalf("retry buttons = %d, want only the banner's", retries)
 	}
+	trigger := a.waitNode(t, window, func(n desktopAutomationNode) bool { return fmt.Sprint(n.Key) == "server-status-menu" })
+	a.call(t, "act", map[string]any{"window": window, "id": trigger.ID, "action": "press"}, nil)
+	a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Role == "menuItemRadio" && n.Label == hostname && strings.HasSuffix(n.Description, " · 已断开")
+	})
+	a.pressKey(t, window, "Down")
+	a.pressKey(t, window, "Enter")
+	offlineRow := a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Role == "button" && n.Label == hostname && strings.HasSuffix(n.Description, " · 已断开")
+	})
+	a.call(t, "act", map[string]any{"window": window, "id": offlineRow.ID, "action": "press"}, nil)
+	a.waitNodeAbsent(t, window, func(n desktopAutomationNode) bool { return n.Role == "dialog" && n.Label == "管理服务器" })
 	a.capture(t, window, "connection-banner")
 	// 3. 重新启动服务后，客户端自己重连：不点任何按钮，横幅消失，状态回到已连接。
 	startE2EProcess(t, binary, config, []string{"serve"}, false)
@@ -3220,7 +3271,7 @@ func TestDesktopGUIConnectionBanner(t *testing.T) {
 		}
 	}
 	waitBannerGone("automatic reconnect")
-	a.waitLabel(t, window, "切换服务器 · 本机 · 已连接")
+	a.waitLabel(t, window, "切换服务器 · "+hostname+" · 已连接")
 	a.capture(t, window, "connection-recovered")
 	// 4. 再停一次服务，横幅出现后重新启动并点一次「重试」；客户端自己的重连可能更早完成，两者都应让横幅消失。
 	stopServe(t, binary, config)
@@ -3233,7 +3284,7 @@ func TestDesktopGUIConnectionBanner(t *testing.T) {
 		}
 	}
 	waitBannerGone("manual retry")
-	a.waitLabel(t, window, "切换服务器 · 本机 · 已连接")
+	a.waitLabel(t, window, "切换服务器 · "+hostname+" · 已连接")
 }
 
 // TestDesktopGUICommandPalette 检查命令面板：标题不带冒号，输入过滤后 Enter 执行第一项；命令很多时列表可滚动，最后一项能滚进可见区。
@@ -3379,4 +3430,190 @@ func TestDesktopGUIEnglishUI(t *testing.T) {
 	a.press(t, window, "Hooks")
 	a.waitLabel(t, window, "From config.yaml. Reload the configuration after editing.")
 	assertEnglish("settings hooks")
+}
+
+// TestDesktopGUIAgentPresets 检查新增 Agent 时从预设填表。
+func TestDesktopGUIAgentPresets(t *testing.T) {
+	binary := requireDesktopDisplay(t)
+	config := writeDesktopE2EConfig(t, newE2EModel(t).server.URL)
+	_, a, window := startDesktopGUI(t, binary, config)
+	a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return fmt.Sprint(node.Key) == "model" && !slices.Contains(node.States, "disabled")
+	})
+	a.press(t, window, "设置")
+	nav := a.waitNode(t, window, func(node desktopAutomationNode) bool { return fmt.Sprint(node.Key) == "settings-nav:agents" })
+	a.call(t, "act", map[string]any{"window": window, "id": nav.ID, "action": "press"}, nil)
+	a.press(t, window, "新增 Agent")
+	picker := a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return fmt.Sprint(node.Key) == "agent-preset" && !slices.Contains(node.States, "disabled")
+	})
+	a.clickNode(t, window, picker, "left")
+	codex := a.waitLabel(t, window, "Codex")
+	a.capture(t, window, "agents-presets-desktop")
+	a.clickNode(t, window, codex, "left")
+	for _, field := range []struct{ label, value string }{
+		{"名称", "codex-acp"}, {"命令", "codex-acp"}, {"描述", "OpenAI's coding agent"},
+	} {
+		a.waitNode(t, window, func(node desktopAutomationNode) bool {
+			return node.Role == "textField" && node.Label == field.label && node.Value == field.value
+		})
+	}
+}
+
+// TestDesktopGUIAgentSettings 检查 Agent 列表、只读名称、保存和删除确认。
+func TestDesktopGUIAgentSettings(t *testing.T) {
+	binary := requireDesktopDisplay(t)
+	config := writeDesktopE2EConfig(t, newE2EModel(t).server.URL)
+	agentPath := filepath.Join(filepath.Dir(config), "agents", "codex-ui.yaml")
+	if err := os.WriteFile(agentPath, []byte("name: codex-ui\ntype: acp\nmcp_servers: []\nacp:\n  command: codex-acp\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, a, window := startDesktopGUI(t, binary, config)
+	a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return fmt.Sprint(node.Key) == "model" && !slices.Contains(node.States, "disabled")
+	})
+	a.press(t, window, "工作位置")
+	a.selectOption(t, window, "new-agent", "codex-ui", "codex-ui")
+	a.pressKey(t, window, "Escape")
+	a.press(t, window, "设置")
+	nav := a.waitNode(t, window, func(node desktopAutomationNode) bool { return fmt.Sprint(node.Key) == "settings-nav:agents" })
+	a.call(t, "act", map[string]any{"window": window, "id": nav.ID, "action": "press"}, nil)
+	a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return node.Role == "button" && node.Label == "codex-ui"
+	})
+	a.capture(t, window, "agents-desktop-list")
+	a.press(t, window, "codex-ui")
+	name := a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return node.Label == "名称" && node.Role == "textField" && node.Value == "codex-ui"
+	})
+	if !slices.Contains(name.States, "readOnly") || slices.Contains(name.Actions, "setValue") {
+		t.Fatalf("Agent name is editable: %+v", name)
+	}
+	a.setField(t, window, "描述", "Discard this edit")
+	a.press(t, window, "撤销")
+	a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return node.Role == "textField" && node.Label == "描述" && node.Value == ""
+	})
+	a.setField(t, window, "描述", "Updated via GUI")
+	a.capture(t, window, "agents-desktop-edit")
+	a.press(t, window, "保存")
+	a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return node.Role == "status" && strings.HasPrefix(node.Label, "Agent 已保存")
+	})
+	data, err := os.ReadFile(agentPath)
+	if err != nil || !strings.Contains(string(data), "Updated via GUI") {
+		t.Fatalf("saved Agent = %q, %v", data, err)
+	}
+	var saved map[string]yaml.Node
+	if err := yaml.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"tools", "skills", "mcp_servers"} {
+		if _, found := saved[field]; found {
+			t.Errorf("saved blank Agent field %q: %s", field, data)
+		}
+	}
+	a.waitNodeAbsent(t, window, func(node desktopAutomationNode) bool {
+		return node.Label == "加载中…"
+	})
+	remove := a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return fmt.Sprint(node.Key) == "delete-agent" && !slices.Contains(node.States, "disabled")
+	})
+	a.clickNode(t, window, remove, "left")
+	a.waitLabel(t, window, "使用这个 Agent 的对话将无法继续。")
+	a.press(t, window, "删除")
+	a.waitNodeAbsent(t, window, func(node desktopAutomationNode) bool {
+		return node.Role == "button" && node.Label == "codex-ui"
+	})
+	a.press(t, window, "返回对话")
+	a.press(t, window, "工作位置")
+	a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return node.Role == "popUpButton" && fmt.Sprint(node.Key) == "new-agent"
+	})
+	if options := a.listSelectOptions(t, window, "new-agent"); slices.Contains(options, "codex-ui") {
+		t.Fatalf("deleted Agent still in new-conversation options: %v", options)
+	}
+	a.waitNode(t, window, func(node desktopAutomationNode) bool {
+		return node.Role == "popUpButton" && fmt.Sprint(node.Key) == "new-agent" && node.Value == "default"
+	})
+}
+
+func TestDesktopGUIWorldSettings(t *testing.T) {
+	binary := requireDesktopDisplay(t)
+	cfg := writeDesktopE2EConfig(t, newE2EModel(t).server.URL)
+	_, a, window := startDesktopGUI(t, binary, cfg)
+	a.waitLabel(t, window, "设置")
+	a.press(t, window, "设置")
+	a.press(t, window, "World")
+	a.waitLabel(t, window, "本机节点")
+	a.waitLabel(t, window, "在本机托管控制面")
+	a.waitLabel(t, window, "加入并重启")
+	if a.hasNodeLabel(t, window, "button", "保存并重启") {
+		t.Fatal("join form opened the settings save bar")
+	}
+	a.setField(t, window, "域", "desktop.test")
+	a.press(t, window, "保存并重启")
+	a.waitLabel(t, window, "保存并重启 serve？")
+	a.press(t, window, "保存并重启")
+	a.dismissToast(t, window, "serve 已重启")
+	a.waitNode(t, window, func(n desktopAutomationNode) bool { return n.Role == "textField" && n.Value == "desktop.test" })
+	control := newFederationServer(t, "domain")
+	control.register(t, filepath.Join(t.TempDir(), "identity"), "offline", "studio")
+	invite := federationJSON[worldserver.CreateJoinTokenResponse](t, "POST", control.url+"/world/v1/admin/tokens",
+		worldserver.CreateJoinTokenRequest{Owner: "studio", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}, 201)
+	inviteField := a.waitNode(t, window, func(n desktopAutomationNode) bool {
+		return n.Label == "入网码" && slices.Contains(n.States, "password")
+	})
+	a.call(t, "act", map[string]any{"window": window, "id": inviteField.ID, "action": "setValue", "text": invite.Token}, nil)
+	a.press(t, window, "加入并重启")
+	a.press(t, window, "保存并重启")
+	a.dismissToast(t, window, "serve 已重启")
+	a.waitLabel(t, window, "更换控制面")
+	a.waitLabel(t, window, "未设置时自动通告默认 Agent")
+	const directHint = "其他节点可直接连入本机的地址；未设置时经控制面中继。"
+	a.waitLabel(t, window, directHint)
+	name, err := world.GetJoinNodeName("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.waitLabel(t, window, name+"@"+federationDomain)
+	a.waitLabel(t, window, control.url+" · 已连接")
+	a.setField(t, window, "直连地址", "wss://studio.example/world/v1/direct")
+	if a.hasNodeLabel(t, window, "button", "保存并重启") {
+		t.Fatal("unadded address appeared in settings draft")
+	}
+	a.press(t, window, "添加 · 直连地址")
+	a.waitLabel(t, window, directHint)
+	a.press(t, window, "添加 · 通告目标")
+	a.setField(t, window, "描述", "Studio")
+	a.capture(t, window, "desktop-world")
+	a.press(t, window, "放弃")
+	a.waitLabel(t, window, "未设置时自动通告默认 Agent")
+	a.waitLabel(t, window, directHint)
+	wire := openExternalWire(t, cfg)
+	wire.call(t, "world/sendMessage", map[string]string{"to": "offline", "message": "test"}, nil)
+	a.waitLabel(t, window, control.url+" · 已连接 · 1 条待发送")
+	control.stop()
+	a.waitLabel(t, window, control.url+" · 未连接 · 1 条待发送")
+	a.press(t, window, "Agent")
+	a.waitLabel(t, window, "新增 Agent")
+}
+
+func TestDesktopWorldLinkWithoutWebPage(t *testing.T) {
+	binary := requireDesktopDisplay(t)
+	f := startRemoteRuntime(t)
+	for _, tc := range []struct{ name, link string }{
+		{"direct", f.directLink},
+		{"relay", f.link},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := writeDesktopE2EConfig(t, newE2EModel(t).server.URL)
+			appendE2EConfig(t, cfg, fmt.Sprintf("\nclient: {token: %q}\n", f.token))
+			_, app, window := launchDesktopGUI(t, binary, cfg, "app", "--url", tc.link)
+			app.press(t, window, "设置")
+			app.press(t, window, "World")
+			app.waitLabel(t, window, "bob@"+federationDomain)
+			app.waitLabel(t, window, "复制链接")
+		})
+	}
 }

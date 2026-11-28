@@ -169,12 +169,12 @@ func TestProviderDraftHeaders(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		headers map[string]string
-		added   []*providerHeaderDraft
+		added   []*keyValueDraft
 		want    map[string]string
 	}{
 		{"round_trip", map[string]string{"X-Title": "MyTool", "Session-Id": ""}, nil, map[string]string{"X-Title": "MyTool", "Session-Id": ""}},
-		{"skip_empty_name_trim_name", nil, []*providerHeaderDraft{{Name: "  ", Value: "x"}, {Name: " X-Team ", Value: "infra"}}, map[string]string{"X-Team": "infra"}},
-		{"only_blank_rows_omit_headers", nil, []*providerHeaderDraft{{}}, nil},
+		{"skip_empty_name_trim_name", nil, []*keyValueDraft{{Name: "  ", Value: "x"}, {Name: " X-Team ", Value: "infra"}}, map[string]string{"X-Team": "infra"}},
+		{"only_blank_rows_omit_headers", nil, []*keyValueDraft{{}}, nil},
 		{"no_headers", nil, nil, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -216,7 +216,7 @@ func TestProviderHeadersForm(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		action func(t *testing.T, tester *ui.Tester)
-		want   []providerHeaderDraft
+		want   []keyValueDraft
 	}{
 		{"add", func(t *testing.T, tester *ui.Tester) {
 			// 添加行的标题和按钮同名，按钮与删除按钮右对齐、同宽，取删除按钮的横坐标和标题所在行的纵坐标点击。
@@ -226,7 +226,7 @@ func TestProviderHeadersForm(t *testing.T) {
 				t.Fatalf("add or remove header missing in %q", tester.Texts())
 			}
 			tester.ClickAt(remove.X+remove.W/2, title.Y+title.H/2)
-		}, []providerHeaderDraft{{"X-Title", "MyTool"}, {}}},
+		}, []keyValueDraft{{"X-Title", "MyTool"}, {}}},
 		{"remove", func(t *testing.T, tester *ui.Tester) {
 			if err := tester.Click("删除请求头"); err != nil {
 				t.Fatal(err)
@@ -238,7 +238,7 @@ func TestProviderHeadersForm(t *testing.T) {
 			}
 			tester.Key(ui.Cmd, ui.KeyA)
 			tester.Type("X-Team")
-		}, []providerHeaderDraft{{"X-Team", "MyTool"}}},
+		}, []keyValueDraft{{"X-Team", "MyTool"}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			d := testDesktop()
@@ -253,7 +253,7 @@ func TestProviderHeadersForm(t *testing.T) {
 				}
 			}
 			tt.action(t, tester)
-			var got []providerHeaderDraft
+			var got []keyValueDraft
 			for _, header := range d.providerDraft.Headers {
 				got = append(got, *header)
 			}
@@ -282,10 +282,10 @@ func (r *providerFetchRecorder) FetchProviderModels(_ context.Context, provider 
 func TestProviderFetchModelsHeaders(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
-		headers []*providerHeaderDraft
+		headers []*keyValueDraft
 		want    map[string]string
 	}{
-		{"edited_rows", []*providerHeaderDraft{{Name: " X-Title ", Value: "MyTool"}, {Name: "Session-Id"}, {Name: " ", Value: "dropped"}}, map[string]string{"X-Title": "MyTool", "Session-Id": ""}},
+		{"edited_rows", []*keyValueDraft{{Name: " X-Title ", Value: "MyTool"}, {Name: "Session-Id"}, {Name: " ", Value: "dropped"}}, map[string]string{"X-Title": "MyTool", "Session-Id": ""}},
 		{"no_rows", nil, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

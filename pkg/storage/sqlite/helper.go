@@ -77,12 +77,16 @@ func getRecordFilterSQL(fieldPaths map[string]string, filter storage.RecordFilte
 		expression := "json_extract(CAST(payload AS TEXT), " + path + ")"
 		var comparison string
 		switch condition.Operator {
-		case storage.RecordFilterIn:
+		case storage.RecordFilterIn, storage.RecordFilterNotIn:
 			if len(condition.Values) == 0 {
 				return "", nil, fmt.Errorf("filter %q requires at least one value", condition.Field)
 			}
 			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(condition.Values)), ",")
-			comparison = expression + " IN (" + placeholders + ")"
+			op := " IN "
+			if condition.Operator == storage.RecordFilterNotIn {
+				op = " NOT IN "
+			}
+			comparison = expression + op + "(" + placeholders + ")"
 		case storage.RecordFilterContains:
 			if len(condition.Values) != 1 {
 				return "", nil, fmt.Errorf("filter %q requires exactly one value", condition.Field)

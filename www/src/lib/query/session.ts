@@ -15,10 +15,18 @@ import type {
 export function turnListOptions(
   connection: ServerConnection,
   conversationID: ConversationID,
-  sessionID: SessionID
+  sessionID: SessionID,
+  historyGeneration = 0
 ) {
   return infiniteQueryOptions({
-    queryKey: [connection.getServerID(), "turns", conversationID, sessionID],
+    queryKey: [
+      connection.getServerID(),
+      "turns",
+      conversationID,
+      sessionID,
+      historyGeneration,
+    ],
+    meta: { externalHistory: !!historyGeneration },
     queryFn: ({ pageParam }) =>
       connection.call("session/turns/list", {
         conversation_id: conversationID,
@@ -37,7 +45,8 @@ export function turnsOptions(
   connection: ServerConnection,
   conversationID: ConversationID,
   sessionID: SessionID,
-  turnIDs: TurnID[]
+  turnIDs: TurnID[],
+  historyGeneration = 0
 ) {
   return queryOptions({
     queryKey: [
@@ -45,8 +54,9 @@ export function turnsOptions(
       "turns",
       conversationID,
       sessionID,
-      { turnIDs },
+      { turnIDs, historyGeneration },
     ],
+    meta: { externalHistory: !!historyGeneration },
     queryFn: () =>
       connection.call("session/turns/get", {
         conversation_id: conversationID,
@@ -97,5 +107,22 @@ export function sessionDetailsOptions(
         conversation_id: conversationID,
         session_id: sessionID,
       }),
+  })
+}
+
+// 对话内全部 Session 的持久记录，包含后台和已转出的会话。
+export function sessionListOptions(
+  connection: ServerConnection,
+  conversationID: ConversationID
+) {
+  return infiniteQueryOptions({
+    queryKey: [connection.getServerID(), "sessions", conversationID],
+    queryFn: ({ pageParam }) =>
+      connection.call("session/list", {
+        conversation_id: conversationID,
+        cursor: pageParam,
+      }),
+    initialPageParam: undefined as RecordCursor<SessionID> | undefined,
+    getNextPageParam: (page) => page.next_cursor,
   })
 }

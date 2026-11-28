@@ -1,0 +1,46 @@
+name: Docker image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GOWORK: "off"
+      KO_DOCKER_REPO: docker.io/vaalacat/openvaala
+      VERSION: alpha
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Build WebUI
+        run: |
+          pnpm install --frozen-lockfile --filter openvaala-web
+          pnpm --dir www build
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: ko-build/setup-ko@v0.9
+        with:
+          version: v0.18.1
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build image
+        run: ko build ./cmd/openvaala --bare --sbom=none -t "$VERSION" --push=${{ github.event_name == 'push' }}
+      - uses: imjasonh/setup-crane@v0.4
+        if: github.event_name == 'push'
+      - name: Copy image to GHCR
+        if: github.event_name == 'push'
+        run: crane copy "$KO_DOCKER_REPO:$VERSION" "ghcr.io/vaalacat/openvaala:$VERSION"

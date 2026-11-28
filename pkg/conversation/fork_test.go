@@ -168,9 +168,10 @@ func TestForkConversation(t *testing.T) {
 			check: func(t *testing.T, sourceStore, targetStore *conversationStore, opt *ConversationOpt, source forkSource, forked defs.Conversation) {
 				// 再次分叉只复制第一轮：这一轮在首次分叉里由 SessionFork 指向来源，要从来源历史里读出来，原样写进新日志。
 				second, err := ForkConversation(t.Context(), &ForkConversationRequest{
-					Source:       forked,
-					SourceQuery:  targetStore.query,
-					BeforeTurnID: source.turnIDs[1],
+					Source:        forked,
+					SourceQuery:   targetStore.query,
+					SourceSession: getForkRoot(t, targetStore, forked),
+					BeforeTurnID:  source.turnIDs[1],
 				}, opt)
 				if err != nil {
 					t.Fatal(err)
@@ -214,8 +215,9 @@ func TestForkConversation(t *testing.T) {
 					t.Fatalf("root Model = %+v %v, want %+v", root.Model, err, want)
 				}
 				_, err = ForkConversation(t.Context(), &ForkConversationRequest{
-					Source:      source.record,
-					SourceQuery: sourceStore.query,
+					Source:        source.record,
+					SourceQuery:   sourceStore.query,
+					SourceSession: getForkRoot(t, sourceStore, source.record),
 					Model: defs.ModelSelection{Ref: defs.ModelRef{
 						ProviderID: "test",
 						ModelID:    "missing",
@@ -275,6 +277,7 @@ func TestForkConversation(t *testing.T) {
 			opt := conversationOpt(target, model)
 			request := tt.request(source)
 			request.SourceQuery = store.query
+			request.SourceSession = getForkRoot(t, store, request.Source)
 			forked, err := ForkConversation(t.Context(), request, opt)
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
@@ -462,6 +465,15 @@ func getRunningTurnItems(turnID defs.TurnID) []*defs.Item {
 	return []*defs.Item{historyMessage(defs.NewItemID(), turnID, "长任务"), reply, call}
 }
 
+func getForkRoot(t *testing.T, store *conversationStore, record defs.Conversation) defs.Session {
+	t.Helper()
+	root, found, err := store.query.GetSession(t.Context(), record.ID, record.RootSessionID)
+	if err != nil || !found {
+		t.Fatalf("GetSession(%s) = %v, %v", record.RootSessionID, found, err)
+	}
+	return root
+}
+
 // listForkTestTurns 按 TurnID 正序读出 Session 的全部 Turn 记录。
 func listForkTestTurns(t *testing.T, store *conversationStore, sessionID defs.SessionID) []defs.Turn {
 	t.Helper()
@@ -575,7 +587,7 @@ func TestForkRejectsMissingSourceHistory(t *testing.T) {
 			model, store := newConversationModel(t), openConversationDAO(t)
 			source := newForkSource(t, store, model, steps)
 			opt := conversationOpt(store, model)
-			forked, err := ForkConversation(t.Context(), &ForkConversationRequest{Source: source.record, SourceQuery: store.query}, opt)
+			forked, err := ForkConversation(t.Context(), &ForkConversationRequest{Source: source.record, SourceQuery: store.query, SourceSession: getForkRoot(t, store, source.record)}, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -583,7 +595,7 @@ func TestForkRejectsMissingSourceHistory(t *testing.T) {
 			if err := store.logs.Delete(t.Context(), storage.StreamPath(forked.ID), storage.StreamID(forked.RootSessionID)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := ForkConversation(t.Context(), &ForkConversationRequest{Source: forked, SourceQuery: store.query}, opt); err == nil {
+			if _, err := ForkConversation(t.Context(), &ForkConversationRequest{Source: forked, SourceQuery: store.query, SourceSession: getForkRoot(t, store, forked)}, opt); err == nil {
 				t.Fatal("published fork without source Items")
 			}
 			requireConversationIDs(t, store, source.record.ID, forked.ID)

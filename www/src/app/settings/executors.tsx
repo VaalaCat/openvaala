@@ -7,7 +7,8 @@ import {
   PlusIcon,
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
-import { Link, useNavigate, useSearchParams } from "react-router"
+import { useNavigate, useSearchParams } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { ConfigurationLayout } from "@/components/base/configuration-layout"
 import { DangerZone } from "@/components/base/danger-zone"
 import { DetailPageState } from "@/components/base/detail-page-state"
@@ -107,8 +108,8 @@ export function ExecutorSettingsPage() {
       actions={
         <Button
           className="text-ui"
-          nativeButton={false}
-          render={<Link to={getExecutorCreatePath(serverID)} />}
+          role="button"
+          render={<NavigationButton to={getExecutorCreatePath(serverID)} />}
         >
           <PlusIcon data-icon="inline-start" />
           {t("settings.executors.addSSH")}

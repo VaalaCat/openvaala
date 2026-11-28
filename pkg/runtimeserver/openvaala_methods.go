@@ -1,7 +1,9 @@
 package runtimeserver
 
 import (
+	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,19 +13,108 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/externalagent"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
-	"github.com/VaalaCat/openvaala/pkg/terminal"
+	"github.com/VaalaCat/openvaala/pkg/storage"
+	"github.com/VaalaCat/openvaala/pkg/world"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 )
 
 // maxItemsPageBytes 是一页日志累计 JSON 字节数的截取值，超过后保留当前 Item 再截断。
 // 一页可超出该值一条 Item；单条 Item 超过客户端帧上限时，客户端读取失败并重连。
 const maxItemsPageBytes = 4 << 20
 
+var errSessionPermissionDenied = errors.New("permission denied")
+
+// collaborationPermissionError 只读取调用方自己的记录，为已分离的会话说明原对话的权限。
+func collaborationPermissionError(ctx context.Context, rt runtime.Runtime, cid defs.ConversationID, sid defs.SessionID) error {
+	source, err := rt.GetSession(ctx, cid, sid)
+	if err != nil {
+		return errSessionPermissionDenied
+	}
+	return source.WithDetachOriginHint(errSessionPermissionDenied)
+}
+
+// scopedOpenVaalaMethods 列出会话连接可调用的方法及其目标范围。
+var scopedOpenVaalaMethods = map[string]sessionMethodScope{
+	runtimeprotocol.InitializeMethod: sessionMethodGlobal,
+	"agent/list":                     sessionMethodGlobal,
+	"agent/getOptions":               sessionMethodGlobal,
+	"executor/list":                  sessionMethodBoundConversation,
+	"executor/tool":                  sessionMethodBoundConversation,
+	"skill/list":                     sessionMethodGlobal,
+	"skill/get":                      sessionMethodGlobal,
+	"terminal/open":                  sessionMethodBoundConversation,
+	"terminal/attach":                sessionMethodGlobal,
+	"terminal/input":                 sessionMethodGlobal,
+	"terminal/close":                 sessionMethodGlobal,
+	"terminal/capture":               sessionMethodGlobal,
+	"terminal/subscribe":             sessionMethodGlobal,
+	"terminal/unsubscribe":           sessionMethodGlobal,
+	"executor/exec":                  sessionMethodBoundConversation,
+	"session/spawn":                  sessionMethodConversation,
+	"session/send":                   sessionMethodConversation,
+	"session/wait":                   sessionMethodConversation,
+	"session/setOption":              sessionMethodDescendant,
+	"session/reload":                 sessionMethodDescendant,
+	"session/stop":                   sessionMethodDescendant,
+	"session/update":                 sessionMethodDescendant,
+	"session/list":                   sessionMethodConversation,
+	"attachment/upload":              sessionMethodConversation,
+	"session/turns/list":             sessionMethodDescendant,
+	"session/turns/get":              sessionMethodDescendant,
+	"session/items/list":             sessionMethodDescendant,
+	"session/history":                sessionMethodConversation,
+	"session/details":                sessionMethodDescendant,
+	"session/subscribe":              sessionMethodDescendant,
+	"session/unsubscribe":            sessionMethodDescendant,
+}
+
 // openvaalaMethods 是 OpenVaala 协议的方法表：方法名 → 解析参数 → 调用对应的 Runtime 公开方法。
 var openvaalaMethods = map[string]methodHandler{
+	"server/resetToken":        newMethodHandler(handleResetToken),
+	"world/getStatus":          newMethodHandler(handleWorldGetStatus),
+	"world/listPeers":          newMethodHandler(handleWorldListPeers),
+	"world/sendMessage":        newMethodHandlerWithResult[world.SendMessageRequest, *world.WorldMessage](handleWorldSendMessage),
+	"world/forward":            newMethodHandler(handleWorldForward),
+	"world/listMessages":       newMethodHandler(handleWorldListMessages),
+	"world/cancelMessage":      newMethodHandler(handleWorldCancelMessage),
+	"world/listThreads":        newMethodHandler(handleWorldListThreads),
+	"world/subscribe":          newMethodHandler(handleWorldSubscribe),
+	"world/unsubscribe":        newMethodHandler(handleWorldUnsubscribe),
+	"world/admin/listUsers":    newMethodHandler(handleWorldAdminListUsers),
+	"world/admin/getACLMatrix": newMethodHandler(handleWorldAdminGetACLMatrix),
+	"world/admin/listNodes":    newMethodHandler(handleWorldAdminListNodes),
+	"world/admin/revokeNode":   newMethodHandler(handleWorldAdminRevokeNode),
+	"world/admin/revokeOwner":  newMethodHandler(handleWorldAdminRevokeOwner),
+	"world/admin/listTokens":   newMethodHandler(handleWorldAdminListTokens),
+	"world/admin/createToken":  newMethodHandler(handleWorldAdminCreateToken),
+	"world/admin/revokeToken":  newMethodHandler(handleWorldAdminRevokeToken),
+	"world/admin/listDomains":  newMethodHandler(handleWorldAdminListDomains),
+	"world/admin/addDomain":    newMethodHandler(handleWorldAdminAddDomain),
+	"world/admin/acceptDomain": newMethodHandler(handleWorldAdminDomainDecision(true)),
+	"world/admin/rejectDomain": newMethodHandler(handleWorldAdminDomainDecision(false)),
+	"world/admin/deleteDomain": newMethodHandler(handleWorldAdminDeleteDomain),
+	"world/admin/getACL":       newMethodHandler(handleWorldAdminGetACL),
+	"world/admin/replaceACL":   newMethodHandler(handleWorldAdminReplaceACL),
+
+	"agent/getOptions":                    newMethodHandler(handleAgentGetOptions),
+	"agent/listSessions":                  newMethodHandler(handleAgentListSessions),
+	"agent/previewSession":                newMethodHandler(handleAgentPreviewSession),
+	"session/setOption":                   newMethodHandler(handleSessionSetOption),
+	"session/reload":                      newMethodHandler(handleSessionReload),
+	"session/import":                      newMethodHandler(handleSessionImport),
+	"session/detach":                      newMethodHandler(handleSessionDetach),
+	"session/spawn":                       newMethodHandler(handleSessionSpawn),
+	"session/send":                        newMethodHandler(handleSessionSend),
+	"session/wait":                        newMethodHandler(handleSessionWait),
+	"session/stop":                        newMethodHandler(handleSessionStop),
+	"session/update":                      newMethodHandler(handleSessionUpdate),
+	"executor/exec":                       newMethodHandler(handleExecutorExec),
+	"executor/tool":                       newMethodHandler(handleExecutorTool),
 	runtimeprotocol.InitializeMethod:      newMethodHandler(handleInitialize),
 	"conversation/create":                 newMethodHandler(handleConversationCreate),
 	"conversation/open":                   newMethodHandler(handleConversationOpen),
@@ -35,6 +126,7 @@ var openvaalaMethods = map[string]methodHandler{
 	"conversation/delete":                 newMethodHandler(handleConversationDelete),
 	"conversation/setExecutorSettings":    newMethodHandler(handleConversationSetExecutorSettings),
 	"conversation/submitInput":            newMethodHandler(handleConversationSubmitInput),
+	"attachment/upload":                   newMethodHandler(handleAttachmentUpload),
 	"conversation/steerInput":             newMethodHandler(handleConversationSteerInput),
 	"conversation/interruptTurnWithInput": newMethodHandler(handleConversationInterruptTurnWithInput),
 	"conversation/withdrawInput":          newMethodHandler(handleConversationWithdrawInput),
@@ -46,11 +138,15 @@ var openvaalaMethods = map[string]methodHandler{
 	"session/turns/list":                  newMethodHandler(handleSessionTurnsList),
 	"session/turns/get":                   newMethodHandler(handleSessionTurnsGet),
 	"session/items/list":                  newMethodHandler(handleSessionItemsList),
+	"session/history":                     newMethodHandler(handleSessionHistory),
 	"session/contextUsage":                newMethodHandler(handleSessionContextUsage),
 	"session/details":                     newMethodHandler(handleSessionDetails),
 	"session/setModel":                    newMethodHandler(handleSessionSetModel),
 	"model/list":                          newMethodHandler(handleModelList),
 	"agent/list":                          newMethodHandler(handleAgentList),
+	"agent/get":                           newMethodHandler(handleAgentGet),
+	"agent/set":                           newMethodHandler(handleAgentSet),
+	"agent/delete":                        newMethodHandler(handleAgentDelete),
 	"executor/list":                       newMethodHandler(handleExecutorList),
 	"executor/resolveDirectory":           newMethodHandler(handleExecutorResolveDirectory),
 	"executor/listDirectories":            newMethodHandler(handleExecutorListDirectories),
@@ -64,10 +160,14 @@ var openvaalaMethods = map[string]methodHandler{
 	"provider/delete":                     newMethodHandler(handleProviderDelete),
 	"provider/fetchModels":                newMethodHandler(handleProviderFetchModels),
 	"config/setDefaultModel":              newMethodHandler(handleConfigSetDefaultModel),
+	"config/getWorld":                     newMethodHandler(handleGetWorld),
+	"config/setWorld":                     newMethodHandler(handleSetWorld),
 	"config/reload":                       newMethodHandler(handleConfigReload),
 	"catalog/providers/list":              newMethodHandler(handleCatalogProvidersList),
+	"catalog/agents/list":                 newMethodHandler(handleAgentPresetsList),
 	"catalog/models/list":                 newMethodHandler(handleCatalogModelsList),
 	"skill/list":                          newMethodHandler(handleSkillList),
+	"skill/get":                           newMethodHandler(handleSkillGet),
 	"hook/list":                           newMethodHandler(handleHookList),
 	"mcpServer/list":                      newMethodHandler(handleMCPServerList),
 	"conversation/setClientExecutor":      newMethodHandler(handleConversationSetClientExecutor),
@@ -79,7 +179,9 @@ var openvaalaMethods = map[string]methodHandler{
 	"session/unsubscribe":                 newMethodHandler(handleSessionUnsubscribe),
 	"terminal/open":                       newMethodHandler(handleTerminalOpen),
 	"terminal/attach":                     newMethodHandler(handleTerminalAttach),
+	"terminal/input":                      newMethodHandler(handleTerminalInput),
 	"terminal/close":                      newMethodHandler(handleTerminalClose),
+	"terminal/capture":                    newMethodHandler(handleTerminalCapture),
 	"terminal/reset":                      newMethodHandler(handleTerminalReset),
 	"terminal/subscribe":                  newMethodHandler(handleTerminalsSubscribe),
 	"terminal/unsubscribe":                newMethodHandler(handleTerminalsUnsubscribe),
@@ -93,7 +195,7 @@ func handleInitialize(_ context.Context, connection *serverConnection, params *r
 	}
 	// 2. 返回服务名、协议版本和 ServerID。
 	return &runtimeprotocol.InitializeResult{
-		ServerInfo:      runtimeprotocol.ServerInfo{Name: "openvaala"},
+		ServerInfo:      runtimeprotocol.ServerInfo{Name: connection.server.remoteTarget.Name},
 		ProtocolVersion: runtimeprotocol.ProtocolVersion,
 		ServerID:        connection.serverID,
 	}, nil
@@ -104,6 +206,7 @@ func handleConversationCreate(ctx context.Context, connection *serverConnection,
 	// 1. 提交 Agent、模型、Executor 设置和环境；设置无效时返回 -32602；WithoutExecutors 的对话不装配 Executor 和 Skill。
 	record, err := connection.runtime.CreateConversation(ctx, &runtime.CreateConversationRequest{
 		AgentName:        params.AgentName,
+		InitialOptions:   params.InitialOptions,
 		Model:            params.Model,
 		ExecutorSettings: params.ExecutorSettings,
 		Environment:      params.Environment,
@@ -186,6 +289,7 @@ func handleConversationSetTitle(ctx context.Context, connection *serverConnectio
 func handleConversationFork(ctx context.Context, connection *serverConnection, params *runtimeprotocol.ForkConversationParams) (*runtimeprotocol.ConversationResult, error) {
 	// 1. 提交截取点、模型、Executor 设置、环境和是否临时；截取点之前没有轮次时新建未保存的对话，截取点或新增 Executor ID 无效时返回 -32602，来源已删除的 Executor 只记 Warn。
 	record, err := connection.runtime.ForkConversation(ctx, &runtime.ForkConversationRequest{
+		SourceSessionID:  params.SourceSessionID,
 		ConversationID:   params.ConversationID,
 		BeforeTurnID:     params.BeforeTurnID,
 		LastTurnID:       params.LastTurnID,
@@ -261,6 +365,22 @@ func handleConversationSubmitInput(ctx context.Context, connection *serverConnec
 	return &runtimeprotocol.SubmitInputResult{ItemID: itemID}, nil
 }
 
+// handleAttachmentUpload 写入对话的附件并返回文件引用。
+func handleAttachmentUpload(ctx context.Context, connection *serverConnection, params *runtimeprotocol.UploadAttachmentParams) (*defs.FileRef, error) {
+	// 1. 解码原始文件，交给 Runtime 写入目标 Executor。
+	data, err := base64.StdEncoding.DecodeString(params.Data)
+	if err != nil {
+		return nil, newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams, "invalid attachment base64 data")
+	}
+	return connection.runtime.UploadAttachment(ctx, &runtime.UploadAttachmentRequest{
+		ConversationID: params.ConversationID,
+		ExecutorID:     params.ExecutorID,
+		Name:           params.Name,
+		MIME:           params.MIME,
+		Data:           data,
+	})
+}
+
 // handleConversationInterruptTurn 请求中断根 Session 的活动 Turn。
 func handleConversationInterruptTurn(ctx context.Context, connection *serverConnection, params *runtimeprotocol.ConversationParams) (*runtimeprotocol.InterruptTurnResult, error) {
 	// 1. 请求中断并取回 TurnID，不等待 Turn 结束。
@@ -296,18 +416,41 @@ func handleSessionGet(ctx context.Context, connection *serverConnection, params 
 
 // handleSessionList 分页读取对话内的 Session。
 func handleSessionList(ctx context.Context, connection *serverConnection, params *runtimeprotocol.ListSessionsParams) (*runtimeprotocol.ListSessionsResult, error) {
+	if params.Filter != nil {
+		instance, source, err := connection.getCollaborationSource(ctx, runtimeprotocol.CollaborationSource{
+			ConversationID: params.ConversationID, SourceSessionID: params.SourceSessionID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		filtered, err := instance.ListAgents(ctx, source, params.Filter)
+		if err != nil {
+			return nil, err
+		}
+		result := &runtimeprotocol.ListSessionsResult{Sessions: make([]defs.Session, 0, len(filtered.Agents)), AppliedFilter: &filtered.AppliedFilter, TotalMatched: &filtered.TotalMatched, Truncated: filtered.Truncated, Hint: filtered.Hint}
+		for _, info := range filtered.Agents {
+			result.Sessions = append(result.Sessions, info.Session)
+		}
+		return result, nil
+	}
 	// 1. 补齐并校验排序。
 	order, err := getRecordOrder(params.Order)
 	if err != nil {
 		return nil, err
 	}
 	// 2. 按请求筛选和游标读取一页记录，未指定条数时使用默认值。
-	page, err := connection.runtime.ListSessions(ctx, &dao.ListSessionsRequest{
+	request := dao.ListSessionsRequest{
 		ConversationID: params.ConversationID,
 		Order:          order,
 		Cursor:         params.Cursor,
 		Limit:          getPageLimit(params.Limit),
-	})
+	}
+	var page storage.Page[defs.Session, dao.RecordCursor[defs.SessionID]]
+	if connection.sessionCaller != nil {
+		page, err = connection.listSessionDescendants(ctx, request)
+	} else {
+		page, err = connection.runtime.ListSessions(ctx, &request)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +459,38 @@ func handleSessionList(ctx context.Context, connection *serverConnection, params
 		Sessions:   getNonNilSlice(page.Items),
 		NextCursor: page.Next,
 	}, nil
+}
+
+// listSessionDescendants 分页读取调用会话的后代，游标只返回可见的 Session。
+func (c *serverConnection) listSessionDescendants(ctx context.Context, request dao.ListSessionsRequest) (storage.Page[defs.Session, dao.RecordCursor[defs.SessionID]], error) {
+	var result storage.Page[defs.Session, dao.RecordCursor[defs.SessionID]]
+	// 1. 扫描原排序的记录，直到读到下一页的首个可见 Session 或末尾。
+	scan := request
+	for {
+		page, err := c.runtime.ListSessions(ctx, &scan)
+		if err != nil {
+			return result, err
+		}
+		for _, record := range page.Items {
+			allowed, err := c.runtime.IsSessionRecordDescendant(ctx, c.sessionCaller.sessionID, record)
+			if err != nil {
+				return result, err
+			}
+			if !allowed {
+				continue
+			}
+			if len(result.Items) == request.Limit {
+				last := result.Items[len(result.Items)-1]
+				result.Next = dao.RecordCursor[defs.SessionID]{ID: last.ID, UpdatedAt: last.UpdatedAt}
+				return result, nil
+			}
+			result.Items = append(result.Items, record)
+		}
+		if page.Next == (dao.RecordCursor[defs.SessionID]{}) {
+			return result, nil
+		}
+		scan.Cursor = page.Next
+	}
 }
 
 // handleSessionTurnsList 分页读取 Session 的 Turn。
@@ -395,6 +570,19 @@ func handleSessionItemsList(ctx context.Context, connection *serverConnection, p
 		Items:      items,
 		NextCursor: next,
 	}, nil
+}
+
+// handleSessionHistory 分页读取协作后代在 fork 之后的本地记录。
+func handleSessionHistory(ctx context.Context, c *serverConnection, p *runtimeprotocol.ReadSessionHistoryParams) (*runtimeprotocol.ListItemsResult, error) {
+	instance, source, err := c.getCollaborationSource(ctx, p.CollaborationSource)
+	if err != nil {
+		return nil, err
+	}
+	page, err := instance.ReadSessionHistory(ctx, cmp.Or(source, instance.GetRootSessionID()), &p.SessionHistoryParam)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.ListItemsResult{Items: toLoggedItems(page.Items), NextCursor: page.Next}, nil
 }
 
 // handleMCPServerList 返回对话中各 Executor 的 MCP 连接情况。
@@ -520,7 +708,7 @@ func handleSessionSetModel(ctx context.Context, connection *serverConnection, pa
 // handleModelList 返回公开模型目录和 Agent 默认模型。
 func handleModelList(ctx context.Context, connection *serverConnection, params *runtimeprotocol.ListModelsParams) (*runtime.ModelList, error) {
 	// 1. 查询指定 Agent 对应的模型目录。
-	list, err := connection.runtime.ListModels(ctx, &runtime.ListModelsRequest{AgentName: params.AgentName})
+	list, err := connection.runtime.ListModels(ctx, (*runtime.ListModelsRequest)(params))
 	if err != nil {
 		return nil, err
 	}
@@ -542,8 +730,16 @@ func handleAgentList(ctx context.Context, connection *serverConnection, _ *runti
 	return &runtimeprotocol.ListAgentsResult{Agents: getNonNilSlice(agents)}, nil
 }
 
-// handleExecutorList 返回全部 Executor 的说明和默认目录。
-func handleExecutorList(ctx context.Context, connection *serverConnection, _ *runtimeprotocol.EmptyParams) (*runtimeprotocol.ListExecutorsResult, error) {
+// handleExecutorList 返回对话已装配的环境，未指定对话时列出全局 Executor。
+func handleExecutorList(ctx context.Context, connection *serverConnection, params *runtimeprotocol.ListExecutorsParams) (*runtimeprotocol.ListExecutorsResult, error) {
+	if params.ConversationID != "" {
+		instance, err := connection.runtime.GetCollaborationConversation(ctx, params.ConversationID)
+		if err != nil {
+			return nil, err
+		}
+		executors, defaultID := instance.GetExecutorDetails()
+		return &runtimeprotocol.ListExecutorsResult{Executors: getNonNilSlice(executors), DefaultExecutorID: defaultID}, nil
+	}
 	// 1. 读取当前定义中的 Executor，不访问 Executor。
 	executors, err := connection.runtime.ListExecutors(ctx)
 	if err != nil {
@@ -635,6 +831,33 @@ func handleExecutorSSHConfigHosts(ctx context.Context, connection *serverConnect
 		return nil, err
 	}
 	return &runtimeprotocol.ListSSHConfigHostsResult{Hosts: getNonNilSlice(hosts)}, nil
+}
+
+// handleAgentGet 读取指定 Agent 的完整配置。
+func handleAgentGet(ctx context.Context, connection *serverConnection, params *runtimeprotocol.AgentNameParams) (*defs.AgentConfig, error) {
+	return connection.configuration.GetAgent(ctx, params.Name)
+}
+
+// handleAgentSet 保存 Agent 并应用新配置。
+func handleAgentSet(ctx context.Context, connection *serverConnection, params *runtimeprotocol.SetAgentParams) (*runtime.SetDefinitionsResult, error) {
+	definitions, err := connection.configuration.SetAgent(ctx, params.Definition)
+	if err != nil {
+		return nil, err
+	}
+	result, err := connection.runtime.SetDefinitions(ctx, definitions)
+	result.PendingConversationIDs = getNonNilSlice(result.PendingConversationIDs)
+	return &result, err
+}
+
+// handleAgentDelete 删除 Agent 并应用新配置。
+func handleAgentDelete(ctx context.Context, connection *serverConnection, params *runtimeprotocol.AgentNameParams) (*runtime.SetDefinitionsResult, error) {
+	definitions, err := connection.configuration.DeleteAgent(ctx, params.Name)
+	if err != nil {
+		return nil, err
+	}
+	result, err := connection.runtime.SetDefinitions(ctx, definitions)
+	result.PendingConversationIDs = getNonNilSlice(result.PendingConversationIDs)
+	return &result, err
 }
 
 // handleProviderList 返回 Provider 配置、默认模型和模型默认配置。
@@ -756,6 +979,11 @@ func handleCatalogProvidersList(ctx context.Context, connection *serverConnectio
 	return &runtimeprotocol.ListCatalogProvidersResult{Providers: getNonNilSlice(providers)}, nil
 }
 
+// handleAgentPresetsList 返回 Agent 设置可用的 ACP 预设。
+func handleAgentPresetsList(context.Context, *serverConnection, *runtimeprotocol.EmptyParams) (*runtimeprotocol.ListAgentPresetsResult, error) {
+	return &runtimeprotocol.ListAgentPresetsResult{Presets: agent.GetAgentPresets()}, nil
+}
+
 // handleCatalogModelsList 返回指定服务的模型目录。
 func handleCatalogModelsList(ctx context.Context, connection *serverConnection, params *runtimeprotocol.ProviderIDParams) (*runtimeprotocol.ProviderModelsResult, error) {
 	// 1. 按服务 ID 查询模型 ID 到配置的映射。
@@ -862,11 +1090,18 @@ func handleSessionSubscribe(ctx context.Context, connection *serverConnection, p
 	connection.startAfterResponse(func() {
 		forwardOpenVaalaSubscription(ctx, connection, key, registration, subscription.Events, newOpenVaalaNotification, subscription.GetCloseReason)
 	})
-	return &runtimeprotocol.SubscribeSessionResult{
+	result := &runtimeprotocol.SubscribeSessionResult{
+		Restoring:        subscription.Restoring,
 		LastSavedOrdinal: subscription.LastSavedOrdinal,
 		StreamingItems:   toStreamingItems(subscription.StreamingItems),
 		PendingInputs:    subscription.PendingInputs,
-	}, nil
+	}
+	if state := subscription.ExternalState; state != nil {
+		result.Options = &state.Options
+		result.Capabilities = &state.Capabilities
+		result.Commands = state.Commands
+	}
+	return result, nil
 }
 
 // handleSessionUnsubscribe 取消 Session 内容订阅，等待旧转发任务结束。
@@ -1004,6 +1239,10 @@ func newOpenVaalaNotification(key subscriptionKey, event conversation.Conversati
 func newOpenVaalaSessionNotification(target runtimeprotocol.NotificationTarget, event session.SessionEvent) *runtimeprotocol.JSONRPCMessage {
 	// 1. 按 Session 事件填入通知参数；Agent 测量和模型调用结束事件不生成内容通知。
 	switch event := event.(type) {
+	case *session.SessionExternalBindingUpdated, *session.SessionHistoryRestored:
+		return nil
+	case *session.SessionExternalStateUpdated:
+		return &runtimeprotocol.JSONRPCMessage{Method: "session/externalStateUpdated", Params: &runtimeprotocol.SessionExternalStateUpdatedParams{NotificationTarget: target, Options: event.Options, Capabilities: event.Capabilities, Commands: event.Commands}}
 	case *session.SessionPendingInputsUpdated:
 		return &runtimeprotocol.JSONRPCMessage{
 			Method: "session/pendingInputsUpdated",
@@ -1084,18 +1323,14 @@ func newHookRunNotification(target runtimeprotocol.NotificationTarget, turnID de
 	}
 }
 
-// handleSkillList 返回对话或草稿 Agent 的可用 Skill。
+// handleSkillList 返回当前身份可用的 Skill，支持按名称和说明搜索。
 func handleSkillList(ctx context.Context, connection *serverConnection, params *runtimeprotocol.ListSkillsParams) ([]skill.SkillInfo, error) {
-	// 1. 检查对话 ID 和 Agent 名称至少提供一个。
-	if params.ConversationID == "" && params.AgentName == "" {
-		return nil, newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams, "conversation_id or agent_name is required")
-	}
-	// 2. 提交对话 ID、Agent 名称和草稿 Executor 设置。
-	return connection.runtime.GetSkills(ctx, &runtime.GetSkillsRequest{
-		ConversationID:   params.ConversationID,
-		AgentName:        params.AgentName,
-		ExecutorSettings: params.ExecutorSettings,
-	})
+	return connection.runtime.GetSkills(ctx, getSkillRequest(connection.sessionCaller, *params))
+}
+
+// handleSkillGet 返回当前身份可读取的 Skill 正文。
+func handleSkillGet(ctx context.Context, connection *serverConnection, params *runtimeprotocol.GetSkillParams) (*runtimeprotocol.GetSkillResult, error) {
+	return getSkill(ctx, connection.runtime, connection.sessionCaller, params)
 }
 
 // handleHookList 按配置顺序返回 Hook 目录。
@@ -1182,15 +1417,8 @@ func handleConversationAppendContextItems(ctx context.Context, connection *serve
 
 // handleTerminalOpen 新开一个终端并让本连接接入：在所选 Executor 上新建独立工作区并启动 TTY shell。
 func handleTerminalOpen(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalOpenParams) (*runtimeprotocol.TerminalOpenResult, error) {
-	// 1. 交给 Runtime 新建工作区并启动 shell；virtual Executor 和无效目录在这里返回错误。
-	opened, err := connection.runtime.OpenTerminal(ctx, &runtime.OpenTerminalRequest{
-		ExecutorID:     params.ExecutorID,
-		Directory:      params.Directory,
-		Environment:    params.Environment,
-		Rows:           params.Rows,
-		Cols:           params.Cols,
-		ConversationID: params.ConversationID,
-	})
+	// 1. 在所属对话打开交互终端。
+	opened, err := openConversationTerminal(ctx, connection.runtime, connection.sessionCaller, params)
 	if err != nil {
 		return nil, err
 	}
@@ -1210,7 +1438,7 @@ func handleTerminalOpen(ctx context.Context, connection *serverConnection, param
 // handleTerminalAttach 把本连接接入已有终端，从 cursor 起补发输出。
 func handleTerminalAttach(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalAttachParams) (*runtimeprotocol.TerminalAttachResult, error) {
 	// 1. 查找终端，找不到时返回错误，不新开 shell。
-	runtimeTerminal, err := connection.runtime.GetTerminal(ctx, params.TerminalID)
+	runtimeTerminal, err := getConversationTerminal(ctx, connection.runtime, connection.sessionCaller, params.TerminalID)
 	if err != nil {
 		return nil, err
 	}
@@ -1231,23 +1459,20 @@ func handleTerminalAttach(ctx context.Context, connection *serverConnection, par
 	}, nil
 }
 
+// handleTerminalInput 校验终端归属并等待输入写入。
+func handleTerminalInput(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalInputParams) (*runtimeprotocol.EmptyResult, error) {
+	return writeConversationTerminalInput(ctx, connection.runtime, connection.sessionCaller, params.TerminalID, string(params.Data))
+}
+
 // handleTerminalClose 结束一个终端，终端可由任何连接打开；终端已经结束或不存在时成功，terminal/exited 由各接入自己发出。
 func handleTerminalClose(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalParams) (*runtimeprotocol.EmptyResult, error) {
-	// 1. 查找终端，不存在说明已经结束。
-	runtimeTerminal, err := connection.runtime.GetTerminal(ctx, params.TerminalID)
-	if errors.Is(err, terminal.ErrTerminalNotFound) {
-		return &runtimeprotocol.EmptyResult{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	// 2. 限时结束进程组。
-	stopCtx, cancel := context.WithTimeout(ctx, terminalCloseTimeout)
-	defer cancel()
-	if _, err := runtimeTerminal.Stop(stopCtx); err != nil {
-		return nil, err
-	}
-	return &runtimeprotocol.EmptyResult{}, nil
+	return closeConversationTerminal(ctx, connection.runtime, connection.sessionCaller, params.TerminalID)
+}
+
+// handleTerminalCapture 读取终端保留的最近纯文本输出。
+func handleTerminalCapture(ctx context.Context, connection *serverConnection, params *runtimeprotocol.TerminalCaptureParams) (*runtimeprotocol.TerminalCaptureResult, error) {
+	text, err := captureTerminal(ctx, connection.runtime, connection.sessionCaller, params)
+	return &runtimeprotocol.TerminalCaptureResult{Text: text}, err
 }
 
 // handleTerminalReset 丢掉终端保留的输出并让全部接入的客户端清屏。
@@ -1284,7 +1509,7 @@ func handleTerminalsSubscribe(ctx context.Context, connection *serverConnection,
 			func(running []runtime.RunningTerminal) *runtimeprotocol.JSONRPCMessage {
 				return &runtimeprotocol.JSONRPCMessage{
 					Method: "terminal/listChanged",
-					Params: &runtimeprotocol.TerminalListResult{Terminals: getTerminalItems(running)},
+					Params: &runtimeprotocol.TerminalListResult{Terminals: getScopedTerminalItems(running, connection.sessionCaller)},
 				}
 			},
 			func() *runtimeprotocol.JSONRPCMessage {
@@ -1294,7 +1519,7 @@ func handleTerminalsSubscribe(ctx context.Context, connection *serverConnection,
 				}
 			})
 	})
-	return &runtimeprotocol.TerminalListResult{Terminals: getTerminalItems(subscription.Initial)}, nil
+	return &runtimeprotocol.TerminalListResult{Terminals: getScopedTerminalItems(subscription.Initial, connection.sessionCaller)}, nil
 }
 
 // handleTerminalsUnsubscribe 取消运行中终端列表的订阅并等待旧转发结束。
@@ -1302,4 +1527,214 @@ func handleTerminalsUnsubscribe(ctx context.Context, connection *serverConnectio
 	// 1. 取消并等待转发结束，未订阅时直接成功。
 	connection.cancelSubscription(ctx, subscriptionKey{kind: subscriptionKindTerminals})
 	return &runtimeprotocol.EmptyResult{}, nil
+}
+
+// getCollaborationSource 将会话令牌绑定到授权的来源，操作者可以省略来源。
+func (c *serverConnection) getCollaborationSource(ctx context.Context, p runtimeprotocol.CollaborationSource) (conversation.Conversation, defs.SessionID, error) {
+	id := p.SourceSessionID
+	if c.sessionCaller != nil {
+		if id != "" && id != c.sessionCaller.sessionID {
+			return nil, "", errSessionPermissionDenied
+		}
+		id = c.sessionCaller.sessionID
+	}
+	instance, err := c.runtime.GetCollaborationConversation(ctx, p.ConversationID)
+	if err != nil {
+		return nil, "", err
+	}
+	return instance, id, nil
+}
+
+// handleExecutorTool 使用来源会话的本地工具表执行调用。
+func handleExecutorTool(ctx context.Context, c *serverConnection, p *runtimeprotocol.CallExecutorToolParams) (*defs.ToolResult, error) {
+	source := p.CollaborationSource
+	if c.sessionCaller != nil {
+		source.ConversationID = c.sessionCaller.conversationID
+	}
+	instance, id, err := c.getCollaborationSource(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	tools, err := instance.GetCollaborationTools(ctx, cmp.Or(id, instance.GetRootSessionID()))
+	if err != nil {
+		return nil, err
+	}
+	return runCollaborationTool(ctx, tools, p.Name, p.Arguments), nil
+}
+
+// handleSessionSpawn 用来源的活动轮创建直接子会话。
+func handleSessionSpawn(ctx context.Context, c *serverConnection, p *runtimeprotocol.SpawnSessionParams) (*conversation.SpawnAgentResult, error) {
+	instance, source, err := c.getCollaborationSource(ctx, p.CollaborationSource)
+	if err != nil {
+		return nil, err
+	}
+	result, err := instance.SpawnAgent(ctx, cmp.Or(source, instance.GetRootSessionID()), &p.SpawnAgentParam)
+	return &result, err
+}
+
+// handleSessionSend 向目标会话提交消息并返回入队 ID。
+func handleSessionSend(ctx context.Context, c *serverConnection, p *runtimeprotocol.SendSessionParams) (*runtimeprotocol.SendSessionResult, error) {
+	instance, source, err := c.getCollaborationSource(ctx, p.CollaborationSource)
+	if err != nil {
+		return nil, err
+	}
+	if p.Interrupt {
+		p.Mode = session.SessionInputModeInterrupt
+	} else if p.Mode == "" {
+		p.Mode = session.SessionInputModeNormal
+	}
+	id, err := instance.SendMessage(ctx, source, &p.SendMessageParam)
+	if errors.Is(err, conversation.ErrSendPermissionDenied) {
+		return nil, collaborationPermissionError(ctx, c.runtime, p.ConversationID, source)
+	}
+	return &runtimeprotocol.SendSessionResult{InputItemID: id}, err
+}
+
+// handleSessionWait 等来源会话的收件箱收到通知。
+func handleSessionWait(ctx context.Context, c *serverConnection, p *runtimeprotocol.WaitSessionParams) (*conversation.WaitAgentResult, error) {
+	instance, source, err := c.getCollaborationSource(ctx, p.CollaborationSource)
+	if err != nil {
+		return nil, err
+	}
+	result, err := instance.WaitAgent(ctx, cmp.Or(source, instance.GetRootSessionID()), &p.WaitAgentParam)
+	return &result, err
+}
+
+// handleSessionStop 中断目标会话正在执行的轮。
+func handleSessionStop(ctx context.Context, c *serverConnection, p *runtimeprotocol.StopSessionParams) (*runtimeprotocol.StopSessionResult, error) {
+	instance, source, err := c.getCollaborationSource(ctx, p.CollaborationSource)
+	if err != nil {
+		return nil, err
+	}
+	id, err := instance.StopAgent(ctx, source, p.SessionID)
+	return &runtimeprotocol.StopSessionResult{TurnID: id}, err
+}
+
+// handleSessionUpdate 保存元数据并刷新会话订阅。
+func handleSessionUpdate(ctx context.Context, c *serverConnection, p *runtimeprotocol.UpdateSessionParams) (*runtimeprotocol.SessionResult, error) {
+	record, err := c.runtime.UpdateSession(ctx, p.ConversationID, p.SessionID, p.SessionUpdate)
+	return &runtimeprotocol.SessionResult{Session: record}, err
+}
+
+// handleExecutorExec 在选定的工作区执行命令并返回退出结果。
+func handleExecutorExec(ctx context.Context, c *serverConnection, p *runtime.ExecutorExecRequest) (*runtime.ExecutorExecResult, error) {
+	// 1. 会话连接省略对话时使用令牌绑定的对话。
+	if c.sessionCaller != nil && p.ConversationID == "" {
+		p.ConversationID = c.sessionCaller.conversationID
+	}
+	// 2. 按对话的 Executor 设置运行命令。
+	result, err := c.runtime.Exec(ctx, p)
+	return &result, err
+}
+
+// handleAgentGetOptions 从目标机探测外部 Agent 的可选项。
+func handleAgentGetOptions(ctx context.Context, c *serverConnection, p *runtime.AgentOptionsRequest) (*defs.ExternalOptions, error) {
+	result, err := c.runtime.GetAgentOptions(ctx, *p)
+	return &result, err
+}
+
+// handleAgentListSessions 读取外部列表的一页。
+func handleAgentListSessions(ctx context.Context, c *serverConnection, p *runtime.ExternalSessionsRequest) (*runtime.ExternalSessionsResult, error) {
+	result, err := c.runtime.ListExternalSessions(ctx, *p)
+	return &result, err
+}
+
+// handleAgentPreviewSession 只回放指定会话。
+func handleAgentPreviewSession(ctx context.Context, c *serverConnection, p *runtime.ExternalSessionRequest) (*externalagent.ExternalSessionPreview, error) {
+	result, err := c.runtime.PreviewExternalSession(ctx, *p)
+	return &result, err
+}
+
+// handleSessionSetOption 把选项交给运行实例。
+func handleSessionSetOption(ctx context.Context, c *serverConnection, p *runtimeprotocol.SetSessionOptionParams) (*runtimeprotocol.EmptyResult, error) {
+	instance, err := c.runtime.GetCollaborationConversation(ctx, p.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.EmptyResult{}, instance.SetExternalOption(ctx, p.SessionID, p.ExternalOptionSelection)
+}
+
+// handleSessionReload 重新装配指定外部会话并等到驱动就绪。
+func handleSessionReload(ctx context.Context, c *serverConnection, p *runtimeprotocol.SessionParams) (*runtimeprotocol.EmptyResult, error) {
+	instance, err := c.runtime.GetCollaborationConversation(ctx, p.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.EmptyResult{}, instance.ReloadExternalSession(ctx, p.SessionID)
+}
+
+// handleSessionImport 恢复选中的外部会话并返回新的持久对话。
+func handleSessionImport(ctx context.Context, c *serverConnection, p *runtime.ImportSessionRequest) (*runtimeprotocol.ConversationResult, error) {
+	result, err := c.runtime.ImportSession(ctx, *p)
+	return &runtimeprotocol.ConversationResult{Conversation: result}, err
+}
+
+// handleSessionDetach 返回转出后的新对话与根会话。
+func handleSessionDetach(ctx context.Context, c *serverConnection, p *runtimeprotocol.SessionParams) (*runtimeprotocol.ConversationResult, error) {
+	result, err := c.runtime.DetachSession(ctx, p.ConversationID, p.SessionID)
+	return &runtimeprotocol.ConversationResult{Conversation: result}, err
+}
+
+func handleGetWorld(_ context.Context, c *serverConnection, _ *runtimeprotocol.EmptyParams) (*runtimeprotocol.GetWorldResult, error) {
+	settings, err := c.configuration.GetWorldSettings()
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeprotocol.GetWorldResult{Settings: settings, Running: c.worldRunning}, nil
+}
+
+func handleSetWorld(ctx context.Context, c *serverConnection, p *runtimeprotocol.SetWorldParams) (response *runtimeprotocol.SetWorldResult, err error) {
+	select {
+	case c.worldConfigWrite <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() {
+		if err != nil {
+			<-c.worldConfigWrite
+		}
+	}()
+	saved, err := c.configuration.GetWorldSettings()
+	if err != nil {
+		return nil, err
+	}
+	archive := saved.Server.IsDatabaseCreated && saved.Server.Domain != p.Settings.Server.Domain
+	if p.Join != nil {
+		p.Settings.Node.Enabled = true
+	} else if archive && saved.Node.Domain == saved.Server.Domain {
+		p.Settings.Node.Enabled = false
+	}
+	update, err := c.configuration.PrepareWorldSettings(p.Settings, p.Join != nil)
+	if err != nil {
+		return nil, err
+	}
+	var registration *worldserver.RegisterNodeResponse
+	var serverURL string
+	if join := p.Join; join != nil {
+		identity, err := world.LoadOrCreateIdentity(c.worldIdentityPath)
+		if err != nil {
+			return nil, err
+		}
+		serverURL, err = worldserver.ParseJoinCode(join.InviteCode)
+		if err != nil {
+			return nil, err
+		}
+		result, err := world.RegisterNode(ctx, identity, serverURL, saved.Node.Name, join.InviteCode)
+		if err != nil {
+			return nil, err
+		}
+		registration = &result
+		if archive && result.Domain == saved.Server.Domain {
+			update.NodeEnabled = false
+		}
+	}
+	if err := c.configuration.SaveWorldSettings(update, registration, serverURL); err != nil {
+		return nil, err
+	}
+	c.restartAfterResponse = &ServeRestartRequest{ArchiveWorldServer: archive}
+	return &runtimeprotocol.SetWorldResult{Restarting: true}, nil
+}
+
+func handleResetToken(_ context.Context, c *serverConnection, _ *runtimeprotocol.EmptyParams) (*runtimeprotocol.ResetTokenResult, error) {
+	return c.server.resetToken(c)
 }

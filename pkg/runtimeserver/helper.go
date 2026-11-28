@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
@@ -17,7 +19,16 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	"github.com/VaalaCat/openvaala/pkg/terminal"
 	"github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
 )
+
+// getRequestToken 从请求读取 Bearer 令牌，未提供时读取查询参数。
+func getRequestToken(c *gin.Context) string {
+	if token, found := strings.CutPrefix(c.GetHeader("Authorization"), "Bearer "); found {
+		return token
+	}
+	return c.Query("token")
+}
 
 // defaultPageLimit 是分页请求省略 limit 时的每页条数。
 const defaultPageLimit = 50
@@ -198,6 +209,15 @@ func getErrorText(err error) string {
 func newMethodHandler[P any, R any](
 	handle func(ctx context.Context, connection *serverConnection, params *P) (R, error),
 ) methodHandler {
+	return newMethodHandlerWithResult[P, R](func(ctx context.Context, connection *serverConnection, params *P) (any, error) {
+		return handle(ctx, connection, params)
+	})
+}
+
+// newMethodHandlerWithResult 登记线上结果类型并在调用处理函数前解析参数。
+func newMethodHandlerWithResult[P any, R any](
+	handle func(ctx context.Context, connection *serverConnection, params *P) (any, error),
+) methodHandler {
 	// 1. 记录 P、R 的类型，返回接收原始 JSON 参数的处理函数。
 	return methodHandler{
 		params: reflect.TypeFor[P](),
@@ -233,4 +253,40 @@ func newNotificationTarget(key subscriptionKey, sessionID defs.SessionID) runtim
 		SessionID:      sessionID,
 		Subscription:   subscription,
 	}
+}
+
+// getSkillRequest 绑定会话身份，操作者使用显式查询范围。
+func getSkillRequest(caller *sessionCaller, params runtimeprotocol.ListSkillsParams) *runtime.GetSkillsRequest {
+	if caller != nil {
+		return &runtime.GetSkillsRequest{
+			ConversationID: caller.conversationID, SourceSessionID: caller.sessionID, Query: params.Query,
+		}
+	}
+	return &runtime.GetSkillsRequest{
+		ConversationID: params.ConversationID, AgentName: params.AgentName,
+		ExecutorSettings: params.ExecutorSettings, Query: params.Query,
+	}
+}
+
+// getScopedTerminalItems 只返回令牌所属对话的终端。
+func getScopedTerminalItems(running []runtime.RunningTerminal, caller *sessionCaller) []runtimeprotocol.TerminalItem {
+	items := getTerminalItems(running)
+	if caller == nil {
+		return items
+	}
+	return slices.DeleteFunc(items, func(item runtimeprotocol.TerminalItem) bool {
+		return item.ConversationID != caller.conversationID
+	})
+}
+
+// getSkill 读取调用方可见的 Skill 文件。
+func getSkill(ctx context.Context, rt runtime.Runtime, caller *sessionCaller, params *runtimeprotocol.GetSkillParams) (*runtimeprotocol.GetSkillResult, error) {
+	if strings.TrimSpace(params.Name) == "" {
+		return nil, newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams, "name is required")
+	}
+	request := getSkillRequest(caller, runtimeprotocol.ListSkillsParams{
+		ConversationID: params.ConversationID, AgentName: params.AgentName, ExecutorSettings: params.ExecutorSettings,
+	})
+	content, err := rt.GetSkill(ctx, request, params.Name, params.File)
+	return &runtimeprotocol.GetSkillResult{Content: content}, err
 }

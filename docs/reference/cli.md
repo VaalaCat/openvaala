@@ -13,6 +13,13 @@ openvaala acp                      serve an editor over ACP on stdio
 openvaala app-server               serve Codex clients over the Codex app-server protocol
 openvaala codex [-- CODEX_ARGS]    open the Codex TUI connected to OpenVaala
 openvaala codex app [directory]    open the Codex desktop app connected to OpenVaala (macOS)
+openvaala session                  manage sessions
+openvaala agent                    list Agents and options
+openvaala executor                 list Executors and run tools
+openvaala exec                     run a command on an Executor
+openvaala terminal                 manage interactive terminals
+openvaala skill                    list, search and read skills
+openvaala mcp-bridge               relay stdio MCP for Agent processes (normally invoked by the Agent)
 openvaala reindex                  rebuild the conversation index
 openvaala plugin <subcommand>      install and manage plugins
 openvaala config <subcommand>      initialize, inspect and validate configuration
@@ -43,6 +50,8 @@ When a client starts the local runtime server for you, it passes these flags on,
 - `--url <ws-url>` — the runtime server to connect to, such as `ws://10.0.0.5:8790/api/v1/openvaala`.
 
 Without `--url`, they use `client.url`; without that, they use the local runtime server and start it in the background if it is not running. A server started this way by `tui`, `acp`, `app-server` or `codex` exits on its own about ten seconds after its last client disconnects and nothing is running. A server started by `web` or the desktop app keeps running until you stop it. See [Configuration → client](../configuration/overview.md#client) for tokens and path mappings.
+
+The `session`, `agent`, `executor`, `exec`, `terminal`, and `skill` commands also accept `--url` and `--token`. They read `OPENVAALA_URL` and `OPENVAALA_TOKEN` when those flags are omitted. `OPENVAALA_CONVERSATION_ID` and `OPENVAALA_SESSION_ID` supply the collaboration context. Where a command accepts `--conversation`, it overrides the conversation environment variable.
 
 ## tui
 
@@ -128,6 +137,49 @@ openvaala codex app [directory]
 ```
 
 macOS only. Opens the installed Codex desktop app with OpenVaala as its backend, in `directory` (default: the current directory), and returns. Quit the Codex app first. No Codex configuration is changed and the app is not installed for you.
+
+## session
+
+The session CLI and the local `openvaala` MCP tools provide equivalent collaboration operations. With an injected session token, both use the same conversation and session permissions. If a network sandbox such as Codex's blocks the CLI from connecting to OpenVaala, use the `openvaala` MCP tools. Without a source session, an operator can use `spawn` to create a new conversation.
+
+- `openvaala session spawn <prompt>` (`spawn_agent`). Use `--agent <name>` to choose the Agent and `--model <provider/model>` to choose the model. `--reasoning-effort <value>` selects native model reasoning effort. Repeat `--initial-option <kind:id=value>` for external startup options. Use `--executor <id>`, `--cwd <path>`, `--task <name>`, `--label <key=value>`, and `--background` to set work location and metadata. For a child session, `--fork-turns <none|all|n>` selects completed turns to inherit and `--notify-on-finish=false` suppresses the parent's completion notice.
+- `openvaala session send <session-id> <prompt>` (`send_message`). Use `--prompt-file <path>` in place of the prompt to read a local file. `--mode <normal|steer>` queues a turn or supplements the current one. `--interrupt` interrupts the current turn before sending. `--model <provider/model>` and `--reasoning-effort <value>` update a descendant's model selection before sending.
+- `spawn` and `send` wait for the submitted turn's final text. Add `--no-wait` to print the session and input IDs as soon as the input is accepted.
+- `openvaala session ls [--conversation <id>]` (`list_agents`). Filter by `--session-id <id>`, `--status <idle,running,stopping,stopped>`, `--cwd <path>` (`*` for any directory), `--since-hours <n>` (default 24, 0 for any time), or `--label <key=value>`. Use `--all` to include background sessions and `--limit <n>` to set the page size.
+- `openvaala session logs <session-id> [--limit <n>] [--cursor <n>]` (`read_session_history`). Pass the printed `next_cursor` to read older items. With a source session, only the descendant's own history after the fork is included.
+- `openvaala session wait [session-id] [--timeout <seconds>] [--wait-for subagent_result]` (`wait_agent`). Omit the ID to wait on the source session. Use `subagent_result` to return immediately when no descendants are running and there is no unread message.
+- `openvaala session stop <session-id>` (`interrupt_agent`) requests cancellation of the active turn.
+- `openvaala session option <session-id> [--set <kind:id=value>]` reads or sets external options (`get_agent_options`, `set_agent_option`). `openvaala session reload <session-id>` restarts the external driver (`reload_agent`).
+- `openvaala session inspect <session-id>` shows session details, `session attach <session-id>` streams its output, and `session open <session-id>` opens it in the Web UI.
+- `openvaala session update <session-id> [--task-name <name>] [--label <key=value>] [--background=<bool>]` updates session metadata. `session detach <session-id>` moves an external child into its own conversation.
+- `openvaala session import --agent <name> [--executor <id>] [--cwd <path>]` lists external sessions. Use `--query <text>` to search titles and directories and `--cursor <cursor>` for the next page. Add the external session ID as an argument to import it.
+
+## agent
+
+- `openvaala agent ls` lists configured Agent definitions (`list_agent_definitions`).
+- `openvaala agent options <agent-name>` reads a definition's available external options (`get_agent_options`).
+
+## executor and exec
+
+- `openvaala executor ls [--conversation <id>] [--refresh-tools]` (`list_executors`) lists Executors. Within a conversation, the working Executor is marked `(default)`. Refreshing a tool table only affects a native model turn.
+- `openvaala exec --executor <id> [--conversation <id>] [--cwd <path>] -- <command> [args...]` runs one command and prints its output. Relative working directories start at the selected Executor's workspace root.
+- `openvaala executor tool <name> [arguments-json] [--conversation <id>]` invokes the same workspace and command tools the local MCP exposes, using their JSON argument names and defaults. For example, `openvaala executor tool read_file '{"path":"README.md","offset":1,"limit":20}'`. Available tools depend on the source session and its Executors.
+
+## terminal
+
+- `openvaala terminal ls` lists running terminals (`terminal_list`).
+- `openvaala terminal open [--executor <id>] [--cwd <path>] [--rows <n>] [--cols <n>]` opens a terminal and prints its ID (`terminal_open`).
+- `openvaala terminal send <terminal-id> <keys>` writes keys verbatim (`terminal_send_keys`). Include a newline to submit a command.
+- `openvaala terminal capture <terminal-id> [--lines <n>]` prints recent output with ANSI control sequences removed (`terminal_capture`).
+- `openvaala terminal close <terminal-id>` closes the terminal (`terminal_close`).
+
+## skill
+
+- `openvaala skill list [--agent <name>]` lists available skills (`list_skills`).
+- `openvaala skill search <query> [--agent <name>]` searches names and descriptions (`search_skills`).
+- `openvaala skill get <name> [file] [--agent <name>]` reads `SKILL.md` or a relative file in that skill's directory (`get_skill`). Example: `openvaala skill get openvaala reference/cli.md`.
+
+`--agent` selects the skill catalog for an operator. A session token always uses the calling Agent's configured skills plus the built-in `openvaala` skill.
 
 ## reindex
 

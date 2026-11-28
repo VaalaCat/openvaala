@@ -19,7 +19,7 @@ const sidebarSections = [
   },
   {
     label: { en: "Guides", zh: "使用" },
-    pages: ["guides/terminal", "guides/web", "guides/desktop", "guides/editors", "guides/codex", "guides/conversations"],
+    pages: ["guides/terminal", "guides/web", "guides/desktop", "guides/editors", "guides/codex", "guides/conversations", "guides/docker"],
   },
   {
     label: { en: "Configuration", zh: "配置" },

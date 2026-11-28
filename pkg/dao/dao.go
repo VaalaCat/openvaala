@@ -40,7 +40,7 @@ type SessionQuery interface {
 	GetSessionCheckpoint(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) (checkpoint *defs.SessionCheckpoint, err error)
 	// GetSession 读取对话内指定 Session，返回记录及是否找到。
 	GetSession(context.Context, defs.ConversationID, defs.SessionID) (defs.Session, bool, error)
-	// GetSessionByID 只凭 Session ID 读取记录；Session 还没写过 Item 时返回未找到。
+	// GetSessionByID 只凭 Session ID 读取记录；尚无 Item 时也按元数据查询。
 	GetSessionByID(ctx context.Context, sessionID defs.SessionID) (defs.Session, bool, error)
 	// ListSessions 分页读取对话内的 Session。
 	ListSessions(context.Context, ListSessionsRequest) (storage.Page[defs.Session, RecordCursor[defs.SessionID]], error)
@@ -184,5 +184,9 @@ func RecordNamespaces() []storage.RecordNamespace {
 		})
 	}
 	// 2. 加入 Session 和 Turn 记录分组。
-	return append(namespaces, storage.RecordNamespace{Name: SessionNamespace}, storage.RecordNamespace{Name: turnNamespace})
+	return append(namespaces, storage.RecordNamespace{
+		Name:          SessionNamespace,
+		Fields:        []storage.RecordField{{Name: "id", PayloadJSONPath: []string{"id"}}},
+		IndexedFields: []string{"id"},
+	}, storage.RecordNamespace{Name: turnNamespace})
 }

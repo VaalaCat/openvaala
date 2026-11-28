@@ -240,6 +240,8 @@ func getEventConversationID(event runtimeclient.ClientEvent) defs.ConversationID
 	switch event := event.(type) {
 	case *runtimeclient.SessionSynced:
 		return event.ConversationID
+	case *runtimeclient.SessionExternalStateChanged:
+		return event.ConversationID
 	case *runtimeclient.ItemsSaved:
 		return event.ConversationID
 	case *runtimeclient.ItemChanged:

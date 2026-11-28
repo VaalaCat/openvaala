@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -21,16 +23,32 @@ func (d *Desktop) applyStartTarget() {
 	if strings.TrimSpace(d.opt.StartTarget.URL) == "" {
 		return
 	}
-	parsedURL, parsedToken, defaultName, _, err := parseRemoteServerInput(d.opt.StartTarget.URL, d.opt.StartTarget.Token)
+	input, err := parseRemoteServerInput(d.opt.StartTarget.URL, d.opt.StartTarget.Token)
 	if err != nil {
 		d.startTargetError = err
 		return
 	}
 	target := &remoteServer{
 		ID:    "startup-remote",
-		Name:  defaultName,
-		URL:   parsedURL,
-		Token: parsedToken,
+		URL:   input.URL,
+		Token: input.Token,
+	}
+	if input.ExtractedToken && input.WorldTarget != nil && d.opt.StartTarget.IsOverride {
+		id := worldserver.GetNodeIDFromSignPublic(input.WorldTarget.PublicKey)
+		target.ID = id
+		idx := slices.IndexFunc(d.preferences.RemoteServers, func(s remoteServer) bool { return s.ID == id })
+		if idx < 0 {
+			d.preferences.RemoteServers = append(d.preferences.RemoteServers, *target)
+		} else {
+			saved := d.preferences.RemoteServers[idx]
+			if prior, err := parseRemoteServerInput(saved.URL, ""); err == nil && saved.Name != prior.DefaultName {
+				target.Name = saved.Name
+			}
+			d.preferences.RemoteServers[idx] = *target
+		}
+		d.preferences.ActiveServer = id
+		d.startTargetError = d.savePreferences()
+		return
 	}
 	if d.opt.StartTarget.IsOverride {
 		d.serverOverride = target
@@ -39,86 +57,67 @@ func (d *Desktop) applyStartTarget() {
 	d.defaultRemote = target
 }
 
-// getServerMenuItems 返回左下角状态栏服务器菜单条目：本机、已保存远端列表、分隔线和「管理服务器…」。
-func (d *Desktop) getServerMenuItems() []kit.MenuItem {
-	// 1. 判断当前激活项，按统一顺序列出本机和所有远端。
-	activeTarget, isLocal := d.getActiveServerTarget()
-	items := []kit.MenuItem{
-		{
-			Icon:  checkedIcon(isLocal),
-			Title: d.t("server.local"),
-			OnSelect: func() {
-				if !isLocal {
-					d.switchServer(localServerID)
-				}
-			},
-		},
+// serverMenuView 用与管理弹窗相同的双行条目显示服务器，方向键在条目间移动。
+func (d *Desktop) serverMenuView(c *ui.Context, trigger ui.Element) {
+	wasOpen := d.serverMenuOpen
+	if trigger.Clicked() || !wasOpen && (trigger.Shortcut(0, ui.KeyDown) || trigger.Shortcut(0, ui.KeyUp)) {
+		d.serverMenuOpen = !d.serverMenuOpen
 	}
-	// 2. 命令行 --url 或 config.yaml 默认远端正在生效时也在菜单里标出。
-	if d.serverOverride != nil {
-		label := d.serverOverride.Name
-		if label == "" {
-			label = getRemoteServerHost(d.serverOverride.URL)
+	var selectedRow ui.Element
+	kit.Popover(c, trigger, &d.serverMenuOpen, func() {
+		active, _ := d.getActiveServerTarget()
+		serverRow := func(id string, server *remoteServer) {
+			selected := server == active
+			row := d.serverRowView(c.Key(id), server, selected, nil).Role(ui.RoleMenuItemRadio).Checked(selected)
+			if selected {
+				selectedRow = row
+			}
+			if row.Clicked() {
+				d.serverMenuOpen = false
+				d.connectToServer(id, selected)
+			}
 		}
-		items = append(items, kit.MenuItem{
-			Icon:     kit.IconCheck,
-			Title:    label,
-			Shortcut: d.t("server.override.badge"),
-			OnSelect: func() {},
-		})
-	}
-	if d.defaultRemote != nil {
-		isDefaultActive := !isLocal && activeTarget != nil && d.serverOverride == nil && d.preferences.ActiveServer == ""
-		label := d.defaultRemote.Name
-		if label == "" {
-			label = getRemoteServerHost(d.defaultRemote.URL)
+		serverRow(localServerID, &d.localServer)
+		if d.serverOverride != nil {
+			serverRow(d.serverOverride.ID, d.serverOverride)
 		}
-		items = append(items, kit.MenuItem{
-			Icon:     checkedIcon(isDefaultActive),
-			Title:    label,
-			Shortcut: d.t("server.config.default"),
-			OnSelect: func() {
-				if !isDefaultActive {
-					d.switchServer("")
-				}
-			},
-		})
-	}
-	for _, server := range d.preferences.RemoteServers {
-		server := server
-		isActive := !isLocal && d.serverOverride == nil && d.preferences.ActiveServer == server.ID
-		title := server.Name
-		if title == "" {
-			title = getRemoteServerHost(server.URL)
+		if d.defaultRemote != nil {
+			serverRow("", d.defaultRemote)
 		}
-		items = append(items, kit.MenuItem{
-			Icon:     checkedIcon(isActive),
-			Title:    title,
-			Shortcut: getRemoteServerHost(server.URL),
-			OnSelect: func() {
-				if !isActive {
-					d.switchServer(server.ID)
-				}
-			},
-		})
+		for i := range d.preferences.RemoteServers {
+			server := &d.preferences.RemoteServers[i]
+			serverRow(server.ID, server)
+		}
+		kit.Separator(c)
+		if kit.ListRow(c.Key("manage"), kit.ListRowOpt{Title: d.t("server.manage.ellipsis")}).Role(ui.RoleMenuItem).Clicked() {
+			d.serverMenuOpen = false
+			d.openServersDialog()
+		}
+	}).Role(ui.RoleMenu).FocusGroup(ui.Vertical).MinWidth(160)
+	trigger.Expanded(d.serverMenuOpen)
+	if !wasOpen && d.serverMenuOpen {
+		selectedRow.Focus()
 	}
-	items = append(items,
-		kit.MenuItem{Separator: true},
-		kit.MenuItem{
-			Icon:     kit.IconPlus,
-			Title:    d.t("server.manage.ellipsis"),
-			OnSelect: func() { d.openServersDialog() },
-		},
-	)
-	return items
 }
 
-// checkedIcon 当前项被选中时返回勾选图标，否则留空但保留对齐槽位。
-func checkedIcon(selected bool) *ui.SVG {
-	if selected {
-		return kit.IconCheck
+// serverRowView 在切换器和管理列表显示同一台服务器的名字、地址和断线状态。
+func (d *Desktop) serverRowView(c *ui.Context, server *remoteServer, selected bool, trailing func()) ui.Element {
+	name, address := getServerDisplay(*server)
+	if selected && d.isServerDisconnected() {
+		address = cmp.Or(address, name) + " · " + d.t("server.disconnected")
 	}
-	return nil
+	return kit.ListRow(c, kit.ListRowOpt{
+		Title: name, Description: address, Selected: selected, Trailing: trailing,
+	}).Description(address)
+}
+
+// connectToServer 点已断开的当前行时重新连接，点另一行时切换服务器。
+func (d *Desktop) connectToServer(id string, selected bool) {
+	if !selected {
+		d.switchServer(id)
+	} else if d.isServerDisconnected() {
+		d.connect()
+	}
 }
 
 // openServersDialog 打开「管理服务器」弹窗并回到列表态。
@@ -142,9 +141,10 @@ func (d *Desktop) openServerForm(editing *remoteServer) {
 		EditingID: editing.ID,
 		Name:      editing.Name,
 		URL:       editing.URL,
-		Token:     editing.Token,
 		ParsedURL: editing.URL,
+		Token:     editing.Token,
 	}
+	d.handleServerAddressChanged()
 }
 
 // cancelServerTest 取消进行中的连接测试并清理结果提示。
@@ -192,61 +192,44 @@ func (d *Desktop) serversDialogView(c *ui.Context) {
 // serverListView 绘制「管理服务器」列表视图：本机默认项、远端列表、行内删除确认和底部操作。
 func (d *Desktop) serverListView(c *ui.Context) {
 	t := kit.GetTheme(c)
-	_, isLocal := d.getActiveServerTarget()
-	// 1. 服务器列表容器：本机与已保存远端用淡色分割线隔开。
+	active, _ := d.getActiveServerTarget()
+	// 1. 点击服务器行连接，远端档案的编辑和删除留在行尾。
 	ui.Column(c).Gap(0).Dividers(1, t.Colors.BorderSubtle).Children(func() {
-		kit.ListRow(c.Key("server-row-local"), kit.ListRowOpt{
-			Title: d.t("server.local"),
-			Trailing: func() {
-				if isLocal {
+		serverRow := func(id string, server *remoteServer, editable bool) {
+			selected := server == active
+			row := d.serverRowView(c.Key("server-row-"+id), server, selected, func() {
+				if selected {
 					kit.Badge(c, d.t("server.current"), kit.BadgeAccent)
-					return
 				}
-				if kit.Button(c.Key("switch-local-row"), d.t("server.switch")).Clicked() {
-					d.serversDialogOpen = false
-					d.switchServer(localServerID)
-				}
-			},
-		}).FillWidth()
-		for _, server := range d.preferences.RemoteServers {
-			server := server
-			isActive := !isLocal && d.serverOverride == nil && d.preferences.ActiveServer == server.ID
-			displayName := server.Name
-			if displayName == "" {
-				displayName = getRemoteServerHost(server.URL)
-			}
-			kit.ListRow(c.Key("server-row-"+server.ID), kit.ListRowOpt{
-				Title:       displayName,
-				Description: getRemoteServerHost(server.URL),
-				Trailing: func() {
-					if isActive {
-						kit.Badge(c, d.t("server.current"), kit.BadgeAccent)
-					} else if kit.Button(c.Key("switch-"+server.ID), d.t("server.switch")).Clicked() {
-						d.serversDialogOpen = false
-						d.switchServer(server.ID)
+				if editable {
+					if kit.Button(c.Key("edit-"+id), d.t("server.edit.action")).Clicked() {
+						d.openServerForm(server)
 					}
-					if kit.Button(c.Key("edit-"+server.ID), d.t("server.edit.action")).Clicked() {
-						d.openServerForm(&server)
-					}
-					if kit.Button(c.Key("delete-"+server.ID), d.t("delete")).Clicked() {
-						if isActive {
-							d.serverDeleteConfirmID = server.ID
+					if kit.Button(c.Key("delete-"+id), d.t("delete")).Clicked() {
+						if selected {
+							d.serverDeleteConfirmID = id
 						} else {
-							d.deleteRemoteServer(server.ID)
+							d.deleteRemoteServer(id)
 						}
 					}
-				},
+				}
 			}).FillWidth()
+			if row.Clicked() {
+				d.serversDialogOpen = false
+				d.connectToServer(id, selected)
+			}
+		}
+		serverRow(localServerID, &d.localServer, false)
+		saved := d.preferences.RemoteServers
+		for i := range saved {
+			serverRow(saved[i].ID, &saved[i], true)
 		}
 	})
 	// 2. 删除当前活跃服务器时的行内二次确认，避免叠双层弹窗。
 	if d.serverDeleteConfirmID != "" {
 		if index := slices.IndexFunc(d.preferences.RemoteServers, func(s remoteServer) bool { return s.ID == d.serverDeleteConfirmID }); index >= 0 {
 			target := d.preferences.RemoteServers[index]
-			name := target.Name
-			if name == "" {
-				name = getRemoteServerHost(target.URL)
-			}
+			name, _ := getServerDisplay(target)
 			kit.Callout(c.Key("delete-active-server-confirm"), kit.CalloutWarning, fmt.Sprintf(d.t("server.delete.active.confirm"), name), "", func() {
 				if kit.Button(c.Key("cancel-delete-server"), d.t("cancel")).Clicked() {
 					d.serverDeleteConfirmID = ""
@@ -275,16 +258,11 @@ func (d *Desktop) serverListView(c *ui.Context) {
 func (d *Desktop) serverFormView(c *ui.Context) {
 	t := kit.GetTheme(c)
 	// 1. 名称、连接地址与访问令牌。
-	kit.Field(c.Key("server-name-field"), kit.FieldOpt{Label: d.t("server.name")}, func() ui.Element {
-		return kit.TextInputWith(c.Key("server-name-input"), &d.serverForm.Name, kit.InputOpt{
-			Placeholder: d.t("server.name.placeholder"),
-		}).FillWidth().Label(d.t("server.name"))
-	})
 	kit.Field(c.Key("server-url-field"), kit.FieldOpt{Label: d.t("server.address"), Error: d.serverForm.URLError}, func() ui.Element {
 		input := kit.TextInputWith(c.Key("server-url-input"), &d.serverForm.URL, kit.InputOpt{
 			Placeholder: d.t("server.address.placeholder"),
 			Invalid:     d.serverForm.URLError != "",
-		}).FillWidth().Label(d.t("server.address"))
+		}).FillWidth()
 		if input.Changed() {
 			d.handleServerAddressChanged()
 		}
@@ -293,55 +271,61 @@ func (d *Desktop) serverFormView(c *ui.Context) {
 	if d.serverForm.ParsedURL != "" && d.serverForm.URLError == "" && d.serverForm.ParsedURL != strings.TrimSpace(d.serverForm.URL) {
 		kit.FieldMessage(c, kit.MessageDescription, "→ "+d.serverForm.ParsedURL)
 	}
-	kit.Field(c.Key("server-token-field"), kit.FieldOpt{Label: d.t("server.token")}, func() ui.Element {
-		return ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
-			tokenInput := kit.TextInputWith(c.Key("server-token-input"), &d.serverForm.Token, kit.InputOpt{}).Grow(1).Shrink(1).MinWidth(0).Label(d.t("server.token"))
-			if !d.serverForm.ShowToken {
-				tokenInput.Password()
-			}
-			if tokenInput.Changed() {
-				d.serverForm.TokenAutoFilled = false
-				d.serverTestSuccess = ""
-				d.serverTestError = nil
-			}
-			toggleLabel := d.t("server.token.show")
-			if d.serverForm.ShowToken {
-				toggleLabel = d.t("server.token.hide")
-			}
-			if kit.Button(c.Key("toggle-server-token"), toggleLabel).Shrink(0).Clicked() {
-				d.serverForm.ShowToken = !d.serverForm.ShowToken
-			}
-		})
+	kit.Field(c.Key("server-name-field"), kit.FieldOpt{Label: d.t("server.name")}, func() ui.Element {
+		return kit.TextInputWith(c.Key("server-name-input"), &d.serverForm.Name, kit.InputOpt{
+			Placeholder: d.t("server.name.placeholder"),
+		}).FillWidth().Label(d.t("server.name"))
 	})
-	if d.serverForm.TokenAutoFilled {
-		kit.FieldMessage(c, kit.MessageDescription, d.t("server.token.autofilled"))
+	if strings.TrimSpace(d.serverForm.URL) != "" && !d.serverForm.IsWorldLink {
+		kit.Field(c.Key("server-token-field"), kit.FieldOpt{Label: d.t("server.token")}, func() ui.Element {
+			return ui.Row(c).FillWidth().Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+				tokenInput := kit.TextInputWith(c.Key("server-token-input"), &d.serverForm.Token, kit.InputOpt{}).Grow(1).Shrink(1).MinWidth(0).Label(d.t("server.token"))
+				if !d.serverForm.ShowToken {
+					tokenInput.Password()
+				}
+				if tokenInput.Changed() {
+					d.serverTestSuccess = ""
+					d.serverTestError = nil
+				}
+				toggleLabel := d.t("server.token.show")
+				if d.serverForm.ShowToken {
+					toggleLabel = d.t("server.token.hide")
+				}
+				if kit.Button(c.Key("toggle-server-token"), toggleLabel).Shrink(0).Clicked() {
+					d.serverForm.ShowToken = !d.serverForm.ShowToken
+				}
+			})
+		})
 	}
-	// 2. 独立测试连接区：不打断当前主连接。
-	ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Padding(t.Space(1), 0, 0, 0).Children(func() {
-		testLabel := d.t("server.test")
-		if d.serverTestPending {
-			testLabel = d.t("server.testing")
-		}
-		if kit.Button(c.Key("test-server-connection"), testLabel).Disabled(d.serverTestPending || strings.TrimSpace(d.serverForm.URL) == "").Clicked() {
-			d.startServerConnectionTest()
-		}
-		if d.serverTestPending {
-			kit.Spinner(c, kit.IconSizeDefault)
-		} else if d.serverTestSuccess != "" {
+	// 2. 握手结果在底部操作区上方显示。
+	if d.serverTestSuccess != "" {
+		ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
 			kit.StatusDot(c, t.Colors.Success)
 			t.TextRole(ui.Text(c, d.serverTestSuccess), kit.TextCaption).TextColor(t.Colors.Success).Shrink(1)
-		}
-	})
+		})
+	}
 	if d.serverTestError != nil {
 		d.errorMessageView(c, d.serverTestError)
 	}
-	// 3. 底部动作：返回、仅保存、保存并切换。
+	// 3. 左侧测试地址与令牌，右侧返回或保存。
 	ui.Row(c).Justify(ui.SpaceBetween).AlignItems(ui.Center).Padding(t.Space(2), 0, 0, 0).Gap(t.Space(2)).Children(func() {
-		if kit.Button(c.Key("server-form-back"), d.t("server.back")).Clicked() {
-			d.cancelServerTest()
-			d.serverFormOpen = false
-		}
 		ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+			testLabel := d.t("server.test")
+			if d.serverTestPending {
+				testLabel = d.t("server.testing")
+			}
+			if kit.Button(c.Key("test-server-connection"), testLabel).Disabled(d.serverTestPending || strings.TrimSpace(d.serverForm.URL) == "").Clicked() {
+				d.startServerConnectionTest()
+			}
+			if d.serverTestPending {
+				kit.Spinner(c, kit.IconSizeDefault)
+			}
+		})
+		ui.Row(c).Gap(t.Space(2)).AlignItems(ui.Center).Children(func() {
+			if kit.Button(c.Key("server-form-back"), d.t("server.back")).Clicked() {
+				d.cancelServerTest()
+				d.serverFormOpen = false
+			}
 			if kit.Button(c.Key("server-save-only"), d.t("server.save.only")).Disabled(strings.TrimSpace(d.serverForm.URL) == "").Clicked() {
 				d.saveServerForm(false)
 			}
@@ -356,71 +340,51 @@ func (d *Desktop) serverFormView(c *ui.Context) {
 func (d *Desktop) handleServerAddressChanged() {
 	d.serverTestSuccess = ""
 	d.serverTestError = nil
-	if strings.TrimSpace(d.serverForm.URL) == "" {
-		d.serverForm.ParsedURL = ""
-		d.serverForm.URLError = ""
-		return
-	}
-	parsedURL, parsedToken, _, extractedToken, err := parseRemoteServerInput(d.serverForm.URL, d.serverForm.Token)
-	if err != nil {
-		d.serverForm.ParsedURL = ""
-		d.serverForm.URLError = err.Error()
-		return
-	}
+	previousURL := d.serverForm.ParsedURL
+	input, err := parseRemoteServerInput(d.serverForm.URL, d.serverForm.Token)
+	d.serverForm.ParsedURL = input.URL
+	d.serverForm.IsWorldLink = input.WorldTarget != nil
 	d.serverForm.URLError = ""
-	d.serverForm.ParsedURL = parsedURL
-	if extractedToken {
-		d.serverForm.URL = parsedURL
-		d.serverForm.Token = parsedToken
-		d.serverForm.TokenAutoFilled = true
+	if err != nil && strings.TrimSpace(d.serverForm.URL) != "" {
+		d.serverForm.URLError = err.Error()
+	}
+	if input.ExtractedToken {
+		d.serverForm.URL = input.URL
+		d.serverForm.Token = input.Token
+	} else if previousURL != input.URL {
+		d.serverForm.Token = ""
+	}
+	if target := input.WorldTarget; target != nil && strings.TrimSpace(d.serverForm.Name) == "" {
+		d.serverForm.Name = target.Name
 	}
 }
 
 // saveServerForm 校验并保存表单中的远端服务器档案；switchNow 为真时保存后立刻切换过去。
 func (d *Desktop) saveServerForm(switchNow bool) {
-	parsedURL, parsedToken, _, _, err := parseRemoteServerInput(d.serverForm.URL, d.serverForm.Token)
+	input, err := parseRemoteServerInput(d.serverForm.URL, d.serverForm.Token)
 	if err != nil {
 		d.serverForm.URLError = err.Error()
 		return
 	}
 	d.serverForm.URLError = ""
-	d.serverForm.ParsedURL = parsedURL
 	name := strings.TrimSpace(d.serverForm.Name)
 	id := d.serverForm.EditingID
 	if id == "" {
 		id = newRemoteServerID(d.preferences.RemoteServers)
-		d.preferences.RemoteServers = append(d.preferences.RemoteServers, remoteServer{
-			ID:    id,
-			Name:  name,
-			URL:   parsedURL,
-			Token: parsedToken,
-		})
+	}
+	server := remoteServer{ID: id, Name: name, URL: input.URL, Token: input.Token}
+	index := slices.IndexFunc(d.preferences.RemoteServers, func(saved remoteServer) bool { return saved.ID == id })
+	if index >= 0 {
+		if saved := d.preferences.RemoteServers[index]; saved.URL == server.URL {
+			server.NodeAddr = saved.NodeAddr
+		}
+		d.preferences.RemoteServers[index] = server
 	} else {
-		updated := false
-		for i := range d.preferences.RemoteServers {
-			if d.preferences.RemoteServers[i].ID == id {
-				d.preferences.RemoteServers[i] = remoteServer{
-					ID:    id,
-					Name:  name,
-					URL:   parsedURL,
-					Token: parsedToken,
-				}
-				updated = true
-				break
-			}
-		}
-		if !updated {
-			d.preferences.RemoteServers = append(d.preferences.RemoteServers, remoteServer{
-				ID:    id,
-				Name:  name,
-				URL:   parsedURL,
-				Token: parsedToken,
-			})
-		}
+		d.preferences.RemoteServers = append(d.preferences.RemoteServers, server)
 	}
 	d.cancelServerTest()
 	d.savePreferencesWithToast()
-	d.showSuccess(d.t("server.saved"), name)
+	d.showSuccess(d.t("server.saved"), cmp.Or(name, input.DefaultName))
 	if switchNow {
 		d.serversDialogOpen = false
 		d.serverFormOpen = false
@@ -444,10 +408,7 @@ func (d *Desktop) deleteRemoteServer(id string) {
 	d.preferences.RemoteServers = slices.Delete(d.preferences.RemoteServers, index, index+1)
 	wasActive := d.serverOverride == nil && d.preferences.ActiveServer == id
 	d.savePreferencesWithToast()
-	name := removed.Name
-	if name == "" {
-		name = getRemoteServerHost(removed.URL)
-	}
+	name, _ := getServerDisplay(removed)
 	d.showSuccess(d.t("server.deleted"), name)
 	if wasActive {
 		d.serversDialogOpen = false
@@ -455,23 +416,26 @@ func (d *Desktop) deleteRemoteServer(id string) {
 	}
 }
 
-// startServerConnectionTest 用独立临时 Client 对表单地址做一次 10 秒超时的连通与协议握手测试。
+// startServerConnectionTest 用独立临时 Client 在拨号和初始化预算内测试表单中的服务器。
 func (d *Desktop) startServerConnectionTest() {
-	parsedURL, parsedToken, _, _, err := parseRemoteServerInput(d.serverForm.URL, d.serverForm.Token)
+	input, err := parseRemoteServerInput(d.serverForm.URL, d.serverForm.Token)
 	if err != nil {
 		d.serverForm.URLError = err.Error()
 		return
 	}
 	d.serverForm.URLError = ""
-	d.serverForm.ParsedURL = parsedURL
 	d.cancelServerTest()
-	testCtx, testCancel := context.WithTimeout(d.ctx, serverTestTimeout)
+	timeout := serverTestTimeout
+	if input.WorldTarget != nil {
+		timeout = input.WorldTarget.ConnectionTimeout()
+	}
+	testCtx, testCancel := context.WithTimeout(d.ctx, timeout)
 	d.serverTestCancel = testCancel
 	d.serverTestRequest++
 	request := d.serverTestRequest
 	d.serverTestPending = true
 	d.tasks.Go(func() {
-		err := testRemoteServerConnection(testCtx, parsedURL, parsedToken)
+		err := testRemoteServerConnection(testCtx, input)
 		testCancel()
 		if d.window == nil {
 			return
@@ -494,9 +458,10 @@ func (d *Desktop) startServerConnectionTest() {
 }
 
 // testRemoteServerConnection 建立临时 Client 执行一次 initialize 握手，成功或首轮失败后立即关闭连接。
-func testRemoteServerConnection(ctx context.Context, serverURL, token string) error {
+func testRemoteServerConnection(ctx context.Context, input remoteServerInput) error {
 	// 1. 创建独立临时 Client，不干扰主工作区连接。
-	opt := runtimeclient.NewClientOpt(serverURL, token)
+	opt := runtimeclient.NewClientOpt(input.URL, input.Token)
+	opt.WorldTarget = input.WorldTarget
 	opt.FailRequestsWhenDisconnected = true
 	opt.DisableSubmitInputRetry = true
 	client, err := runtimeclient.NewClient(opt)

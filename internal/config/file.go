@@ -2,10 +2,13 @@ package config
 
 import (
 	"bufio"
+	"cmp"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,6 +19,8 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/world"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,13 +30,84 @@ import (
 type ConfigFiles struct {
 	// DataDirectory 保存运行中服务的数据目录，重载时继续使用。
 	DataDirectory string
-	opt           LoadConfigOpt
+	// ExtraTools 在配置重载和写后重建时继续使用启动时装配的工具。
+	ExtraTools executor.ToolProvider
+	opt        LoadConfigOpt
 }
 
 // NewConfigFiles 创建 ConfigFiles，保存一份配置加载参数。
 func NewConfigFiles(opt *LoadConfigOpt) *ConfigFiles {
 	// 1. 复制参数，之后的读写都用同一个路径和 flag。
 	return &ConfigFiles{opt: *opt}
+}
+
+// GetAgent 按名读取可编辑的 Agent 定义；default 没有文件时返回内置定义。
+func (f *ConfigFiles) GetAgent(_ context.Context, name string) (*defs.AgentConfig, error) {
+	if !isValidID(name) {
+		return nil, fmt.Errorf("agent %q is not configured", name)
+	}
+	cfg, _, err := LoadConfigSettings(&f.opt)
+	if err != nil {
+		return nil, err
+	}
+	definition, err := loadAgentDefinition(filepath.Join(cfg.Agents.Directory, name+".yaml"))
+	if errors.Is(err, os.ErrNotExist) {
+		if name == defaultAgentName {
+			return newBuiltinDefaultAgent(), nil
+		}
+		return nil, fmt.Errorf("agent %q is not configured", name)
+	}
+	return definition, err
+}
+
+// SetAgent 原子写入整份 Agent 配置并重载。
+func (f *ConfigFiles) SetAgent(ctx context.Context, definition defs.AgentConfig) (*runtime.Definitions, error) {
+	if !isValidID(definition.Name) {
+		return nil, errors.New("invalid agent name")
+	}
+	cfg, err := LoadConfig(&f.opt)
+	if err != nil {
+		return nil, err
+	}
+	content, err := encodeYAML(&definition)
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(cfg.Agents.Directory, definition.Name+".yaml")
+	original, err := readOriginalFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFileAtomic(path, content); err != nil {
+		return nil, err
+	}
+	return f.reloadOrRestore(ctx, original)
+}
+
+// DeleteAgent 删除 Agent 文件并重载。
+func (f *ConfigFiles) DeleteAgent(ctx context.Context, name string) (*runtime.Definitions, error) {
+	if name == defaultAgentName {
+		return nil, errors.New("agent default cannot be deleted")
+	}
+	if !isValidID(name) {
+		return nil, errors.New("invalid agent name")
+	}
+	cfg, err := LoadConfig(&f.opt)
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(cfg.Agents.Directory, name+".yaml")
+	original, err := readOriginalFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if !original.existed {
+		return nil, fmt.Errorf("agent %q is not configured", name)
+	}
+	if err := os.Remove(path); err != nil {
+		return nil, &Error{Path: path, Reason: "cannot remove file"}
+	}
+	return f.reloadOrRestore(ctx, original)
 }
 
 // ListProviders 按 ID 顺序返回各 Provider 文件里原样的配置、当前默认模型和模型默认配置。
@@ -449,7 +525,7 @@ func unquoteSSHConfigValue(value string) string {
 // getDefaultModelEdit 读取配置文件，返回原文件和改了 default_model 之后的内容；默认模型没变时都返回 nil。
 func (f *ConfigFiles) getDefaultModelEdit(ref defs.ModelRef) (*originalFile, []byte, error) {
 	// 1. 找到配置文件并记下原内容，默认模型没变时直接返回。
-	path, _, err := GetConfigPath(f.opt.Home, f.opt.Path)
+	path, err := GetConfigPath(f.opt.Home, f.opt.Path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -471,10 +547,168 @@ func (f *ConfigFiles) getDefaultModelEdit(ref defs.ModelRef) (*originalFile, []b
 	return original, content, nil
 }
 
+// GetWorldSettings 读取实际保存的选项；未入网时建议使用本机主机名。
+func (f *ConfigFiles) GetWorldSettings() (WorldSettings, error) {
+	cfg, _, err := LoadConfigSettings(&f.opt)
+	if err != nil {
+		return WorldSettings{}, err
+	}
+	node, server := cfg.World.Node, cfg.World.Server
+	name, err := world.GetJoinNodeName(node.Name)
+	if err != nil {
+		return WorldSettings{}, err
+	}
+	_, err = os.Stat(filepath.Join(cmp.Or(f.DataDirectory, cfg.GetDataDirectory()), "worldserver", "world.db"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return WorldSettings{}, err
+	}
+	return WorldSettings{
+		RemoteAccess: cfg.World.RemoteAccess,
+		Relays:       append([]string{}, cfg.World.Relays...), RelayMode: cfg.World.RelayMode, WebURL: cfg.World.WebURL,
+		Node: WorldNodeSettings{
+			Enabled: node.Enabled, Name: name, Domain: node.Domain, ServerURL: node.ServerURL,
+			DirectURLs:       append([]string{}, node.DirectURLs...),
+			DefaultTarget:    node.DefaultTarget,
+			AdvertiseTargets: append([]worldserver.AdvertisedTarget{}, node.AdvertiseTargets...),
+		},
+		Server: WorldServerSettings{Enabled: server.Enabled, Domain: server.Domain, IsDatabaseCreated: err == nil},
+	}, nil
+}
+
+// PrepareWorldSettings 校验待保存的字段，入网时由控制面在注册后确定节点身份。
+func (f *ConfigFiles) PrepareWorldSettings(settings WorldSettings, joining bool) (*WorldSettingsUpdate, error) {
+	cfg, err := LoadConfig(&f.opt)
+	if err != nil {
+		return nil, err
+	}
+	top := map[string]any{}
+	if settings.RemoteAccess != cfg.World.RemoteAccess {
+		top["remote_access"] = settings.RemoteAccess
+	}
+	if settings.RelayMode != cfg.World.RelayMode {
+		top["relay_mode"] = settings.RelayMode
+	}
+	if settings.WebURL != cfg.World.WebURL {
+		top["web_url"] = settings.WebURL
+	}
+	if !slices.Equal(settings.Relays, cfg.World.Relays) {
+		top["relays"] = settings.Relays
+	}
+	cfg.World.Relays, cfg.World.RelayMode, cfg.World.WebURL = settings.Relays, settings.RelayMode, settings.WebURL
+	n := &cfg.World.Node
+	fields := map[string]any{"default_target": settings.Node.DefaultTarget}
+	// 未编辑的列表保留原 YAML 节点及各行注释。
+	if !slices.Equal(n.DirectURLs, settings.Node.DirectURLs) {
+		fields["direct_urls"] = settings.Node.DirectURLs
+	}
+	if !slices.Equal(n.AdvertiseTargets, settings.Node.AdvertiseTargets) {
+		fields["advertise_targets"] = settings.Node.AdvertiseTargets
+	}
+	n.Enabled = settings.Node.Enabled && !joining
+	n.DirectURLs = settings.Node.DirectURLs
+	n.DefaultTarget = settings.Node.DefaultTarget
+	n.AdvertiseTargets = settings.Node.AdvertiseTargets
+	cfg.World.Server.Enabled, cfg.World.Server.Domain = settings.Server.Enabled, settings.Server.Domain
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.World.Server.Domain != "" && !worldserver.IsValidDomain(cfg.World.Server.Domain) {
+		return nil, errors.New("world server requires a valid domain and a non-empty admin token")
+	}
+	targets := cfg.WorldNodeWithDefaults()
+	for _, target := range targets.AdvertiseTargets {
+		if cfg.agentDefinitions[target.Name] == nil {
+			return nil, fmt.Errorf("unknown agent %s in world settings", target.Name)
+		}
+	}
+	if targets.DefaultTarget != "" && cfg.agentDefinitions[targets.DefaultTarget] == nil {
+		return nil, fmt.Errorf("unknown agent %s in world settings", targets.DefaultTarget)
+	}
+	if err := world.ValidateAdvertisedTargets(targets.DefaultTarget, targets.AdvertiseTargets); err != nil {
+		return nil, err
+	}
+	return &WorldSettingsUpdate{NodeEnabled: settings.Node.Enabled, fields: top, node: fields, server: settings.Server}, nil
+}
+
+// SaveWorldSettings 将已校验的设置与控制面返回的注册信息一次写回。
+func (f *ConfigFiles) SaveWorldSettings(update *WorldSettingsUpdate, join *worldserver.RegisterNodeResponse, serverURL string) error {
+	update.node["enabled"] = update.NodeEnabled
+	if join != nil {
+		update.node["name"], update.node["domain"], update.node["server_url"] = join.NodeName, join.Domain, serverURL
+	}
+	if err := f.writeWorldSettings(update.fields, map[string]map[string]any{"node": update.node, "server": {"enabled": update.server.Enabled, "domain": update.server.Domain}}); err != nil {
+		return fmt.Errorf("save world settings: %w", err)
+	}
+	return nil
+}
+
+// SetWorldNodeRegistration 写入注册结果，保留其他配置及节点开放目标。
+func (f *ConfigFiles) SetWorldNodeRegistration(name, domain, serverURL string) error {
+	// 1. 启用节点并记录远端已确认的名称、域名和控制面地址。
+	return f.writeWorldSettings(nil, map[string]map[string]any{"node": {"enabled": true, "name": name, "domain": domain, "server_url": serverURL}})
+}
+
+// SetWorldAdminToken 将首次生成的控制面管理凭据保存到私有配置文件。
+func (f *ConfigFiles) SetWorldAdminToken(token string) error {
+	// 1. 只更新控制面管理凭据。
+	return f.writeWorldSettings(nil, map[string]map[string]any{"server": {"admin_token": token}})
+}
+
+func (f *ConfigFiles) writeWorldSettings(top map[string]any, sections map[string]map[string]any) error {
+	// 1. 读取原配置，在缺少配置时创建空文档。
+	path, err := GetConfigPath(f.opt.Home, f.opt.Path)
+	if err != nil {
+		return err
+	}
+	original, err := readOriginalFile(path)
+	if err != nil {
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(original.content, &doc); err != nil {
+		return err
+	}
+	if len(doc.Content) == 0 {
+		doc.Kind = yaml.DocumentNode
+		doc.Content = []*yaml.Node{{HeadComment: string(original.content)}}
+	}
+	// 2. 仅更新本次操作涉及的字段，原子写回权限为 0600 的文件。
+	root := doc.Content[0]
+	toBlockMapping(root)
+	world := getOrAddMappingEntry(root, "world")
+	toBlockMapping(world)
+	writeFields := func(group *yaml.Node, values map[string]any) error {
+		for _, key := range slices.Sorted(maps.Keys(values)) {
+			entry := getOrAddMappingEntry(group, key)
+			head, line, foot := entry.HeadComment, entry.LineComment, entry.FootComment
+			if err := entry.Encode(values[key]); err != nil {
+				return err
+			}
+			entry.HeadComment, entry.LineComment, entry.FootComment = head, line, foot
+		}
+		return nil
+	}
+	if err := writeFields(world, top); err != nil {
+		return err
+	}
+	for _, section := range slices.Sorted(maps.Keys(sections)) {
+		group := getOrAddMappingEntry(world, section)
+		toBlockMapping(group)
+		if err := writeFields(group, sections[section]); err != nil {
+			return err
+		}
+	}
+	content, err := encodeYAML(&doc)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, content)
+}
+
 // getDefaultModelRemoval 默认模型属于 providerID 时，返回原配置文件和去掉 default_model 之后的内容；否则都返回 nil。
 func (f *ConfigFiles) getDefaultModelRemoval(providerID string) (*originalFile, []byte, error) {
 	// 1. 找到配置文件并记下原内容，默认模型解析不了或不属于这个 Provider 时直接返回。
-	path, _, err := GetConfigPath(f.opt.Home, f.opt.Path)
+	path, err := GetConfigPath(f.opt.Home, f.opt.Path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -507,7 +741,12 @@ func (f *ConfigFiles) Reload(ctx context.Context) (*runtime.Definitions, error) 
 	if f.DataDirectory != "" {
 		cfg.DataDirectory = f.DataDirectory
 	}
-	return cfg.GetRuntimeDefinitions(ctx)
+	definitions, err := cfg.GetRuntimeDefinitions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	definitions.ExtraTools = f.ExtraTools
+	return definitions, nil
 }
 
 // reloadOrRestore 重新加载改过的配置；加载失败时把 originals 逐个恢复。
@@ -701,7 +940,7 @@ func InitConfig(opt *LoadConfigOpt) (string, error) {
 	if opt == nil {
 		return "", errors.New("configuration options are required")
 	}
-	path, _, err := GetConfigPath(opt.Home, opt.Path)
+	path, err := GetConfigPath(opt.Home, opt.Path)
 	if err != nil {
 		return "", err
 	}
@@ -836,4 +1075,31 @@ func writeFileAtomic(path string, content []byte) error {
 		}
 	}
 	return nil
+}
+
+// ConfiguredTokenDigest 标记手工配置的令牌是否在重置后发生过更改。
+func ConfiguredTokenDigest(token string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(token)))
+}
+
+// SaveRuntimeToken 原子更新本机连接文件，保留地址、服务标识和可执行文件信息。
+func SaveRuntimeToken(path, configuredToken, token string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var fields map[string]any
+	if err := yaml.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return errors.New("empty runtime server file")
+	}
+	fields["token"] = token
+	fields["reset_for"] = ConfiguredTokenDigest(configuredToken)
+	data, err = yaml.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, data)
 }

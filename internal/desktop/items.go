@@ -333,7 +333,7 @@ func (d *Desktop) userMessageView(c *ui.Context, view viewItem, columnWidth floa
 	canFork := item.TurnID != "" && view.Ordinal != 0 && d.readingTarget.SessionID == d.conversation.RootSessionID
 	textParts := make([]string, 0, len(item.Message.Content))
 	contextParts := make([]*defs.TextContent, 0)
-	images := make([]*defs.ImageContent, 0)
+	attachments := make([]*defs.Content, 0)
 	for _, part := range item.Message.Content {
 		if part == nil {
 			continue
@@ -345,8 +345,8 @@ func (d *Desktop) userMessageView(c *ui.Context, view viewItem, columnWidth floa
 				textParts = append(textParts, part.Text.Text)
 			}
 		}
-		if part.Image != nil {
-			images = append(images, part.Image)
+		if part.Image != nil || part.File != nil {
+			attachments = append(attachments, part)
 		}
 	}
 	text := strings.Join(textParts, "\n")
@@ -410,7 +410,7 @@ func (d *Desktop) userMessageView(c *ui.Context, view viewItem, columnWidth floa
 				}
 			}
 		}
-		if long || len(images) > 0 || len(contextParts) > 0 {
+		if long || len(attachments) > 0 || len(contextParts) > 0 {
 			ui.Column(c).MinWidth(0).Padding(0, t.Space(3)).Gap(t.Space(2)).Children(func() {
 				if long {
 					label := d.t("expand")
@@ -421,9 +421,7 @@ func (d *Desktop) userMessageView(c *ui.Context, view viewItem, columnWidth floa
 						open = !open
 					}
 				}
-				for _, img := range images {
-					d.imageView(c, img.DataURL, img.Alt, 240)
-				}
+				d.attachmentStrip(c, attachments, nil)
 				for index, ctxPart := range contextParts {
 					ctxKey := fmt.Sprintf("user-context:%s:%d", item.ID, index)
 					ctxOpen := d.itemExpanded[ctxKey]

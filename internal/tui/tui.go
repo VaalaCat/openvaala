@@ -1,5 +1,5 @@
 // Package tui 是 OpenVaala 的终端界面：inline 模式，已定稿的内容按顺序写进终端 scrollback，横向缩放时按新宽度重建，
-// 底部实时区域每帧重绘尾部或面板、状态行、排队预览、输入框与 footer；只通过 runtimeclient 与 Runtime 交互。
+// 底部实时区域每帧重绘尾部或面板、状态行、排队预览、输入框与 footer。
 package tui
 
 import (
@@ -21,6 +21,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
+	"github.com/VaalaCat/openvaala/pkg/world"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -97,6 +98,8 @@ func (t *tuiImpl) Run(ctx context.Context) error {
 	opt := t.opt
 	markdownStyle, background := resolveTerminalAppearance(opt.MarkdownStyle, opt.Input, opt.Output)
 	opt.MarkdownStyle = markdownStyle
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	program := tea.NewProgram(newTUIModel(ctx, &opt, background), tea.WithContext(ctx), tea.WithInput(opt.Input), tea.WithOutput(opt.Output))
 	// 2. 运行事件循环；上下文结束时正常返回，其他程序错误原样返回，正常退出时返回重建画面时记下的终端错误。
 	model, err := program.Run()
@@ -121,7 +124,10 @@ type tuiModel struct {
 	// hasWindowSize 是否收到过终端尺寸？首次尺寸通知只初始化布局，之后横向缩放才重建 scrollback。
 	hasWindowSize bool
 
-	connection runtimeclient.ConnectionChanged
+	connection        runtimeclient.ConnectionChanged
+	worldStatus       world.NodeStatus
+	worldStatusSeq    int
+	cancelWorldStatus context.CancelFunc
 	// isLocalServer 当前连上的是否本机 serve？每次连上时按 ConnectionChanged.ServerID 与 TUIOpt.LocalServerID 比较。
 	isLocalServer bool
 	// hasConnected 是否连上过 serve？第一次连上时初始化草稿设置，之后重连不再重置。
@@ -156,8 +162,11 @@ type tuiModel struct {
 	skills []skill.SkillInfo
 	// skillListSeq 是最近一次 Skill 目录查询的序号，切换对话前发出的查询结果按它丢弃。
 	skillListSeq int
-	// commands 是静态注册的命令表。
-	commands []command
+	// commands 是当前会话可用的斜杠命令。
+	commands          []command
+	externalModel     defs.ModelRef
+	historyRestoring  bool
+	historyRestoreErr error
 	// slashCursor 是 slash 弹窗中选中的命令。
 	slashCursor int
 	// isSlashDismissed slash 弹窗是否被 Esc 关掉了？输入框内容或光标变化后重新打开。
@@ -170,7 +179,7 @@ type tuiModel struct {
 	expandView *expandView
 	// isLeavingExpandView 展开视图是否已关闭、但终端还没退出全屏？期间定稿行继续暂存，收到 expandViewLeftMsg 后写出。
 	isLeavingExpandView bool
-	// shouldLoadHistory 同步完成后是否要用这个对话已保存的用户输入初始化输入历史？只在 /resume 打开已有对话时为 true。
+	// shouldLoadHistory 是否由 /resume 请求在就绪后初始化输入历史？外部快照每次就绪时都会替换。
 	shouldLoadHistory bool
 	// sessionStatuses、queuedInputs 属于当前对话，切换对话时重建；草稿时是空的。
 	sessionStatuses *sessionStatuses
@@ -181,8 +190,8 @@ type tuiModel struct {
 	agentDefaultModel defs.ModelRef
 	// draftModel 是草稿里在 /model 选择、新建对话时带上的模型，零值表示用 Agent 默认模型。
 	draftModel defs.ModelSelection
-	// isModelListEmpty 最近一次拉到的 model/list 是否没有任何模型？是时状态行一直提示用 /provider 添加。
-	isModelListEmpty bool
+	// shouldSuggestModelProvider 是否已确认没有本机模型和外部 Agent？
+	shouldSuggestModelProvider bool
 	// hasDismissedProviderOnboarding 本次运行里用户是否按 Esc 关掉过 /provider 面板？关掉后再连上没有模型的 serve 也不自动打开引导。
 	hasDismissedProviderOnboarding bool
 	// modelSetSeq 是最近一次 setSessionModel 请求的序号，结果序号不同时丢弃。
@@ -204,7 +213,7 @@ type tuiModel struct {
 	pendingPrints []string
 	// isPrintingScrollback 是否有一批定稿输出或画面重建还没完成？期间新的定稿行和重建都等它完成。
 	isPrintingScrollback bool
-	// shouldRebuildScrollback 是否有横向缩放还没重建？展开视图内暂存，返回 inline 后处理。
+	// shouldRebuildScrollback 横向缩放或替换历史页后是否还需要重绘终端？展开视图关闭后继续。
 	shouldRebuildScrollback bool
 	// terminalError 是重建画面时写终端失败的错误，记下后界面退出，Run 返回它。
 	terminalError error
@@ -244,7 +253,6 @@ func newTUIModel(ctx context.Context, opt *TUIOpt, background color.Color) *tuiM
 		height:            defaultHeight,
 		styles:            styles,
 		connection:        runtimeclient.ConnectionChanged{State: runtimeclient.ConnectionConnecting},
-		commands:          newCommands(),
 		composer:          newComposer(styles),
 		renderer:          mustNewMarkdownRenderer(opt.MarkdownStyle, defaultWidth),
 		modelDisplayNames: make(map[defs.ModelRef]string),
@@ -323,6 +331,8 @@ func (m *tuiModel) update(msg tea.Msg) tea.Cmd {
 		return m.handleExecutorSettingsSet(msg)
 	case panelResultMsg:
 		return m.handlePanelResult(msg)
+	case worldStatusLoadedMsg:
+		return m.handleWorldStatusLoaded(msg)
 	case spinner.TickMsg:
 		return m.handleSpinnerTick(msg)
 	case turnInterruptedMsg:
@@ -363,6 +373,9 @@ func (m *tuiModel) View() tea.View {
 	// 2. 计算尾部、面板、状态、队列、弹窗和输入块的行数预算。
 	matches := m.getSlashMatches()
 	body := m.transcript.getLiveLines(m.spinner.View())
+	if hint := m.getHistoryRestoreHint(); hint != "" {
+		body = append(body, hint)
+	}
 	wantedBody := len(body)
 	if m.activePanel != nil {
 		wantedBody = m.height * panelHeightPercent / 100
@@ -406,9 +419,11 @@ func (m *tuiModel) View() tea.View {
 	}
 	m.lastLiveHeight = len(lines)
 	view := tea.NewView(strings.Join(lines, "\n"))
-	if cursor := m.composer.getCursor(); cursor != nil {
-		cursor.Y += composerTop
-		view.Cursor = cursor
+	if _, isContactsPanel := m.activePanel.(*worldPanel); !isContactsPanel {
+		if cursor := m.composer.getCursor(); cursor != nil {
+			cursor.Y += composerTop
+			view.Cursor = cursor
+		}
 	}
 	return view
 }
@@ -567,7 +582,7 @@ func (m *tuiModel) handleGlobalKey(msg tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 	// 2. 其他按键执行命令表中当前可用的快捷命令。
-	for _, each := range m.commands {
+	for _, each := range newCommands() {
 		if each.key == key && each.isAvailable(m) {
 			return each.run(m, "")
 		}
@@ -643,8 +658,9 @@ func (m *tuiModel) handleClientEvent(event runtimeclient.ClientEvent) tea.Cmd {
 	// 1. 连接事件更新连接状态，连上后查询 Executor 与模型，首次连上时初始化草稿目录。
 	if changed, ok := event.(*runtimeclient.ConnectionChanged); ok {
 		m.connection = *changed
+		m.resetWorldStatus()
 		if changed.State == runtimeclient.ConnectionConnected {
-			return m.handleConnected(changed.ServerID)
+			return tea.Batch(m.handleConnected(changed.ServerID), m.loadWorldStatus(0))
 		}
 		return nil
 	}
@@ -656,7 +672,7 @@ func (m *tuiModel) handleClientEvent(event runtimeclient.ClientEvent) tea.Cmd {
 	case *runtimeclient.ConversationTitleChanged:
 		m.handleConversationTitleChanged(event.Title)
 	case *runtimeclient.ConversationSyncFailed:
-		return m.leaveFailedConversation(event.Err)
+		return m.handleConversationOpenFailed(event.Err)
 	case *runtimeclient.ConversationSynced:
 		// 已经有根 Session 运行信息时这是重新同步：订阅被关闭过（serve 给对话换了配置或重连），打开后的第一次同步不算。
 		_, isResynced := m.sessionStatuses.getRoot()
@@ -678,7 +694,28 @@ func (m *tuiModel) handleClientEvent(event runtimeclient.ClientEvent) tea.Cmd {
 		if event.Info.Session.ID == m.conversation.RootSessionID {
 			m.queuedInputs.handleRootChanged(event.Info)
 		}
+	case *runtimeclient.SessionExternalStateChanged:
+		if event.SessionID == m.conversation.RootSessionID {
+			root, _ := m.sessionStatuses.getRoot()
+			m.externalModel = runtimeclient.GetExternalModelRef(root.Session.AgentName, &event.Options)
+			m.commands = newExternalCommands(event.Commands)
+		}
 	case *runtimeclient.SessionSynced:
+		if event.External {
+			m.commands = newExternalCommands(event.Commands)
+			root, _ := m.sessionStatuses.getRoot()
+			m.externalModel = runtimeclient.GetExternalModelRef(root.Session.AgentName, event.Options)
+		}
+		m.historyRestoreErr = nil
+		m.historyRestoring = event.HistoryAction == runtimeclient.HistoryWait
+		switch event.HistoryAction {
+		case runtimeclient.HistoryWait:
+			return nil
+		case runtimeclient.HistoryReplace:
+			m.resetTranscript()
+			m.shouldRebuildScrollback = true
+			m.shouldLoadHistory = true
+		}
 		root, _ := m.sessionStatuses.getRoot()
 		m.print(m.transcript.handleSessionSynced(event, root.ActiveTurnID)...)
 		m.queuedInputs.handleItemsSaved(event.Items)
@@ -705,7 +742,7 @@ func (m *tuiModel) handleClientEvent(event runtimeclient.ClientEvent) tea.Cmd {
 // submitComposer 提交输入框内容，草稿输入先进入新建对话流程。
 func (m *tuiModel) submitComposer(mode session.SessionInputMode) tea.Cmd {
 	// 1. 忽略空白输入，取出待提交文字；已打开且不在新建流程时直接提交。
-	if m.composer.isBlank() {
+	if m.historyRestoreErr != nil || m.composer.isBlank() {
 		return nil
 	}
 	text := m.composer.takeSubmission()
@@ -969,20 +1006,30 @@ func (m *tuiModel) handleConversationForked(msg conversationForkedMsg) tea.Cmd {
 
 // handleConversationOpened 处理打开结果并开始提交草稿队列。
 func (m *tuiModel) handleConversationOpened(msg conversationOpenedMsg) tea.Cmd {
-	// 1. 丢弃过期结果，失败时退回草稿。
+	// 1. 丢弃过期结果，按打开失败的原因更新阅读界面。
 	if msg.seq != m.navigationSeq {
 		return nil
 	}
 	if msg.err != nil {
-		return m.leaveFailedConversation(msg.err)
+		return m.handleConversationOpenFailed(msg.err)
 	}
 	// 2. 打开成功后清空草稿模型，并提交下一条待发输入。
 	m.draftModel = defs.ModelSelection{}
 	return m.submitNextPending()
 }
 
-// leaveFailedConversation 退出打开失败的对话并显示重试提示。
-func (m *tuiModel) leaveFailedConversation(err error) tea.Cmd {
+// handleConversationOpenFailed 保留外部会话的恢复错误，普通打开失败仍回到草稿修改设置。
+func (m *tuiModel) handleConversationOpenFailed(err error) tea.Cmd {
+	root, _ := m.sessionStatuses.getRoot()
+	if errors.Is(err, runtimeclient.ErrExternalSessionRestore) || m.historyRestoring || root.Session.External != nil {
+		m.historyRestoring = false
+		m.historyRestoreErr = err
+		if m.isOpeningDraft {
+			m.isOpeningDraft = false
+			m.composer.restorePendingSends("")
+		}
+		return nil
+	}
 	// 1. 保存失败对话记录，关闭面板并切回草稿。
 	failed := *m.conversation
 	m.closePanel()
@@ -1063,16 +1110,35 @@ func (m *tuiModel) setConversation(conversation *defs.Conversation) {
 	}
 	m.sessionStatuses = newSessionStatuses(rootSessionID)
 	m.queuedInputs = &queuedInputs{}
+	m.commands = newCommands()
+	m.externalModel = defs.ModelRef{}
+	m.historyRestoring, m.historyRestoreErr = false, nil
+	m.resetTranscript()
+	// 2. 清空 Skill 列表，重置模型和 Skill 请求序号，之前对话还没返回的结果随后按序号丢弃。
+	m.modelSetSeq = 0
+	m.skills = nil
+	m.skillListSeq = 0
+}
+
+// resetTranscript 切换对话或外部历史库时，从空记录重新渲染当前历史。
+func (m *tuiModel) resetTranscript() {
 	m.transcript = newTranscript(m.renderer, m.styles, m.sessionStatuses, m.modelDisplayNames, m.height, func() time.Time { return m.now() },
 		func() bool { return m.isLocalServer },
 		func() string {
 			executorID, _ := m.getWorkLocation()
 			return executorID
 		})
-	// 2. 清空 Skill 列表，重置模型和 Skill 请求序号，之前对话还没返回的结果随后按序号丢弃。
-	m.modelSetSeq = 0
-	m.skills = nil
-	m.skillListSeq = 0
+}
+
+// getHistoryRestoreHint 返回等待或失败原因，直至阅读目标或快照发生变化。
+func (m *tuiModel) getHistoryRestoreHint() string {
+	if m.historyRestoreErr != nil {
+		return "恢复历史失败：" + m.historyRestoreErr.Error()
+	}
+	if m.historyRestoring {
+		return "正在从外部 Agent 恢复历史"
+	}
+	return ""
 }
 
 // loadSkills 查询草稿或已打开对话可用的 Skill 目录。
@@ -1106,11 +1172,8 @@ func (m *tuiModel) loadModelList() tea.Cmd {
 	// 1. 按界面 Agent 查询模型目录，返回目录或错误。
 	client, ctx, agentName := m.opt.Client, m.ctx, m.opt.AgentName
 	return func() tea.Msg {
-		list, err := client.ListModels(ctx, agentName)
-		return modelListLoadedMsg{
-			list: list,
-			err:  err,
-		}
+		list, err := client.ListModels(ctx, &runtime.ListModelsRequest{AgentName: agentName})
+		return modelListLoadedMsg{list: list, err: err}
 	}
 }
 
@@ -1121,21 +1184,24 @@ func (m *tuiModel) handleModelListLoaded(msg modelListLoadedMsg) tea.Cmd {
 		return nil
 	}
 	m.applyModelList(msg.list, m.opt.AgentName)
-	// 2. 无模型、未关闭过引导且没有其他面板时，打开提供商添加流程。
-	if len(msg.list.Models) > 0 || m.hasDismissedProviderOnboarding || m.activePanel != nil {
+	m.shouldSuggestModelProvider = len(msg.list.Models) == 0
+	// 2. 模型目录为空、未关闭过引导且没有其他面板时，打开提供商添加流程。
+	if !m.shouldSuggestModelProvider || m.hasDismissedProviderOnboarding || m.activePanel != nil {
 		return nil
 	}
 	return m.openProviderOnboarding()
 }
 
-// applyModelList 更新模型显示名、空目录标记和界面 Agent 的默认模型。
+// applyModelList 更新模型显示名和界面 Agent 的默认模型。
 func (m *tuiModel) applyModelList(list runtime.ModelList, agentName string) {
-	// 1. 原地更新显示名映射并记录目录是否为空。
+	// 1. 原地更新显示名映射；目录有模型时关闭添加提示。
 	clear(m.modelDisplayNames)
 	for _, model := range list.Models {
 		m.modelDisplayNames[model.Ref] = model.DisplayName
 	}
-	m.isModelListEmpty = len(list.Models) == 0
+	if len(list.Models) > 0 {
+		m.shouldSuggestModelProvider = false
+	}
 	// 2. 查询的是界面新建对话所用的 Agent 时，才记下它的默认模型。
 	if agentName == m.opt.AgentName {
 		m.agentDefaultModel = list.AgentDefaultModel
@@ -1147,6 +1213,9 @@ func (m *tuiModel) getCurrentModelSelection() defs.ModelSelection {
 	// 1. 有根 Session 时取它的模型，否则取草稿模型；没指定模型时补 Agent 默认模型。
 	selection := m.draftModel
 	if root, found := m.sessionStatuses.getRoot(); found {
+		if root.Session.External != nil {
+			return defs.ModelSelection{Ref: m.externalModel}
+		}
 		selection = root.Session.Model
 	}
 	if selection.Ref == (defs.ModelRef{}) {
@@ -1166,12 +1235,19 @@ func (m *tuiModel) setSessionModel(selection defs.ModelSelection) tea.Cmd {
 		SessionID:      m.conversation.RootSessionID,
 		Model:          selection,
 	}
+	previousExternalModel := m.externalModel
 	return func() tea.Msg {
 		record, err := client.SetSessionModel(ctx, request)
+		model := record.Model
+		if record.External != nil {
+			model = defs.ModelSelection{Ref: selection.Ref}
+		}
 		return modelSetMsg{
-			seq:     seq,
-			session: record,
-			err:     err,
+			seq:                   seq,
+			model:                 model,
+			previousExternalModel: previousExternalModel,
+			external:              record.External != nil,
+			err:                   err,
 		}
 	}
 }
@@ -1185,7 +1261,11 @@ func (m *tuiModel) handleModelSet(msg modelSetMsg) tea.Cmd {
 	if msg.err != nil {
 		return m.showNotice("切换模型失败："+msg.err.Error(), true, noticeDuration)
 	}
-	text := "已切换到 " + m.formatModelSelection(msg.session.Model)
+	model := msg.model
+	if msg.external && m.externalModel != (defs.ModelRef{}) && m.externalModel != msg.previousExternalModel {
+		model.Ref = m.externalModel
+	}
+	text := "已切换到 " + m.formatModelSelection(model)
 	if m.sessionStatuses.isRootRunning() {
 		text += "，下一 Turn 生效"
 	}

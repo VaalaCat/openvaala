@@ -1,4 +1,8 @@
-import { keepPreviousData, useInfiniteQuery } from "@tanstack/react-query"
+import {
+  keepPreviousData,
+  useInfiniteQuery,
+  useQuery,
+} from "@tanstack/react-query"
 import { useStore } from "@nanostores/react"
 import { useTranslation } from "react-i18next"
 import { useSearchParams } from "react-router"
@@ -9,17 +13,37 @@ import { ConversationListItem } from "@/components/conversation-list/conversatio
 import { useServerConnection } from "@/components/server-connection-provider"
 import { SidebarGroup } from "@/components/ui/sidebar"
 import type { Order } from "@/lib/api/protocol.gen"
+import {
+  getInboundThreadBindings,
+  parseWorldAddress,
+  type WorldStatus,
+} from "@/lib/api/world"
 import { conversationListOptions } from "@/lib/query/conversation"
+import { worldThreadsOptions } from "@/lib/query/world"
 import { shouldShowLoadError } from "@/lib/rpc-error"
 
 // 最近更新的在前，和 TUI 的恢复对话列表一致
 const conversationListOrder: Order = { by: "updated_at", direction: "desc" }
 
 // 左栏按搜索词显示未归档对话，滚到底时加载下一页。
-export function ConversationList() {
+export function ConversationList({
+  worldStatus,
+}: {
+  worldStatus?: WorldStatus
+}) {
   const { t } = useTranslation()
   const connection = useServerConnection()
   const connected = useStore(connection.$state) === "connected"
+  const threads = useQuery({
+    ...worldThreadsOptions(connection),
+    enabled: worldStatus?.enabled === true,
+    select: getInboundThreadBindings,
+  })
+  const inboundThreads =
+    worldStatus?.enabled && threads.isSuccess ? threads.data : undefined
+  const localDomain = worldStatus?.enabled
+    ? parseWorldAddress(worldStatus.node_addr)?.domain
+    : undefined
   const [searchParams, setSearchParams] = useSearchParams()
   const keyword = searchParams.get("q") ?? ""
   const searchTerm = keyword.trim()
@@ -77,6 +101,8 @@ export function ConversationList() {
             <ConversationListItem
               key={entry.conversation.id}
               conversation={entry.conversation}
+              threadBinding={inboundThreads?.get(entry.conversation.id)}
+              localDomain={localDomain}
             />
           )}
           emptyState={

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react"
+import { type ComponentProps, useLayoutEffect, useRef, useState } from "react"
 import { FoldVerticalIcon } from "lucide-react"
 import { useMutation } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
@@ -15,22 +15,14 @@ import {
 import { LatticeLoader } from "@/components/base/lattice-loader"
 import { Separator } from "@/components/ui/separator"
 import type { ConversationSync } from "@/lib/api/conversation-sync"
-import type { ModelSelection, SessionRuntimeInfo } from "@/lib/api/protocol.gen"
+import type { SessionRuntimeInfo } from "@/lib/api/protocol.gen"
 import { notifyFailure } from "@/lib/notify"
 import { formatNumberUnit } from "@/lib/number-unit"
 
 // Session 的模型和推理强度选择；窄容器合并为一个入口。
 export function SessionControls({
-  agentName,
-  value,
-  onChange,
-  disabled = false,
-}: {
-  agentName?: string
-  value?: ModelSelection
-  onChange(model: ModelSelection): void
-  disabled?: boolean
-}) {
+  ...props
+}: ComponentProps<typeof ModelPicker>) {
   const container = useRef<HTMLDivElement>(null)
   const [compact, setCompact] = useState(true)
   useLayoutEffect(() => {
@@ -46,13 +38,7 @@ export function SessionControls({
   }, [])
   return (
     <div ref={container} className="flex min-w-0 flex-1 items-center">
-      <ModelPicker
-        agentName={agentName}
-        value={value}
-        onChange={onChange}
-        compact={compact}
-        disabled={disabled}
-      />
+      <ModelPicker {...props} compact={compact} />
     </div>
   )
 }

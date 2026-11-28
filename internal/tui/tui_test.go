@@ -9,6 +9,8 @@ import (
 	"image/color"
 	"io"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,8 +35,179 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/session"
+	"github.com/VaalaCat/openvaala/pkg/world"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
+
+// TestWorldStatusControlsCommands 检查当前服务的联系人状态和命令可见性。
+func TestWorldStatusControlsCommands(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantStatus string
+	}{
+		{"disabled", http.StatusOK, `{"enabled":false,"connected":true}`, ""},
+		{"unavailable", http.StatusServiceUnavailable, "", ""},
+		{"invalid_response", http.StatusOK, `{"enabled":true,"connected":"unknown"}`, ""},
+		{"online", http.StatusOK, `{"enabled":true,"connected":true}`, "● 联系人在线"},
+		{"offline", http.StatusOK, `{"enabled":true,"connected":false}`, "● 联系人断线"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newWorldTestClient(t, func(method string, _ json.RawMessage) (json.RawMessage, *runtimeprotocol.JSONRPCError) {
+				if method != "world/getStatus" {
+					t.Errorf("unexpected method %q", method)
+				}
+				if tt.statusCode != http.StatusOK {
+					return nil, &runtimeprotocol.JSONRPCError{Code: -32000, Message: "world status unavailable"}
+				}
+				return json.RawMessage(tt.body), nil
+			})
+			h := newTUIHarness(t, 100, 32)
+			h.client.Client = client
+			h.emit(&runtimeclient.ConnectionChanged{State: runtimeclient.ConnectionConnected, ServerID: tuiTestLocalServerID})
+			probeDeadline := time.After(10 * time.Second)
+		waitProbe:
+			for {
+				select {
+				case msg := <-h.msgs:
+					h.send(msg)
+					if _, ok := msg.(worldStatusLoadedMsg); ok {
+						break waitProbe
+					}
+				case <-probeDeadline:
+					t.Fatal("contacts status probe did not complete")
+				}
+			}
+			enabled := tt.wantStatus != ""
+			if enabled && !strings.Contains(h.view(), tt.wantStatus) {
+				t.Fatalf("contacts status = %q, want %q", h.view(), tt.wantStatus)
+			}
+			h.press("?")
+			if view := h.view(); strings.Contains(view, "/contacts") != enabled || strings.Contains(view, "/forward") != enabled {
+				t.Fatalf("contacts help visibility, enabled = %v:\n%s", enabled, view)
+			}
+			h.press("esc")
+			h.typeText("/contacts")
+			if view := h.view(); strings.Contains(view, "命令 · 联系人") != enabled || strings.Contains(view, "● 联系人") != enabled {
+				t.Fatalf("contacts visibility, enabled = %v:\n%s", enabled, view)
+			}
+			h.press("ctrl+c")
+			h.openDraftConversation("开场")
+			h.typeText("/forward")
+			if view := h.view(); strings.Contains(view, "命令 · 转发") != enabled {
+				t.Fatalf("forward visibility, enabled = %v:\n%s", enabled, view)
+			}
+		})
+	}
+}
+
+// TestWorldCommandSubmissions 从联系人面板选中联系人或开放目标并检查实际请求。
+func TestWorldCommandSubmissions(t *testing.T) {
+	tests := []struct {
+		command string
+		address string
+		selects []string
+		text    string
+		path    string
+		want    map[string]string
+	}{
+		{"/contacts", "", []string{"enter"}, "你好", "world/sendMessage", map[string]string{"to": "alice@example.com", "message": "你好"}},
+		{"/contacts", "research@partner.test/reviewerX", []string{"backspace", "enter"}, "进度如何", "world/sendMessage", map[string]string{"to": "research@partner.test/reviewer", "message": "进度如何"}},
+		{"/forward", "", []string{"down", "enter"}, "请看看", "world/forward", map[string]string{"to": "alice@example.com/review", "conversation_id": "c1", "note": "请看看"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			client := newWorldTestClient(t, func(method string, params json.RawMessage) (json.RawMessage, *runtimeprotocol.JSONRPCError) {
+				switch method {
+				case "world/getStatus":
+					return json.RawMessage(`{"enabled":true,"connected":true}`), nil
+				case "world/listPeers":
+					return json.RawMessage(`{"peers":[{"address":"alice@example.com","node_name":"Alice","online":false,"targets":[{"name":"review"}]},{"address":"bob@example.com","node_name":"Bob","online":true,"targets":[]}]}`), nil
+				case tt.path:
+					var body map[string]string
+					if err := json.Unmarshal(params, &body); err != nil || !maps.Equal(body, tt.want) {
+						t.Errorf("request = %v, error = %v, want %v", body, err, tt.want)
+					}
+					return json.RawMessage(`{"status":"pending_offline"}`), nil
+				default:
+					t.Errorf("unexpected request: %s", method)
+					return nil, &runtimeprotocol.JSONRPCError{Code: -32601, Message: "method not found"}
+				}
+			})
+			h := newTUIHarness(t, 100, 32)
+			h.client.Client = client
+			h.emit(&runtimeclient.ConnectionChanged{State: runtimeclient.ConnectionConnected, ServerID: tuiTestLocalServerID})
+			h.waitFor("contacts online", func() bool { return strings.Contains(h.view(), "● 联系人在线") })
+			if tt.command == "/forward" {
+				h.openDraftConversation("开场")
+			}
+			h.typeText(tt.command)
+			h.press("enter")
+			h.waitFor("contacts and open targets", func() bool {
+				view := h.view()
+				return strings.Contains(view, "Alice") && strings.Contains(view, "review") && strings.Contains(view, "Bob") && strings.Contains(view, "离线")
+			})
+			h.typeText(tt.address)
+			h.press(tt.selects...)
+			h.typeText(tt.text)
+			h.press("enter")
+			h.waitFor("delivery status", func() bool { return strings.Contains(h.view(), "等待对方上线") })
+		})
+	}
+}
+
+func newWorldTestClient(t *testing.T, handle func(string, json.RawMessage) (json.RawMessage, *runtimeprotocol.JSONRPCError)) runtimeclient.Client {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Error("missing operator token")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			var request runtimeprotocol.JSONRPCRequest
+			if err := wsjson.Read(r.Context(), conn, &request); err != nil {
+				return
+			}
+			reply := runtimeprotocol.JSONRPCMessage{ID: request.ID}
+			if request.Method == "initialize" {
+				reply.Result = runtimeprotocol.InitializeResult{ProtocolVersion: runtimeprotocol.ProtocolVersion, ServerID: tuiTestLocalServerID}
+			} else {
+				result, rpcErr := handle(request.Method, request.Params)
+				reply.Error = rpcErr
+				if rpcErr == nil {
+					reply.Result = result
+				}
+			}
+			if err := wsjson.Write(r.Context(), conn, reply); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	client, err := runtimeclient.NewClient(runtimeclient.NewClientOpt(server.URL, "test-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	go func() {
+		for range client.Events() {
+		}
+	}()
+	return client
+}
 
 // updateGolden 是否把本次画面写回 testdata 里的 golden 文件？用 go test ./internal/tui -update 打开。
 var updateGolden = flag.Bool("update", false, "rewrite golden files in testdata")
@@ -1293,6 +1466,37 @@ func TestTUIModel(t *testing.T) {
 	}
 }
 
+// TestTUIProviderOnboardingWithExternalAgents 检查空目录和外部模型目录的引导行为。
+func TestTUIProviderOnboardingWithExternalAgents(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		modelID        string
+		wantOnboarding bool
+	}{
+		{name: "empty", wantOnboarding: true},
+		{name: "external_default", modelID: "default"},
+		{name: "external_discovered", modelID: "sonnet"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newFakeClient()
+			client.modelList = runtime.ModelList{}
+			if tt.modelID != "" {
+				client.modelList.Models = []*defs.ModelDefinition{{Ref: defs.ModelRef{ProviderID: "external", ModelID: tt.modelID}}}
+			}
+			opt := NewTUIOpt(client, "default", "", strings.NewReader(""), io.Discard)
+			opt.MarkdownStyle = markdownStyleNoTTY
+			m := newTUIModel(t.Context(), opt, nil)
+			m.update(m.loadModelList()())
+			if _, opened := m.activePanel.(*providerPanel); opened != tt.wantOnboarding {
+				t.Fatalf("provider onboarding opened = %v, want %v", opened, tt.wantOnboarding)
+			}
+			if hasHint := strings.Contains(strings.Join(m.getStatusLines(), "\n"), "/provider"); hasHint != tt.wantOnboarding {
+				t.Fatalf("provider hint visible = %v, want %v", hasHint, tt.wantOnboarding)
+			}
+		})
+	}
+}
+
 // TestTUIConversationTitles 检查标题更新后的主视图、展开视图和状态面板。
 func TestTUIConversationTitles(t *testing.T) {
 	// 1. 发送标题变更和重新同步事件，核对标题及历史内容。
@@ -2507,7 +2711,7 @@ func requireGolden(t *testing.T, name, got string) {
 // fakeClient 是测试用的 Client：按调用顺序记录调用，按预设返回结果或错误；预设的 gate 非 nil 时，对应调用等它关闭后才返回。
 // 预设字段用 set 在锁内修改。
 type fakeClient struct {
-	// 未使用的客户端能力沿用接口占位；TUI 只调用下方实现的方法。
+	// World 用例通过嵌入的客户端发起 RPC。
 	runtimeclient.Client
 	events chan runtimeclient.ClientEvent
 
@@ -2521,6 +2725,7 @@ type fakeClient struct {
 	interruptErr      error
 	compactErr        error
 	setModelErr       error
+	setModelSession   *defs.Session
 	createGate        chan struct{}
 	submitGate        chan struct{}
 	conversations     []defs.Conversation
@@ -2860,9 +3065,9 @@ func (c *fakeClient) OpenConversation(_ context.Context, request *runtimeclient.
 }
 
 // ListModels 记录模型列表查询并返回预设目录。
-func (c *fakeClient) ListModels(_ context.Context, agentName string) (runtime.ModelList, error) {
+func (c *fakeClient) ListModels(_ context.Context, request *runtime.ListModelsRequest) (runtime.ModelList, error) {
 	// 1. 记录 Agent 名，在锁内读取模型目录。
-	c.record("ListModels " + agentName)
+	c.record("ListModels " + request.AgentName)
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	return c.modelList, nil
@@ -2894,6 +3099,9 @@ func (c *fakeClient) SetSessionModel(_ context.Context, request *runtimeclient.S
 	defer c.mutex.Unlock()
 	if c.setModelErr != nil {
 		return defs.Session{}, c.setModelErr
+	}
+	if c.setModelSession != nil {
+		return *c.setModelSession, nil
 	}
 	return defs.Session{
 		ID:             request.SessionID,
@@ -3160,4 +3368,129 @@ func (c *fakeClient) WithdrawInput(_ context.Context, conversationID defs.Conver
 	// 1. 记录请求并返回空内容。
 	c.record(fmt.Sprintf("WithdrawInput %s %s %t", conversationID, itemID, returnContent))
 	return nil, nil
+}
+
+// TestExternalClientRestore 验证快照在阅读界面替换历史、重置输入历史或留下恢复失败原因。
+func TestExternalClientRestore(t *testing.T) {
+	for _, action := range []string{"ready_same_tail", "restoring_then_ready", "restoring_then_failure", "reconnect_failure", "native_incremental"} {
+		t.Run(action, func(t *testing.T) {
+			h := newTUIHarness(t, 80, 24)
+			m := h.model
+			m.setConversation(&defs.Conversation{ID: "c1", RootSessionID: "s1"})
+			external := action != "native_incremental"
+			root := newRootInfo("")
+			if external {
+				root.Session.External = &defs.ExternalSession{}
+			}
+			h.emit(&runtimeclient.ConversationSynced{ConversationID: "c1", SessionInfos: []runtime.SessionRuntimeInfo{root}})
+			snapshot := runtimeclient.SessionSynced{ConversationID: "c1", SessionID: "s1", External: external,
+				Items: logItems(userItem("old", "旧页首条"), userItem("tail", "旧页末条")), LastSavedOrdinal: 2}
+			if external {
+				snapshot.HistoryAction = runtimeclient.HistoryReplace
+			}
+			h.emit(&snapshot)
+			if strings.HasPrefix(action, "restoring") {
+				h.emit(&runtimeclient.SessionSynced{ConversationID: "c1", SessionID: "s1", External: true, Restoring: true, HistoryAction: runtimeclient.HistoryWait})
+				if !strings.Contains(h.view(), "正在从外部 Agent 恢复历史") || m.transcript.lastSavedOrdinal != 2 {
+					t.Fatalf("restoring ordinal=%d view=%s", m.transcript.lastSavedOrdinal, h.view())
+				}
+			}
+			if strings.HasSuffix(action, "failure") {
+				h.emit(&runtimeclient.ConversationSyncFailed{ConversationID: "c1", Err: errors.New("peer refused history")})
+				h.send(noticeExpiredMsg{id: m.notice.id})
+				if !strings.Contains(h.view(), "peer refused history") || strings.Contains(h.view(), "正在从外部") || m.conversation == nil {
+					t.Fatalf("failed view=%s", h.view())
+				}
+				return
+			}
+			snapshot.Items = []runtimeprotocol.LoggedItem{{Ordinal: 2, Item: userItem("new", "新库末条")}}
+			h.emit(&snapshot)
+			want := []string{"新库末条"}
+			if !external {
+				want = []string{"旧页首条", "旧页末条"}
+			}
+			if !slices.Equal(m.transcript.getUserInputs(), want) || strings.Contains(h.view(), "正在从外部") {
+				t.Fatalf("inputs=%v view=%s", m.transcript.getUserInputs(), h.view())
+			}
+			if external {
+				if !m.shouldRebuildScrollback || !slices.Equal(m.composer.history, want) {
+					t.Fatalf("rebuild=%t input history=%v", m.shouldRebuildScrollback, m.composer.history)
+				}
+				var screen strings.Builder
+				if err := m.rebuildScrollback(&screen); err != nil || !strings.Contains(screen.String(), "新库末条") || strings.Contains(screen.String(), "旧页") {
+					t.Fatalf("screen=%s err=%v", screen.String(), err)
+				}
+			}
+		})
+	}
+}
+
+// TestExternalModelSelection 检查外部模型的首次显示、切换通知和本地切换提示。
+func TestExternalModelSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, requested, wantFooter string
+		updateID                    defs.SessionID
+	}{
+		{"root update before RPC result", "large-alias", "large", "s1"},
+		{"other session update", "large", "small", "s2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTUIHarness(t, 80, 24)
+			root := newRootInfo("")
+			root.Session.AgentName = "peer"
+			root.Session.External = &defs.ExternalSession{}
+			h.client.set(func(c *fakeClient) { c.setModelSession = &root.Session })
+			m := h.model
+			m.setConversation(&defs.Conversation{ID: "c1", RootSessionID: "s1"})
+			h.emit(&runtimeclient.ConversationSynced{ConversationID: "c1", SessionInfos: []runtime.SessionRuntimeInfo{root}})
+			h.emit(&runtimeclient.SessionSynced{ConversationID: "c1", SessionID: "s1", External: true,
+				Options: &defs.ExternalOptions{Model: &defs.ExternalOptionGroup{CurrentValue: "small"}}})
+			if got := m.formatFooterModel(); got != "small" {
+				t.Errorf("initial model = %q, want small", got)
+			}
+			setModel := m.setSessionModel(defs.ModelSelection{Ref: defs.ModelRef{ProviderID: "peer", ModelID: tc.requested}})
+			h.emit(&runtimeclient.SessionExternalStateChanged{NotificationTarget: runtimeprotocol.NotificationTarget{ConversationID: "c1", SessionID: tc.updateID},
+				Options: defs.ExternalOptions{Model: &defs.ExternalOptionGroup{CurrentValue: "large"}}})
+			if got := m.formatFooterModel(); got != tc.wantFooter {
+				t.Errorf("updated model = %q, want %s", got, tc.wantFooter)
+			}
+			h.send(setModel())
+			if got := m.notice.text; got != "已切换到 large" {
+				t.Errorf("switch notice = %q, want 已切换到 large", got)
+			}
+		})
+	}
+}
+
+// TestExternalInitialRestoreFailure 验证首次打开在快照交付前失败时，原因留在所选对话并可返回列表。
+func TestExternalInitialRestoreFailure(t *testing.T) {
+	for _, method := range []string{"conversation/open", "session/subscribe"} {
+		t.Run(method, func(t *testing.T) {
+			cause := "external session cannot be restored: executor archive not found"
+			h := newTUIHarness(t, 120, 24, func(c *fakeClient) {
+				c.openErr = fmt.Errorf("%s: %w", method, &runtimeclient.ResponseError{Code: runtimeprotocol.ErrorCodeRuntime, Message: cause})
+			})
+			h.run(h.model.resumeConversation(defs.Conversation{ID: "c7", RootSessionID: "s7"}))
+			h.waitFor("open failure", func() bool { return strings.Contains(h.view(), cause) })
+			h.send(noticeExpiredMsg{id: h.model.notice.id})
+			h.typeText("草稿")
+			h.press("enter")
+			if h.model.conversation == nil || h.model.conversation.ID != "c7" || !strings.Contains(h.view(), cause) || h.model.composer.getValue() != "草稿" {
+				t.Fatalf("conversation=%+v view=%s", h.model.conversation, h.view())
+			}
+			h.model.composer.clear()
+			h.typeText("/resume")
+			h.press("enter")
+			if _, ok := h.model.activePanel.(*resumePanel); !ok {
+				t.Fatalf("panel=%T", h.model.activePanel)
+			}
+		})
+	}
+}
+
+func (c *fakeClient) GetWorldStatus(ctx context.Context) (world.NodeStatus, error) {
+	if c.Client == nil {
+		return world.NodeStatus{}, nil
+	}
+	return c.Client.GetWorldStatus(ctx)
 }

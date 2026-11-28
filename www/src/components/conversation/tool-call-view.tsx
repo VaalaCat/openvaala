@@ -11,8 +11,10 @@ import {
   FilePen,
   FileText,
   History,
+  Mail,
   Send,
   Terminal,
+  Users,
   Wrench,
 } from "lucide"
 import { MorphIcon } from "morphicons/react"
@@ -91,6 +93,9 @@ export function ToolCard({
     apply_patch: FilePen,
     spawn_agent: Bot,
     send_message: Send,
+    send_world_message: Send,
+    list_world_peers: Users,
+    get_world_message: Mail,
     wait_agent: Clock,
     interrupt_agent: CircleSlash,
     list_agents: Bot,

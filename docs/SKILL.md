@@ -36,3 +36,15 @@ description: 用户问 OpenVaala 本身怎么工作、怎么安装、运行或�
 4. 运行 `openvaala serve reload` 让改动生效。改了 `server.listen`、`server.token`、`tools.max_image_kb` 或 `telemetry` 时，请用户自己运行 `openvaala serve stop` 再重新启动：停掉服务会连同当前对话一起停掉。
 
 配置文件和 `openvaala config show` 的输出里有 API key 和 token，不要原样复述给用户。
+
+## 从外部 Agent 协作
+
+OpenVaala 启动外部 Agent 时提供 `OPENVAALA_URL`、`OPENVAALA_TOKEN`、`OPENVAALA_CONVERSATION_ID` 和 `OPENVAALA_SESSION_ID`。在外部 Agent 运行的机器上使用 `openvaala` CLI，连接和会话身份默认取这些环境变量。CLI 与本地 openvaala MCP 工具提供等价的协作能力，完整参数见 `reference/cli.md` 或 `zh/reference/cli.md`。在 Codex 等带网络沙箱的 Agent 中，如果 CLI 连不上 OpenVaala，请使用 `openvaala` MCP 工具。
+
+- 派发子任务用 `openvaala session spawn --agent <name> "<prompt>"`。可用 `--executor <id>`、`--cwd <path>`、`--task <name>` 和 `--label k=v` 指定工作位置及任务信息。要换模型，用 CLI 的 `--model <provider/model>` 或 MCP 的 `model` 参数。
+- 向会话发送消息用 `openvaala session send <session-id> "<prompt>"`，或用 `openvaala session send <session-id> --prompt-file <path>` 从文件读取正文。要中断当前轮再发时加 `--interrupt`。`spawn` 和 `send` 默认等待本轮结束，可加 `--no-wait` 提交后立即返回。
+- 查看后代用 `openvaala session ls`，可加 `--label k=v` 或 `--all`。查看详情、日志和实时输出分别用 `openvaala session inspect <session-id>`、`openvaala session logs <session-id> --limit <n>` 和 `openvaala session attach <session-id>`。
+- 等待、停止和重新加载会话分别用 `openvaala session wait <session-id> --timeout <sec>`、`openvaala session stop <session-id>` 和 `openvaala session reload <session-id>`。读取选项用 `openvaala session option <session-id>`，修改时加 `--set kind:id=value`。
+- 列出 Executor 用 `openvaala executor ls`。运行一次命令用 `openvaala exec --executor <id> --cwd <path> -- <command> <args...>`，可用 `--conversation <id>` 指定对话。读取 `/skills/openvaala/` 下的内置文档时，选择 `openvaala` Executor，或直接运行 `openvaala skill get openvaala <file>`。操作项目文件、运行项目命令时，使用 `executor ls` 标记为 `(default)` 的对话工作 Executor。
+- 管理交互终端用 `openvaala terminal ls`、`openvaala terminal open` 和 `openvaala terminal close`。向已打开的终端发送按键用 `openvaala terminal send`，读取终端输出用 `openvaala terminal capture`。
+- 用 openvaala MCP 的 `get_skill` 工具读取 `openvaala` 可查看本文（或运行 `openvaala skill get openvaala`）。CLI 列出、搜索和读取 skill 分别用 `openvaala skill list`、`openvaala skill search <词>` 和 `openvaala skill get <name> [file]`。

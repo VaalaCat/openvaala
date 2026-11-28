@@ -315,3 +315,39 @@ func TestContextTextContent(t *testing.T) {
 		})
 	}
 }
+
+func TestFileAttachmentContent(t *testing.T) {
+	file := defs.FileRef{Name: "report.pdf", MIME: "application/pdf", Size: 3, Path: "/tmp/report.pdf"}
+	for _, test := range []struct {
+		name    string
+		file    *defs.FileRef
+		wantErr bool
+	}{
+		{"file", &file, false},
+		{"missing", nil, true},
+		{"missing_path", &defs.FileRef{Name: "report.pdf"}, true},
+		{"relative_path", &defs.FileRef{Name: "report.pdf", Path: "report.pdf"}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			content := &defs.Content{Kind: defs.ContentFile, File: test.file}
+			if err := content.Validate(); (err != nil) != test.wantErr {
+				t.Fatalf("Validate() = %v", err)
+			}
+			if test.wantErr {
+				return
+			}
+			cloned := content.Clone()
+			if cloned.File == content.File || *cloned.File != *content.File {
+				t.Fatalf("Clone() = %+v", cloned.File)
+			}
+			encoded, err := json.Marshal(content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded defs.Content
+			if err := json.Unmarshal(encoded, &decoded); err != nil || !reflect.DeepEqual(&decoded, content) {
+				t.Fatalf("file JSON round trip = %+v, %v", decoded, err)
+			}
+		})
+	}
+}

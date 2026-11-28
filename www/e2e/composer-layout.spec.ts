@@ -148,7 +148,7 @@ test("composer_compact_pending_and_stop", async ({ page, fixture }) => {
     // 左组与右组各自紧凑排列；输入出现排队按钮后也保持方形、4px间距和同一行。
     const model = toolbar.locator('[aria-label="模型"]')
     const context = toolbar.getByRole("button", { name: /^上下文占用：/ })
-    const image = toolbar.getByRole("button", { name: "添加图片", exact: true })
+    const image = toolbar.getByRole("button", { name: "添加附件", exact: true })
     const queue = toolbar.getByRole("button", { name: "排队", exact: true })
     for (const hasDraft of [true, false]) {
       await composer.fill(hasDraft ? "检查排队按钮尺寸" : "")

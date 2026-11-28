@@ -10,26 +10,67 @@ import (
 	"time"
 
 	"github.com/VaalaCat/llmkit"
+	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
+	"github.com/VaalaCat/openvaala/pkg/externalagent"
 	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/session"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
+	"github.com/VaalaCat/openvaala/pkg/workspace"
 )
 
 // Conversation 管理一段对话里的根 Session 和子 Session、子任务结果通知、执行环境、Skill 和客户端登记的 MCP。
 type Conversation interface {
+	// GetLiveExternalOptions 读取运行实例最近报告的选项，冷会话不启动驱动。
+	GetLiveExternalOptions(defs.SessionID) (defs.ExternalOptions, bool)
+	// GetExternalOptions 必要时打开目标会话并等首次恢复。
+	GetExternalOptions(context.Context, defs.SessionID) (defs.ExternalOptions, error)
+	// SetExternalOption 只修改目标外部驱动的选项。
+	SetExternalOption(context.Context, defs.SessionID, defs.ExternalOptionSelection) error
+	// ReloadExternalSession 按已装配定义和工作区重载单个会话。
+	ReloadExternalSession(context.Context, defs.SessionID) error
+	// PrepareSessionDetach 标记转出原因并等待旧驱动及回报任务退出。
+	PrepareSessionDetach(context.Context, defs.SessionID) (defs.Session, error)
+	// FinishSessionDetach 保存新对话入口并通知父会话；目标为空时解除转出状态。
+	FinishSessionDetach(context.Context, defs.SessionID, defs.Conversation) (defs.Session, error)
+	// BorrowExecutorWorkspace 登记命令并借出工作区。命令结束或启动失败后，调用方须调用 release。
+	BorrowExecutorWorkspace(ctx context.Context, executorID string) (work workspace.Workspace, commandCtx context.Context, release func(), err error)
+	// GetExecutor 返回对话能使用的 Executor，供创建独立工作区。
+	GetExecutor(executorID string) (executor.Executor, error)
+	// IsExecutorCommandRunning 对话是否有尚未结束的 Executor 命令？
+	IsExecutorCommandRunning() bool
+	// SpawnAgent 在来源会话的活动轮上创建子会话。
+	SpawnAgent(context.Context, defs.SessionID, *SpawnAgentParam) (SpawnAgentResult, error)
+	// SendMessage 将消息交给后代或直接父会话。
+	SendMessage(context.Context, defs.SessionID, *SendMessageParam) (defs.ItemID, error)
+	// WaitAgent 等待来源会话收件箱里的消息。
+	WaitAgent(context.Context, defs.SessionID, *WaitAgentParam) (WaitAgentResult, error)
+	// StopAgent 中断后代会话的活动轮。
+	StopAgent(context.Context, defs.SessionID, defs.SessionID) (defs.TurnID, error)
+	// ListAgents 按来源范围和实际过滤条件列出会话。
+	ListAgents(context.Context, defs.SessionID, *ListAgentsParam) (ListAgentsResult, error)
+	// UpdateSession 将指定元数据合并到最新会话记录。
+	UpdateSession(context.Context, defs.SessionID, SessionUpdate) (defs.Session, error)
+	// GetCollaborationTools 获取绑定来源会话的工具执行器。
+	GetCollaborationTools(context.Context, defs.SessionID) (executor.ToolExecutor, error)
+	// ReadSessionHistory 读取后代 fork 之后的本地历史。
+	ReadSessionHistory(context.Context, defs.SessionID, *SessionHistoryParam) (storage.Page[dao.LoggedItem, storage.Ordinal], error)
+	// GetSessionHistoryDAO 为历史读取启动目标外部会话；wait 指定是否等首次回放完成。
+	GetSessionHistoryDAO(ctx context.Context, id defs.SessionID, wait bool) (dao.Query, bool, error)
+
 	// GetID 返回对话 ID。
 	GetID() defs.ConversationID
 	// GetRootSessionID 返回根 Session ID。
 	GetRootSessionID() defs.SessionID
-	// GetSkills 返回根 Agent 可用的 Skill 信息。
-	GetSkills() []skill.SkillInfo
+	// GetSessionSkills 返回可由斜杠输入选用的 Skill，省略 ID 时取根。
+	GetSessionSkills(id defs.SessionID) ([]*skill.Skill, error)
 	// GetMCPServers 按执行环境顺序返回各 MCP 连接的当前状态，客户端登记的排在最后；还在连接的也直接列出。
 	GetMCPServers() []MCPServerInfo
 	// Run 启动执行环境和根 Session，串行处理换配置和客户端 MCP 登记，等 Session、连接和工作区全部停止后关闭 events；只能调用一次。
@@ -62,6 +103,8 @@ type Conversation interface {
 	// SetSessionModel 校验并保存模型和推理强度，通知运行中的 Session 从下个 Turn 起使用；已保存但通知失败时仍返回记录和错误。
 	// 没指定强度时，原强度新模型也支持就保留，否则用新模型的默认强度。
 	SetSessionModel(ctx context.Context, sessionID defs.SessionID, model defs.ModelSelection) (defs.Session, error)
+	// GetExecutorDetails 返回对话在线环境的说明和默认 Executor。
+	GetExecutorDetails() ([]ExecutorDetails, string)
 	// GetExecutorSettings 返回当前配置的 Executor 设置，已补上 local 目录。
 	GetExecutorSettings() defs.ExecutorSettings
 	// SetExecutorSettings 按新设置装配配置，交给 Run 停掉旧 Session 和执行环境、重启根 Session，返回补上 local 目录的设置；客户端 MCP 登记保留。
@@ -76,6 +119,8 @@ type Conversation interface {
 
 // conversationImpl 由 Run 串行处理换配置和客户端 MCP 登记，每个 Session 各有一个 Run 任务和一个事件转发任务。
 type conversationImpl struct {
+	forkSummary         string
+	sessionRecordWrites sync.Mutex // 串行合并绑定、模型和会话元数据。
 	// opt 的 Query、Mutation、Environment、MaxImageBytes、WithoutExecutors 整个生命周期都用；Definitions 只用来建初始配置，之后以 config 为准。
 	opt           ConversationOpt
 	id            defs.ConversationID
@@ -93,7 +138,11 @@ type conversationImpl struct {
 	// clientMCPRunCancels 按 ExecutorID 保存客户端环境任务；只由 Run 读写。
 	clientMCPRunCancels map[string]clientExecutorRun
 	// configChanges 是交给 Run 串行处理的换配置请求。
-	configChanges chan *configChange
+	configChanges    chan *configChange
+	sessionOpens     chan sessionOpenRequested
+	workspaceBorrows chan executorWorkspaceBorrowRequested
+	// executorCommands 记录借出工作区后尚未结束的命令。Run 登记，命令返回时移除。
+	executorCommands atomic.Int64
 	// configBaseRequests 接收 setter 对装配 base 的查询。
 	configBaseRequests chan *configBaseRequested
 	// clientMCPChanges 是交给 Run 串行处理的客户端 MCP 登记。
@@ -130,6 +179,17 @@ type conversationImpl struct {
 
 // ConversationOpt 是对话整个生命周期都不变的依赖，加上建对话时的定义。
 type ConversationOpt struct {
+	Ephemeral bool
+	// ForkSummary 只移交给外部根会话的第一个运行实例。
+	ForkSummary  string
+	ForkedFromID defs.ConversationID
+	// DetachedConversations 用于临时来源对话读取已持久保存的转出目标。
+	DetachedConversations dao.ConversationQuery
+	ServerURL             string
+	DataDirectory         string
+	InitialOptions        []defs.ExternalOptionSelection
+	// SessionTokenSecret 是签发会话 Token 使用的 serve 令牌。
+	SessionTokenSecret *sessiontoken.Secret
 	// ModelClient 是本对话共用的模型客户端，须支持并发调用；nil 时创建默认客户端。
 	ModelClient llmkit.Client
 	Query       dao.Query
@@ -159,7 +219,7 @@ func CreateConversation(ctx context.Context, conversationID defs.ConversationID,
 	if err := validateConversationDependencies(opt); err != nil {
 		return nil, err
 	}
-	config, err := newConversationConfig(ctx, conversationID, settings, storedSettings, opt, opt.Definitions, nil)
+	config, err := newConversationConfig(ctx, conversationID, settings, storedSettings, opt, opt.Definitions, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -167,15 +227,16 @@ func CreateConversation(ctx context.Context, conversationID defs.ConversationID,
 	definition, found := config.agentDefinitions[rootAgentName]
 	if !found {
 		closeWorkspaces(ctx, config.workspaces)
-		return nil, fmt.Errorf("root agent %q is not configured", rootAgentName)
+		return nil, newSpawnAgentNotConfiguredError(rootAgentName, config.agentDefinitions)
 	}
-	selection, err := getRequestedModelSelection(config.models, model, definition.Model)
+	selection, err := getRequestedModelSelection(config.models, model, definition)
 	if err != nil {
 		closeWorkspaces(ctx, config.workspaces)
 		return nil, err
 	}
 	record := defs.Conversation{
 		ID:               conversationID,
+		ForkedFromID:     opt.ForkedFromID,
 		RootSessionID:    defs.NewSessionID(),
 		ExecutorSettings: config.settings,
 	}
@@ -185,16 +246,25 @@ func CreateConversation(ctx context.Context, conversationID defs.ConversationID,
 		AgentName:      rootAgentName,
 		Model:          selection,
 	}
-	c, err := newConversation(record, []defs.Session{root}, opt, config)
+	if definition.Type.IsExternal() {
+		root.External = &defs.ExternalSession{AgentType: definition.Type}
+	}
+	c, err := newConversation(record, nil, opt, config)
 	if err != nil {
 		closeWorkspaces(ctx, config.workspaces)
 		return nil, err
 	}
-	// 3. 先保存根 Session，再保存对话记录。
+	// 3. 保存根 Session 并读回存储分配的更新时间，再登记对话。
 	if err := opt.Mutation.SetSession(ctx, root); err != nil {
 		closeWorkspaces(ctx, config.workspaces)
 		return nil, fmt.Errorf("create Conversation %s root %s: %w", record.ID, root.ID, err)
 	}
+	root, _, err = opt.Query.GetSession(ctx, record.ID, record.RootSessionID)
+	if err != nil {
+		closeWorkspaces(ctx, config.workspaces)
+		return nil, fmt.Errorf("read saved root Session %s: %w", record.RootSessionID, err)
+	}
+	c.sessionRecords.Store(root.ID, root)
 	if err := opt.Mutation.SetConversation(ctx, record); err != nil {
 		closeWorkspaces(ctx, config.workspaces)
 		return nil, fmt.Errorf("create Conversation %s; root %s saved: %w", record.ID, root.ID, err)
@@ -229,7 +299,7 @@ func GetConversation(ctx context.Context, record defs.Conversation, storedSettin
 		return nil, err
 	}
 	// 3. 按记录设置装配配置，校验各 Session 的 Agent，再创建尚未启动的对话实例。
-	config, err := newConversationConfig(ctx, record.ID, record.ExecutorSettings, storedSettings, opt, opt.Definitions, records)
+	config, err := newConversationConfig(ctx, record.ID, record.ExecutorSettings, storedSettings, opt, opt.Definitions, root.ID, records)
 	if err != nil {
 		return nil, err
 	}
@@ -249,6 +319,7 @@ func newConversation(record defs.Conversation, records []defs.Session, opt *Conv
 		return nil, err
 	}
 	c := &conversationImpl{
+		forkSummary:         opt.ForkSummary,
 		opt:                 *opt,
 		id:                  record.ID,
 		rootSessionID:       record.RootSessionID,
@@ -256,12 +327,15 @@ func newConversation(record defs.Conversation, records []defs.Session, opt *Conv
 		environmentsManager: environmentsManager,
 		clientMCPRunCancels: make(map[string]clientExecutorRun),
 		configChanges:       make(chan *configChange),
+		sessionOpens:        make(chan sessionOpenRequested),
+		workspaceBorrows:    make(chan executorWorkspaceBorrowRequested),
 		configBaseRequests:  make(chan *configBaseRequested),
 		clientMCPChanges:    make(chan *clientMCPChange),
 		stopped:             make(chan struct{}),
 		started:             make(chan struct{}, 1),
 		rootStarted:         make(chan struct{}),
 	}
+	c.opt.ForkSummary = ""
 	if c.modelClient == nil {
 		c.modelClient = llmkit.NewClient(llmkit.ClientOptions{HTTPClient: httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt())})
 	}
@@ -291,22 +365,38 @@ func (c *conversationImpl) GetExecutorSettings() defs.ExecutorSettings {
 	return c.config.Load().settings
 }
 
-// GetSkills 返回根 Agent 可用的 Skill 信息。
-func (c *conversationImpl) GetSkills() []skill.SkillInfo {
-	// 1. 按根 Agent 的 SkillNames 筛选 Skill，并提取公开信息。
-	config := c.config.Load()
-	root, _ := c.sessionRecords.Load(c.rootSessionID)
-	selected := skill.GetSkillsByNames(config.agentDefinitions[root.AgentName].SkillNames, config.skills)
-	result := make([]skill.SkillInfo, 0, len(selected))
-	for _, item := range selected {
-		result = append(result, skill.SkillInfo{
-			Name:        item.Name,
-			Description: item.Description,
-			Path:        item.Path,
-			Executor:    item.Executor,
-		})
+// GetSessionSkills 返回同一份可用于输入解析和补全的 Skill 目录。
+func (c *conversationImpl) GetSessionSkills(id defs.SessionID) ([]*skill.Skill, error) {
+	selected, err := c.getSessionSkills(id)
+	if err != nil {
+		return nil, err
 	}
-	return result
+	return c.getInputSkills(selected)
+}
+
+// getSessionSkills 按会话绑定的 Agent 从当前对话配置选取 Skill。
+func (c *conversationImpl) getSessionSkills(id defs.SessionID) ([]*skill.Skill, error) {
+	if id == "" {
+		id = c.rootSessionID
+	}
+	record, found := c.sessionRecords.Load(id)
+	if !found {
+		return nil, fmt.Errorf("session %s does not belong to conversation %s", id, c.id)
+	}
+	config := c.config.Load()
+	definition := config.agentDefinitions[record.AgentName]
+	if definition == nil {
+		return nil, newAgentNotConfiguredError(record)
+	}
+	return skill.GetSkillsByNames(definition.SkillNames, config.skills), nil
+}
+
+// getInputSkills 为对话的输入目录补上内置 Skill。
+func (c *conversationImpl) getInputSkills(selected []*skill.Skill) ([]*skill.Skill, error) {
+	if c.opt.WithoutExecutors {
+		return nil, nil
+	}
+	return skill.WithBuiltinSkill(selected)
 }
 
 // GetMCPServers 返回环境和客户端登记的 MCP 连接信息。
@@ -355,7 +445,7 @@ func (c *conversationImpl) Run(ctx context.Context, events chan<- ConversationEv
 	config.sessionsCtx, config.stopSessions = context.WithCancelCause(c.runCtx)
 	c.startEnvironments(config.environments)
 	root, _ := c.sessionRecords.Load(c.rootSessionID)
-	_, startErr := c.startSession(root, false)
+	_, startErr := c.startSession(root, nil)
 	close(c.rootStarted)
 	if startErr != nil {
 		c.stopRun(startErr)
@@ -368,6 +458,12 @@ func (c *conversationImpl) Run(ctx context.Context, events chan<- ConversationEv
 		}
 		select {
 		case <-c.runCtx.Done():
+		case request := <-c.sessionOpens:
+			record, _ := c.sessionRecords.Load(request.record.ID)
+			instance, err := c.startSession(record, request.spawn)
+			request.reply <- sessionOpenReply{instance, err}
+		case request := <-c.workspaceBorrows:
+			c.handleExecutorWorkspaceBorrow(request)
 		case request := <-c.configBaseRequests:
 			base := c.pendingConfig
 			if base == nil {
@@ -424,6 +520,11 @@ func (c *conversationImpl) handleConfigChange(change *configChange) {
 	if change.base != base {
 		closeWorkspaces(c.runCtx, change.next.workspaces)
 		change.reply <- configChangeReply{err: errConfigChanged}
+		return
+	}
+	if !change.deferIfBusy && c.IsExecutorCommandRunning() {
+		closeWorkspaces(c.runCtx, change.next.workspaces)
+		change.reply <- configChangeReply{err: session.ErrSessionBusy}
 		return
 	}
 	// 2. 关闭被替换的备用工作区，接收并尝试应用新配置。
@@ -493,10 +594,13 @@ func (c *conversationImpl) applyPendingConfig(deferIfBusy bool) (isPending bool,
 	}
 	c.startEnvironments(next.environments)
 	root, _ := c.sessionRecords.Load(c.rootSessionID)
-	if _, err := c.startSession(root, false); err != nil {
-		c.stopRun(err)
-		return false, err
+	if root.External == nil {
+		if _, err := c.startSession(root, nil); err != nil {
+			c.stopRun(err)
+			return false, err
+		}
 	}
+	// 外部根会话在下次读历史、订阅或投递输入时按绑定重开。
 	// 7. 发出新模型目录、Agent 默认模型和 Executor 设置。
 	c.sendEvent(&ConversationReconfigured{
 		Models:             next.models,
@@ -582,7 +686,7 @@ func (c *conversationImpl) SetExecutorSettings(ctx context.Context, settings def
 		if err != nil {
 			return defs.ExecutorSettings{}, err
 		}
-		next, err := newConversationConfig(ctx, c.id, settings, base.settings, &c.opt, base.definitions, c.sessionRecords.Values())
+		next, err := newConversationConfig(ctx, c.id, settings, base.settings, &c.opt, base.definitions, c.rootSessionID, c.sessionRecords.Values())
 		if err != nil {
 			return defs.ExecutorSettings{}, err
 		}
@@ -606,7 +710,7 @@ func (c *conversationImpl) SetDefinitions(ctx context.Context, definitions *Conv
 		if err != nil {
 			return false, err
 		}
-		next, err := newConversationConfig(ctx, c.id, base.settings, base.settings, &c.opt, definitions, c.sessionRecords.Values())
+		next, err := newConversationConfig(ctx, c.id, base.settings, base.settings, &c.opt, definitions, c.rootSessionID, c.sessionRecords.Values())
 		if err != nil {
 			return false, err
 		}
@@ -686,7 +790,15 @@ func (c *conversationImpl) HandleInput(ctx context.Context, input *ConversationI
 	// 2. 取运行中的根 Session，没在运行时返回错误。
 	root, found := c.runningSessions.Load(c.rootSessionID)
 	if !found {
-		return "", errors.New("Conversation root Session is not running")
+		record, _ := c.sessionRecords.Load(c.rootSessionID)
+		if record.External == nil {
+			return "", errors.New("Conversation root Session is not running")
+		}
+		external, err := c.getExternalSession(ctx, record)
+		if err != nil {
+			return "", err
+		}
+		root = external
 	}
 	// 3. 复制消息内容并分配 Item ID，按指定模式和 InputID 提交给根 Session。
 	item := &defs.Item{
@@ -760,8 +872,16 @@ func (c *conversationImpl) AppendContextItems(ctx context.Context, items []*defs
 
 // IsBusy 对话内是否有活动 Turn、待处理输入或未结束的后台命令？
 func (c *conversationImpl) IsBusy(ctx context.Context) (bool, error) {
+	if c.IsExecutorCommandRunning() {
+		return true, nil
+	}
 	// 1. 向各 Session 查询执行状态与待处理输入，再检查它的后台命令。
 	for _, instance := range c.runningSessions.Values() {
+		if external, ok := instance.(*conversationExternalSession); ok {
+			if _, restoring := external.GetHistoryDAO(); restoring {
+				return true, nil
+			}
+		}
 		status, err := instance.GetStatus(ctx)
 		if err != nil {
 			return false, err
@@ -803,7 +923,7 @@ func (c *conversationImpl) ListSessionInfos(ctx context.Context) ([]SessionInfo,
 }
 
 // GetSessionDetails 返回 Session 的模型、Executor、Skill 和可用工具信息。
-func (c *conversationImpl) GetSessionDetails(_ context.Context, sessionID defs.SessionID) (SessionDetails, error) {
+func (c *conversationImpl) GetSessionDetails(ctx context.Context, sessionID defs.SessionID) (SessionDetails, error) {
 	// 1. 查找 Session 和对应 Agent 定义，缺失时返回错误。
 	record, found := c.sessionRecords.Load(sessionID)
 	if !found {
@@ -813,6 +933,22 @@ func (c *conversationImpl) GetSessionDetails(_ context.Context, sessionID defs.S
 	definition, found := config.agentDefinitions[record.AgentName]
 	if !found {
 		return SessionDetails{}, newAgentNotConfiguredError(record)
+	}
+	if record.External != nil {
+		instance, err := c.getExternalSession(ctx, record)
+		if err != nil {
+			return SessionDetails{}, err
+		}
+		if err := instance.waitForHistory(ctx); err != nil {
+			return SessionDetails{}, err
+		}
+		record, _ = c.sessionRecords.Load(record.ID)
+		details := SessionDetails{ConversationID: c.id, Session: record, Executors: newExecutorDetails(config.environments, config.executors)}
+		if state := instance.state.Load(); state != nil {
+			details.MCPServers = state.MCPServers
+			details.Capabilities = new(state.Capabilities)
+		}
+		return details, nil
 	}
 	// 2. 合并协作工具和附加工具，汇总 Executor、Skill 和模型可见的工具名（含已连接的 MCP 工具）。
 	collaborationTools, err := newCollaborationTools(c, record, config.definitions, definition)
@@ -842,7 +978,28 @@ func (c *conversationImpl) SetSessionModel(ctx context.Context, sessionID defs.S
 	if !found {
 		return defs.Session{}, fmt.Errorf("Session %s is not in Conversation %s", sessionID, c.id)
 	}
-	definition, found := c.config.Load().models[model.Ref]
+	config := c.config.Load()
+	if record.External != nil {
+		if model.Ref.ProviderID != record.AgentName {
+			return defs.Session{}, errors.New("cannot switch agent in an existing session")
+		}
+		instance, err := c.getExternalSession(ctx, record)
+		if err != nil {
+			return defs.Session{}, err
+		}
+		if err = instance.waitForHistory(ctx); err != nil {
+			return defs.Session{}, err
+		}
+		if err = instance.SetOption(ctx, defs.ExternalOptionSelection{Kind: "model", Value: model.Ref.ModelID}); err != nil {
+			return defs.Session{}, err
+		}
+		record, _ = c.sessionRecords.Load(sessionID)
+		return record, nil
+	}
+	if def := config.agentDefinitions[model.Ref.ProviderID]; def != nil && def.Type.IsExternal() {
+		return defs.Session{}, errors.New("cannot switch agent in an existing session")
+	}
+	definition, found := config.models[model.Ref]
 	if !found {
 		return defs.Session{}, fmt.Errorf("model %s is not configured", model.Ref)
 	}
@@ -851,11 +1008,10 @@ func (c *conversationImpl) SetSessionModel(ctx context.Context, sessionID defs.S
 		return defs.Session{}, err
 	}
 	// 2. 先保存 Session 记录，再替换内存记录。
-	record.Model = selection
-	if err := c.opt.Mutation.SetSession(ctx, record); err != nil {
-		return defs.Session{}, fmt.Errorf("save Session %s: %w", sessionID, err)
+	record, err = c.saveSessionUpdate(ctx, sessionID, SessionUpdate{}, &selection, nil)
+	if err != nil {
+		return defs.Session{}, err
 	}
-	c.sessionRecords.Store(sessionID, record)
 	// 3. 通知运行实例；通知失败时仍返回已保存的记录和错误。
 	if instance, found := c.runningSessions.Load(sessionID); found {
 		if err := instance.SelectModel(ctx, selection); err != nil {
@@ -866,8 +1022,11 @@ func (c *conversationImpl) SetSessionModel(ctx context.Context, sessionID defs.S
 }
 
 // startSession 返回 Session 的运行实例；没在运行时新建实例并启动它的 Run 和事件转发任务。
-func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (session.Session, error) {
+func (c *conversationImpl) startSession(record defs.Session, spawn *SpawnAgentParam) (session.Session, error) {
 	// 1. 已在运行时返回现有实例，否则检查这套配置的 Session 还没停止、Agent 在目录里。
+	if err := c.detachedSessionError(c.runCtx, record); err != nil {
+		return nil, err
+	}
 	if instance, found := c.runningSessions.Load(record.ID); found {
 		return instance, nil
 	}
@@ -879,11 +1038,90 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 	if !found {
 		return nil, newAgentNotConfiguredError(record)
 	}
+	var instance session.Session
+	var lastSavedOrdinal storage.Ordinal
+	var skillWorkspace workspace.Workspace
+	runCtx := config.sessionsCtx
+	var external *conversationExternalSession
+	var err error
+	if err := validateSessionAgentType(record, agentDefinition); err != nil {
+		return nil, err
+	}
+	if record.External != nil {
+		launch, launchErr := c.newExternalSessionLaunch(config.sessionsCtx, config, record, agentDefinition, spawn)
+		if launchErr != nil {
+			return nil, launchErr
+		}
+		external = &conversationExternalSession{
+			stopped: make(chan struct{}), ready: make(chan struct{}),
+		}
+		var summary string
+		if record.ID == c.rootSessionID {
+			summary = c.forkSummary
+			c.forkSummary = ""
+		}
+		external.ExternalSession, err = externalagent.NewExternalSession(&externalagent.ExternalSessionOpt{
+			AgentType: agentDefinition.Type, Session: record, Launch: launch, ForkSummary: summary,
+		})
+		if err != nil {
+			closeWorkspace(config.sessionsCtx, launch.SkillWorkspace)
+			return nil, err
+		}
+		runCtx, external.cancel = context.WithCancel(config.sessionsCtx)
+		skillWorkspace = launch.SkillWorkspace
+		instance = external
+	} else {
+		instance, lastSavedOrdinal, err = c.newNativeSession(config, record, agentDefinition, spawn != nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// 3. 登记运行实例；并发登记时只用最先存入的实例。
+	if running, loaded := c.runningSessions.LoadOrStore(record.ID, instance); loaded {
+		if external != nil {
+			external.cancel()
+			closeWorkspace(config.sessionsCtx, skillWorkspace)
+		}
+		return running, nil
+	}
+	// 4. 先发出 ConversationSessionStarted，再启动 Session.Run 和事件转发任务。
+	c.sendEvent(&ConversationSessionStarted{
+		Session:          record,
+		LastSavedOrdinal: lastSavedOrdinal,
+		Restoring:        external != nil,
+	})
+	events := make(chan session.SessionEvent)
+	runErrs := make(chan error, 1)
+	c.tasks.Go(func() {
+		runErrs <- instance.Run(runCtx, events)
+	})
+	c.tasks.Go(func() {
+		c.routeSessionEvents(config, record, external, events)
+		c.handleSessionStopped(config, record, instance, <-runErrs)
+		if external != nil {
+			external.cancel()
+			close(external.stopped)
+		}
+	})
+	return instance, nil
+}
+
+// newNativeSession 按原生模型和工具装配 Session，并取得本次启动的日志游标。
+func (c *conversationImpl) newNativeSession(config *conversationConfig, record defs.Session, agentDefinition *agent.AgentDefinition, isSpawned bool) (session.Session, storage.Ordinal, error) {
+	if !isSpawned && record.ID != c.rootSessionID {
+		if _, err := getAgentDefaultModel(config.models, agentDefinition); err != nil {
+			return nil, 0, err
+		}
+	}
 	// 2. 复制 Agent 定义，依次追加 Skill、执行环境、记忆规则和 Session 身份说明。
 	definition := *agentDefinition
 	skills := skill.GetSkillsByNames(definition.SkillNames, config.skills)
 	if skillInstructions := prompt.FormatSkillInstructions(skills); skillInstructions != "" {
 		definition.Instructions += "\n" + skillInstructions
+	}
+	inputSkills, err := c.getInputSkills(skills)
+	if err != nil {
+		return nil, 0, err
 	}
 	if executorInstructions := prompt.FormatExecutorInstructions(newExecutorPromptEntries(config.environments)); executorInstructions != "" {
 		definition.Instructions += "\n" + executorInstructions
@@ -895,56 +1133,53 @@ func (c *conversationImpl) startSession(record defs.Session, isSpawned bool) (se
 	// 3. 合并协作工具和附加工具，创建 Session 配置并按日志最新序号确定 SessionStart hook 的来源。
 	collaborationTools, err := newCollaborationTools(c, record, config.definitions, &definition)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	opt := session.NewSessionOpt(record, c.opt.Query, c.opt.Mutation, c.modelClient, &definition)
 	opt.Models = config.models
 	opt.Environments = config.environments
 	opt.AgentTools = append(collaborationTools, config.extraTools...)
 	opt.EnvironmentsManager = c.environmentsManager
-	opt.Skills = skills
+	opt.Skills = inputSkills
 	opt.Hooks = config.hooks
 	lastSavedOrdinal, err := dao.GetLastOrdinal(config.sessionsCtx, c.opt.Query, c.id, record.ID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	opt.HookStartSource = getHookStartSource(record, lastSavedOrdinal, isSpawned)
 	instance, err := session.NewSession(opt)
-	if err != nil {
-		return nil, err
-	}
-	// 4. 登记运行实例；并发登记时只用最先存入的实例。
-	if running, loaded := c.runningSessions.LoadOrStore(record.ID, instance); loaded {
-		return running, nil
-	}
-	// 5. 先发出 ConversationSessionStarted，再启动 Session.Run 和事件转发任务。
-	c.sendEvent(&ConversationSessionStarted{
-		Session:          record,
-		LastSavedOrdinal: lastSavedOrdinal,
-	})
-	events := make(chan session.SessionEvent)
-	runErrs := make(chan error, 1)
-	c.tasks.Go(func() {
-		runErrs <- instance.Run(config.sessionsCtx, events)
-	})
-	c.tasks.Go(func() {
-		c.routeSessionEvents(config, record, events)
-		c.handleSessionStopped(config, record, instance, <-runErrs)
-	})
-	return instance, nil
+	return instance, lastSavedOrdinal, err
 }
 
 // routeSessionEvents 把 Session 事件转发给应用，子 Session 的 Turn 结束时通知父 Session。
-func (c *conversationImpl) routeSessionEvents(config *conversationConfig, record defs.Session, events <-chan session.SessionEvent) {
+func (c *conversationImpl) routeSessionEvents(config *conversationConfig, record defs.Session, external *conversationExternalSession, events <-chan session.SessionEvent) {
 	// 1. 逐条转发事件；子 Session 的 Turn 结束时，按它启动时的配置把结果通知父 Session。
 	isRoot := record.ID == c.rootSessionID
+	var bindingErr error
 	for event := range events {
+		switch value := event.(type) {
+		case *session.SessionExternalBindingUpdated:
+			if _, err := c.saveSessionUpdate(context.WithoutCancel(config.sessionsCtx), record.ID, SessionUpdate{}, nil, &value.Binding); err != nil {
+				bindingErr = fmt.Errorf("save external Session binding: %w", err)
+				c.stopRun(bindingErr)
+				continue
+			}
+		case *session.SessionExternalStateUpdated:
+			external.state.Store(value)
+		case *session.SessionHistoryRestored:
+			if bindingErr != nil {
+				value.Err = errors.Join(bindingErr, value.Err)
+			}
+			external.restoreErr = value.Err
+			close(external.ready)
+		}
 		c.sendEvent(&ConversationSessionEvent{
 			SessionID: record.ID,
 			Event:     event,
 		})
-		if finished, ok := event.(*session.SessionTurnFinished); ok && !isRoot {
-			c.notifyParent(config, record, newSubagentResultMessage(record, finished))
+		if finished, ok := event.(*session.SessionTurnFinished); ok && !isRoot && (external == nil || !external.detaching.Load()) {
+			child, _ := c.sessionRecords.Load(record.ID)
+			c.notifyParent(config, child, newSubagentResultMessage(child, finished))
 		}
 	}
 }
@@ -975,11 +1210,15 @@ func (c *conversationImpl) handleSessionStopped(config *conversationConfig, reco
 		c.runningSessions.DeleteIf(record.ID, func(running session.Session) bool { return running == instance })
 		return
 	}
+	if external, ok := instance.(*conversationExternalSession); ok && external.detaching.Load() {
+		return
+	}
 	// 3. 移除已停止的实例；这套配置的 Session 还没停止时，向父 Session 发送异常退出消息。
 	c.runningSessions.DeleteIf(record.ID, func(running session.Session) bool { return running == instance })
 	if config.sessionsCtx.Err() != nil {
 		return
 	}
+	record, _ = c.sessionRecords.Load(record.ID)
 	c.notifyParent(config, record, newAgentMessage(record, record.ParentSessionID, defs.AgentRelationChild,
 		fmt.Sprintf("子任务 %s 异常退出：%v", record.ID, err)))
 }
@@ -1030,4 +1269,224 @@ func (c *conversationImpl) WithdrawInput(ctx context.Context, itemID defs.ItemID
 	}
 	// 2. 将操作交给根 Session。
 	return root.WithdrawInput(ctx, itemID)
+}
+
+// GetSessionHistoryDAO 为原生会话返回所在对话的库，外部会话按需启动并按读取方式等待历史。
+func (c *conversationImpl) GetSessionHistoryDAO(ctx context.Context, id defs.SessionID, wait bool) (dao.Query, bool, error) {
+	record, found := c.sessionRecords.Load(id)
+	if !found {
+		return nil, false, fmt.Errorf("Session %s is not in Conversation %s", id, c.id)
+	}
+	if record.External == nil {
+		return c.opt.Query, false, nil
+	}
+	select {
+	case <-c.rootStarted:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+	run, err := c.getExternalSession(ctx, record)
+	if err != nil {
+		return nil, false, err
+	}
+	if wait {
+		if err = run.waitForHistory(ctx); err != nil {
+			return nil, false, err
+		}
+	}
+	query, restoring := run.GetHistoryDAO()
+	if query == nil && !restoring {
+		return nil, false, errors.New("external session has stopped")
+	}
+	return query, restoring, nil
+}
+
+// getExternalSession 借用已有实例，冷会话由对话循环在当前配置下启动。
+func (c *conversationImpl) getExternalSession(ctx context.Context, record defs.Session) (*conversationExternalSession, error) {
+	if record.External == nil {
+		return nil, fmt.Errorf("%w for native sessions", externalagent.ErrExternalUnsupported)
+	}
+	instance, err := c.getOrOpenSession(ctx, record, nil)
+	if err != nil {
+		return nil, err
+	}
+	return instance.(*conversationExternalSession), nil
+}
+
+// getOrOpenSession 复用运行实例，冷启动经对话循环与配置替换、停止按序交接。
+func (c *conversationImpl) getOrOpenSession(ctx context.Context, record defs.Session, spawn *SpawnAgentParam) (session.Session, error) {
+	if record.DetachedConversationID == "" {
+		if instance, ok := c.runningSessions.Load(record.ID); ok {
+			if ext, ok := instance.(*conversationExternalSession); ok && ext.detaching.Load() {
+				return nil, session.ErrSessionBusy
+			}
+			return instance, nil
+		}
+	}
+	request := sessionOpenRequested{record: record, spawn: spawn, reply: make(chan sessionOpenReply, 1)}
+	select {
+	case c.sessionOpens <- request:
+		result := <-request.reply
+		return result.instance, result.err
+	case <-c.stopped:
+		return nil, context.Cause(c.runCtx)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// waitForHistory 等待首次恢复完成，向调用方报告后端返回的错误。
+func (s *conversationExternalSession) waitForHistory(ctx context.Context) error {
+	select {
+	case <-s.ready:
+		return s.restoreErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// detachedSessionError 按新对话的实际根 ID 生成旧会话跳转提示。
+func (c *conversationImpl) detachedSessionError(ctx context.Context, record defs.Session) error {
+	if record.DetachedConversationID != "" {
+		query := c.opt.DetachedConversations
+		if query == nil {
+			query = c.opt.Query
+		}
+		target, found, err := query.GetConversation(ctx, record.DetachedConversationID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("detached Conversation %s not found", record.DetachedConversationID)
+		}
+		return NewSessionDetachedError(target)
+	}
+	return nil
+}
+
+// GetLiveExternalOptions 只读活动驱动最近发布的一份不可变选项。
+func (c *conversationImpl) GetLiveExternalOptions(id defs.SessionID) (defs.ExternalOptions, bool) {
+	running, _ := c.runningSessions.Load(id)
+	if ext, ok := running.(*conversationExternalSession); ok {
+		if state := ext.state.Load(); state != nil {
+			return state.Options, true
+		}
+	}
+	return defs.ExternalOptions{}, false
+}
+
+func (c *conversationImpl) getReadyExternalSession(ctx context.Context, id defs.SessionID) (*conversationExternalSession, error) {
+	record, err := c.getCollaborationSource(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	ext, err := c.getExternalSession(ctx, record)
+	if err != nil {
+		return nil, err
+	}
+	return ext, ext.waitForHistory(ctx)
+}
+
+// GetExternalOptions 等首次 Ready 后读取会话实际选项。
+func (c *conversationImpl) GetExternalOptions(ctx context.Context, id defs.SessionID) (defs.ExternalOptions, error) {
+	ext, err := c.getReadyExternalSession(ctx, id)
+	if err != nil {
+		return defs.ExternalOptions{}, err
+	}
+	return ext.state.Load().Options, nil
+}
+
+// SetExternalOption 将修改交给同一个运行实例。
+func (c *conversationImpl) SetExternalOption(ctx context.Context, id defs.SessionID, selection defs.ExternalOptionSelection) error {
+	ext, err := c.getReadyExternalSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	return ext.SetOption(ctx, selection)
+}
+
+// ReloadExternalSession 用这套配置的定义、Executor、会话身份重新装配启动参数。
+func (c *conversationImpl) ReloadExternalSession(ctx context.Context, id defs.SessionID) error {
+	ext, err := c.getReadyExternalSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	config, err := c.getConfigBase(ctx)
+	if err != nil {
+		return err
+	}
+	record, _ := c.sessionRecords.Load(id)
+	definition := config.agentDefinitions[record.AgentName]
+	if definition == nil {
+		return newAgentNotConfiguredError(record)
+	}
+	if err := validateSessionAgentType(record, definition); err != nil {
+		return err
+	}
+	launch, err := c.newExternalSessionLaunch(ctx, config, record, definition, nil)
+	if err != nil {
+		return err
+	}
+	return ext.Reload(ctx, launch)
+}
+
+// PrepareSessionDetach 先标明转出，再取消并等到旧实例退出；失败时仍可用原绑定重开。
+func (c *conversationImpl) PrepareSessionDetach(ctx context.Context, id defs.SessionID) (defs.Session, error) {
+	record, err := c.getCollaborationSource(ctx, id)
+	if err != nil {
+		return defs.Session{}, err
+	}
+	if record.External == nil {
+		return defs.Session{}, fmt.Errorf("%w for native sessions", externalagent.ErrExternalUnsupported)
+	}
+	if record.ParentSessionID == "" {
+		return defs.Session{}, errors.New("only child sessions can be detached")
+	}
+	ext, err := c.getExternalSession(ctx, record)
+	if err != nil {
+		return defs.Session{}, err
+	}
+	if err = ext.waitForHistory(ctx); err != nil {
+		return defs.Session{}, err
+	}
+	if !ext.detaching.CompareAndSwap(false, true) {
+		return defs.Session{}, session.ErrSessionBusy
+	}
+	ext.cancel()
+	<-ext.stopped
+	record, _ = c.sessionRecords.Load(id)
+	return record, nil
+}
+
+// FinishSessionDetach 解除对旧实例的占用；转出成功先保存跳转，再通知父会话，空闲时留到下一轮。
+func (c *conversationImpl) FinishSessionDetach(ctx context.Context, id defs.SessionID, target defs.Conversation) (defs.Session, error) {
+	defer c.runningSessions.Delete(id)
+	if target.ID == "" {
+		return defs.Session{}, nil
+	}
+	child, err := c.saveSessionUpdate(ctx, id, SessionUpdate{detachedConversationID: target.ID}, nil, nil)
+	if err != nil {
+		return defs.Session{}, err
+	}
+	notice := fmt.Sprintf("用户已将子 Agent %s（任务：%s，旧会话 %s）转为独立对话。新对话 ID：%s，新会话 ID：%s。它以后不再向你回报，你也不能再给它派活或发消息。", child.AgentName, child.TaskName, child.ID, target.ID, target.RootSessionID)
+	msg := newAgentMessage(child, child.ParentSessionID, defs.AgentRelationChild, notice)
+	msg.Message.AgentSender.DetachedConversationID = target.ID
+	msg.Message.AgentSender.DetachedSessionID = target.RootSessionID
+	parent, _ := c.sessionRecords.Load(child.ParentSessionID)
+	instance, err := c.getOrOpenSession(ctx, parent, nil)
+	var status session.SessionStatus
+	if err == nil {
+		status, err = instance.GetStatus(ctx)
+	}
+	if err == nil {
+		if status.ActiveTurnID == "" {
+			err = instance.AppendContextItems(ctx, []*defs.Item{msg})
+		} else {
+			_, err = instance.HandleInput(ctx, &session.SessionInput{Mode: session.SessionInputModeSteer, Item: msg})
+		}
+	}
+	if err != nil {
+		telemetry.GetLogger(ctx).Warn("notify parent of detached session failed", "session", id, "error", err)
+	}
+	return child, nil
 }

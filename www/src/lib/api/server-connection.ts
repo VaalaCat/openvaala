@@ -1,4 +1,4 @@
-import { atom } from "nanostores"
+import { atom, computed } from "nanostores"
 import packageInfo from "../../../package.json" with { type: "json" }
 import { RpcError, rpcConnectionLostCode } from "../rpc-error"
 import {
@@ -7,10 +7,17 @@ import {
   type ClientNotificationParams,
   type ConversationID,
   type JSONRPCMessage,
+  type InitializeResult,
   type MethodParams,
   type MethodResult,
   type NotificationParams,
 } from "./protocol.gen"
+import {
+  WorldTransport,
+  connectionBudget,
+  parseWorldLink,
+  type WorldTarget,
+} from "./world-transport"
 import type { ServerEntry } from "./servers"
 
 // ConnectionState 描述页面和 serve 的连接：unauthorized 和 incompatible 要用户处理，不再自动重连
@@ -44,14 +51,16 @@ export type GlobalServerNotification = Exclude<
 export interface WebSocketLike {
   send(data: string): void
   close(): void
-  onopen: ((event: Event) => void) | null
+  onopen: ((event: Event) => void | Promise<void>) | null
   onmessage: ((event: MessageEvent) => void) | null
   onclose: ((event: CloseEvent) => void) | null
 }
 
+type ConnectionEntry = ServerEntry & { worldTarget?: WorldTarget }
+
 // ServerConnectionDeps 是连接依赖的外部能力，测试用内存实现替换
 export interface ServerConnectionDeps {
-  createWebSocket(url: string): WebSocketLike
+  createTransport(entry: ConnectionEntry): WebSocketLike
   fetch: typeof fetch
   setTimeout(callback: () => void, delayMs: number): unknown
   clearTimeout(handle: unknown): void
@@ -65,7 +74,10 @@ interface PendingCall {
 }
 
 const defaultDeps: ServerConnectionDeps = {
-  createWebSocket: (url) => new WebSocket(url),
+  createTransport: (entry) =>
+    entry.worldTarget
+      ? new WorldTransport(entry.worldTarget, entry.token)
+      : new WebSocket(`${entry.url}?token=${encodeURIComponent(entry.token)}`),
   // 包一层，保证 fetch 以全局对象为 this 调用
   fetch: (input, init) => fetch(input, init),
   setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
@@ -83,10 +95,14 @@ const textEncoder = new TextEncoder()
 
 // ServerConnection 保存页面和一个 serve 之间的 WebSocket 连接：握手、请求与响应、通知分发、断线重连和 RPC 记录。
 export class ServerConnection {
-  readonly entry: ServerEntry
-  readonly $state = atom<ConnectionState>("connecting")
+  readonly entry: ConnectionEntry
+  readonly $status = atom<{ state: ConnectionState; reason?: string }>({
+    state: "connecting",
+  })
+  readonly $state = computed(this.$status, ({ state }) => state)
   // 连上之后才有值，之后断线重连也保留
-  readonly $serverID = atom<string | undefined>(undefined)
+  readonly $identity = atom<InitializeResult | undefined>(undefined)
+  readonly $serverID = computed(this.$identity, (result) => result?.server_id)
   readonly $rpcLog = atom<RpcFrame[]>([])
   // RPC 记录是否暂停？暂停期间收发的帧不记
   readonly $isRpcLogPaused = atom(false)
@@ -116,8 +132,14 @@ export class ServerConnection {
     (notification: GlobalServerNotification) => void
   >()
 
-  constructor(entry: ServerEntry, deps: ServerConnectionDeps = defaultDeps) {
-    this.entry = entry
+  constructor(
+    entry: ConnectionEntry,
+    deps: ServerConnectionDeps = defaultDeps
+  ) {
+    this.entry =
+      entry.url.includes("#world=") && !entry.worldTarget
+        ? { ...entry, worldTarget: parseWorldLink(entry.url).target }
+        : entry
     this.deps = deps
   }
 
@@ -127,7 +149,6 @@ export class ServerConnection {
     if (this.isRunning) this.stop(this.runID)
     const runID = ++this.runID
     this.isRunning = true
-    this.$state.set("connecting")
     this.failedConnectionAttempts = 0
     this.connect(runID)
     // 2. 返回结束这一次运行的函数。
@@ -182,7 +203,7 @@ export class ServerConnection {
     socket.send(text)
   }
 
-  // initialize 返回的 server_id；只在连上之后调用，之前调用直接抛错
+  // initialize 返回的 server_id；只在连上之后调用，之前调用直接抛错。
   getServerID(): string {
     const serverID = this.$serverID.get()
     if (serverID === undefined)
@@ -230,13 +251,15 @@ export class ServerConnection {
   // 打开一条 WebSocket，握手、消息和断开都交给对应的处理函数
   private connect(runID: number): void {
     // 1. 为本次 socket 和 initialize 登记共同期限。
+    if (this.failedConnectionAttempts === 0 || this.entry.worldTarget)
+      this.$status.set({ state: "connecting" })
     const attemptID = ++this.attemptID
-    const url = `${this.entry.url}?token=${encodeURIComponent(this.entry.token)}`
-    const socket = this.deps.createWebSocket(url)
+    const socket = this.deps.createTransport(this.entry)
     this.socket = socket
-    socket.onopen = () => void this.handleOpen(socket)
+    socket.onopen = () => this.handleOpen(socket)
     socket.onmessage = (event) => this.handleMessage(socket, event)
-    socket.onclose = () => this.handleClose(socket, runID, attemptID)
+    socket.onclose = (event) =>
+      this.handleClose(socket, runID, attemptID, event)
     this.attemptTimer = this.deps.setTimeout(() => {
       if (
         runID !== this.runID ||
@@ -246,20 +269,19 @@ export class ServerConnection {
       )
         return
       this.handleClose(socket, runID, attemptID)
-    }, connectionAttemptTimeoutMs)
+    }, connectionBudget(this.entry.worldTarget))
   }
 
   // 连接建立后发 initialize；成功才算连上，协议版本不一致时不再重连
   private async handleOpen(socket: WebSocketLike): Promise<void> {
     // 1. 发出 initialize 并等待回复。
     if (this.socket !== socket) return
-    let serverID: string
+    let result: InitializeResult
     try {
-      const result = await this.sendRequest(socket, "initialize", {
+      result = await this.sendRequest(socket, "initialize", {
         client_info: { name: "openvaala-web", version: packageInfo.version },
         protocol_version: ProtocolVersion,
       })
-      serverID = result.server_id
     } catch (error) {
       // 2. 失败：连接已经断开的由 handleClose 处理；协议版本不一致停止重连；其他错误关闭连接后重连。
       if (this.socket !== socket) return
@@ -267,7 +289,7 @@ export class ServerConnection {
         this.clearAttemptTimer()
         this.detachSocket(socket)
         this.$isManualReconnectPending.set(false)
-        this.$state.set("incompatible")
+        this.$status.set({ state: "incompatible" })
         return
       }
       socket.close()
@@ -278,8 +300,8 @@ export class ServerConnection {
     this.clearAttemptTimer()
     this.$isManualReconnectPending.set(false)
     this.failedConnectionAttempts = 0
-    this.$serverID.set(serverID)
-    this.$state.set("connected")
+    this.$identity.set(result)
+    this.$status.set({ state: "connected" })
     for (const handler of [...this.connectedHandlers]) handler()
   }
 
@@ -299,7 +321,14 @@ export class ServerConnection {
       this.recordFrame(
         "received",
         event.data,
-        message,
+        pending &&
+          [
+            "world/admin/createToken",
+            "server/resetToken",
+            "world/getStatus",
+          ].includes(pending.method)
+          ? undefined
+          : message,
         pending?.method,
         message.id
       )
@@ -310,7 +339,8 @@ export class ServerConnection {
           new RpcError(
             message.error.code,
             message.error.message,
-            pending.method
+            pending.method,
+            message.error.data
           )
         )
       else pending.resolve(message.result)
@@ -338,14 +368,22 @@ export class ServerConnection {
   private handleClose(
     socket: WebSocketLike,
     runID: number,
-    attemptID: number
+    attemptID: number,
+    event?: CloseEvent
   ): void {
     // 1. 结束本次连接尝试并关闭 socket。
     if (this.socket !== socket) return
     this.clearAttemptTimer()
     this.detachSocket(socket)
     this.$isManualReconnectPending.set(false)
-    this.$state.set("reconnecting")
+    if (event?.code === 4401) {
+      this.$status.set({ state: "unauthorized" })
+      return
+    }
+    this.$status.set({
+      state: "reconnecting",
+      reason: event?.code === 4004 ? event.reason : undefined,
+    })
     this.failedConnectionAttempts++
     // 2. 查 token 是否有效，再安排下一次连接。
     void this.scheduleReconnect(runID, attemptID)
@@ -357,11 +395,12 @@ export class ServerConnection {
     attemptID: number
   ): Promise<void> {
     // 1. WebSocket 握手失败后用普通请求探测 401。
-    const isTokenRejected = await this.isTokenRejected()
+    const isTokenRejected =
+      !this.entry.worldTarget && (await this.isTokenRejected())
     if (runID !== this.runID || attemptID !== this.attemptID || !this.isRunning)
       return
     if (isTokenRejected) {
-      this.$state.set("unauthorized")
+      this.$status.set({ state: "unauthorized" })
       return
     }
     // 2. 其他结果继续退避重连。
@@ -450,7 +489,7 @@ export class ServerConnection {
     // 2. 关闭连接并结束手动进行状态。
     if (this.socket) this.detachSocket(this.socket)
     this.$isManualReconnectPending.set(false)
-    this.$state.set("reconnecting")
+    this.$status.set({ state: "reconnecting" })
   }
 
   // 主动关闭连接，不再处理它之后的事件，等待回复的请求以「连接已断开」失败

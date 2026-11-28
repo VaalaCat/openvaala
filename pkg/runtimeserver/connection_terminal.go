@@ -2,13 +2,17 @@ package runtimeserver
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/terminal"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const (
@@ -189,4 +193,91 @@ func (c *serverConnection) cancelTerminalAttachment(ctx context.Context, termina
 	case <-attachment.done:
 	case <-ctx.Done():
 	}
+}
+
+// openConversationTerminal 在操作者指定或令牌绑定的对话下打开终端。
+func openConversationTerminal(ctx context.Context, rt runtime.Runtime, caller *sessionCaller, params *runtimeprotocol.TerminalOpenParams) (*runtime.OpenedTerminal, error) {
+	conversationID := params.ConversationID
+	if caller != nil {
+		conversationID = caller.conversationID
+	}
+	return rt.OpenTerminal(ctx, &runtime.OpenTerminalRequest{
+		ExecutorID: params.ExecutorID, Directory: params.Directory, Environment: params.Environment,
+		Rows: params.Rows, Cols: params.Cols, ConversationID: conversationID, UseConversationExecutor: caller != nil,
+	})
+}
+
+// getConversationTerminal 按调用方身份获取指定终端。
+func getConversationTerminal(ctx context.Context, rt runtime.Runtime, caller *sessionCaller, id string) (terminal.Terminal, error) {
+	if caller != nil {
+		return rt.GetConversationTerminal(ctx, caller.conversationID, id)
+	}
+	return rt.GetTerminal(ctx, id)
+}
+
+// writeConversationTerminalInput 校验终端归属并写入按键。
+func writeConversationTerminalInput(ctx context.Context, rt runtime.Runtime, caller *sessionCaller, id, keys string) (*runtimeprotocol.EmptyResult, error) {
+	instance, err := getConversationTerminal(ctx, rt, caller, id)
+	if err != nil {
+		return nil, err
+	}
+	_, err = instance.WriteInput(ctx, keys)
+	return &runtimeprotocol.EmptyResult{}, err
+}
+
+// closeConversationTerminal 限时结束终端；算作可访问的终端已被清理时直接返回。
+func closeConversationTerminal(ctx context.Context, rt runtime.Runtime, caller *sessionCaller, id string) (*runtimeprotocol.EmptyResult, error) {
+	instance, err := getConversationTerminal(ctx, rt, caller, id)
+	if errors.Is(err, terminal.ErrTerminalNotFound) {
+		return &runtimeprotocol.EmptyResult{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, terminalCloseTimeout)
+	defer cancel()
+	_, err = instance.Stop(stopCtx)
+	return &runtimeprotocol.EmptyResult{}, err
+}
+
+// captureTerminal 读取首个快照位置之前保留的输出，并返回最近的纯文本行。
+func captureTerminal(ctx context.Context, rt runtime.Runtime, caller *sessionCaller, params *runtimeprotocol.TerminalCaptureParams) (string, error) {
+	instance, err := getConversationTerminal(ctx, rt, caller, params.TerminalID)
+	if err != nil {
+		return "", err
+	}
+	if params.Lines < 0 {
+		return "", errors.New("lines must be non-negative")
+	}
+	page, err := instance.ReadOutput(ctx, 0, 0)
+	if err != nil {
+		return "", err
+	}
+	endCursor := page.EndCursor
+	var output strings.Builder
+	for {
+		text := page.Text
+		if page.NextCursor > endCursor {
+			startCursor := page.NextCursor - uint64(len(text))
+			if startCursor < endCursor {
+				text = strings.ToValidUTF8(text[:endCursor-startCursor], "")
+				output.WriteString(text)
+			}
+			break
+		}
+		output.WriteString(text)
+		if !page.HasMore || page.NextCursor >= endCursor {
+			break
+		}
+		page, err = instance.ReadOutput(ctx, page.NextCursor, 0)
+		if err != nil {
+			return "", err
+		}
+	}
+	text := strings.ReplaceAll(ansi.Strip(output.String()), "\r\n", "\n")
+	if params.Lines == 0 {
+		return text, nil
+	}
+	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	return strings.Join(lines[max(0, len(lines)-params.Lines):], "\n"), nil
 }

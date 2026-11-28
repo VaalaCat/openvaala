@@ -4,15 +4,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
+	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/storage"
+	"github.com/VaalaCat/openvaala/pkg/world"
 )
 
 // ── Client 错误 ──
@@ -25,6 +28,9 @@ var ErrUnauthorized = errors.New("runtime server rejected the token")
 
 // ErrClientStopped 表示 Client.Run 已返回，不再处理调用。
 var ErrClientStopped = errors.New("runtime client has stopped")
+
+// ErrExternalSessionRestore 表示外部会话的历史恢复已失败，错误原文包含后端原因。
+var ErrExternalSessionRestore = errors.New("external session cannot be restored")
 
 // ErrInitializeRejected 表示服务端拒绝 initialize；Client.Run 返回此错误，不再重连。
 // 错误文本提示用户停止旧 serve 后重试。
@@ -52,14 +58,23 @@ func (e *serverRuntimeError) Unwrap() error {
 // 另外还原为哨兵错误，不是 ResponseError。
 // 调用方用 errors.As 取出，按错误码转换成自己协议的错误。
 type ResponseError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int                               `json:"code"`
+	Message string                            `json:"message"`
+	Data    *runtimeprotocol.JSONRPCErrorData `json:"data,omitempty"`
 }
 
 // Error 返回带错误码的服务端错误文本。
 func (e *ResponseError) Error() string {
-	// 1. 拼接错误消息和错误码。
+	if e.Data != nil && e.Data.Code != "" {
+		return e.Data.Code + ": " + e.Message
+	}
 	return fmt.Sprintf("%s (code %d)", e.Message, e.Code)
+}
+
+// Is 服务端返回的是外部会话恢复失败吗？此错误使用通用 Runtime 错误码和固定消息前缀。
+func (e *ResponseError) Is(target error) bool {
+	return target == ErrExternalSessionRestore && e.Code == runtimeprotocol.ErrorCodeRuntime &&
+		strings.HasPrefix(e.Message, ErrExternalSessionRestore.Error()+":")
 }
 
 // ── Client 请求参数 ──
@@ -88,7 +103,8 @@ type ListConversationsResult struct {
 
 // ForkConversationRequest 把对话复制到截取点为止；BeforeTurnID 和 LastTurnID 最多填一个，都不填时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
 type ForkConversationRequest struct {
-	ConversationID defs.ConversationID
+	SourceSessionID defs.SessionID
+	ConversationID  defs.ConversationID
 	// BeforeTurnID 复制到这一轮之前（不含），回退重来用。
 	BeforeTurnID defs.TurnID
 	// LastTurnID 复制到这一轮（含）。
@@ -132,7 +148,8 @@ type AppendContextItemsRequest struct {
 
 // CreateConversationRequest 以 AgentName 对应的 Agent 新建对话。
 type CreateConversationRequest struct {
-	AgentName string
+	InitialOptions []defs.ExternalOptionSelection
+	AgentName      string
 	// Model 为零值时使用 Agent 的默认模型。
 	Model defs.ModelSelection
 	// ExecutorSettings 里没有 local 目录时由服务端使用默认目录（配了 server.workspace_directory 时是它，否则是 serve 的启动目录）。
@@ -153,8 +170,10 @@ type OpenConversationRequest struct {
 	// Environment 为 nil 时本机命令继承 serve 进程的环境；对话已在服务端运行时沿用它第一次打开时的。
 	Environment []string
 	// SkipHistory 首次同步是否跳过已保存的历史？跳过时 SessionSynced.Items 为空，只交付订阅位置之后的内容；
-	// 之后的重新同步照常从上次交付的位置补齐。
+	// 原生会话之后按序号补齐；外部会话每次换库都由调用方重新读取自己的页。
 	SkipHistory bool
+	// WaitForHistory 要求打开请求等外部会话首次恢复完成，未指定 SkipHistory 时完整回放给编辑器。
+	WaitForHistory bool
 }
 
 // SetClientExecutorRequest 登记本机执行环境。MCPServerIDs 为空时注销，ExecutorID 为空时由 serve 选择。
@@ -181,6 +200,7 @@ type TerminalOpenRequest struct {
 
 // GetSkillsRequest 选择已有对话的 Skills；尚未建立对话时用 AgentName 和 ExecutorSettings 查草稿 Skills。
 type GetSkillsRequest struct {
+	Query            string
 	ConversationID   defs.ConversationID
 	AgentName        string
 	ExecutorSettings defs.ExecutorSettings
@@ -246,16 +266,22 @@ type ListTurnsResult struct {
 
 // ListSessionsRequest 是分页列出对话内 Session 记录的参数；Order 与 Cursor 的零值含义同 ListConversationsRequest。
 type ListSessionsRequest struct {
-	ConversationID defs.ConversationID
-	Order          storage.Order
-	Cursor         dao.RecordCursor[defs.SessionID]
-	Limit          int
+	SourceSessionID defs.SessionID
+	Filter          *conversation.ListAgentsParam
+	ConversationID  defs.ConversationID
+	Order           storage.Order
+	Cursor          dao.RecordCursor[defs.SessionID]
+	Limit           int
 }
 
 // ListSessionsResult 是一页 Session 记录；NextCursor 为零值表示没有下一页。
 type ListSessionsResult struct {
-	Sessions   []defs.Session
-	NextCursor dao.RecordCursor[defs.SessionID]
+	AppliedFilter *conversation.ListAgentsParam
+	TotalMatched  *int
+	Truncated     bool
+	Hint          string
+	Sessions      []defs.Session
+	NextCursor    dao.RecordCursor[defs.SessionID]
 }
 
 // SetSessionModelRequest 保存一个 Session 所选的模型与推理强度，从下一个 Turn 开始生效；推理强度为空时由服务端按规则解析。
@@ -292,7 +318,8 @@ type ConnectionChanged struct {
 	// RetryIn 是距离这次重连的等待时长。
 	RetryIn time.Duration
 	// ServerID 在 State 为 connected 时是 initialize 返回的 server_id，其他状态为空。
-	ServerID string
+	ServerID   string
+	ServerInfo runtimeprotocol.ServerInfo
 }
 
 // RunningConversationsChanged 由 Client 在订阅完成、集合变化、连接丢失或订阅失败时交付；未知时不把空切片当成空集合。
@@ -339,11 +366,28 @@ func (*RunningConversationsChanged) isClientEvent() {}
 func (*TerminalsChanged) isClientEvent()            {}
 func (*RPCLogChanged) isClientEvent()               {}
 
+// SessionHistoryAction 指定本次同步如何更新阅读器已经显示的历史。
+type SessionHistoryAction uint8
+
+const (
+	HistoryAppend  SessionHistoryAction = iota // 按已交付的 ordinal 追加。
+	HistoryWait                                // 等外部历史恢复，保留页面和游标。
+	HistoryReplace                             // 用新库中的历史替换旧页，并重置游标。
+)
+
 // SessionSynced 由 Client 在打开对话或重连后完成同步时发出，紧跟在 ConversationSynced 之后；之后的 ItemsSaved 紧接 Items。
 type SessionSynced struct {
 	SessionID      defs.SessionID
 	ConversationID defs.ConversationID
-	// Items 是上次交付位置之后补齐的已保存 Item；打开对话时为全部历史，SkipHistory 时为空。
+	HistoryAction  SessionHistoryAction
+	// External 表示历史来自外部会话，每次重新订阅都以本页替换旧页。
+	External bool
+	// Restoring 时不读取历史，不移动旧游标。
+	Restoring    bool
+	Options      *defs.ExternalOptions
+	Capabilities *defs.ExternalCapabilities
+	Commands     []defs.ExternalCommand
+	// Items 是原生会话按流水号补齐的历史或外部会话的最近一页；编辑器首次打开可要求完整历史。
 	Items []runtimeprotocol.LoggedItem
 	// StreamingItems 是跟随的 Session 正在生成的 Item 列表。
 	StreamingItems []runtimeprotocol.StreamingItem
@@ -352,6 +396,11 @@ type SessionSynced struct {
 	// LastSavedOrdinal 是本次同步交付到的位置。
 	LastSavedOrdinal storage.Ordinal
 }
+
+// SessionExternalStateChanged 由 Client 在驱动上报新选项、命令或能力时交付给会话订阅方。
+type SessionExternalStateChanged runtimeprotocol.SessionExternalStateUpdatedParams
+
+func (*SessionExternalStateChanged) isClientEvent() {}
 
 // ItemsSaved 由 Client 在跟随的 Session 写入一批 Item 后发出，流水号与之前交付的连续。
 type ItemsSaved struct {
@@ -541,6 +590,9 @@ type wireMessage struct {
 
 // notificationParams 汇集各通知可能带的字段，按通知名读取需要的部分。
 type notificationParams struct {
+	Options        defs.ExternalOptions         `json:"options"`
+	Capabilities   defs.ExternalCapabilities    `json:"capabilities"`
+	Commands       []defs.ExternalCommand       `json:"commands"`
 	ConversationID defs.ConversationID          `json:"conversation_id"`
 	SessionID      defs.SessionID               `json:"session_id"`
 	Subscription   string                       `json:"subscription"`
@@ -608,7 +660,7 @@ type conversationOpenResult struct {
 // connectionReady 由连接任务在拨号并完成 initialize 后触发；serverID 是 initialize 返回的 server_id。
 type connectionReady struct {
 	connection *clientConnection
-	serverID   string
+	runtimeprotocol.InitializeResult
 }
 
 // connectionFailed 由连接任务在拨号或 initialize 失败后触发。
@@ -628,6 +680,9 @@ type notificationReceived struct {
 	message    *wireMessage
 }
 
+// conversationSubscriptionsRemoved 由同步任务在旧订阅全部退订、即将登记新订阅时发出。
+type conversationSubscriptionsRemoved struct{ generation int }
+
 // syncFinished 由同步任务在订阅并补齐后触发；generation 与当前同步不符时结果已过时。
 type syncFinished struct {
 	generation int
@@ -637,22 +692,22 @@ type syncFinished struct {
 
 // syncResult 是一次同步得到的对话、跟随的 SessionID、Session 状态、补齐的 Item 与生成中 Item 列表。
 type syncResult struct {
-	conversation     defs.Conversation
-	sessionID        defs.SessionID
-	sessionInfos     []runtime.SessionRuntimeInfo
-	items            []runtimeprotocol.LoggedItem
-	streamingItems   []runtimeprotocol.StreamingItem
-	pendingInputs    session.SessionPendingInputs
-	lastSavedOrdinal storage.Ordinal
+	conversation  defs.Conversation
+	sessionID     defs.SessionID
+	sessionInfos  []runtime.SessionRuntimeInfo
+	items         []runtimeprotocol.LoggedItem
+	historyAction SessionHistoryAction
+	snapshot      runtimeprotocol.SubscribeSessionResult
 }
 
-func (*connectionRequested) isClientLoopInput()       {}
-func (*conversationOpenRequested) isClientLoopInput() {}
-func (*connectionReady) isClientLoopInput()           {}
-func (*connectionFailed) isClientLoopInput()          {}
-func (*connectionLost) isClientLoopInput()            {}
-func (*notificationReceived) isClientLoopInput()      {}
-func (*syncFinished) isClientLoopInput()              {}
+func (*connectionRequested) isClientLoopInput()              {}
+func (*conversationOpenRequested) isClientLoopInput()        {}
+func (*connectionReady) isClientLoopInput()                  {}
+func (*connectionFailed) isClientLoopInput()                 {}
+func (*connectionLost) isClientLoopInput()                   {}
+func (*notificationReceived) isClientLoopInput()             {}
+func (*conversationSubscriptionsRemoved) isClientLoopInput() {}
+func (*syncFinished) isClientLoopInput()                     {}
 
 // reconnectRequested 由调用方点击重连时触发，循环确认是否需要跳过退避。
 type reconnectRequested struct{ reply chan struct{} }
@@ -700,3 +755,18 @@ func (*rpcLogRequested) isClientLoopInput()    {}
 func (*globalSubscribeRequested[T]) isClientLoopInput()   {}
 func (*globalSubscribed[T]) isClientLoopInput()           {}
 func (*globalSubscriptionPrepared[T]) isClientLoopInput() {}
+
+// SessionSubscriptionClosed 在直接订阅被服务端关闭时交付。
+type SessionSubscriptionClosed struct {
+	SessionID defs.SessionID
+	Reason    string
+}
+
+func (*SessionSubscriptionClosed) isClientEvent() {}
+
+// WorldMessageUpdated 由节点的连接级订阅收到状态、联系人或消息更新时发出。
+type WorldMessageUpdated struct {
+	Notification world.NodeNotification
+}
+
+func (*WorldMessageUpdated) isClientEvent() {}

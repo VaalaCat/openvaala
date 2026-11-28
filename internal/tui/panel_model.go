@@ -59,9 +59,14 @@ func (p *modelPanel) getTitle() string {
 // getFetch 返回按已记录 Agent 读取模型目录的请求。
 func (p *modelPanel) getFetch(m *tuiModel) func(ctx context.Context) (any, error) {
 	// 1. 保存客户端和 Agent 名称，生成列表查询。
-	client, agentName := m.opt.Client, p.agentName
+	client := m.opt.Client
+	request := runtime.ListModelsRequest{AgentName: p.agentName}
+	if m.conversation != nil {
+		request.ConversationID = m.conversation.ID
+		request.SessionID = m.conversation.RootSessionID
+	}
 	return func(ctx context.Context) (any, error) {
-		return client.ListModels(ctx, agentName)
+		return client.ListModels(ctx, &request)
 	}
 }
 

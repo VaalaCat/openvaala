@@ -1,0 +1,53 @@
+[
+  {
+    "name": "one",
+    "instances": [
+      "wss://relay.example/a"
+    ],
+    "key": "rDR7fiRakWZVO21-K9QXq_5S42EgFkNf91KMe6ox-hc",
+    "selected": [
+      "wss://relay.example/a"
+    ]
+  },
+  {
+    "name": "two",
+    "instances": [
+      "wss://relay.example/a",
+      "ws://b.example:80"
+    ],
+    "key": "rDR7fiRakWZVO21-K9QXq_5S42EgFkNf91KMe6ox-hc",
+    "selected": [
+      "ws://b.example:80",
+      "wss://relay.example/a"
+    ]
+  },
+  {
+    "name": "five",
+    "instances": [
+      "wss://relay.example/a",
+      "ws://b.example:80",
+      "wss://C.example:443/",
+      "wss://relay.example/eu",
+      "ws://d.example"
+    ],
+    "key": "rDR7fiRakWZVO21-K9QXq_5S42EgFkNf91KMe6ox-hc",
+    "selected": [
+      "ws://d.example",
+      "ws://b.example:80"
+    ]
+  },
+  {
+    "name": "remove first choice",
+    "instances": [
+      "wss://relay.example/a",
+      "ws://b.example:80",
+      "wss://C.example:443/",
+      "wss://relay.example/eu"
+    ],
+    "key": "rDR7fiRakWZVO21-K9QXq_5S42EgFkNf91KMe6ox-hc",
+    "selected": [
+      "ws://b.example:80",
+      "wss://C.example:443/"
+    ]
+  }
+]

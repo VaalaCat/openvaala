@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,8 +16,12 @@ import (
 	"time"
 
 	"github.com/VaalaCat/openvaala/internal/config"
+	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/dao"
+	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
 	storagefile "github.com/VaalaCat/openvaala/pkg/storage/file"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
@@ -102,10 +108,19 @@ func ResolveDesktopStartTarget(command *cobra.Command) (DesktopStartTarget, *con
 
 // getRuntimeConnection 选择客户端命令要连的 serve 地址和令牌；本机需要拉起 serve 时，idleTimeout 是它的空闲退出时间，0 表示常驻。
 func getRuntimeConnection(ctx context.Context, args *AppArgs, idleTimeout time.Duration) (runtimeConnection, error) {
-	// 1. 依次读取 --url、client.url；都为空时复用或拉起本机 serve，用连接文件里的地址和令牌。
+	// 1. 依次使用命令行、环境变量和客户端配置；未指定地址时复用或启动本机 serve。
 	source, runtimeURL := runtimeConnectionSourceFlag, args.RuntimeURL
+	conversationID := cmp.Or(args.ConversationID, defs.ConversationID(os.Getenv("OPENVAALA_CONVERSATION_ID")))
+	sessionID := defs.SessionID(os.Getenv("OPENVAALA_SESSION_ID"))
+	if runtimeURL == "" {
+		source, runtimeURL = runtimeConnectionSourceEnvironment, os.Getenv("OPENVAALA_URL")
+	}
 	if runtimeURL == "" {
 		source, runtimeURL = runtimeConnectionSourceConfig, args.Config.Client.URL
+	}
+	token := args.RuntimeToken
+	if token == "" && !(strings.Contains(runtimeURL, "#world=") && isTokenInURL(runtimeURL)) {
+		token = os.Getenv("OPENVAALA_TOKEN")
 	}
 	if runtimeURL == "" {
 		file, err := EnsureRuntimeServer(ctx, &RuntimeServerStartOpt{Config: args.Config, Executable: args.Executable, ConfigFlags: args.ConfigFlags, IdleTimeout: idleTimeout, LogFile: args.Config.Telemetry.LogFile})
@@ -114,7 +129,9 @@ func getRuntimeConnection(ctx context.Context, args *AppArgs, idleTimeout time.D
 		}
 		return runtimeConnection{
 			URL:                   file.URL,
-			Token:                 file.Token,
+			Token:                 cmp.Or(token, file.Token),
+			ConversationID:        conversationID,
+			SessionID:             sessionID,
 			Source:                runtimeConnectionSourceLocal,
 			LocalServerID:         file.ServerID,
 			IsFromOtherExecutable: !isRuntimeServerFromCurrentExecutable(ctx, file),
@@ -126,13 +143,17 @@ func getRuntimeConnection(ctx context.Context, args *AppArgs, idleTimeout time.D
 		telemetry.GetLogger(ctx).Warn("cannot read the runtime server file; treating the runtime server as a remote one", "error", err)
 	}
 	connection := runtimeConnection{
-		URL:           runtimeURL,
-		Source:        source,
-		LocalServerID: file.ServerID,
+		URL:            runtimeURL,
+		ConversationID: conversationID,
+		SessionID:      sessionID,
+		Source:         source,
+		LocalServerID:  file.ServerID,
 	}
-	// 3. URL 带 token 参数时以它为准（空值也算）；不带时用 client.token，仍为空且地址指向本机 serve 时用连接文件里的 token。
-	if !isTokenInURL(runtimeURL) {
-		connection.Token = args.Config.Client.Token
+	// 3. 解析显式令牌，只为地址相同的本机 serve 补连接文件里的令牌。
+	if args.RuntimeToken != "" {
+		connection.Token = args.RuntimeToken
+	} else if !isTokenInURL(runtimeURL) || source != runtimeConnectionSourceFlag && token != "" {
+		connection.Token = cmp.Or(token, args.Config.Client.Token)
 		if connection.Token == "" && found && isSameRuntimeServer(runtimeURL, file.URL) {
 			connection.Token = file.Token
 		}
@@ -281,11 +302,14 @@ func startDetachedRun(ctx context.Context, run func(context.Context) error) (sto
 }
 
 // newRuntime 读取 Runtime 定义、打开存储并创建 Runtime，同时返回关闭存储的函数。
-func newRuntime(ctx context.Context, cfg *config.Config, tel *telemetry.Telemetry) (runtime.Runtime, func() error, error) {
+func newRuntime(ctx context.Context, cfg *config.Config, tel *telemetry.Telemetry, connection RuntimeServerConnection, tokenSecret *sessiontoken.Secret, extraTools ...executor.ToolProvider) (runtime.Runtime, func() error, error) {
 	// 1. 加载 Runtime 定义。
 	definitions, err := cfg.GetRuntimeDefinitions(ctx)
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(extraTools) > 0 {
+		definitions.ExtraTools = extraTools[0]
 	}
 	// 2. 创建数据目录并打开存储。
 	dataDirectory := cfg.GetDataDirectory()
@@ -298,6 +322,9 @@ func newRuntime(ctx context.Context, cfg *config.Config, tel *telemetry.Telemetr
 	}
 	// 3. 带上遥测和图片大小上限创建 Runtime；创建失败时关闭存储并返回错误。
 	opt := runtime.NewRuntimeOpt(storageOpt.Records, storageOpt.Logs, definitions)
+	opt.DataDirectory = dataDirectory
+	opt.SessionTokenSecret = tokenSecret
+	opt.ServerURL = connection.URL
 	opt.Telemetry = tel
 	opt.MaxImageBytes = cfg.Tools.MaxImageKB << 10
 	opt.SavedConversationIdleTimeout = cfg.Server.ConversationIdleTimeout
@@ -368,4 +395,63 @@ func openStorage(dataDirectory string) (*dao.DAOOpt, func() error, error) {
 		return nil, nil, errors.Join(fmt.Errorf("open conversation log: %w", err), database.Close())
 	}
 	return dao.NewDAOOpt(database.Record(), logs), database.Close, nil
+}
+
+// addRuntimeCommandFlags 注册一次性客户端命令共用的连接参数。
+func addRuntimeCommandFlags(flags *pflag.FlagSet) {
+	addURLFlag(flags)
+	flags.String("token", "", "runtime server token")
+}
+
+// runRuntimeCommand 连接并在退出前等待客户端停止。
+func runRuntimeCommand(ctx context.Context, args *AppArgs, run func(context.Context, runtimeclient.Client, runtimeConnection, string) error) (err error) {
+	connection, err := getRuntimeConnection(ctx, args, runtimeServerIdleTimeout)
+	if err != nil {
+		return err
+	}
+	opt := runtimeclient.NewClientOpt(connection.URL, connection.Token)
+	opt.FailRequestsWhenDisconnected = true
+	opt.DisableSubmitInputRetry = true
+	client, err := runtimeclient.NewClient(opt)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	defer func() {
+		cancel()
+		if runErr := <-done; errors.Is(err, runtimeclient.ErrConnectionLost) && runErr != nil && !errors.Is(runErr, context.Canceled) {
+			err = runErr
+		}
+	}()
+	for {
+		event, err := nextRuntimeEvent(ctx, client)
+		if err != nil {
+			var networkErr *net.OpError
+			if connection.SessionID != "" && errors.As(err, &networkErr) {
+				return fmt.Errorf("%w. If the sandbox cannot connect to OpenVaala, use the openvaala MCP tools provided for this session", err)
+			}
+			return err
+		}
+		if changed, ok := event.(*runtimeclient.ConnectionChanged); ok && changed.State == runtimeclient.ConnectionConnected {
+			return run(ctx, client, connection, changed.ServerID)
+		}
+	}
+}
+
+// nextRuntimeEvent 等待客户端事件或命令取消。
+func nextRuntimeEvent(ctx context.Context, client runtimeclient.Client) (runtimeclient.ClientEvent, error) {
+	select {
+	case event, open := <-client.Events():
+		if !open {
+			return nil, runtimeclient.ErrConnectionLost
+		}
+		if change, ok := event.(*runtimeclient.ConnectionChanged); ok && change.State == runtimeclient.ConnectionReconnecting {
+			return nil, cmp.Or(change.Err, runtimeclient.ErrConnectionLost)
+		}
+		return event, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

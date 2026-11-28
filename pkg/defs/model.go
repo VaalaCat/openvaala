@@ -38,6 +38,8 @@ func ParseModelRef(text string) (ModelRef, error) {
 type ModelDefinition struct {
 	Ref         ModelRef `json:"ref"`
 	DisplayName string   `json:"display_name"`
+	// Icon 是外部 Agent 的品牌图标。
+	Icon string `json:"icon,omitempty"`
 	// Description 是给 Agent 选模型时看的用途说明。
 	Description string `json:"description,omitempty"`
 	// Target 是连接参数，含凭证，不序列化。

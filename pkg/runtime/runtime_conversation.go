@@ -21,6 +21,9 @@ import (
 // runtimeConversation 是 Runtime 运行表里的一个已打开对话：保存对话记录、订阅、Session 运行信息和空闲停止计时，
 // 由它自己的事件循环串行修改。
 type runtimeConversation struct {
+	runtime *runtimeImpl
+	// rootCreated 由创建方等待，本循环在首次恢复和绑定保存完成或启动失败后回复一次。
+	rootCreated  chan<- error
 	conversation conversation.Conversation
 	// cancel 取消这个对话实例的 ctx：删除对话时由 Runtime 事件循环调用以停止实例，
 	// 对话空闲到时停止（未保存的对话同时丢弃）由本对话的事件循环调用，实例退出后由运行任务调用以释放 ctx。
@@ -120,6 +123,9 @@ func (c *runtimeConversation) Run(ctx context.Context) {
 	c.runEventLoop(ctx, events)
 	// 3. 等待对话退出，先关闭 stopped，再以退出原因关闭全部订阅。
 	tasks.Wait()
+	if c.rootCreated != nil {
+		c.rootCreated <- newConversationStoppedError(c.record.ID, c.stopReason)
+	}
 	close(c.stopped)
 	c.closeSubscribers(newConversationStoppedError(c.conversation.GetID(), c.stopReason))
 }
@@ -158,8 +164,8 @@ func (c *runtimeConversation) runEventLoop(ctx context.Context, events <-chan co
 				c.idleTimer = nil
 				continue
 			}
-			// 2. 已保存的对话还有后台命令时重新计时；命令结束没有事件，只能到期再看一次。
-			if !c.isUnsaved() && c.conversation.IsTerminalBusy() {
+			// 2. 仍有 Executor 命令，或已保存对话仍有后台命令时重新计时。
+			if c.conversation.IsExecutorCommandRunning() || !c.isUnsaved() && c.conversation.IsTerminalBusy() {
 				c.idleTimer.Reset(idleTimeout)
 				continue
 			}
@@ -248,6 +254,11 @@ func (c *runtimeConversation) isUnsaved() bool {
 // isIdle 对话是否没有订阅者和运行中的 Turn？
 func (c *runtimeConversation) isIdle() bool {
 	// 1. 检查订阅和 Session 运行信息。
+	for _, s := range c.runtimeSessions {
+		if s.restoring {
+			return false
+		}
+	}
 	return len(c.contentSubscribers) == 0 && len(c.conversationSubscribers) == 0 && !c.isAnyRuntimeSessionRunning()
 }
 
@@ -292,6 +303,9 @@ func (c *runtimeConversation) handleConversationEvent(ctx context.Context, event
 	case *conversation.ConversationSessionStarted:
 		c.lastSavedOrdinals[event.Session.ID] = event.LastSavedOrdinal
 		projection.handleSessionStarted(event.Session)
+		projection.restoring = event.Restoring
+		projection.restoreErr = nil
+		projection.externalState = nil
 	case *conversation.ConversationSessionEvent:
 		c.applySessionEvent(ctx, sessionID, event.Event)
 		projection.handleSessionEvent(event.Event)
@@ -304,7 +318,7 @@ func (c *runtimeConversation) handleConversationEvent(ctx context.Context, event
 	}
 	// 3. 刷新上下文占用，运行信息变化时推送给对话订阅者，再转发内容事件。
 	projection.refreshContext(c.models, c.agentDefaultModels)
-	if projection.info != before {
+	if !IsSameSessionRuntimeInfo(projection.info, before) {
 		c.publishConversationEvent(ctx, projection.info)
 	}
 	c.forwardContentEvent(ctx, sessionID, event)
@@ -345,7 +359,7 @@ func (c *runtimeConversation) closeSubscribers(reason error) {
 // isBusy 对话是否有 Session 在执行 Turn 或后台命令尚未结束？
 func (c *runtimeConversation) isBusy(ctx context.Context) bool {
 	// 1. 查询全部 Session 和后台命令；对话退出或请求取消时 Session 查询按 false 计。
-	return c.isAnySessionRunning(ctx) || c.conversation.IsTerminalBusy()
+	return c.isAnySessionRunning(ctx) || c.conversation.IsExecutorCommandRunning() || c.conversation.IsTerminalBusy()
 }
 
 // isAnySessionRunning 对话中是否有 Session 正在执行 Turn？
@@ -384,7 +398,7 @@ func (c *runtimeConversation) handleSessionRecordReplaceRequested(ctx context.Co
 	projection.info.Session = request.record
 	projection.refreshContext(c.models, c.agentDefaultModels)
 	// 2. 运行信息变化时通知对话订阅者。
-	if projection.info != before {
+	if !IsSameSessionRuntimeInfo(projection.info, before) {
 		c.publishConversationEvent(ctx, projection.info)
 	}
 }
@@ -437,6 +451,35 @@ func (c *runtimeConversation) forwardContentEvent(ctx context.Context, sessionID
 func (c *runtimeConversation) applySessionEvent(ctx context.Context, sessionID defs.SessionID, event session.SessionEvent) {
 	// 1. Turn 开始时创建生成记录，Agent 事件更新副本，保存事件移除已保存 Item 并累加消息数，Turn 结束时保存根消息数。
 	switch event := event.(type) {
+	case *session.SessionExternalBindingUpdated:
+		p := c.runtimeSessions[sessionID]
+		p.info.Session.External = &event.Binding
+	case *session.SessionExternalStateUpdated:
+		c.runtimeSessions[sessionID].externalState = event
+	case *session.SessionHistoryRestored:
+		p := c.runtimeSessions[sessionID]
+		p.restoring = false
+		p.restoreErr = event.Err
+		if sessionID == c.record.RootSessionID && c.rootCreated != nil {
+			if p.restoreErr == nil {
+				p.restoreErr = c.runtime.saveExternalRootBinding(ctx, c.record.ID, sessionID)
+			}
+			c.rootCreated <- p.restoreErr
+			c.rootCreated = nil
+		}
+		if p.restoreErr == nil {
+			c.lastSavedOrdinals[sessionID] = storage.Ordinal(event.LastSavedOrdinal)
+			p.info.LastTurnID, p.info.LastTurnStatus, p.info.Usage = event.LastTurnID, event.LastTurnStatus, event.Usage
+			p.measurement, p.lastRequest = nil, nil
+			p.info.Context = ContextUsage{Source: ContextUsageSourceUnknown}
+		}
+		reason := p.restoreErr
+		if reason == nil {
+			reason = ErrSessionHistoryRestored
+		}
+		c.closeSessionSubscribers(sessionID, reason)
+	case *session.SessionExternalReloaded:
+		c.closeSessionSubscribers(sessionID, ErrSessionHistoryRestored)
 	case *session.SessionTurnStarted:
 		c.streamingTurns[sessionID] = &streamingTurn{}
 	case *session.SessionAgentEvent:
@@ -451,6 +494,9 @@ func (c *runtimeConversation) applySessionEvent(ctx context.Context, sessionID d
 		}
 	case *session.SessionTurnFinished:
 		delete(c.streamingTurns, sessionID)
+		if p := c.runtimeSessions[sessionID]; p.info.Session.External != nil {
+			p.info.Usage = p.info.Usage.Add(event.Usage)
+		}
 		if sessionID == c.conversation.GetRootSessionID() {
 			c.saveRootMessageCount(ctx)
 		}
@@ -511,6 +557,17 @@ func (c *runtimeConversation) handleSubscribeRequested(request *subscribeRequest
 	}
 	// 3. 复制生成中 Item，登记内容订阅后回复初始信息与事件流。
 	reply := subscribeReply{lastSavedOrdinal: lastSavedOrdinal, pendingInputs: session.SessionPendingInputs{Inputs: []session.PendingInput{}}}
+	if p := c.runtimeSessions[request.sessionID]; p != nil {
+		if p.restoreErr != nil {
+			request.reply <- subscribeReply{err: p.restoreErr}
+			return
+		}
+		reply.restoring = p.restoring
+		reply.externalState = p.externalState
+		if p.restoring {
+			reply.lastSavedOrdinal = 0
+		}
+	}
 	if runtimeSession := c.runtimeSessions[request.sessionID]; runtimeSession != nil && runtimeSession.pendingInputs.Inputs != nil {
 		reply.pendingInputs = runtimeSession.pendingInputs
 	}
@@ -695,6 +752,9 @@ type runtimeSubscriber struct {
 
 // runtimeSession 是 runtimeConversation 为一个 Session 维护的运行信息；只由事件循环读写。
 type runtimeSession struct {
+	restoreErr    error
+	restoring     bool
+	externalState *session.SessionExternalStateUpdated
 	// info 是推给对话订阅者的运行信息。
 	info SessionRuntimeInfo
 	// pendingInputs 是 Session 最近发布的轻量待处理列表。
@@ -785,6 +845,13 @@ func (s *runtimeSession) handleAgentEvent(event *agent.AgentEvent) {
 
 // refreshContext 按下一次请求的模型重新计算窗口和预计占用。
 func (s *runtimeSession) refreshContext(models map[defs.ModelRef]*defs.ModelDefinition, agentDefaultModels map[string]defs.ModelRef) {
+	if s.info.Session.External != nil {
+		if s.measurement != nil {
+			s.info.Context = ContextUsage{Tokens: s.measurement.RequestTokens, Window: s.measurement.Window, Source: ContextUsageSourceActual}
+		}
+		return
+	}
+
 	// 1. 解析下一次模型，从目录读取上下文窗口。
 	nextModel := s.getNextRequestModel(models, agentDefaultModels)
 	s.info.Context.Window = 0
@@ -865,4 +932,13 @@ func (t *streamingTurn) cloneStreamingItems() []StreamingItem {
 		}
 	}
 	return items
+}
+
+// closeSessionSubscribers 只让指定会话的内容订阅重取快照。
+func (c *runtimeConversation) closeSessionSubscribers(id defs.SessionID, reason error) {
+	for stream, subscriber := range c.contentSubscribers {
+		if subscriber.sessionID == id {
+			removeSubscriber(c.contentSubscribers, stream, reason)
+		}
+	}
 }

@@ -351,7 +351,7 @@ test("opening the same sub agent selects its tab", async () => {
     )
     // 对话级订阅整个工作区只有一份，子 Agent 只多订阅各自 Session 的内容，并共用根 Session 的标题和 Session 信息。
     assert.equal(connection.getCalls("conversation/subscribe").length, 1)
-    assert.equal(connection.getCalls("conversation/unsubscribe").length, 1)
+    assert.equal(connection.getCalls("conversation/unsubscribe").length, 0)
     assert.deepEqual(
       connection
         .getCalls("session/subscribe")

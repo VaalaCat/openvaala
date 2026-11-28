@@ -17,6 +17,7 @@ import {
 } from "./conversation-items"
 import type {
   AgentToolProgress,
+  SubscribeSessionResult,
   Content,
   ConversationID,
   Item,
@@ -54,6 +55,8 @@ type ConversationNotification = Extract<
 interface SyncResult {
   // 对话的标题和全部 Session 运行信息；只读 Session 内容的同步（有 rootSync）不订阅对话状态，没有这一项
   conversationStatus?: { title: string; sessions: SessionRuntimeInfo[] }
+  snapshot: SubscribeSessionResult
+  replaceHistory: boolean
   lastSavedOrdinal: Ordinal
   streamingItems: StreamingItem[]
   pendingInputs: SessionPendingInputs
@@ -74,7 +77,14 @@ const maxToolProgressLength = 200 * 1024
 export class ConversationSync {
   readonly $title: WritableAtom<string>
   readonly $sessions: MapStore<Record<SessionID, SessionRuntimeInfo>>
-  // 已保存的和生成中的 Item，按首次出现顺序
+  // 最近一次外部会话快照或通知上报的选项、能力和命令。
+  readonly $externalState = atom<
+    Pick<SubscribeSessionResult, "options" | "capabilities" | "commands">
+  >({})
+  readonly $historyGeneration = atom(0)
+  readonly $restoring = atom(false)
+  readonly $restoreError = atom<string | undefined>(undefined)
+  // 已保存的和生成中的 Item，按首次出现顺序。
   readonly $items = atom<ViewItem[]>([])
   readonly $turns = map<Record<TurnID, TurnView>>({})
   readonly $hasEarlierItems = atom(false)
@@ -97,8 +107,9 @@ export class ConversationSync {
   private followedSessionID: SessionID | undefined
   // 已交付的最后一个已保存 Item 的流水号：items/saved 按它去重，重新同步从它往后补
   private lastDeliveredOrdinal: Ordinal = 0
-  // 是否完成过一次同步？完成后重新同步只补齐，不再读最近一页
+  // 是否完成过一次同步？原生会话据此选择补拉或读取最近一页。
   private hasSynced = false
+  private followingNewSubscriptions = false
   // 加载更早 Item 的游标：最近一页和每次向前加载时 serve 返回的 next_cursor
   private earlierItemsCursor: Ordinal | undefined
   private earlierItemsLoading: Promise<void> | undefined
@@ -182,6 +193,11 @@ export class ConversationSync {
 
   // 向前加载一页更早的 Item（session/items/list，desc，从上一页的 next_cursor 往前）；加载中再调用时等同一次
   loadEarlierItems(): Promise<void> {
+    if (
+      this.$restoring.get() ||
+      (this.$historyGeneration.get() && this.$syncState.get() !== "synced")
+    )
+      return Promise.resolve()
     if (this.earlierItemsLoading) return this.earlierItemsLoading
     const cursor = this.earlierItemsCursor
     if (cursor === undefined) return Promise.resolve()
@@ -189,6 +205,20 @@ export class ConversationSync {
       this.earlierItemsLoading = undefined
     })
     return this.earlierItemsLoading
+  }
+
+  // 重载驱动，重建已经结束的内容订阅。
+  async reloadSession(sessionID: SessionID): Promise<void> {
+    const generation = this.syncGeneration
+    await this.connection.call("session/reload", {
+      conversation_id: this.conversationID,
+      session_id: sessionID,
+    })
+    if (
+      sessionID === this.followedSessionID &&
+      generation === this.syncGeneration
+    )
+      this.startSync(true)
   }
 
   // 提交输入；队列只由服务端订阅更新。
@@ -259,24 +289,28 @@ export class ConversationSync {
   }
 
   // 作废上一次同步，开始暂存通知并同步；完成后写入结果，失败时断线等重连、其他错误标记失败
-  private startSync(): void {
+  private startSync(replaceSubscriptions = false): void {
     this.flushItemDeltas()
     const generation = ++this.syncGeneration
     this.stagedNotifications = []
     this.unpresentedLiveItemKeys.clear()
     this.$syncError.set(undefined)
+    this.followingNewSubscriptions = false
     this.$syncState.set("syncing")
-    void this.syncConversation(generation).then(
+    void this.syncConversation(generation, replaceSubscriptions).then(
       (result) => this.handleSyncFinished(generation, result),
       (error: unknown) => this.handleSyncFailed(generation, error)
     )
   }
 
-  // 退订旧订阅、打开对话、重新订阅、读已保存 Item，返回读到的内容；同 internal/runtimeclient 的 syncConversation
-  private async syncConversation(generation: number): Promise<SyncResult> {
+  // 打开对话，建立订阅，再按快照位置读已保存的 Item。
+  private async syncConversation(
+    generation: number,
+    replaceSubscriptions: boolean
+  ): Promise<SyncResult> {
     const isResync = this.hasSynced
-    // 1. 重新同步时，先退订自己上一次的两个订阅。
-    if (isResync)
+    // 1. 只有在同一条连接上重建已有订阅时才需要退订。
+    if (replaceSubscriptions)
       await this.unsubscribeForSync(generation, this.getFollowedSessionID())
     // 2. 打开对话；没有指定 Session 时跟随根 Session。
     const opened = await this.callForSync(generation, "conversation/open", {
@@ -285,32 +319,44 @@ export class ConversationSync {
     this.$rootSessionID.set(opened.conversation.root_session_id)
     this.followedSessionID ??= opened.conversation.root_session_id
     const sessionID = this.followedSessionID
-    // 3. 为防止残留，再退订一次目标对话和跟随 Session 的订阅；同步期间的 subscription/closed 由 handleNotification 处理。
-    await this.unsubscribeForSync(generation, sessionID)
-    // 4. 订阅对话状态：标题和全部 Session 运行信息；有 rootSync 时由它订阅，这里等它第一次同步完成。
-    let conversationStatus: SyncResult["conversationStatus"]
+    // 3. 根会话同时订阅对话与 Session，子会话只订阅自己的 Session。
     if (this.rootSync) await this.waitForRootSync(generation)
-    else {
-      const status = await this.callForSync(
-        generation,
-        "conversation/subscribe",
-        { conversation_id: this.conversationID }
-      )
-      conversationStatus = { title: status.title, sessions: status.sessions }
-    }
-    // 5. 订阅 Session 内容：已保存位置和生成中 Item。
-    const content = await this.callForSync(generation, "session/subscribe", {
-      conversation_id: this.conversationID,
-      session_id: sessionID,
-    })
+    this.followingNewSubscriptions = true
+    const [status, snapshot] = await Promise.allSettled([
+      this.rootSync
+        ? undefined
+        : this.callForSync(generation, "conversation/subscribe", {
+            conversation_id: this.conversationID,
+          }),
+      this.callForSync(generation, "session/subscribe", {
+        conversation_id: this.conversationID,
+        session_id: sessionID,
+      }),
+    ])
+    if (generation !== this.syncGeneration)
+      throw new Error("conversation sync is outdated")
+    if (status.status === "rejected") throw status.reason
+    const conversationStatus = status.value
+    const followed =
+      conversationStatus?.sessions.find(
+        (info) => info.session.id === sessionID
+      ) ?? this.$sessions.get()[sessionID]
+    const replaceHistory = !!followed?.session.external
+    // 4. 内容订阅被拒绝时仍交付会话身份，让聊天区能够重载。
+    if (followed && !this.rootSync) this.$sessions.setKey(sessionID, followed)
+    if (snapshot.status === "rejected") throw snapshot.reason
+    const content = snapshot.value
     const result = {
       conversationStatus,
+      snapshot: content,
+      replaceHistory,
       lastSavedOrdinal: content.last_saved_ordinal,
       streamingItems: content.streaming_items,
       pendingInputs: content.pending_inputs,
     }
-    // 6. 重新同步从已交付的位置往后按 asc 补齐到 last_saved_ordinal。
-    if (isResync) {
+    // 5. 重新同步从已交付的位置往后按 asc 补齐到 last_saved_ordinal。
+    if (content.restoring) return { ...result, savedItems: [] }
+    if (isResync && !replaceHistory) {
       const savedItems = await this.listItemsBetween(
         generation,
         sessionID,
@@ -319,7 +365,7 @@ export class ConversationSync {
       )
       return { ...result, savedItems }
     }
-    // 7. 首次同步按 desc 读最近一页，订阅之后才保存的留给暂存的 items/saved。
+    // 6. 首次同步按 desc 读最近一页，订阅之后才保存的留给暂存的 items/saved。
     const page = await this.callForSync(generation, "session/items/list", {
       conversation_id: this.conversationID,
       session_id: sessionID,
@@ -382,16 +428,31 @@ export class ConversationSync {
           info
         )
     }
+    if (result.replaceHistory) {
+      this.$historyGeneration.set(generation)
+      this.$items.set([])
+      this.$turns.set({})
+      this.$toolProgress.set({})
+      if (!result.snapshot.restoring) this.lastDeliveredOrdinal = 0
+    }
+    this.$externalState.set({
+      options: result.snapshot.options,
+      capabilities: result.snapshot.capabilities,
+      commands: result.snapshot.commands,
+    })
+    this.$restoring.set(!!result.snapshot.restoring)
+    this.$restoreError.set(undefined)
     this.applyFollowedSessionTurns(
       this.$sessions.get()[this.followedSessionID!]
     )
     // 3. 首次同步记下向前加载的游标；应用已保存 Item，再用生成中 Item 替换未保存的。
-    if (!this.hasSynced) {
+    if (!this.hasSynced || result.replaceHistory) {
       this.earlierItemsCursor = result.earlierItemsCursor
       this.$hasEarlierItems.set(result.earlierItemsCursor !== undefined)
     }
     this.applySavedItems(result.savedItems)
-    this.lastDeliveredOrdinal = result.lastSavedOrdinal
+    if (!result.snapshot.restoring)
+      this.lastDeliveredOrdinal = result.lastSavedOrdinal
     this.applyStreamingItems(result.streamingItems)
     this.$pendingInputs.set(result.pendingInputs)
     // 4. 结束同步，按到达顺序交付暂存的通知。
@@ -400,8 +461,10 @@ export class ConversationSync {
     this.$syncState.set("synced")
     const staged = this.stagedNotifications
     this.stagedNotifications = []
-    for (const notification of staged)
+    for (const notification of staged) {
+      if (generation !== this.syncGeneration) break
       this.deliverNotification(notification, false)
+    }
     this.flushItemDeltas()
   }
 
@@ -427,6 +490,16 @@ export class ConversationSync {
     if (error instanceof RpcError && error.code === rpcConnectionLostCode)
       return
     this.stagedNotifications = []
+    if (
+      error instanceof Error &&
+      (error.message.includes("external session cannot be restored") ||
+        (error instanceof RpcError &&
+          error.method === "session/subscribe" &&
+          this.$sessions.get()[this.followedSessionID!]?.session.external))
+    ) {
+      this.$restoreError.set(error.message)
+      this.$restoring.set(false)
+    }
     this.$syncError.set(error)
     this.$syncState.set("failed")
   }
@@ -444,7 +517,10 @@ export class ConversationSync {
       return
     // 2. 同步期间暂存；subscription/closed 是同步时退订引起的，删掉同一种订阅暂存的通知，不重新同步。
     if (this.$syncState.get() === "syncing") {
-      if (notification.method === "subscription/closed")
+      if (
+        notification.method === "subscription/closed" &&
+        !this.followingNewSubscriptions
+      )
         this.stagedNotifications = this.stagedNotifications.filter(
           (staged) => staged.params.subscription !== params.subscription
         )
@@ -464,11 +540,30 @@ export class ConversationSync {
     if (notification.method !== "item/delta") this.flushItemDeltas()
     // 2. 订阅被 serve 关闭时重新同步。
     if (notification.method === "subscription/closed") {
-      this.startSync()
+      if (
+        notification.params.reason.includes(
+          "external session cannot be restored"
+        )
+      ) {
+        if (!this.$restoreError.get())
+          this.$restoreError.set(notification.params.reason)
+        this.$restoring.set(false)
+        this.$syncState.set("failed")
+      } else this.startSync(true)
       return
     }
     // 3. 按通知更新对话内容和状态。
+    if (
+      this.$restoring.get() &&
+      notification.params.subscription === "session" &&
+      notification.method !== "session/pendingInputsUpdated" &&
+      notification.method !== "session/externalStateUpdated"
+    )
+      return
     switch (notification.method) {
+      case "session/externalStateUpdated":
+        this.$externalState.set(notification.params)
+        break
       case "item/started":
         if (notification.params.item)
           this.putStreamingItem(

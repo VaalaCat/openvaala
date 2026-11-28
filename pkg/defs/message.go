@@ -2,6 +2,7 @@ package defs
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/VaalaCat/llmkit"
 )
@@ -17,19 +18,29 @@ type Message struct {
 	SubagentNotification *SubagentNotification `json:"subagent_notification,omitempty"`
 }
 
-// ContentKind 区分文本和图片内容。
+// ContentKind 区分文本、图片和文件附件。
 type ContentKind string
 
 const (
 	ContentText  ContentKind = "text"
 	ContentImage ContentKind = "image"
+	ContentFile  ContentKind = "file"
 )
 
-// Content 是消息里的一项文本或图片，Kind 决定哪个字段有值。
+// Content 是消息里的一项内容，Kind 决定哪个字段有值。
 type Content struct {
 	Kind  ContentKind   `json:"kind"`
 	Text  *TextContent  `json:"text,omitempty"`
 	Image *ImageContent `json:"image,omitempty"`
+	File  *FileRef      `json:"file,omitempty"`
+}
+
+// FileRef 记录已上传附件的元数据及其在目标 Executor 上的绝对路径。
+type FileRef struct {
+	Name string `json:"name"`
+	MIME string `json:"mime"`
+	Size int64  `json:"size"`
+	Path string `json:"path"`
 }
 
 // TextContent 是一段文字。
@@ -114,9 +125,9 @@ func (message *Message) FromLLMKit(modelMessage *llmkit.Message, from, to *Addre
 	return nil
 }
 
-// Validate 检查内容类型及对应的文本或图片载荷。
+// Validate 检查内容类型及对应载荷。
 func (content *Content) Validate() error {
-	// 1. 要求文本载荷存在，或图片载荷及 DataURL 非空；未知类型返回错误。
+	// 1. 检查对应载荷及必填字段。
 	if content == nil {
 		return fmt.Errorf("content is missing")
 	}
@@ -128,6 +139,10 @@ func (content *Content) Validate() error {
 	case ContentImage:
 		if content.Image == nil || content.Image.DataURL == "" {
 			return fmt.Errorf("image source is missing")
+		}
+	case ContentFile:
+		if content.File == nil || content.File.Name == "" || !filepath.IsAbs(content.File.Path) || content.File.Size < 0 {
+			return fmt.Errorf("invalid file reference")
 		}
 	default:
 		return fmt.Errorf("unsupported content kind %q", content.Kind)
@@ -146,6 +161,9 @@ func (content *Content) ToLLMKit() (*llmkit.ContentBlock, error) {
 			Type: llmkit.ContentTypeText,
 			Text: content.Text.Text,
 		}, nil
+	}
+	if content.Kind == ContentFile {
+		return nil, fmt.Errorf("unsupported model content kind %q", content.Kind)
 	}
 	// 2. 图片 data URL 拆成 MIME 类型和 base64，其他来源保留 URL。
 	block := &llmkit.ContentBlock{Type: llmkit.ContentTypeImage}
@@ -209,6 +227,9 @@ type SubagentNotification struct {
 
 // AgentSender 是 Agent 消息发送方的任务名，以及它和接收方的关系。
 type AgentSender struct {
+	// 转出通知携带新入口，供等待这条消息的父会话直接跳转。
+	DetachedConversationID ConversationID `json:"detached_conversation_id,omitempty"`
+	DetachedSessionID      SessionID      `json:"detached_session_id,omitempty"`
 	// TaskName 是发送方 Session 的任务名；主 Agent 没有任务名，为空。
 	TaskName string        `json:"task_name,omitempty"`
 	Relation AgentRelation `json:"relation"`

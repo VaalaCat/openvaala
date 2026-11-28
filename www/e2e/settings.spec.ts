@@ -4,6 +4,7 @@ import { defaultAppearance } from "../src/lib/appearance/preferences"
 import {
   expect,
   getComposer,
+  getNewConversationLink,
   getMessages,
   openTurnRaw,
   startConversation,
@@ -42,10 +43,7 @@ test(
     await startConversation(page, "归档运行验证")
     const conversationURL = page.url()
     const conversationID = conversationURL.split("/c/")[1]
-    const sidebarRow = page
-      .getByRole("listitem")
-      .filter({ has: page.locator(`a[href*="/c/${conversationID}"]`) })
-      .filter({ has: page.getByRole("button", { name: /的更多操作/ }) })
+    const sidebarRow = page.locator(`[data-conversation-id="${conversationID}"]`)
     const conversationLink = sidebarRow.getByRole("link")
     await renameConversation(page, sidebarRow, "归档运行验证")
     await sidebarRow.getByRole("button", { name: /的更多操作/ }).click()
@@ -70,17 +68,14 @@ test(
     await gate.cleanup()
 
     // 2. 侧栏搜索和归档搜索分别保存在地址里，互不覆盖。
-    await page.getByRole("link", { name: "新对话", exact: true }).click()
+    await getNewConversationLink(page).click()
     await expect(page).toHaveURL(serverURL)
     await expect(
       page.getByRole("combobox", { name: "工作目录", exact: true })
     ).toBeVisible()
     await startConversation(page, "侧栏保留验证")
     const secondID = page.url().split("/c/")[1]
-    const secondRow = page
-      .getByRole("listitem")
-      .filter({ has: page.locator(`a[href*="/c/${secondID}"]`) })
-      .filter({ has: page.getByRole("button", { name: /的更多操作/ }) })
+    const secondRow = page.locator(`[data-conversation-id="${secondID}"]`)
     const secondLink = secondRow.getByRole("link")
     await renameConversation(page, secondRow, "侧栏保留验证")
     await page
@@ -192,10 +187,7 @@ test("fork_running_conversation_shows_the_running_turn_as_interrupted", async ({
   await expect(
     page.getByRole("button", { name: "中断", exact: true })
   ).toBeVisible()
-  const sourceRow = page
-    .getByRole("listitem")
-    .filter({ has: page.locator(`a[href*="/c/${sourceID}"]`) })
-    .filter({ has: page.getByRole("button", { name: /的更多操作/ }) })
+  const sourceRow = page.locator(`[data-conversation-id="${sourceID}"]`)
   await sourceRow.getByRole("button", { name: /的更多操作/ }).click()
   await page.getByRole("menuitem", { name: "分叉", exact: true }).click()
   await expect(page).not.toHaveURL(sourceURL)
@@ -222,10 +214,6 @@ test("fork_running_conversation_shows_the_running_turn_as_interrupted", async ({
   expect(Math.abs(originBox!.x - firstTurnBox!.x)).toBeLessThanOrEqual(1)
   expect(originBox!.y).toBeLessThan(firstTurnBox!.y)
   const originLink = origin.getByRole("link", { name: "从『运行中分叉』分叉" })
-  await expect(originLink).toHaveAttribute(
-    "href",
-    new RegExp(`/c/${sourceID}$`)
-  )
   // 3. 回到原对话：它没有被打断，放行命令后照常收尾，新对话里这一轮仍是已中断；原对话不是分叉，没有来源提示。
   await originLink.click()
   await expect(page).toHaveURL(sourceURL)
@@ -472,7 +460,6 @@ test(
   async ({ page, fixture }) => {
     // 1. 保存配色和双字体，切换页面和刷新后仍使用已选外观。
     await fixture.openApp(page)
-    const newConversationPath = new URL(page.url()).pathname
     await page.getByRole("link", { name: "设置", exact: true }).click()
     await page.getByRole("tab", { name: "外观", exact: true }).click()
     await page
@@ -558,10 +545,7 @@ test(
       page.getByRole("heading", { name: "外观", exact: true })
     ).toHaveCSS("font-family", '"JetBrains Mono Variable", monospace')
     await fixture.replies({ text: "```text\nappearance_code_42\n```" })
-    await page
-      .getByRole("link", { name: "新对话", exact: true })
-      .and(page.locator(`a[href="${newConversationPath}"]`))
-      .click()
+    await getNewConversationLink(page).click()
     await startConversation(page, "字体隔离验证")
     await expect(
       getMessages(page).getByText("appearance_code_42", { exact: true })
@@ -814,7 +798,7 @@ test(
       .getByRole("menuitemradio", { name: "English", exact: true })
       .click()
     await expect(
-      page.getByRole("heading", { name: "Enter token", exact: true })
+      page.getByRole("heading", { name: "Enter Token", exact: true })
     ).toBeVisible()
     await expect(page.locator("html")).toHaveAttribute("lang", "en")
   }
@@ -905,3 +889,140 @@ test(
     }
   }
 )
+
+test("agent settings create edit and delete ACP definitions", async ({
+  page,
+  fixture,
+}, testInfo) => {
+  const name = "codex-acp"
+  await page.setViewportSize({ width: 1280, height: 1000 })
+  await fixture.openApp(page)
+  await page.getByRole("link", { name: "设置", exact: true }).click()
+  await page.getByRole("tab", { name: "Agent", exact: true }).click()
+  await page.getByRole("button", { name: "新增 Agent" }).click()
+  await page.getByRole("combobox", { name: "从预设填充" }).click()
+  const codex = page.getByRole("option", { name: /^Codex/ })
+  await expect(codex).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath("agents-presets-web.png") })
+  await page.getByRole("combobox", { name: "搜索", exact: true }).fill("codex")
+  await expect(page.getByRole("option")).toHaveCount(1)
+  await codex.click()
+  await expect(page.getByLabel("类型", { exact: true })).toContainText("ACP")
+  await expect(page.getByLabel("名称", { exact: true })).toHaveValue(name)
+  await expect(page.getByLabel("描述", { exact: true })).toHaveValue("OpenAI's coding agent")
+  await expect(page.getByLabel("命令", { exact: true })).toHaveValue("codex-acp")
+  await page
+    .getByLabel("命令", { exact: true })
+    .fill(process.env.FAKE_ACP_BINARY || "codex-acp")
+  await page.getByRole("button", { name: "保存", exact: true }).click()
+  const row = page.getByRole("link", { name: new RegExp(name) })
+  await expect(row).toBeVisible()
+  // 移开停在页头的指针，让右上角的保存提示正常消失。
+  await row.hover()
+  await expect(page.getByText("Agent 已保存", { exact: true })).toBeHidden()
+  await page.screenshot({ path: testInfo.outputPath("agents-web-list.png") })
+  await row.click()
+  await expect(page.getByRole("combobox", { name: "从预设填充" })).toHaveCount(0)
+  await expect(page.getByRole("heading", { name, exact: true })).toBeAttached()
+  await expect(
+    page.getByRole("textbox", { name: "名称", exact: true })
+  ).toHaveCount(0)
+  await expect(page.getByLabel("OpenVaala 工具")).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath("agents-web-acp.png") })
+  await page.getByRole("link", { name: "Agent", exact: true }).click()
+  await page.getByRole("link", { name: /^default/ }).click()
+  await expect(page.getByLabel("指令")).toBeVisible()
+  await expect(page.getByRole("button", { name: "删除 Agent" })).toHaveCount(0)
+  await page.screenshot({ path: testInfo.outputPath("agents-web-native.png") })
+  await getNewConversationLink(page).click()
+  await page.getByLabel("模型", { exact: true }).first().click()
+  const group = page.getByRole("group").filter({
+    has: page.getByText(name, { exact: true }),
+  })
+  await expect(group.getByRole("option").first()).toBeVisible()
+  await page.keyboard.press("Escape")
+  await page.getByRole("link", { name: "设置", exact: true }).click()
+  await page.getByRole("tab", { name: "Agent", exact: true }).click()
+  await row.click()
+  await page.getByRole("button", { name: "删除 Agent", exact: true }).click()
+  const confirm = page.getByRole("alertdialog")
+  await expect(confirm).toContainText("使用这个 Agent 的对话将无法继续")
+  await confirm.getByRole("button", { name: "删除 Agent", exact: true }).click()
+  await expect(row).toHaveCount(0)
+})
+
+for (const scenario of ["duplicate name", "blank lists"] as const) {
+  test(`agent settings reject overwrite and omit empty lists - ${scenario}`, async ({
+    page,
+    fixture,
+  }) => {
+    const name =
+      scenario === "duplicate name" ? "codex-duplicate" : "codex-empty"
+    const connection = new ServerConnection({
+      url: fixture.state.url.replace(/^http/, "ws") + "/api/v1/openvaala",
+      token: fixture.state.token,
+    })
+    const stop = connection.run()
+    try {
+      await expect.poll(() => connection.$state.get()).toBe("connected")
+      await connection.call("agent/set", {
+        definition: {
+          name,
+          type: "acp",
+          acp: {
+            command: "existing-command",
+            param_overwrite: { "session/prompt": { _meta: { mode: "test" } } },
+            ephemeral_param_overwrite: { "session/new": { _meta: { save: false } } },
+          },
+          mcp_servers: [],
+        },
+      })
+      await fixture.openApp(page)
+      await page.getByRole("link", { name: "设置", exact: true }).click()
+      await page.getByRole("tab", { name: "Agent", exact: true }).click()
+      const row = page.getByRole("link", { name: new RegExp(name) })
+      await expect(row).toBeVisible()
+      if (scenario === "duplicate name") {
+        await page.getByRole("button", { name: "新增 Agent" }).click()
+        await page.getByLabel("类型", { exact: true }).click()
+        await page.getByRole("option", { name: "ACP", exact: true }).click()
+        const field = page.getByLabel("名称", { exact: true })
+        await field.fill(` ${name} `)
+        await page.getByLabel("命令", { exact: true }).fill("replacement")
+        await page.getByRole("button", { name: "保存", exact: true }).click()
+        await expect(field).toHaveAttribute("aria-invalid", "true")
+        const saved = await connection.call("agent/get", { name })
+        expect(saved.acp?.command).toBe("existing-command")
+      } else {
+        await row.click()
+        const mcp = page.getByLabel("MCP", { exact: true })
+        const save = page.getByRole("button", { name: "保存", exact: true })
+        await expect(save).toBeDisabled()
+        await mcp.fill("temporary")
+        await page.getByRole("button", { name: "撤销", exact: true }).click()
+        await expect(mcp).toHaveValue("")
+        await expect(save).toBeDisabled()
+        await page.getByLabel("描述", { exact: true }).fill("Updated")
+        await save.click()
+        await expect
+          .poll(
+            async () =>
+              (await connection.call("agent/get", { name })).description
+          )
+          .toBe("Updated")
+        const saved = await connection.call("agent/get", { name })
+        expect(saved.acp?.param_overwrite).toEqual({
+          "session/prompt": { _meta: { mode: "test" } },
+        })
+        expect(saved.acp?.ephemeral_param_overwrite).toEqual({
+          "session/new": { _meta: { save: false } },
+        })
+        for (const key of ["mcp_servers", "tools", "skills"]) {
+          expect(Object.hasOwn(saved, key)).toBe(false)
+        }
+      }
+    } finally {
+      stop()
+    }
+  })
+}

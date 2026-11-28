@@ -1,5 +1,66 @@
 // 由 internal/protocolgen 生成，不要手改
 
+// From worldserver/types.go
+/**
+ * ACLMatrix 以相同的节点顺序排列发送行和接收列。
+ */
+export interface ACLMatrix {
+    nodes: ACLMatrixNode[];
+    cells: ACLMatrixCell[][];
+}
+
+// From worldserver/types.go
+export interface ACLMatrixCell {
+    allowed: boolean;
+    /**
+     * RuleIndex 指向草稿或已保存列表中的规则，默认规则为 -1。
+     */
+    rule_index: number;
+}
+
+// From worldserver/types.go
+export interface ACLMatrixNode {
+    name: string;
+    owner: string;
+    tags: string[];
+}
+
+// From worldserver/types.go
+/**
+ * ACLRule 按 Priority 从小到大匹配，同优先级按提交顺序匹配。
+ */
+export interface ACLRule {
+    priority: number;
+    from: string[];
+    to: string[];
+    action: string;
+}
+
+// From defs/session.go
+/**
+ * ACPCommand 保存 ACP Agent 的启动命令、参数和环境变量。
+ */
+export interface ACPCommand {
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+    /**
+     * ParamOverwrite 按 ACP 方法名合并进驱动发出的请求。
+     */
+    // empty interface{} type, falling back to unknown
+    param_overwrite?: Record<string, Record<string, unknown> | null>;
+    /**
+     * EphemeralParamOverwrite 只在临时会话叠加，非空表示支持不落盘的临时会话。
+     */
+    // empty interface{} type, falling back to unknown
+    ephemeral_param_overwrite?: Record<string, Record<string, unknown> | null>;
+}
+
+// From worldserver/types.go
+export interface AddDomainRequest {
+    card: string;
+}
+
 // From defs/message.go
 /**
  * Address 是消息的发送方或接收方。
@@ -12,13 +73,86 @@ export interface Address {
     id: string;
 }
 
+// From worldserver/types.go
+/**
+ * AdminNode 将注册记录与当前在线公告合并。
+ */
+export interface AdminNode extends NodeRecord {
+    domain: string;
+    online: boolean;
+    targets: AdvertisedTarget[];
+}
+
+// From worldserver/types.go
+/**
+ * AdvertisedTarget 描述节点通告的一个目标。
+ */
+export interface AdvertisedTarget {
+    name: string;
+    description?: string;
+    visibility: string;
+}
+
+// From defs/session.go
+/**
+ * AgentConfig 是 agents/ 下一个 Agent 文件的内容；原生 default Agent 沿用未指定的内置字段。
+ */
+export interface AgentConfig {
+    /**
+     * Name 必须和文件名一致。
+     */
+    name: string;
+    /**
+     * Type 为空时使用原生 Agent。
+     */
+    type?: AgentType;
+    /**
+     * Description 是 Agent 的用途说明。
+     */
+    description?: string;
+    /**
+     * Instructions 是原生 Agent 的指令。
+     */
+    instructions?: string;
+    /**
+     * Model 是 Agent 的主模型；省略时加载后取默认模型，模型目录为空时保持为 nil。
+     */
+    model?: AgentModelConfig;
+    /**
+     * CompactModel 是生成上下文摘要使用的模型；省略时使用 Model。
+     */
+    compact_model?: AgentModelConfig;
+    /**
+     * Tools 是可用普通工具名，由使用方的工具目录解释；省略时可用全部普通工具。
+     */
+    tools?: string[];
+    /**
+     * Skills 是可用 skill 名，由使用方的 skill 目录解释；省略时可用全部 skill。
+     */
+    skills?: string[];
+    /**
+     * MCPServers 是可用的 MCP server id；省略时全部可用（包括客户端连接带来的 MCP server），[] 表示不用 MCP。
+     */
+    mcp_servers?: OptionalStringList;
+    /**
+     * MaxSteps 是一轮最多调用模型的次数；省略或 0 表示不限，不能为负。
+     */
+    max_steps?: number;
+    /**
+     * ACP 保存外部 ACP Agent 的启动命令。
+     */
+    acp?: ACPCommand;
+}
+
 // From runtime/types.go
 /**
  * AgentInfo 是 ListAgents 返回的一个 Agent 的公开说明，不含系统指令。
  */
 export interface AgentInfo {
     name: string;
+    type: AgentType;
     description?: string;
+    icon?: string;
     /**
      * DefaultModel 是 Agent 的默认模型；Agent 没有指定默认模型时为零值。
      */
@@ -49,6 +183,45 @@ export interface AgentItemDelta {
     arguments?: string;
 }
 
+// From defs/session.go
+/**
+ * AgentModelConfig 引用 Provider 中的模型别名。
+ */
+export interface AgentModelConfig {
+    provider: string;
+    model?: string;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * AgentNameParams 指定 Agent 定义的文件名。
+ */
+export interface AgentNameParams {
+    name: string;
+}
+
+// From runtime/types.go
+export interface AgentOptionsRequest extends ExternalAgentLocation {
+    selections?: ExternalOptionSelection[];
+    refresh?: boolean;
+}
+
+// From agent/types.go
+/**
+ * AgentPreset 保存新增 ACP Agent 时可填充的配置。
+ */
+export interface AgentPreset {
+    name: string;
+    display_name: string;
+    description: string;
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+    // empty interface{} type, falling back to unknown
+    ephemeral_param_overwrite?: Record<string, Record<string, unknown> | null>;
+    icon: string;
+}
+
 // From defs/message.go
 /**
  * AgentRelation 是 Agent 消息发送方相对接收方的位置。
@@ -60,6 +233,11 @@ export type AgentRelation = "ancestor" | "child";
  * AgentSender 是 Agent 消息发送方的任务名，以及它和接收方的关系。
  */
 export interface AgentSender {
+    /**
+     * 转出通知携带新入口，供等待这条消息的父会话直接跳转。
+     */
+    detached_conversation_id?: ConversationID;
+    detached_session_id?: SessionID;
     /**
      * TaskName 是发送方 Session 的任务名；主 Agent 没有任务名，为空。
      */
@@ -86,6 +264,12 @@ export interface AgentToolProgress {
     content: unknown;
 }
 
+// From defs/session.go
+/**
+ * AgentType 标识 Agent 使用的执行类型。
+ */
+export type AgentType = "acp" | "native";
+
 // From defs/item.go
 /**
  * AgentsInstruction 是某个 Executor 上一份 AGENTS.md 的路径、正文和适用范围。
@@ -110,6 +294,15 @@ export interface AppendContextItemsParams {
      * Items 可以是任何不需要模型调用、也不由运行时自己写入的种类，载荷必须有效；ID 由调用方生成，还没分配 turn_id 和 model_call_id。
      */
     items: (Item | null)[];
+}
+
+// From runtimeprotocol/types.go
+/**
+ * CallExecutorToolParams 在来源会话的执行环境中调用工具。
+ */
+export interface CallExecutorToolParams extends CollaborationSource {
+    name: string;
+    arguments?: unknown;
 }
 
 // From defs/provider.go
@@ -182,6 +375,15 @@ export interface ClientMCPMessageParams {
 
 // From runtimeprotocol/types.go
 /**
+ * CollaborationSource 指定操作来源，使用会话令牌时由连接身份确定。
+ */
+export interface CollaborationSource {
+    conversation_id: ConversationID;
+    source_session_id?: SessionID;
+}
+
+// From runtimeprotocol/types.go
+/**
  * CompactContextResult 是 conversation/compact 的结果：刚开始的压缩 Turn；压缩尚未完成。
  */
 export interface CompactContextResult {
@@ -235,19 +437,20 @@ export interface ConnectionTool {
 
 // From defs/message.go
 /**
- * Content 是消息里的一项文本或图片，Kind 决定哪个字段有值。
+ * Content 是消息里的一项内容，Kind 决定哪个字段有值。
  */
 export interface Content {
     kind: ContentKind;
     text?: TextContent;
     image?: ImageContent;
+    file?: FileRef;
 }
 
 // From defs/message.go
 /**
- * ContentKind 区分文本和图片内容。
+ * ContentKind 区分文本、图片和文件附件。
  */
-export type ContentKind = "image" | "text";
+export type ContentKind = "file" | "image" | "text";
 
 // From defs/item.go
 /**
@@ -361,6 +564,7 @@ export interface ConversationTitleUpdatedParams extends NotificationTarget {
  * CreateConversationParams 是 conversation/create 的参数。
  */
 export interface CreateConversationParams {
+    initial_options?: ExternalOptionSelection[];
     agent_name: string;
     model?: ModelSelection;
     /**
@@ -379,6 +583,28 @@ export interface CreateConversationParams {
      * WithoutExecutors 是否不装配 Executor 和 Skill？为 true 时 executor_settings 原样记下但不生效，environment 忽略。
      */
     without_executors?: boolean;
+}
+
+// From worldserver/types.go
+/**
+ * CreateJoinTokenRequest 指定入网码归属和过期时间，ExpiresAt 使用 Unix 毫秒。
+ */
+export interface CreateJoinTokenRequest {
+    owner: string;
+    tags: string[];
+    /**
+     * Reusable 入网码是否可供多个节点注册？
+     */
+    reusable: boolean;
+    expires_at: number;
+}
+
+// From worldserver/types.go
+/**
+ * CreateJoinTokenResponse 在创建时一次性返回入网码明文。
+ */
+export interface CreateJoinTokenResponse extends JoinTokenInfo {
+    token: string;
 }
 
 // From runtimeprotocol/types.go
@@ -453,6 +679,25 @@ export interface ExecutorDetails {
     workspace_directory?: string;
 }
 
+// From runtime/types.go
+/**
+ * ExecutorExecRequest 指定执行机器、工作目录和逐项参数。
+ */
+export interface ExecutorExecRequest {
+    conversation_id?: ConversationID;
+    executor_id: string;
+    cwd?: string;
+    command: string;
+    args?: string[];
+}
+
+// From runtime/types.go
+export interface ExecutorExecResult {
+    exit_code: number;
+    stdout: string;
+    stderr: string;
+}
+
 // From defs/executor.go
 /**
  * ExecutorKind 是 Executor 的种类；自定义 Executor 可以用自己的种类。
@@ -489,11 +734,151 @@ export interface ExecutorsChange {
     executors: TurnExecutor[];
 }
 
+// From runtime/types.go
+/**
+ * ExternalAgentLocation 指定 Agent 定义以及外部进程使用的工作位置。
+ */
+export interface ExternalAgentLocation {
+    agent_name: string;
+    executor_id?: string;
+    cwd?: string;
+}
+
+// From defs/session.go
+/**
+ * ExternalCapabilities 是外部会话公开给客户端的能力。
+ */
+export interface ExternalCapabilities {
+    supports_steer: boolean;
+    supports_ephemeral_session: boolean;
+}
+
+// From defs/session.go
+/**
+ * ExternalCommand 是外部后端上报的斜杠命令。
+ */
+export interface ExternalCommand {
+    name: string;
+    description?: string;
+    input_hint?: string;
+}
+
+// From defs/session.go
+/**
+ * ExternalOptionChoice 是外部会话选项的一个可选值。
+ */
+export interface ExternalOptionChoice {
+    value: string;
+    label: string;
+    description?: string;
+}
+
+// From defs/session.go
+/**
+ * ExternalOptionGroup 保存外部会话的一组可选项。
+ */
+export interface ExternalOptionGroup {
+    /**
+     * Kind 为 mode 或 config，对应后端设置选项的方法。
+     */
+    kind: string;
+    id: string;
+    label: string;
+    current_value: string;
+    options: ExternalOptionChoice[];
+}
+
+// From defs/session.go
+/**
+ * ExternalOptionSelection 指定要写入外部会话的选项值。
+ */
+export interface ExternalOptionSelection {
+    kind: string;
+    /**
+     * ID 是后端的选项组 ID；Kind 为 model 时可省略。
+     */
+    id?: string;
+    value: string;
+}
+
+// From defs/session.go
+/**
+ * ExternalOptions 保存外部会话上报的选项及其当前值。
+ */
+export interface ExternalOptions {
+    mode?: ExternalOptionGroup;
+    model?: ExternalOptionGroup;
+    thought?: ExternalOptionGroup;
+    others?: ExternalOptionGroup[];
+}
+
+// From defs/session.go
+/**
+ * ExternalSession 保存外部 Agent 会话的恢复信息。
+ */
+export interface ExternalSession {
+    agent_type: AgentType;
+    executor_id?: string;
+    session_id?: string;
+    cwd?: string;
+    // empty interface{} type, falling back to unknown
+    metadata?: Record<string, unknown>;
+}
+
+// From externalagent/types.go
+/**
+ * ExternalSessionInfo 是可导入会话的列表条目，更新时间为 Unix 毫秒。
+ */
+export interface ExternalSessionInfo {
+    session_id: string;
+    cwd: string;
+    title: string;
+    updated_at: number;
+}
+
+// From externalagent/types.go
+/**
+ * ExternalSessionPreview 保存预览中首末两条用户消息的正文。
+ */
+export interface ExternalSessionPreview {
+    first_user_message: string;
+    last_user_message: string;
+}
+
+// From runtime/types.go
+export interface ExternalSessionRequest extends ExternalAgentLocation {
+    external_session_id: string;
+}
+
+// From runtime/types.go
+export interface ExternalSessionsRequest extends ExternalAgentLocation {
+    query?: string;
+    cursor?: string;
+}
+
+// From runtime/types.go
+export interface ExternalSessionsResult {
+    sessions: ExternalSessionInfo[];
+    next_cursor?: string;
+}
+
+// From defs/message.go
+/**
+ * FileRef 记录已上传附件的元数据及其在目标 Executor 上的绝对路径。
+ */
+export interface FileRef {
+    name: string;
+    mime: string;
+    size: number;
+    path: string;
+}
+
 // From runtimeprotocol/types.go
 /**
  * ForkConversationParams 是 conversation/fork 的参数。
  */
 export interface ForkConversationParams {
+    source_session_id?: SessionID;
     conversation_id: ConversationID;
     /**
      * BeforeTurnID 复制到这一轮之前（不含），LastTurnID 复制到这一轮（含）；最多给一个，都不给时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
@@ -515,12 +900,45 @@ export interface ForkConversationParams {
     ephemeral?: boolean;
 }
 
+// From world/types.go
+export interface ForwardRequest {
+    conversation_id: ConversationID;
+    to: string;
+    item_ids?: ItemID[];
+    note?: string;
+}
+
+// From worldserver/types.go
+export interface GetACLMatrixRequest {
+    rules?: ACLRule[];
+}
+
 // From runtimeprotocol/types.go
 /**
  * GetSessionParams 是 session/get 的参数：只凭 session_id 找 Session，不需要知道它属于哪个对话。
  */
 export interface GetSessionParams {
     session_id: SessionID;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * GetSkillParams 指定 Skill、相对文件路径和操作者查询范围。
+ */
+export interface GetSkillParams {
+    file?: string;
+    name: string;
+    conversation_id?: ConversationID;
+    agent_name?: string;
+    executor_settings?: ExecutorSettings;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * GetSkillResult 返回所选文件的正文，默认读取 SKILL.md。
+ */
+export interface GetSkillResult {
+    content: string;
 }
 
 // From runtimeprotocol/types.go
@@ -539,6 +957,12 @@ export interface GetTurnsParams {
  */
 export interface GetTurnsResult {
     turns: Turn[];
+}
+
+// From runtimeprotocol/types.go
+export interface GetWorldResult {
+    settings: WorldSettings;
+    running: WorldRunning;
 }
 
 // From defs/hook.go
@@ -658,6 +1082,11 @@ export type IdentityKind = "agent" | "user";
 export interface ImageContent {
     data_url: string;
     alt?: string;
+}
+
+// From runtime/types.go
+export interface ImportSessionRequest extends ExternalSessionRequest {
+    title?: string;
 }
 
 // From runtimeprotocol/protocol.go
@@ -793,6 +1222,15 @@ export interface ItemsSavedParams extends NotificationTarget {
 export interface JSONRPCError {
     code: number;
     message: string;
+    data?: JSONRPCErrorData;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * JSONRPCErrorData 保存业务错误码。
+ */
+export interface JSONRPCErrorData {
+    code: string;
 }
 
 // From runtimeprotocol/types.go
@@ -820,6 +1258,24 @@ export interface JSONRPCRequest {
     params: unknown;
 }
 
+// From worldserver/types.go
+/**
+ * JoinTokenInfo 返回入网码状态，时间字段使用 Unix 毫秒。
+ */
+export interface JoinTokenInfo {
+    id: string;
+    owner: string;
+    tags: string[];
+    /**
+     * Reusable 入网码是否可供多个节点注册？
+     */
+    reusable: boolean;
+    used_count: number;
+    expires_at: number;
+    revoked_at: number;
+    created_at: number;
+}
+
 // From runtime/types.go
 /**
  * LastRequestUsage 是最近一次上报了用量的普通模型调用。
@@ -838,6 +1294,28 @@ export interface LastRequestUsage {
      * EstimatedTokens 是调用前未经实际用量校正的本地估算。
      */
     estimated_tokens: number;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * ListAgentPresetsResult 是 catalog/agents/list 返回的 ACP Agent 预设。
+ */
+export interface ListAgentPresetsResult {
+    presets: AgentPreset[];
+}
+
+// From conversation/types.go
+/**
+ * ListAgentsParam 指定会话列表过滤；SinceHours 为零时包括全部时间。
+ */
+export interface ListAgentsParam {
+    session_id?: SessionID;
+    statuses?: SessionState[];
+    cwd?: string;
+    since_hours?: number;
+    labels?: Record<string, string>;
+    all?: boolean;
+    limit?: number;
 }
 
 // From runtimeprotocol/types.go
@@ -888,6 +1366,13 @@ export interface ListDirectoriesParams {
     base_directory?: string;
 }
 
+// From worldserver/types.go
+export interface ListDomainsResult {
+    domain: string;
+    domains: PeerDomain[];
+    self_card: string;
+}
+
 // From runtimeprotocol/types.go
 /**
  * ListExecutorConfigsResult 是 executor/config/list 的返回结果。
@@ -898,9 +1383,22 @@ export interface ListExecutorConfigsResult {
 
 // From runtimeprotocol/types.go
 /**
- * ListExecutorsResult 是 executor/list 的结果：全部 Executor 和它们的默认根目录。
+ * ListExecutorsParams 指定要列出执行环境的对话。
+ */
+export interface ListExecutorsParams {
+    /**
+     * RefreshTools 只在原生模型调用工具时生效。
+     */
+    refresh_tools?: boolean;
+    conversation_id?: ConversationID;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * ListExecutorsResult 返回全局 Executor 或对话中的执行环境和默认项。
  */
 export interface ListExecutorsResult {
+    default_executor_id?: string;
     executors: ExecutorDetails[];
 }
 
@@ -941,12 +1439,34 @@ export interface ListMCPServersResult {
     servers: MCPServerInfo[];
 }
 
+// From world/types.go
+export interface ListMessagesParams {
+    direction?: string;
+    peer_addr?: string[];
+    kind?: string;
+    status?: string;
+    conversation_id?: string;
+    thread_id?: string;
+    limit?: number;
+    cursor_id?: string;
+}
+
 // From runtimeprotocol/types.go
 /**
  * ListModelsParams 是 model/list 的参数；agent_name 为空时不返回 Agent 默认模型。
  */
 export interface ListModelsParams {
-    agent_name: string;
+    agent_name?: string;
+    conversation_id?: ConversationID;
+    session_id?: SessionID;
+    executor_id?: string;
+    cwd?: string;
+}
+
+// From world/types.go
+export interface ListPeersResult {
+    recent: RecentContact[];
+    peers: WorldPeer[];
 }
 
 // From runtimeprotocol/types.go
@@ -973,6 +1493,8 @@ export interface ListSSHConfigHostsResult {
  * ListSessionsParams 是 session/list 的参数。
  */
 export interface ListSessionsParams {
+    source_session_id?: SessionID;
+    filter?: ListAgentsParam;
     conversation_id: ConversationID;
     order?: Order;
     cursor?: RecordCursor<SessionID>;
@@ -984,6 +1506,10 @@ export interface ListSessionsParams {
  * ListSessionsResult 是 session/list 的结果：一页 Session 和下一页游标。
  */
 export interface ListSessionsResult {
+    applied_filter?: ListAgentsParam;
+    total_matched?: number;
+    truncated?: boolean;
+    hint?: string;
     sessions: Session[];
     next_cursor?: RecordCursor<SessionID>;
 }
@@ -993,9 +1519,18 @@ export interface ListSessionsResult {
  * ListSkillsParams 是 skill/list 的参数；没有 conversation_id 时按 agent_name 和 executor_settings 查草稿 Skills。
  */
 export interface ListSkillsParams {
+    query?: string;
     conversation_id?: ConversationID;
     agent_name?: string;
     executor_settings?: ExecutorSettings;
+}
+
+// From world/types.go
+export interface ListThreadsParams {
+    conversation_id?: string;
+    limit?: number;
+    cursor_id?: string;
+    cursor_updated_at?: number;
 }
 
 // From runtimeprotocol/types.go
@@ -1017,6 +1552,11 @@ export interface ListTurnsParams {
 export interface ListTurnsResult {
     turns: Turn[];
     next_cursor?: RecordCursor<TurnID>;
+}
+
+// From worldserver/types.go
+export interface ListUsersResult {
+    users: WorldUser[];
 }
 
 // From runtimeprotocol/types.go
@@ -1077,6 +1617,12 @@ export interface Message {
     subagent_notification?: SubagentNotification;
 }
 
+// From world/types.go
+export interface MessagePage {
+    items: WorldMessage[];
+    next_cursor?: RecordCursor<string>;
+}
+
 // From defs/id.go
 /**
  * ModelCallID 唯一标识一次模型调用，并按创建时间排序。
@@ -1133,6 +1679,10 @@ export interface ModelDefaults {
 export interface ModelDefinition {
     ref: ModelRef;
     display_name: string;
+    /**
+     * Icon 是外部 Agent 的品牌图标。
+     */
+    icon?: string;
     /**
      * Description 是给 Agent 选模型时看的用途说明。
      */
@@ -1205,6 +1755,55 @@ export interface ModelSelection {
     reasoning_effort?: string;
 }
 
+// From world/types.go
+/**
+ * NodeNotification 是节点发布的状态、联系人或消息更新。
+ */
+export interface NodeNotification {
+    event: string;
+    data: unknown;
+}
+
+// From worldserver/types.go
+/**
+ * NodeRecord 保存已入网节点的身份、归属和吊销状态。
+ */
+export interface NodeRecord {
+    node_id: string;
+    node_name: string;
+    owner: string;
+    // this is likely an enum in an external package "gorm.io/datatypes.JSONSlice[string]"
+    tags: string[];
+    sign_public: string;
+    box_public: string;
+    revoked_at: number;
+    created_at: number;
+}
+
+// From world/types.go
+/**
+ * NodeStatus 是节点状态接口返回的运行、连接和离线队列信息。
+ */
+export interface NodeStatus {
+    revoked: boolean;
+    /**
+     * 本机联邦是否启用？
+     */
+    enabled: boolean;
+    admin_enabled: boolean;
+    node_addr: string;
+    server_url: string;
+    /**
+     * 本机是否已收到控制面的通讯录？
+     */
+    connected: boolean;
+    pending_outbox_count: number;
+    remote_access_local_only?: boolean;
+    remote_access_relays?: RelayStatus[];
+    remote_access_url?: string;
+    relay_attachments?: RelayStatus[];
+}
+
 // From runtimeprotocol/types.go
 /**
  * NotificationTarget 是单对话通知的定位字段：对话、事件所属的 Session，以及通知来自哪种订阅；
@@ -1255,6 +1854,27 @@ export type OrderBy = "key" | "updated_at";
  * Ordinal 是 Stream 内从 1 开始、由 LogStorage 分配的严格顺序；0 只用于初始游标。
  */
 export type Ordinal = number;
+
+// From worldserver/types.go
+/**
+ * PeerDomain 保存管理员导入的域名片和添加时间。
+ */
+export interface PeerDomain {
+    status?: string;
+    domain: string;
+    public_key: string;
+    entries: PeerEntries;
+    added_at?: number;
+}
+
+// From worldserver/types.go
+/**
+ * PeerEntries 保存按拨号顺序公布的直连与中转地址。
+ */
+export interface PeerEntries {
+    direct_urls: string[];
+    relays: string[];
+}
 
 // From session/types.go
 /**
@@ -1375,6 +1995,13 @@ export interface ProviderParams {
     provider: ProviderConfig;
 }
 
+// From runtimeprotocol/types.go
+/**
+ * ReadSessionHistoryParams 指定来源、目标和本地历史游标。
+ */
+export interface ReadSessionHistoryParams extends CollaborationSource, SessionHistoryParam {
+}
+
 // From defs/reasoning.go
 /**
  * Reasoning 是一段模型推理：正文、摘要、加密内容和完成状态。
@@ -1393,6 +2020,15 @@ export interface Reasoning {
  */
 export type ReasoningStatus = "completed" | "interrupted";
 
+// From world/types.go
+/**
+ * RecentContact 给出外域对端及最近活动的线程。
+ */
+export interface RecentContact {
+    address: string;
+    thread_id: string;
+}
+
 // From dao/dao.go
 /**
  * RecordCursor 是对话、Session、Turn 列表的翻页位置；零值从头开始。
@@ -1406,6 +2042,27 @@ export interface RecordCursor<ID extends string> {
      * UpdatedAt 是上一页最后一条记录的更新时间；按 Key 排序时不用。
      */
     updated_at?: number;
+}
+
+// From world/types.go
+/**
+ * RelayStatus 是节点到单个 relay 的挂靠状态。
+ */
+export interface RelayStatus {
+    url: string;
+    implicit: boolean;
+    /**
+     * 是否收到 relay 的挂靠确认？
+     */
+    connected: boolean;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * ResetTokenResult 供发起重置的客户端重新认证。
+ */
+export interface ResetTokenResult {
+    token: string;
 }
 
 // From runtimeprotocol/types.go
@@ -1476,6 +2133,44 @@ export interface SSHExecutorConfig {
     identity_file?: string;
 }
 
+// From conversation/types.go
+/**
+ * SendMessageParam 是 send_message 的模型参数，向后代或直接父方提交一次输入。
+ */
+export interface SendMessageParam {
+    session_id: SessionID;
+    message: string;
+    mode?: SessionInputMode;
+    /**
+     * Model 和 ReasoningEffort 只能用于后代；任一非空时先替换接收方的模型选择，再提交输入。
+     */
+    model?: string;
+    reasoning_effort?: string;
+}
+
+// From world/types.go
+export interface SendMessageRequest {
+    to: string;
+    message: string;
+    subject?: string;
+    thread_id?: string;
+    source_conversation_id?: string;
+    /**
+     * 是否等到收到回复？
+     */
+    wait?: boolean;
+}
+
+// From runtimeprotocol/types.go
+export interface SendSessionParams extends CollaborationSource, SendMessageParam {
+    interrupt?: boolean;
+}
+
+// From runtimeprotocol/types.go
+export interface SendSessionResult {
+    input_item_id: ItemID;
+}
+
 // From runtimeprotocol/types.go
 /**
  * ServerInfo 是服务端名称。
@@ -1510,6 +2205,31 @@ export interface Session {
      * Model 是解析后的模型和推理强度，新建或切换模型时写入；零值按 Agent 默认模型处理。
      */
     model?: ModelSelection;
+    /**
+     * External 保存外部后端的恢复句柄。
+     */
+    external?: ExternalSession;
+    /**
+     * Labels 是会话标签。
+     */
+    labels?: Record<string, string>;
+    /**
+     * Background 是否在默认会话列表中隐藏？
+     */
+    background?: boolean;
+    /**
+     * DetachedConversationID 是分离后新对话的 ID。
+     */
+    detached_conversation_id?: ConversationID;
+    /**
+     * DetachedFromConversationID 和 DetachedFromSessionID 是转为独立对话前的对话和会话 ID，仅新根保存。
+     */
+    detached_from_conversation_id?: ConversationID;
+    detached_from_session_id?: SessionID;
+    /**
+     * SuppressFinishReport 是否跳过结束时发给父会话的回报？
+     */
+    suppress_finish_report?: boolean;
 }
 
 // From runtime/types.go
@@ -1550,6 +2270,8 @@ export interface SessionContextUsage {
  * SessionDetails 保存对话里一个 Session 的记录、模型、Executor、Skill 和工具信息。
  */
 export interface SessionDetails {
+    mcp_servers?: string[];
+    capabilities?: ExternalCapabilities;
     conversation_id: ConversationID;
     /**
      * Title 由 Runtime 按已保存的对话记录填写，GetSessionDetails 留空。
@@ -1578,6 +2300,16 @@ export interface SessionDetails {
     tools: string[];
 }
 
+// From runtimeprotocol/types.go
+/**
+ * SessionExternalStateUpdatedParams 由外部驱动就绪或选项、能力、命令发生变化时发给订阅方。
+ */
+export interface SessionExternalStateUpdatedParams extends NotificationTarget {
+    options: ExternalOptions;
+    capabilities: ExternalCapabilities;
+    commands: ExternalCommand[];
+}
+
 // From defs/item.go
 /**
  * SessionFork 是日志里的一条历史分界，按 SourceConversationID 分两种：
@@ -1597,6 +2329,16 @@ export interface SessionFork {
      * SourceEndOrdinal 是来源日志里第一条复制过来的 Item 的序号（来源对外的序号）；接上的部分是 [1, SourceEndOrdinal)。
      */
     source_end_ordinal?: number;
+}
+
+// From conversation/types.go
+/**
+ * SessionHistoryParam 是 read_session_history 的模型参数，从新到旧分页读取后代 fork 之后的历史。
+ */
+export interface SessionHistoryParam {
+    session_id: SessionID;
+    cursor?: Ordinal;
+    limit?: number;
 }
 
 // From defs/id.go
@@ -1647,7 +2389,7 @@ export interface SessionResult {
 
 // From runtime/types.go
 /**
- * SessionRuntimeInfo 是一个 Session 的运行信息，可直接用 == 比较；runtimeConversation 在它有变化时发给对话订阅者，
+ * SessionRuntimeInfo 是一个 Session 的运行信息；runtimeConversation 在它有变化时发给对话订阅者，
  * 例如 Session 启停、Turn 开始或结束、用量和上下文占用变化、换模型。
  */
 export interface SessionRuntimeInfo {
@@ -1699,6 +2441,24 @@ export interface SessionStatusUpdatedParams extends NotificationTarget {
  */
 export interface SessionStoppedParams extends NotificationTarget {
     error?: string;
+}
+
+// From conversation/types.go
+/**
+ * SessionUpdate 指定要替换的会话元数据；省略的字段保留原值。
+ */
+export interface SessionUpdate {
+    task_name?: string;
+    labels?: Record<string, string>;
+    background?: boolean;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * SetAgentParams 保存整份 Agent 定义。
+ */
+export interface SetAgentParams {
+    definition: AgentConfig;
 }
 
 // From runtimeprotocol/types.go
@@ -1786,6 +2546,24 @@ export interface SetSessionModelParams {
     model: ModelSelection;
 }
 
+// From runtimeprotocol/types.go
+/**
+ * SetSessionOptionParams 指定目标会话以及需要交给后端的选择。
+ */
+export interface SetSessionOptionParams extends SessionParams, ExternalOptionSelection {
+}
+
+// From runtimeprotocol/types.go
+export interface SetWorldParams {
+    settings: WorldSettings;
+    join?: WorldJoinParams;
+}
+
+// From runtimeprotocol/types.go
+export interface SetWorldResult {
+    restarting: boolean;
+}
+
 // From skill/skill.go
 /**
  * SkillInfo 是补全列表的显示信息，不含正文和文件读取依赖。
@@ -1812,6 +2590,41 @@ export interface SkillInstruction {
     text: string;
 }
 
+// From conversation/types.go
+/**
+ * SpawnAgentParam 是 spawn_agent 的模型参数，创建一个直接子 Agent 并提交首个任务。
+ */
+export interface SpawnAgentParam {
+    initial_options?: ExternalOptionSelection[];
+    labels?: Record<string, string>;
+    background?: boolean;
+    executor_id?: string;
+    cwd?: string;
+    notify_on_finish?: boolean;
+    task_name: string;
+    message: string;
+    fork_turns?: string;
+    agent_name?: string;
+    model?: string;
+    reasoning_effort?: string;
+}
+
+// From conversation/types.go
+/**
+ * SpawnAgentResult 是 spawn_agent 的结果：Status 为 accepted 表示子 Session 已创建、首个任务已放进它的收件箱，子任务还没做完；
+ * Session 已保存但首个任务没被接收时，工具返回错误，SessionID 写在错误消息里。
+ */
+export interface SpawnAgentResult {
+    input_item_id: ItemID;
+    session_id: SessionID;
+    task_name: string;
+    status: string;
+}
+
+// From runtimeprotocol/types.go
+export interface SpawnSessionParams extends CollaborationSource, SpawnAgentParam {
+}
+
 // From runtimeprotocol/types.go
 /**
  * SteerInputParams 是 conversation/steerInput 的参数。
@@ -1820,6 +2633,16 @@ export interface SteerInputParams {
     conversation_id: ConversationID;
     item_id: ItemID;
     turn_id: TurnID;
+}
+
+// From runtimeprotocol/types.go
+export interface StopSessionParams extends CollaborationSource {
+    session_id: SessionID;
+}
+
+// From runtimeprotocol/types.go
+export interface StopSessionResult {
+    turn_id?: TurnID;
 }
 
 // From runtimeprotocol/types.go
@@ -1885,6 +2708,10 @@ export interface SubscribeConversationResult {
  * SubscribeSessionResult 是 Session 内容订阅的初始信息。
  */
 export interface SubscribeSessionResult {
+    restoring?: boolean;
+    options?: ExternalOptions;
+    capabilities?: ExternalCapabilities;
+    commands?: ExternalCommand[];
     /**
      * LastSavedOrdinal 及之前的日志用 session/items/list 补齐。
      */
@@ -1932,6 +2759,22 @@ export interface TerminalAttachResult {
      */
     rows: number;
     cols: number;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * TerminalCaptureParams 指定终端和要读取的最近行数。
+ */
+export interface TerminalCaptureParams extends TerminalParams {
+    lines?: number;
+}
+
+// From runtimeprotocol/types.go
+/**
+ * TerminalCaptureResult 返回去除 ANSI 控制序列的终端输出。
+ */
+export interface TerminalCaptureResult {
+    text: string;
 }
 
 // From runtimeprotocol/types.go
@@ -2091,6 +2934,27 @@ export interface TextContent {
      * IsContext 是不是附带材料？附带材料不参与用户命令解析。
      */
     is_context?: boolean;
+}
+
+// From world/types.go
+/**
+ * ThreadBinding 将来信线程绑定到本地对话及该轮的转发预算。
+ */
+export interface ThreadBinding {
+    peer_domain: string;
+    target: string;
+    thread_id: string;
+    conversation_id: string;
+    peer_addr: string;
+    direction: string; // inbound | outbound
+    remaining_hops: number; // 收到时保存的剩余跳数
+    created_at: number;
+}
+
+// From world/types.go
+export interface ThreadPage {
+    items: ThreadBinding[];
+    next_cursor?: RecordCursor<string>;
 }
 
 // From defs/turn.go
@@ -2286,6 +3150,57 @@ export interface TurnStartedParams extends NotificationTarget {
 export type TurnStatus = "completed" | "failed" | "interrupted" | "running";
 
 // From runtimeprotocol/types.go
+export interface UpdateSessionParams extends SessionParams, SessionUpdate {
+}
+
+// From runtimeprotocol/types.go
+/**
+ * UploadAttachmentParams 是 attachment/upload 的参数。
+ */
+export interface UploadAttachmentParams {
+    conversation_id: ConversationID;
+    executor_id: string;
+    name: string;
+    mime: string;
+    /**
+     * Data 在线上以 base64 字符串传输。
+     */
+    data: string;
+}
+
+// From conversation/types.go
+/**
+ * WaitAgentParam 是 wait_agent 的模型参数，等待当前 Turn 收到新的补充输入。
+ */
+export interface WaitAgentParam {
+    /**
+     * WaitFor 为 subagent_result 时先检查运行后代；省略时沿用普通等待。
+     */
+    wait_for?: string;
+    timeout_seconds?: number;
+}
+
+// From conversation/types.go
+/**
+ * WaitAgentResult 说明唤醒原因与 Agent 发送方，并携带已完成子任务的最终正文。
+ */
+export interface WaitAgentResult {
+    detached_session_id?: SessionID;
+    text?: string;
+    detached_conversation_id?: ConversationID;
+    /**
+     * Hint 在没有运行后代时提示如何查阅现状；其他原因时为空。
+     */
+    hint?: string;
+    reason: string;
+    from?: SessionID[];
+}
+
+// From runtimeprotocol/types.go
+export interface WaitSessionParams extends CollaborationSource, WaitAgentParam {
+}
+
+// From runtimeprotocol/types.go
 /**
  * WithdrawInputParams 是 conversation/withdrawInput 的参数。
  */
@@ -2312,10 +3227,198 @@ export interface WorkspaceDirectories {
     directories: string[];
 }
 
+// From runtimeprotocol/types.go
+export interface WorldDomainParams {
+    domain: string;
+}
+
+// From runtimeprotocol/types.go
+export interface WorldJoinParams {
+    invite_code: string;
+}
+
+// From world/types.go
+/**
+ * WorldMessage 保存本节点收发的消息、对话归属和处理结果。
+ */
+export interface WorldMessage {
+    message_id: string;
+    thread_id: string;
+    direction: WorldMessageDirection;
+    peer_addr: string;
+    target?: string;
+    kind: string; // message | reply
+    conversation_id?: string;
+    subject?: string;
+    body: string;
+    in_reply_to?: string;
+    hop_limit: number;
+    status: WorldMessageStatus;
+    reply_body?: string;
+    error_code?: string;
+    error_text?: string;
+    notify_conversation: boolean;
+    received_sequence?: number;
+    created_at: number;
+    updated_at: number;
+}
+
+// From world/types.go
+/**
+ * WorldMessageDirection 标记消息相对于本节点的收发方向。
+ */
+export type WorldMessageDirection = "inbound" | "outbound";
+
+// From runtimeprotocol/types.go
+export interface WorldMessageParams {
+    message_id: string;
+}
+
+// From world/types.go
+/**
+ * WorldMessageStatus 记录发件投递或收件处理的进度。
+ */
+export type WorldMessageStatus = "accepted" | "cancelled" | "completed" | "failed" | "pending_offline" | "remote_running" | "replied" | "running" | "sending" | "unknown";
+
+// From runtimeprotocol/types.go
+/**
+ * WorldMessageUpdatedClosedParams 是节点关闭消息事件订阅时的通知。
+ */
+export interface WorldMessageUpdatedClosedParams {
+    reason: string;
+}
+
+// From runtimeprotocol/types.go
+export interface WorldNodeParams {
+    node_id: string;
+}
+
+// From config/types.go
+export interface WorldNodeSettings {
+    enabled: boolean;
+    name: string;
+    domain: string;
+    server_url: string;
+    direct_urls: string[];
+    default_target: string;
+    advertise_targets: AdvertisedTarget[];
+}
+
+// From runtimeprotocol/types.go
+export interface WorldOwnerParams {
+    owner: string;
+}
+
+// From world/types.go
+export interface WorldPeer {
+    address: string;
+    node_name: string;
+    /**
+     * 联系人是否可以投递？
+     */
+    online: boolean;
+    description?: string;
+    targets: AdvertisedTarget[];
+}
+
+// From config/types.go
+/**
+ * WorldRemoteAccessConfig 保存本机远程访问开关和链接显示名。
+ */
+export interface WorldRemoteAccessConfig {
+    /**
+     * 是否经 relay 开放本机 Runtime？
+     */
+    enabled: boolean;
+    name?: string;
+}
+
+// From runtimeprotocol/types.go
+export interface WorldRunning {
+    remote_access_enabled?: boolean;
+    node_enabled: boolean;
+    server_enabled: boolean;
+}
+
+// From config/types.go
+export interface WorldServerSettings {
+    enabled: boolean;
+    domain: string;
+    is_database_created: boolean;
+}
+
+// From config/types.go
+/**
+ * WorldSettings 是设置页可见的本机节点和控制面配置。
+ */
+export interface WorldSettings {
+    remote_access: WorldRemoteAccessConfig;
+    relays: string[];
+    relay_mode: string;
+    web_url: string;
+    node: WorldNodeSettings;
+    server: WorldServerSettings;
+}
+
+// From runtimeprotocol/types.go
+export interface WorldTokenParams {
+    id: string;
+}
+
+// From worldserver/types.go
+/**
+ * WorldUser 汇总归属于同一个人的节点、有效入网码和规则。
+ */
+export interface WorldUser {
+    owner: string;
+    node_count: number;
+    online_count: number;
+    token_count: number;
+    rule_count: number;
+}
+
 /**
  * 每个请求方法的参数类型。
  */
 export interface MethodParams {
+    "server/resetToken": EmptyParams;
+    "world/getStatus": EmptyParams;
+    "world/listPeers": EmptyParams;
+    "world/sendMessage": SendMessageRequest;
+    "world/forward": ForwardRequest;
+    "world/listMessages": ListMessagesParams;
+    "world/cancelMessage": WorldMessageParams;
+    "world/listThreads": ListThreadsParams;
+    "world/subscribe": EmptyParams;
+    "world/unsubscribe": EmptyParams;
+    "world/admin/listUsers": EmptyParams;
+    "world/admin/getACLMatrix": GetACLMatrixRequest;
+    "world/admin/listNodes": EmptyParams;
+    "world/admin/revokeNode": WorldNodeParams;
+    "world/admin/revokeOwner": WorldOwnerParams;
+    "world/admin/listTokens": EmptyParams;
+    "world/admin/createToken": CreateJoinTokenRequest;
+    "world/admin/revokeToken": WorldTokenParams;
+    "world/admin/listDomains": EmptyParams;
+    "world/admin/addDomain": AddDomainRequest;
+    "world/admin/acceptDomain": WorldDomainParams;
+    "world/admin/rejectDomain": WorldDomainParams;
+    "world/admin/deleteDomain": WorldDomainParams;
+    "world/admin/getACL": EmptyParams;
+    "world/admin/replaceACL": ACLRule[];
+    "agent/getOptions": AgentOptionsRequest;
+    "agent/listSessions": ExternalSessionsRequest;
+    "agent/previewSession": ExternalSessionRequest;
+    "session/setOption": SetSessionOptionParams;
+    "session/reload": SessionParams;
+    "session/import": ImportSessionRequest;
+    "session/detach": SessionParams;
+    "session/spawn": SpawnSessionParams;
+    "session/send": SendSessionParams;
+    "session/wait": WaitSessionParams;
+    "session/stop": StopSessionParams;
+    "session/update": UpdateSessionParams;
+    "executor/exec": ExecutorExecRequest;
     "initialize": InitializeParams;
     "conversation/create": CreateConversationParams;
     "conversation/open": OpenConversationParams;
@@ -2327,6 +3430,7 @@ export interface MethodParams {
     "conversation/delete": ConversationParams;
     "conversation/setExecutorSettings": SetExecutorSettingsParams;
     "conversation/submitInput": SubmitInputParams;
+    "attachment/upload": UploadAttachmentParams;
     "conversation/steerInput": SteerInputParams;
     "conversation/interruptTurnWithInput": InterruptTurnWithInputParams;
     "conversation/withdrawInput": WithdrawInputParams;
@@ -2338,12 +3442,17 @@ export interface MethodParams {
     "session/turns/list": ListTurnsParams;
     "session/turns/get": GetTurnsParams;
     "session/items/list": ListItemsParams;
+    "session/history": ReadSessionHistoryParams;
     "session/contextUsage": SessionParams;
     "session/details": SessionParams;
     "session/setModel": SetSessionModelParams;
     "model/list": ListModelsParams;
     "agent/list": EmptyParams;
-    "executor/list": EmptyParams;
+    "agent/get": AgentNameParams;
+    "agent/set": SetAgentParams;
+    "agent/delete": AgentNameParams;
+    "executor/list": ListExecutorsParams;
+    "executor/tool": CallExecutorToolParams;
     "executor/resolveDirectory": ResolveDirectoryParams;
     "executor/listDirectories": ListDirectoriesParams;
     "executor/config/list": EmptyParams;
@@ -2356,10 +3465,14 @@ export interface MethodParams {
     "provider/delete": ProviderIDParams;
     "provider/fetchModels": ProviderParams;
     "config/setDefaultModel": SetDefaultModelParams;
+    "config/getWorld": EmptyParams;
+    "config/setWorld": SetWorldParams;
     "config/reload": EmptyParams;
     "catalog/providers/list": EmptyParams;
+    "catalog/agents/list": EmptyParams;
     "catalog/models/list": ProviderIDParams;
     "skill/list": ListSkillsParams;
+    "skill/get": GetSkillParams;
     "hook/list": EmptyParams;
     "mcpServer/list": ConversationParams;
     "conversation/setClientExecutor": SetClientExecutorParams;
@@ -2371,7 +3484,9 @@ export interface MethodParams {
     "session/unsubscribe": SessionParams;
     "terminal/open": TerminalOpenParams;
     "terminal/attach": TerminalAttachParams;
+    "terminal/input": TerminalInputParams;
     "terminal/close": TerminalParams;
+    "terminal/capture": TerminalCaptureParams;
     "terminal/reset": TerminalParams;
     "terminal/subscribe": EmptyParams;
     "terminal/unsubscribe": EmptyParams;
@@ -2381,6 +3496,44 @@ export interface MethodParams {
  * 每个请求方法的结果类型。
  */
 export interface MethodResult {
+    "server/resetToken": ResetTokenResult;
+    "world/getStatus": NodeStatus;
+    "world/listPeers": ListPeersResult;
+    "world/sendMessage": WorldMessage;
+    "world/forward": WorldMessage;
+    "world/listMessages": MessagePage;
+    "world/cancelMessage": WorldMessage;
+    "world/listThreads": ThreadPage;
+    "world/subscribe": EmptyResult;
+    "world/unsubscribe": EmptyResult;
+    "world/admin/listUsers": ListUsersResult;
+    "world/admin/getACLMatrix": ACLMatrix;
+    "world/admin/listNodes": AdminNode[];
+    "world/admin/revokeNode": EmptyResult;
+    "world/admin/revokeOwner": EmptyResult;
+    "world/admin/listTokens": JoinTokenInfo[];
+    "world/admin/createToken": CreateJoinTokenResponse;
+    "world/admin/revokeToken": EmptyResult;
+    "world/admin/listDomains": ListDomainsResult;
+    "world/admin/addDomain": PeerDomain;
+    "world/admin/acceptDomain": EmptyResult;
+    "world/admin/rejectDomain": EmptyResult;
+    "world/admin/deleteDomain": EmptyResult;
+    "world/admin/getACL": ACLRule[];
+    "world/admin/replaceACL": EmptyResult;
+    "agent/getOptions": ExternalOptions;
+    "agent/listSessions": ExternalSessionsResult;
+    "agent/previewSession": ExternalSessionPreview;
+    "session/setOption": EmptyResult;
+    "session/reload": EmptyResult;
+    "session/import": ConversationResult;
+    "session/detach": ConversationResult;
+    "session/spawn": SpawnAgentResult;
+    "session/send": SendSessionResult;
+    "session/wait": WaitAgentResult;
+    "session/stop": StopSessionResult;
+    "session/update": SessionResult;
+    "executor/exec": ExecutorExecResult;
     "initialize": InitializeResult;
     "conversation/create": ConversationResult;
     "conversation/open": ConversationResult;
@@ -2392,6 +3545,7 @@ export interface MethodResult {
     "conversation/delete": EmptyResult;
     "conversation/setExecutorSettings": ConversationResult;
     "conversation/submitInput": SubmitInputResult;
+    "attachment/upload": FileRef;
     "conversation/steerInput": EmptyResult;
     "conversation/interruptTurnWithInput": EmptyResult;
     "conversation/withdrawInput": WithdrawInputResult;
@@ -2403,12 +3557,17 @@ export interface MethodResult {
     "session/turns/list": ListTurnsResult;
     "session/turns/get": GetTurnsResult;
     "session/items/list": ListItemsResult;
+    "session/history": ListItemsResult;
     "session/contextUsage": SessionContextUsage;
     "session/details": SessionDetails;
     "session/setModel": SessionResult;
     "model/list": ModelList;
     "agent/list": ListAgentsResult;
+    "agent/get": AgentConfig;
+    "agent/set": SetDefinitionsResult;
+    "agent/delete": SetDefinitionsResult;
     "executor/list": ListExecutorsResult;
+    "executor/tool": ToolResult;
     "executor/resolveDirectory": ResolveDirectoryResult;
     "executor/listDirectories": WorkspaceDirectories;
     "executor/config/list": ListExecutorConfigsResult;
@@ -2421,10 +3580,14 @@ export interface MethodResult {
     "provider/delete": SetDefinitionsResult;
     "provider/fetchModels": ProviderModelsResult;
     "config/setDefaultModel": SetDefinitionsResult;
+    "config/getWorld": GetWorldResult;
+    "config/setWorld": SetWorldResult;
     "config/reload": SetDefinitionsResult;
     "catalog/providers/list": ListCatalogProvidersResult;
+    "catalog/agents/list": ListAgentPresetsResult;
     "catalog/models/list": ProviderModelsResult;
     "skill/list": SkillInfo[];
+    "skill/get": GetSkillResult;
     "hook/list": ListHooksResult;
     "mcpServer/list": ListMCPServersResult;
     "conversation/setClientExecutor": EmptyResult;
@@ -2436,7 +3599,9 @@ export interface MethodResult {
     "session/unsubscribe": EmptyResult;
     "terminal/open": TerminalOpenResult;
     "terminal/attach": TerminalAttachResult;
+    "terminal/input": EmptyResult;
     "terminal/close": EmptyResult;
+    "terminal/capture": TerminalCaptureResult;
     "terminal/reset": EmptyResult;
     "terminal/subscribe": TerminalListResult;
     "terminal/unsubscribe": EmptyResult;
@@ -2446,9 +3611,12 @@ export interface MethodResult {
  * 每种服务端通知的参数类型。
  */
 export interface NotificationParams {
+    "world/messageUpdated": NodeNotification;
+    "world/messageUpdatedClosed": WorldMessageUpdatedClosedParams;
     "conversation/runningChanged": RunningConversations;
     "conversation/runningClosed": RunningConversationsClosedParams;
     "subscription/closed": SubscriptionClosedParams;
+    "session/externalStateUpdated": SessionExternalStateUpdatedParams;
     "session/pendingInputsUpdated": SessionPendingInputsUpdatedParams;
     "session/statusUpdated": SessionStatusUpdatedParams;
     "conversation/titleUpdated": ConversationTitleUpdatedParams;

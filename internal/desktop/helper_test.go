@@ -518,7 +518,7 @@ func TestParseRemoteServerInput(t *testing.T) {
 			fallbackToken: "old-token",
 			wantURL:       "ws://10.0.0.5:8790/api/v1/openvaala",
 			wantToken:     "secret-abc",
-			wantDefault:   "10.0.0.5:8790",
+			wantDefault:   "10.0.0.5",
 			wantExtracted: true,
 		},
 		{
@@ -534,7 +534,7 @@ func TestParseRemoteServerInput(t *testing.T) {
 			rawURL:        "ws://10.0.0.5:8790/api/v1/openvaala?token=qtok",
 			wantURL:       "ws://10.0.0.5:8790/api/v1/openvaala",
 			wantToken:     "qtok",
-			wantDefault:   "10.0.0.5:8790",
+			wantDefault:   "10.0.0.5",
 			wantExtracted: true,
 		},
 		{
@@ -552,7 +552,7 @@ func TestParseRemoteServerInput(t *testing.T) {
 			fallbackToken: "t1",
 			wantURL:       "ws://10.0.0.8:8790/api/v1/openvaala",
 			wantToken:     "t1",
-			wantDefault:   "10.0.0.8:8790",
+			wantDefault:   "10.0.0.8",
 			wantExtracted: false,
 		},
 		{
@@ -568,7 +568,7 @@ func TestParseRemoteServerInput(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotURL, gotToken, gotDefault, gotExtracted, err := parseRemoteServerInput(tt.rawURL, tt.fallbackToken)
+			input, err := parseRemoteServerInput(tt.rawURL, tt.fallbackToken)
 			if tt.wantErrContain != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErrContain) {
 					t.Fatalf("err = %v, want containing %q", err, tt.wantErrContain)
@@ -578,8 +578,8 @@ func TestParseRemoteServerInput(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected err: %v", err)
 			}
-			if gotURL != tt.wantURL || gotToken != tt.wantToken || gotDefault != tt.wantDefault || gotExtracted != tt.wantExtracted {
-				t.Fatalf("got (%q, %q, %q, %v), want (%q, %q, %q, %v)", gotURL, gotToken, gotDefault, gotExtracted, tt.wantURL, tt.wantToken, tt.wantDefault, tt.wantExtracted)
+			if input.URL != tt.wantURL || input.Token != tt.wantToken || input.DefaultName != tt.wantDefault || input.ExtractedToken != tt.wantExtracted {
+				t.Fatalf("got (%q, %q, %q, %v), want (%q, %q, %q, %v)", input.URL, input.Token, input.DefaultName, input.ExtractedToken, tt.wantURL, tt.wantToken, tt.wantDefault, tt.wantExtracted)
 			}
 		})
 	}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/internal/tui"
@@ -104,6 +105,9 @@ func runTUIClient(ctx context.Context, args *AppArgs, tel *telemetry.Telemetry, 
 // getConnectURL 生成状态面板显示的带 token 的连接地址。
 func getConnectURL(runtimeURL, token string) string {
 	// 1. 解析 serve 地址，解析失败时返回空串。
+	if strings.Contains(runtimeURL, "#world=") {
+		return runtimeURL
+	}
 	parsed, err := url.Parse(runtimeURL)
 	if err != nil {
 		return ""

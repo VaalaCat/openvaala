@@ -7,3 +7,8 @@ import "embed"
 //
 //go:embed SKILL.md index.md getting-started guides configuration reference zh
 var Files embed.FS
+
+// ExternalAgentSkill 是随外部 Agent 分发的协作入口说明。
+//
+//go:embed external-agent-skill.md
+var ExternalAgentSkill string

@@ -31,7 +31,7 @@ openvaala-desktop app --native    # 原生界面
 
 ## 和 Runtime 服务的关系
 
-两种界面都用本机的 Runtime 服务，没在运行就启动它，所以它们和终端界面、浏览器里的 Web 界面、编辑器、Codex 共享所有对话：
+两种界面默认使用本机的 Runtime 服务，没在运行就启动它，所以它们和终端界面、浏览器里的 Web 界面、编辑器、Codex 共享所有对话：
 
 <!-- scene: shared-progress | 每个客户端实时显示同一个对话 -->
 ```text
@@ -50,7 +50,7 @@ openvaala-desktop app --native    # 原生界面
 
 关掉窗口不会停下你已经发出的任何任务：正在运行的 Turn 会继续，可能继续消耗模型 Provider 的额度。原生界面终端面板里打开的终端也会继续运行，下次启动后回到终端面板。
 
-桌面端总是连接本机的 Runtime 服务。要用别处的服务器，用带 `--url` 的[终端界面](terminal.md)，或者在浏览器里打开那台服务器的 [Web 界面](web.md)。
+在目标机器的「设置 → World → 远程访问」打开开关，保存并重启。用另一台设备扫码，或运行 `openvaala app --url '<远程访问链接>'`。桌面端保存链接里的连接和 Token，下次可在服务器列表中选择它。
 
 ## WebView 和原生界面
 

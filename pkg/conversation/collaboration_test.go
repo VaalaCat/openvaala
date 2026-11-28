@@ -5,8 +5,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VaalaCat/llmkit"
+	"github.com/VaalaCat/openvaala/pkg/agent"
+	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/storage"
@@ -25,7 +28,7 @@ func TestConversationWaitAgent(t *testing.T) {
 			steer := h.input(t, session.SessionInputModeSteer, "check tests")
 			request.reply <- waitResponse("peek", `{"wait_for":"subagent_result","timeout_seconds":1}`)
 			next := receiveModelRequest(t, h.model)
-			var result waitAgentResult
+			var result WaitAgentResult
 			decodeRequestToolResult(t, next, "peek", &result)
 			if result.Reason != "user_steer" {
 				t.Fatal(result)
@@ -51,12 +54,12 @@ func TestConversationWaitAgent(t *testing.T) {
 			root := h.record(t, h.c.GetRootSessionID())
 			h.input(t, session.SessionInputModeNormal, "wait")
 			request := receiveModelRequest(t, h.model)
-			child, err := h.impl().spawnAgent(t.Context(), root, spawnCall("root-turn", "child"), &SpawnAgentParam{TaskName: "child", Message: "task"})
+			child, err := h.spawnForTest(t, root, spawnCall("root-turn", "child"), &SpawnAgentParam{TaskName: "child", Message: "task"})
 			if err != nil {
 				t.Fatal(err)
 			}
 			childRequest := receiveSessionRequest(t, h.model, child)
-			grandchild, err := h.impl().spawnAgent(t.Context(), h.record(t, child), spawnCall("child-turn", "grandchild"), &SpawnAgentParam{TaskName: "grandchild", Message: "long task"})
+			grandchild, err := h.spawnForTest(t, h.record(t, child), spawnCall("child-turn", "grandchild"), &SpawnAgentParam{TaskName: "grandchild", Message: "long task"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -70,7 +73,7 @@ func TestConversationWaitAgent(t *testing.T) {
 			next := receiveSessionRequest(t, h.model, root.ID)
 			next.reply <- waitResponse("grand", `{"wait_for":"subagent_result","timeout_seconds":1}`)
 			next = receiveSessionRequest(t, h.model, root.ID)
-			var result waitAgentResult
+			var result WaitAgentResult
 			decodeRequestToolResult(t, next, "grand", &result)
 			if result.Reason != "timeout" {
 				t.Fatal(result)
@@ -81,7 +84,7 @@ func TestConversationWaitAgent(t *testing.T) {
 			receiveModelRequest(t, h.model).reply <- waitResponse("default", `{}`)
 			h.input(t, session.SessionInputModeSteer, "wake")
 			next := receiveModelRequest(t, h.model)
-			var result waitAgentResult
+			var result WaitAgentResult
 			decodeRequestToolResult(t, next, "default", &result)
 			if result.Reason != "user_steer" {
 				t.Fatal(result)
@@ -97,7 +100,7 @@ func TestConversationWaitAgent(t *testing.T) {
 				root.reply <- waitResponse("wait", `{"timeout_seconds":60}`)
 				child.reply <- modelResponse{text: "child result"}
 				next := receiveSessionRequest(t, h.model, h.c.GetRootSessionID())
-				var waited waitAgentResult
+				var waited WaitAgentResult
 				decodeRequestToolResult(t, next, "wait", &waited)
 				if waited.Reason != waitReasonSubagentResult || !slices.Equal(waited.From, []defs.SessionID{childID}) {
 					t.Fatalf("wait=%+v", waited)
@@ -118,7 +121,7 @@ func TestConversationWaitAgent(t *testing.T) {
 				receiveModelRequest(t, h.model).reply <- waitResponse("wait", `{"timeout_seconds":60}`)
 				steer := h.input(t, session.SessionInputModeSteer, "extra requirement")
 				next := receiveSessionRequest(t, h.model, h.c.GetRootSessionID())
-				var waited waitAgentResult
+				var waited WaitAgentResult
 				decodeRequestToolResult(t, next, "wait", &waited)
 				if waited.Reason != waitReasonUserSteer || len(waited.From) != 0 || !strings.Contains(requestJSON(next), "extra requirement") {
 					t.Fatalf("wait=%+v request=%s", waited, requestJSON(next))
@@ -146,7 +149,7 @@ func TestConversationWaitAgent(t *testing.T) {
 					Arguments: fmt.Sprintf(`{"session_id":%q,"message":"progress report","mode":"steer"}`, h.c.GetRootSessionID()),
 				}}}
 				next := receiveSessionRequest(t, h.model, h.c.GetRootSessionID())
-				var waited waitAgentResult
+				var waited WaitAgentResult
 				decodeRequestToolResult(t, next, "wait", &waited)
 				if waited.Reason != waitReasonAgentMessage || !slices.Equal(waited.From, []defs.SessionID{childID}) {
 					t.Fatalf("wait=%+v", waited)
@@ -166,7 +169,7 @@ func TestConversationWaitAgent(t *testing.T) {
 				id := h.input(t, session.SessionInputModeNormal, "wait briefly")
 				receiveModelRequest(t, h.model).reply <- waitResponse("wait", `{"timeout_seconds":1}`)
 				next := receiveSessionRequest(t, h.model, h.c.GetRootSessionID())
-				var waited waitAgentResult
+				var waited WaitAgentResult
 				decodeRequestToolResult(t, next, "wait", &waited)
 				if waited.Reason != waitReasonTimeout || len(waited.From) != 0 {
 					t.Fatalf("wait=%+v", waited)
@@ -210,7 +213,7 @@ func TestConversationSendMessage(t *testing.T) {
 			model := newConversationModel(t)
 			h := startTestConversation(t, store, model, createTestConversation(t, store, model))
 			root := h.record(t, h.c.GetRootSessionID())
-			child, err := h.impl().spawnAgent(t.Context(), root, spawnCall("root-turn", "a"), &SpawnAgentParam{
+			child, err := h.spawnForTest(t, root, spawnCall("root-turn", "a"), &SpawnAgentParam{
 				TaskName: "review",
 				Message:  "first",
 			})
@@ -218,7 +221,7 @@ func TestConversationSendMessage(t *testing.T) {
 				t.Fatal(err)
 			}
 			first := receiveSessionRequest(t, model, child)
-			if err := h.impl().sendMessage(t.Context(), root, &SendMessageParam{
+			if _, err := h.impl().sendMessage(t.Context(), root, &SendMessageParam{
 				SessionID: child,
 				Mode:      tt.mode,
 				Message:   "second",
@@ -251,17 +254,18 @@ func TestConversationSendMessageModel(t *testing.T) {
 	}
 	const notDescendantErr = "send_message can only change the model of a descendant agent"
 	tests := []struct {
-		name           string
-		historical     bool   // 目标是否为没在运行的历史后代？否则是刚派出、首个请求还在进行的子 Agent
-		spawnModel     string // 派子 Agent 时的 model
-		spawnEffort    string // 派子 Agent 时的 reasoning_effort
-		currentRemoved bool   // 是否把目标当前的模型改成目录里没有的？
-		fromChild      bool   // 是否由子 Agent 给直接父方发送？
-		model          string
-		effort         string
-		wantErr        string
-		wantSelection  defs.ModelSelection // 成功后目标 Session 记录里的选择，也是它下一次请求实际使用的选择
-		wantUpstream   string
+		name             string
+		historical       bool   // 目标是否为没在运行的历史后代？否则是刚派出、首个请求还在进行的子 Agent
+		agentTypeChanged bool   // 重开时历史后代的 Agent 是否由原生改为 ACP？
+		spawnModel       string // 派子 Agent 时的 model
+		spawnEffort      string // 派子 Agent 时的 reasoning_effort
+		currentRemoved   bool   // 是否把目标当前的模型改成目录里没有的？
+		fromChild        bool   // 是否由子 Agent 给直接父方发送？
+		model            string
+		effort           string
+		wantErr          string
+		wantSelection    defs.ModelSelection // 成功后目标 Session 记录里的选择，也是它下一次请求实际使用的选择
+		wantUpstream     string
 	}{
 		{
 			name:  "descendant_model_replaced",
@@ -315,6 +319,13 @@ func TestConversationSendMessageModel(t *testing.T) {
 			wantErr: "model test/gone is not configured",
 		},
 		{
+			name:             "reopened_descendant_agent_type_changed",
+			historical:       true,
+			agentTypeChanged: true,
+			model:            "test/other",
+			wantErr:          "agent worker type changed from native to acp",
+		},
+		{
 			name:    "model_malformed",
 			model:   "nope",
 			wantErr: "provider_id/model_id",
@@ -343,11 +354,26 @@ func TestConversationSendMessageModel(t *testing.T) {
 			// 2. 准备历史或运行中的后代，按参数向目标发送消息。
 			store, model := openConversationDAO(t), newConversationModel(t)
 			created := createTestConversation(t, store, model)
+			opt := conversationOpt(store, model)
 			var historical defs.SessionID
 			if tt.historical {
 				historical = saveHistoricalAgent(t, store, created.GetID(), created.GetRootSessionID(), "historical", nil)
 			}
-			c, err := reopenTestConversation(t, created, conversationOpt(store, model))
+			if tt.agentTypeChanged {
+				saved, found, err := store.query.GetSession(t.Context(), created.GetID(), historical)
+				if err != nil || !found {
+					t.Fatalf("stored Session found = %t, error = %v", found, err)
+				}
+				saved.AgentName = "worker"
+				saved.Model.Ref = opt.Definitions.Agents[1].Model
+				if err := store.mutation.SetSession(t.Context(), saved); err != nil {
+					t.Fatal(err)
+				}
+				opt.Definitions.Agents[1] = &agent.AgentDefinition{
+					Name: "worker", Type: defs.AgentTypeACP, ACP: &defs.ACPCommand{Command: "fakeacp"},
+				}
+			}
+			c, err := reopenTestConversation(t, created, opt)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -356,7 +382,7 @@ func TestConversationSendMessageModel(t *testing.T) {
 			child := historical
 			var first modelRequest
 			if !tt.historical {
-				if child, err = h.impl().spawnAgent(t.Context(), root, spawnCall("root-turn", "a"), &SpawnAgentParam{
+				if child, err = h.spawnForTest(t, root, spawnCall("root-turn", "a"), &SpawnAgentParam{
 					TaskName:        "review",
 					Message:         "first",
 					Model:           tt.spawnModel,
@@ -376,7 +402,7 @@ func TestConversationSendMessageModel(t *testing.T) {
 			if tt.fromChild {
 				source, target = before, root.ID
 			}
-			err = h.impl().sendMessage(t.Context(), source, &SendMessageParam{
+			_, err = c.SendMessage(t.Context(), source.ID, &SendMessageParam{
 				SessionID:       target,
 				Mode:            session.SessionInputModeNormal,
 				Message:         "second",
@@ -388,7 +414,13 @@ func TestConversationSendMessageModel(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("sendMessage() = %v, want error containing %q", err, tt.wantErr)
 				}
-				if h.record(t, child) != before || h.record(t, root.ID) != root {
+				if tt.historical {
+					stored, found, err := store.query.GetSession(t.Context(), c.GetID(), child)
+					if err != nil || !found || stored.Model != before.Model {
+						t.Fatalf("stored model = %+v, found = %t, error = %v; want %+v", stored.Model, found, err, before.Model)
+					}
+				}
+				if !defs.IsSameSession(h.record(t, child), before) || !defs.IsSameSession(h.record(t, root.ID), root) {
 					t.Fatalf("failed send changed Session records: child %+v, before %+v", h.record(t, child), before)
 				}
 				return
@@ -422,21 +454,21 @@ func TestConversationCollaborationScope(t *testing.T) {
 	model := newConversationModel(t)
 	h := startTestConversation(t, store, model, createTestConversation(t, store, model))
 	root := h.record(t, h.c.GetRootSessionID())
-	a, err := h.impl().spawnAgent(t.Context(), root, spawnCall("root-turn", "a"), &SpawnAgentParam{
+	a, err := h.spawnForTest(t, root, spawnCall("root-turn", "a"), &SpawnAgentParam{
 		TaskName: "A",
 		Message:  "task",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := h.impl().spawnAgent(t.Context(), root, spawnCall("root-turn", "b"), &SpawnAgentParam{
+	b, err := h.spawnForTest(t, root, spawnCall("root-turn", "b"), &SpawnAgentParam{
 		TaskName: "B",
 		Message:  "task",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	grandchild, err := h.impl().spawnAgent(t.Context(), h.record(t, a), spawnCall("a-turn", "c"), &SpawnAgentParam{
+	grandchild, err := h.spawnForTest(t, h.record(t, a), spawnCall("a-turn", "c"), &SpawnAgentParam{
 		TaskName: "C",
 		Message:  "task",
 	})
@@ -490,7 +522,7 @@ func TestConversationCollaborationScope(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := h.record(t, tt.source)
-			err := h.impl().sendMessage(t.Context(), source, &SendMessageParam{
+			_, err := h.impl().sendMessage(t.Context(), source, &SendMessageParam{
 				SessionID: tt.target,
 				Mode:      session.SessionInputModeNormal,
 				Message:   "hello",
@@ -508,7 +540,8 @@ func TestConversationCollaborationScope(t *testing.T) {
 		})
 	}
 	// 3. 查询根 Session 的全部后代，检查排序和运行状态；没有后代的 Session 查到空列表。
-	agents, err := h.impl().listAgents(t.Context(), root)
+	listed, err := h.c.ListAgents(t.Context(), root.ID, &ListAgentsParam{})
+	agents := listed.Agents
 	if err != nil || len(agents) != 3 || !slices.IsSortedFunc(agents, func(x, y SessionInfo) int { return strings.Compare(string(x.Session.ID), string(y.Session.ID)) }) {
 		t.Fatalf("agents=%+v %v", agents, err)
 	}
@@ -517,7 +550,7 @@ func TestConversationCollaborationScope(t *testing.T) {
 			t.Fatalf("running agent reported stopped: %+v", agent)
 		}
 	}
-	if agents, err := h.impl().listAgents(t.Context(), h.record(t, b)); err != nil || len(agents) != 0 {
+	if agents, err := h.c.ListAgents(t.Context(), b, &ListAgentsParam{}); err != nil || len(agents.Agents) != 0 {
 		t.Fatalf("leaf agents=%+v %v", agents, err)
 	}
 }
@@ -548,7 +581,7 @@ func TestConversationInterruptAgent(t *testing.T) {
 			root := h.record(t, c.GetRootSessionID())
 			target := historical
 			if tt.running {
-				if target, err = h.impl().spawnAgent(t.Context(), root, spawnCall("root-turn", "a"), &SpawnAgentParam{
+				if target, err = h.spawnForTest(t, root, spawnCall("root-turn", "a"), &SpawnAgentParam{
 					TaskName: "A",
 					Message:  "task",
 				}); err != nil {
@@ -656,7 +689,7 @@ func TestConversationReadSessionHistory(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			// 3. 读取历史，检查消息按正序、下一页游标和预期错误。
-			page, err := impl.readSessionHistory(t.Context(), tt.source, &SessionHistoryParam{
+			page, err := impl.ReadSessionHistory(t.Context(), tt.source.ID, &SessionHistoryParam{
 				SessionID: tt.target,
 				Cursor:    tt.cursor,
 				Limit:     tt.limit,
@@ -810,6 +843,138 @@ func TestGetSessionInfosUsesSelectedModelWindow(t *testing.T) {
 			infos, err := impl.getSessionInfos(t.Context(), []defs.Session{record})
 			if err != nil || len(infos) != 1 || infos[0].ContextWindow != tt.wantWindow {
 				t.Fatalf("infos = %+v, %v; want window %d", infos, err, tt.wantWindow)
+			}
+		})
+	}
+}
+
+func TestAgentListFilters(t *testing.T) {
+	store, model := openConversationDAO(t), newConversationModel(t)
+	c := createTestConversation(t, store, model)
+	ids := make([]defs.SessionID, 105)
+	for i := range ids {
+		id := defs.NewSessionID()
+		ids[i] = id
+		rec := defs.Session{ID: id, ConversationID: c.GetID(), ParentSessionID: c.GetRootSessionID(), ParentTurnID: "turn", AgentName: "assistant", Background: i == 0}
+		switch i {
+		case 2:
+			rec.AgentName = "external"
+			rec.External = &defs.ExternalSession{AgentType: defs.AgentTypeACP, Cwd: "/other", ExecutorID: "local", SessionID: "remote"}
+		case 3:
+			rec.Labels = map[string]string{"team": "ops", "blank": ""}
+		}
+		if err := store.mutation.SetSession(t.Context(), rec); err != nil {
+			t.Fatal(err)
+		}
+		if i == 1 {
+			records := store.database.Record()
+			row, found, err := records.Get(t.Context(), dao.SessionNamespace, storage.RecordKey(string(rec.ConversationID)+"/"+string(rec.ID)))
+			if err != nil || !found {
+				t.Fatalf("stored session: %v %v", found, err)
+			}
+			row.UpdatedAt = time.Now().Add(-48 * time.Hour).UnixMilli()
+			if err := records.Set(t.Context(), dao.SessionNamespace, row); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	opt := conversationOpt(store, model)
+	opt.Definitions.Agents = append(opt.Definitions.Agents, &agent.AgentDefinition{Name: "external", Type: defs.AgentTypeACP, ACP: &defs.ACPCommand{Command: "fakeacp"}})
+	reopened, err := reopenTestConversation(t, c, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startTestConversation(t, store, model, reopened)
+	allTime := 0
+	for _, tc := range []struct {
+		name           string
+		filter         ListAgentsParam
+		matched, shown int
+	}{
+		{"defaults", ListAgentsParam{}, 102, 20},
+		{"across directories", ListAgentsParam{Cwd: "*"}, 103, 20},
+		{"other directory", ListAgentsParam{Cwd: "/other"}, 1, 1},
+		{"background", ListAgentsParam{All: true}, 103, 20},
+		{"no age limit", ListAgentsParam{SessionID: ids[1], SinceHours: &allTime}, 1, 1},
+		{"old hidden", ListAgentsParam{SessionID: ids[1]}, 0, 0},
+		{"hard limit", ListAgentsParam{All: true, Cwd: "*", SinceHours: &allTime, Limit: 125}, 105, 100},
+		{"match labels", ListAgentsParam{Labels: map[string]string{"team": "ops", "blank": ""}}, 1, 1},
+		{"missing label", ListAgentsParam{Labels: map[string]string{"missing": ""}}, 0, 0},
+		{"stopped by id", ListAgentsParam{SessionID: ids[3], Statuses: []session.SessionState{session.SessionStateStopped}}, 1, 1},
+		{"no active match", ListAgentsParam{SessionID: ids[3], Statuses: []session.SessionState{session.SessionStateRunning}}, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := h.c.ListAgents(t.Context(), c.GetRootSessionID(), &tc.filter)
+			if err != nil || result.TotalMatched != tc.matched || len(result.Agents) != tc.shown || result.Truncated != (tc.matched > tc.shown) || result.Hint == "" || result.AppliedFilter.Limit > 100 {
+				t.Fatalf("list %+v %v", result, err)
+			}
+			if tc.name == "defaults" && (result.AppliedFilter.Limit != 20 || *result.AppliedFilter.SinceHours != 24 || result.AppliedFilter.All) {
+				t.Fatalf("defaults %+v", result.AppliedFilter)
+			}
+		})
+	}
+}
+
+func TestSuppressFinishReport(t *testing.T) {
+	for _, setting := range []string{"default", "enabled", "disabled", "silent abnormal exit"} {
+		t.Run(setting, func(t *testing.T) {
+			notify := setting == "default" || setting == "enabled"
+			var notifyParam *bool
+			if setting != "default" {
+				notifyParam = &notify
+			}
+			store := openConversationDAO(t)
+			model := newConversationModel(t)
+			c := createTestConversation(t, store, model)
+			if setting == "silent abnormal exit" {
+				opt := conversationOpt(store, model)
+				opt.Query = &spawnStartupQuery{Query: store.query, root: c.GetRootSessionID()}
+				var err error
+				c, err = reopenTestConversation(t, c, opt)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			h := startTestConversation(t, store, model, c)
+			root := h.record(t, c.GetRootSessionID())
+			spawned, err := h.impl().spawnAgent(t.Context(), root, "parent-turn", "", &SpawnAgentParam{TaskName: "check", Message: "work", NotifyOnFinish: notifyParam})
+			if setting == "silent abnormal exit" {
+				if err == nil || spawned.SessionID == "" {
+					t.Fatalf("child startup: %+v %v", spawned, err)
+				}
+				h.input(t, session.SessionInputModeNormal, "still here")
+				request := receiveSessionRequest(t, model, root.ID)
+				body := requestJSON(request)
+				if strings.Contains(body, "异常退出") || !strings.Contains(body, "still here") {
+					t.Fatal(body)
+				}
+				return
+			}
+			if err != nil || spawned.InputItemID == "" {
+				t.Fatalf("spawn %+v %v", spawned, err)
+			}
+			record := h.record(t, spawned.SessionID)
+			stored, found, err := store.query.GetSession(t.Context(), root.ConversationID, spawned.SessionID)
+			if err != nil || !found || stored.UpdatedAt != record.UpdatedAt {
+				t.Fatalf("timestamp %+v, %+v: %v", stored, record, err)
+			}
+			if record.SuppressFinishReport == notify || record.ParentCallID != "" || record.UpdatedAt == 0 {
+				t.Fatalf("metadata %+v", record)
+			}
+			receiveSessionRequest(t, model, record.ID).reply <- modelResponse{text: "done"}
+			waitCompletedTurns(t, store, record.ID, 1)
+			if notify {
+				if body := requestJSON(receiveSessionRequest(t, model, root.ID)); !strings.Contains(body, "done") {
+					t.Fatal(body)
+				}
+			} else {
+				_, err := h.impl().sendMessage(t.Context(), record, &SendMessageParam{SessionID: root.ID, Message: "explicit", Mode: session.SessionInputModeNormal})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if body := requestJSON(receiveSessionRequest(t, model, root.ID)); !strings.Contains(body, "explicit") || strings.Contains(body, "subagent_notification") {
+					t.Fatal(body)
+				}
 			}
 		})
 	}

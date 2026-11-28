@@ -30,3 +30,41 @@ func joinTextParts(textParts []string) string {
 	}
 	return content.String()
 }
+
+// cutTrailingXMLBlock 取出文本尾端的一块完整提示。
+func cutTrailingXMLBlock(text, tag string) (rest, body string, found bool) {
+	// 1. 从结尾找到最后一块的开标签和紧贴末尾的闭标签。
+	open, end := "<"+tag+">\n", "</"+tag+">"
+	if !strings.HasSuffix(text, end) {
+		return text, "", false
+	}
+	start := strings.LastIndex(text, open)
+	if start < 0 {
+		return text, "", false
+	}
+	body, tail, closed := strings.Cut(text[start+len(open):], end)
+	if !closed || tail != "" {
+		return text, "", false
+	}
+	return strings.TrimSuffix(text[:start], "\n\n"), strings.ReplaceAll(body, "<\\/"+tag+">", end), true
+}
+
+// parseXMLFields 按提示块的字段顺序读取值并还原转义的结束标签。
+func parseXMLFields(body string, names ...string) ([]string, bool) {
+	// 1. 逐字段读取有完整起止标签的值。
+	values := make([]string, 0, len(names))
+	for _, name := range names {
+		start, end := "<"+name+">", "</"+name+">"
+		valueAndTail, found := strings.CutPrefix(body, start)
+		if !found {
+			return nil, false
+		}
+		value, tail, found := strings.Cut(valueAndTail, end+"\n")
+		if !found {
+			return nil, false
+		}
+		values = append(values, strings.ReplaceAll(value, "<\\/"+name+">", end))
+		body = tail
+	}
+	return values, body == ""
+}

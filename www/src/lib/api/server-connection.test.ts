@@ -66,7 +66,8 @@ function createHarness(
     resolve?: (response: Response) => void
   }[] = []
   const deps: ServerConnectionDeps = {
-    createWebSocket(url) {
+    createTransport(entry) {
+      const url = entry.url + "?token=" + encodeURIComponent(entry.token)
       const socket = new FakeWebSocket(url)
       sockets.push(socket)
       return socket
@@ -536,6 +537,50 @@ test("notifications_routed_to_conversation_listeners", async () => {
     ]
   )
   assert.equal(received.c1[0].method, "turn/started")
+})
+
+test("含凭据的响应只在 RPC 日志保留元数据", async (t) => {
+  for (const { method, wantPayload } of [
+    { method: "world/admin/createToken", wantPayload: false },
+    { method: "server/resetToken", wantPayload: false },
+    { method: "world/getStatus", wantPayload: false },
+    { method: "world/admin/listTokens", wantPayload: true },
+  ] as const) {
+    await t.test(method, async () => {
+      const harness = createHarness()
+      const { socket } = await start(harness)
+      const result =
+        method === "world/admin/createToken"
+          ? harness.connection.call(method, {
+              owner: "team",
+              tags: [],
+              reusable: false,
+              expires_at: 2000,
+            })
+          : harness.connection.call(method, {})
+      const id = socket.getSentFrame(socket.sent.length - 1).id
+      const payload = {
+        id,
+        result: wantPayload ? [] : { token: "plaintext-invite" },
+      }
+      socket.receive(payload)
+      assert.deepEqual(await result, payload.result)
+      const frames = harness.connection.$rpcLog.get()
+      const [sent, received] = frames.slice(-2)
+      assert.equal(sent.method, method)
+      assert.ok(sent.payload)
+      assert.equal(received.method, method)
+      assert.equal(received.id, id)
+      assert.equal(received.direction, "received")
+      assert.ok(received.time >= sent.time)
+      assert.equal(received.size, Buffer.byteLength(JSON.stringify(payload)))
+      assert.deepEqual(received.payload, wantPayload ? payload : undefined)
+      assert.equal(
+        formatRpcLogJsonl(frames).includes("plaintext-invite"),
+        false
+      )
+    })
+  }
 })
 
 test("rpc_log_keeps_latest_2000", async () => {

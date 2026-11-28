@@ -25,6 +25,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	storagefile "github.com/VaalaCat/openvaala/pkg/storage/file"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
@@ -69,7 +70,7 @@ func TestTUIEndToEnd(t *testing.T) {
 			},
 			run: func(t *testing.T, h *e2eHarness) {
 				// 1. 补全并提交 Skills，运行中插话，再读取两个文件检查目录规则。
-				h.waitFor("skills loaded", func() bool { return len(h.model.skills) == 2 })
+				h.waitFor("skills loaded", func() bool { return len(h.model.skills) == 3 })
 				h.typeText("请用 /rev")
 				h.press("tab")
 				h.typeText("/tes")
@@ -851,6 +852,7 @@ func newE2EHarness(t *testing.T, agentName string, startupNotice string, configu
 	})
 	// 3. 配置相同 server_id，并应用本场景的模型与服务设置。
 	serverOpt := &runtimeserver.RuntimeServerOpt{
+		TokenSecret:   sessiontoken.NewSecret("e2e-token"),
 		Configuration: e2eConfiguration{},
 		ModelCatalog:  e2eModelCatalog{},
 		ServerID:      tuiTestLocalServerID,
@@ -869,7 +871,7 @@ func newE2EHarness(t *testing.T, agentName string, startupNotice string, configu
 	go func() { runtimeDone <- rt.Run(runtimeCtx) }()
 	t.Cleanup(func() { stopRuntime(); <-runtimeDone })
 	// 5. 将 Runtime 路由挂到 HTTP 服务，登记清理时先关闭 HTTP，再停止连接。
-	serverOpt.Runtime, serverOpt.Token, serverOpt.Telemetry = rt, "e2e-token", pipeline.Telemetry
+	serverOpt.Runtime, serverOpt.Telemetry = rt, pipeline.Telemetry
 	server, err := runtimeserver.NewRuntimeServer(serverOpt)
 	if err != nil {
 		t.Fatal(err)

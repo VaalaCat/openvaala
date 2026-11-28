@@ -101,21 +101,23 @@ func (d *sessionDAOImpl) GetSession(ctx context.Context, conversationID defs.Con
 	return value, true, nil
 }
 
-// GetSessionByID 找出写过这个 Session Item 日志的对话，再读取其中的 Session 记录。
+// GetSessionByID 按元数据中的 Session ID 查找所属对话，包括尚无 Item 的会话。
 func (d *sessionDAOImpl) GetSessionByID(ctx context.Context, sessionID defs.SessionID) (defs.Session, bool, error) {
-	// 1. 以 Session ID 为 Stream 查找 Item 日志所在路径，路径名称即对话 ID。
-	paths, err := d.logs.GetStreamPaths(ctx, storage.StreamID(sessionID))
+	page, err := d.records.List(ctx, storage.ListRecordsRequest{
+		Namespace: SessionNamespace,
+		Limit:     1,
+		Filter: storage.RecordFilter{Conditions: []storage.RecordFilterCondition{
+			{Field: "id", Operator: storage.RecordFilterIn, Values: []string{string(sessionID)}},
+		}},
+	})
 	if err != nil {
 		return defs.Session{}, false, fmt.Errorf("find Session %q: %w", sessionID, err)
 	}
-	// 2. 依次读取各对话下的 Session 记录，读到或出错时直接返回；没写过 Item 或都没有匹配记录时返回未找到。
-	for _, path := range paths {
-		value, found, err := d.GetSession(ctx, defs.ConversationID(path), sessionID)
-		if err != nil || found {
-			return value, found, err
-		}
+	if len(page.Items) == 0 {
+		return defs.Session{}, false, nil
 	}
-	return defs.Session{}, false, nil
+	record, err := decodeSession(page.Items[0])
+	return record, err == nil, err
 }
 
 // ListSessions 分页读取一个对话内的 Session。

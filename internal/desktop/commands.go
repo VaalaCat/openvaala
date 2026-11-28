@@ -8,6 +8,7 @@ import (
 	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/dao"
+	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -222,6 +223,12 @@ func (d *Desktop) cycleModel() {
 			candidates = append(candidates, model.Ref.String())
 		}
 	}
+	if d.conversation.ID != "" && d.getExternalAgent() != nil {
+		candidates = candidates[1:]
+		if len(candidates) == 0 {
+			return
+		}
+	}
 	model, effort := d.getModelSelection()
 	next := candidates[(slices.Index(candidates, model)+1)%len(candidates)]
 	// 2. 新模型不支持当前推理强度时恢复自动。
@@ -234,6 +241,19 @@ func (d *Desktop) cycleModel() {
 
 // cycleReasoning 换成所选模型的下一档推理强度：自动之后依次是各档，最后回到自动。
 func (d *Desktop) cycleReasoning() {
+	if d.getExternalAgent() != nil {
+		if d.externalOptions == nil || d.externalOptions.Thought == nil {
+			return
+		}
+		group := d.externalOptions.Thought
+		if len(group.Options) == 0 {
+			return
+		}
+		index := slices.IndexFunc(group.Options, func(v defs.ExternalOptionChoice) bool { return v.Value == group.CurrentValue })
+		next := group.Options[(index+1)%len(group.Options)]
+		d.changeExternalOption(defs.ExternalOptionSelection{Kind: group.Kind, ID: group.ID, Value: next.Value})
+		return
+	}
 	model, effort := d.getModelSelection()
 	candidates := append([]string{""}, getReasoningEfforts(d.models, model)...)
 	next := candidates[(slices.Index(candidates, effort)+1)%len(candidates)]

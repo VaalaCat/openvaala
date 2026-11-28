@@ -51,6 +51,7 @@ type RecordFilterOperator string
 
 const (
 	RecordFilterIn       RecordFilterOperator = "in"
+	RecordFilterNotIn    RecordFilterOperator = "not_in"
 	RecordFilterContains RecordFilterOperator = "contains"
 )
 
@@ -58,7 +59,7 @@ const (
 type RecordFilterCondition struct {
 	Field    string
 	Operator RecordFilterOperator
-	// Values 在 in 时至少一项，命中任意一项即匹配；contains 时恰好一项，按普通子串匹配。
+	// in 和 not_in 至少需要一项，分别匹配集合内和集合外的值；contains 使用单个普通子串。
 	Values []string
 }
 

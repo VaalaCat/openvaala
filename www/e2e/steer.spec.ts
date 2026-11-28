@@ -2,6 +2,7 @@ import type { Content } from "../src/lib/api/protocol.gen"
 import {
   expect,
   getComposer,
+  getNewConversationLink,
   getMessages,
   startConversation,
   test,
@@ -351,13 +352,14 @@ for (const mode of ["normal", "steer"] as const) {
   }) => {
     // 1. 两个运行中的对话各留一条待处理输入，记录各自的真实 ItemID。
     await fixture.openApp(page)
-    const conversations: { path: string; itemID: string; text: string }[] = []
+    const conversations: {
+      conversationID: string
+      itemID: string
+      text: string
+    }[] = []
     for (const name of ["A", "B"]) {
       if (conversations.length > 0)
-        await page
-          .getByRole("link", { name: "新对话", exact: true })
-          .first()
-          .click()
+        await getNewConversationLink(page).click()
       await fixture.replies({ text: `对话 ${name} 保持运行`, hold: true })
       await startConversation(page, `切换待处理 ${name}`)
       await expect(
@@ -374,14 +376,17 @@ for (const mode of ["normal", "steer"] as const) {
       const rows = page.locator("[data-pending-input]:visible")
       await expect(rows).toHaveCount(1)
       conversations.push({
-        path: new URL(page.url()).pathname,
+        conversationID: new URL(page.url()).pathname.split("/c/")[1],
         itemID: (await rows.getAttribute("data-pending-input"))!,
         text,
       })
     }
     // 2. 通过侧栏反复切回，只有目标对话的一份列表，待处理内容尚未进入历史。
     for (const target of [...conversations, ...conversations]) {
-      await page.locator(`a[href="${target.path}"]`).first().click()
+      await page
+        .locator(`[data-conversation-id="${target.conversationID}"]`)
+        .getByRole("link")
+        .click()
       const pending = page.getByRole("region", { name: "待处理", exact: true })
       await expect(
         pending.locator(`[data-pending-input="${target.itemID}"]`)
@@ -401,7 +406,10 @@ for (const mode of ["normal", "steer"] as const) {
     }
     // 3. 取回本对话的输入后列表消失，不残留另一对话的待处理区域。
     for (const target of conversations) {
-      await page.locator(`a[href="${target.path}"]`).first().click()
+      await page
+        .locator(`[data-conversation-id="${target.conversationID}"]`)
+        .getByRole("link")
+        .click()
       await page
         .locator(`[data-pending-input="${target.itemID}"]`)
         .getByRole("button", { name: "取回修改", exact: true })

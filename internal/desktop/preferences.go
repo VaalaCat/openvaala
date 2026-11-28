@@ -14,10 +14,11 @@ import (
 
 // remoteServer 是原生桌面本地保存的一台远端 Runtime Server 档案。
 type remoteServer struct {
-	ID    string `json:"id"`
-	Name  string `json:"name,omitempty"`
-	URL   string `json:"url"`
-	Token string `json:"token,omitempty"`
+	ID       string  `json:"id"`
+	Name     string  `json:"name,omitempty"`
+	NodeAddr *string `json:"node_addr,omitempty"`
+	URL      string  `json:"url"`
+	Token    string  `json:"token,omitempty"`
 }
 
 type preferences struct {
@@ -100,17 +101,13 @@ func (d *Desktop) loadPreferences() error {
 			if server.ID == "" || server.ID == localServerID || seenIDs[server.ID] {
 				continue
 			}
-			parsedURL, parsedToken, _, _, parseErr := parseRemoteServerInput(server.URL, server.Token)
+			input, parseErr := parseRemoteServerInput(server.URL, server.Token)
 			if parseErr != nil {
 				continue
 			}
 			seenIDs[server.ID] = true
-			validServers = append(validServers, remoteServer{
-				ID:    server.ID,
-				Name:  server.Name,
-				URL:   parsedURL,
-				Token: parsedToken,
-			})
+			server.URL, server.Token = input.URL, input.Token
+			validServers = append(validServers, server)
 		}
 		p.RemoteServers = validServers
 	}

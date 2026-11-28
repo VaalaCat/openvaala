@@ -2,11 +2,18 @@ import { createContext, useContext, useState, type ReactNode } from "react"
 import { createPortal } from "react-dom"
 import { usePageNavigation } from "@/hooks/use-page-navigation"
 
+type PageAncestor = {
+  label: string
+  to?: string
+  icon?: "mail"
+  tooltip?: string
+}
+
 export type PageNavigation = {
   locationKey: string
   title: string
-  parent?: { label: string; to?: string }
-  parents?: { label: string; to?: string }[]
+  parent?: PageAncestor
+  parents?: PageAncestor[]
   // 点顶栏标题时调用，例如对话页改名；有它时标题是按钮，没有时标题只是文字
   onTitleClick?: () => void
 }

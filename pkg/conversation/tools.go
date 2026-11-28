@@ -7,8 +7,10 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
+	"github.com/VaalaCat/openvaala/pkg/executor/tools"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
+	"github.com/VaalaCat/openvaala/pkg/terminal"
 )
 
 // collaborationTool 是一项协作工具：参数解析交给 BaseTool，执行时调用绑定了来源 Session 的 collaborate。
@@ -62,12 +64,14 @@ func newCollaborationTools(c *conversationImpl, source defs.Session, definitions
 			Description: prompt.FormatSpawnAgentDescription(newAgentPromptEntries(definitions.Agents), definitions.Models),
 		},
 		func(ctx context.Context, call *defs.Item, param *SpawnAgentParam) *executor.ToolExecutionResult {
-			id, err := c.spawnAgent(ctx, source, call, param)
-			return encodeToolResult(call.ToolCall.CallID, spawnAgentResult{
-				SessionID: id,
-				TaskName:  param.TaskName,
-				Status:    "accepted",
-			}, err)
+			var result SpawnAgentResult
+			var err error
+			if call.TurnID == "" {
+				result, err = c.SpawnAgent(ctx, source.ID, param)
+			} else {
+				result, err = c.spawnAgent(ctx, source, call.TurnID, call.ToolCall.CallID, param)
+			}
+			return encodeToolResult(call.ToolCall.CallID, result, err)
 		})
 	if err != nil {
 		return nil, err
@@ -79,11 +83,12 @@ func newCollaborationTools(c *conversationImpl, source defs.Session, definitions
 			Description: prompt.SendMessageDescription,
 		},
 		func(ctx context.Context, call *defs.Item, param *SendMessageParam) *executor.ToolExecutionResult {
-			err := c.sendMessage(ctx, source, param)
+			inputID, err := c.SendMessage(ctx, source.ID, param)
 			return encodeToolResult(call.ToolCall.CallID, sendMessageResult{
-				SessionID: param.SessionID,
-				Mode:      param.Mode,
-				Status:    "accepted",
+				InputItemID: inputID,
+				SessionID:   param.SessionID,
+				Mode:        param.Mode,
+				Status:      "accepted",
 			}, err)
 		})
 	if err != nil {
@@ -116,9 +121,9 @@ func newCollaborationTools(c *conversationImpl, source defs.Session, definitions
 			Name:        "list_agents",
 			Description: prompt.ListAgentsDescription,
 		},
-		func(ctx context.Context, call *defs.Item, _ *listAgentsParam) *executor.ToolExecutionResult {
-			infos, err := c.listAgents(ctx, source)
-			return encodeToolResult(call.ToolCall.CallID, listAgentsResult{Sessions: infos}, err)
+		func(ctx context.Context, call *defs.Item, param *ListAgentsParam) *executor.ToolExecutionResult {
+			result, err := c.ListAgents(ctx, source.ID, param)
+			return encodeToolResult(call.ToolCall.CallID, result, err)
 		})
 	if err != nil {
 		return nil, err
@@ -130,10 +135,14 @@ func newCollaborationTools(c *conversationImpl, source defs.Session, definitions
 			Description: prompt.ReadSessionHistoryDescription,
 		},
 		func(ctx context.Context, call *defs.Item, param *SessionHistoryParam) *executor.ToolExecutionResult {
-			page, err := c.readSessionHistory(ctx, source, param)
+			page, err := c.ReadSessionHistory(ctx, source.ID, param)
+			items := make([]*defs.Item, len(page.Items))
+			for index, logged := range page.Items {
+				items[index] = logged.Item
+			}
 			return encodeToolResult(call.ToolCall.CallID, sessionHistoryResult{
 				SessionID:  param.SessionID,
-				Items:      transformHistoryItems(page.Items),
+				Items:      items,
 				NextCursor: page.Next,
 			}, err)
 		})
@@ -209,4 +218,46 @@ type listedMCPServerInfo struct {
 	ServerID string                    `json:"server_id"`
 	Status   mcpclient.ConnectionState `json:"status"`
 	Error    string                    `json:"error,omitempty"`
+}
+
+type sessionTerminalManager interface {
+	GetTerminalManager() terminal.TerminalManager
+}
+
+// GetCollaborationTools 按来源 Session 装配协作工具、工作区工具和命令工具。
+func (c *conversationImpl) GetCollaborationTools(ctx context.Context, id defs.SessionID) (executor.ToolExecutor, error) {
+	// 1. 取得来源会话和它的后台命令集合。
+	source, err := c.getCollaborationSource(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	instance, err := c.getOrOpenSession(ctx, source, nil)
+	if err != nil {
+		return nil, err
+	}
+	// 2. 使用来源 Agent 的定义和对话环境创建本次请求的工具表。
+	config := c.config.Load()
+	definition, found := config.agentDefinitions[source.AgentName]
+	if !found {
+		return nil, newAgentNotConfiguredError(source)
+	}
+	definition = definition.Clone()
+	definition.MCPServerIDs = defs.OptionalStringList{}
+	collaboration, err := newCollaborationTools(c, source, config.definitions, definition)
+	if err != nil {
+		return nil, err
+	}
+	sessionTools, err := tools.NewSessionCommandTools(config.environments, instance.(sessionTerminalManager).GetTerminalManager())
+	if err != nil {
+		return nil, err
+	}
+	opt := executor.NewToolExecutorOpt(c.environmentsManager, collaboration...)
+	opt.Session = source
+	opt.SessionTools = sessionTools
+	opt.ToolNames = definition.ToolNames
+	opt.MCPServerIDs = definition.MCPServerIDs
+	if !definition.Type.IsExternal() {
+		opt.Hooks = config.hooks
+	}
+	return executor.NewToolExecutor(opt)
 }

@@ -24,7 +24,9 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	storagefile "github.com/VaalaCat/openvaala/pkg/storage/file"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
@@ -197,6 +199,98 @@ func TestRuntimeServerAuth(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestScopedRuntimeConnection 检查会话 Token 握手、后代授权和操作者路由。
+func TestScopedRuntimeConnection(t *testing.T) {
+	h := startTestServer(t)
+	conversationID, otherConversationID := defs.NewConversationID(), defs.NewConversationID()
+	root, source, sibling := defs.NewSessionID(), defs.NewSessionID(), defs.NewSessionID()
+	child, grandchild := defs.NewSessionID(), defs.NewSessionID()
+	for _, record := range []defs.Session{
+		{ID: root, ConversationID: conversationID, AgentName: "assistant"},
+		{ID: source, ConversationID: conversationID, ParentSessionID: root, AgentName: "assistant"},
+		{ID: sibling, ConversationID: conversationID, ParentSessionID: root, AgentName: "assistant"},
+		{ID: child, ConversationID: conversationID, ParentSessionID: source, AgentName: "assistant"},
+		{ID: grandchild, ConversationID: conversationID, ParentSessionID: child, AgentName: "assistant"},
+	} {
+		if err := h.store.mutation.SetSession(t.Context(), record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token := sessiontoken.Issue(testToken, conversationID, source)
+	headers := http.Header{"Authorization": {"Bearer " + token}}
+	conn, _, err := h.dialWith(t, "/api/v1/openvaala", headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := newTestClient(t, conn)
+	client.initialize(t)
+	for _, test := range []struct {
+		name   string
+		method string
+		params any
+		denied bool
+	}{
+		{name: "direct_child_history", method: "session/items/list", params: runtimeprotocol.SessionParams{ConversationID: conversationID, SessionID: child}},
+		{name: "grandchild_history", method: "session/items/list", params: runtimeprotocol.SessionParams{ConversationID: conversationID, SessionID: grandchild}},
+		{name: "cross_conversation", method: "session/items/list", params: runtimeprotocol.SessionParams{ConversationID: otherConversationID, SessionID: child}, denied: true},
+		{name: "parent_history", method: "session/items/list", params: runtimeprotocol.SessionParams{ConversationID: conversationID, SessionID: root}, denied: true},
+		{name: "sibling_history", method: "session/turns/list", params: runtimeprotocol.SessionParams{ConversationID: conversationID, SessionID: sibling}, denied: true},
+		{name: "own_history", method: "session/items/list", params: runtimeprotocol.SessionParams{ConversationID: conversationID, SessionID: source}, denied: true},
+		{name: "missing_conversation", method: "session/items/list", params: runtimeprotocol.SessionParams{SessionID: child}, denied: true},
+		{name: "cross_conversation_list", method: "session/list", params: runtimeprotocol.ListSessionsParams{ConversationID: otherConversationID}, denied: true},
+		{name: "agent_list", method: "agent/list"},
+		{name: "agent_get", method: "agent/get", denied: true},
+		{name: "agent_set", method: "agent/set", denied: true},
+		{name: "agent_delete", method: "agent/delete", denied: true},
+		{name: "executor_list", method: "executor/list"},
+		{name: "config_reload", method: "config/reload", denied: true},
+		{name: "submit_as_user", method: "conversation/submitInput", params: runtimeprotocol.ConversationParams{ConversationID: conversationID}, denied: true},
+		{name: "unknown_method", method: "unknown", denied: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := client.call(t, test.method, test.params)
+			if test.denied {
+				if response.Error == nil || response.Error.Code != -32000 || response.Error.Message != "permission denied" {
+					t.Fatalf("%s = %+v, want permission denied", test.method, response.Error)
+				}
+			} else if response.Error != nil {
+				t.Fatalf("%s = %+v", test.method, response.Error)
+			}
+		})
+	}
+
+	// 分页只返回后代记录，下一页游标也指向可见记录。
+	params := runtimeprotocol.ListSessionsParams{ConversationID: conversationID, Limit: 1}
+	for _, want := range []defs.SessionID{child, grandchild} {
+		var page runtimeprotocol.ListSessionsResult
+		client.callResult(t, "session/list", params, &page)
+		if len(page.Sessions) != 1 || page.Sessions[0].ID != want {
+			t.Fatalf("session/list = %+v, want %s", page, want)
+		}
+		if want == child && page.NextCursor.ID != child || want == grandchild && page.NextCursor.ID != "" {
+			t.Fatalf("session/list next cursor = %+v after %s", page.NextCursor, want)
+		}
+		params.Cursor = page.NextCursor
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+h.address+"/api/v1/shutdown", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header = headers
+	response, err := h.httpServer.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("shutdown = %d, want 401", response.StatusCode)
+	}
+	operator := h.dial(t)
+	operator.initialize(t)
+	operator.callResult(t, "session/items/list", runtimeprotocol.SessionParams{ConversationID: conversationID, SessionID: sibling}, nil)
 }
 
 // TestRuntimeServerWebUI 检查页面路由：根路径跳转、首页、前端路由回退、静态资源及缓存头、缺失资源、没有打包页面和 API 仍需 token。
@@ -885,6 +979,7 @@ func (calls testCalls) drain() []testCall {
 
 // testConfiguration 是测试用的 Configuration，把收到的调用记进 calls。
 type testConfiguration struct {
+	runtimeserver.Configuration
 	// providers、defaultModel、defaults 是 ListProviders 的返回值。
 	providers    []defs.ProviderConfig
 	defaultModel defs.ModelRef
@@ -1144,8 +1239,10 @@ func (m *serverModel) requireNoRequest(t *testing.T) {
 
 // serverHarness 运行一个真实 Runtime 与监听本机空闲端口的 RuntimeServer；测试结束时先停 Server 再停 Runtime。
 type serverHarness struct {
-	store *serverStore
-	model *serverModel
+	server        runtimeserver.RuntimeServer
+	dataDirectory string
+	store         *serverStore
+	model         *serverModel
 	// runtime 是 Server 背后的真实 Runtime，供测试换定义。
 	runtime runtime.Runtime
 	// defaultDirectory 是 local Executor 的默认根目录（serve 的工作目录），其中 .agents/skills 下有一个以目录名为名的 Skill。
@@ -1185,6 +1282,8 @@ func startTestServerWithIdleTimeout(t *testing.T, tel *telemetry.Telemetry, idle
 	// 2. 创建 Runtime，绑定测试遥测。
 	runtimeOpt := newTestRuntimeOpt(store, model, defaultDirectory)
 	runtimeOpt.Telemetry = tel
+	dataDirectory := t.TempDir()
+	runtimeOpt.DataDirectory = dataDirectory
 	rt, err := runtime.NewRuntime(runtimeOpt)
 	if err != nil {
 		t.Fatal(err)
@@ -1210,6 +1309,8 @@ func startTestServerWithIdleTimeout(t *testing.T, tel *telemetry.Telemetry, idle
 	serverCtx, cancel := context.WithCancel(ctx)
 	httpServer.Config.BaseContext = func(net.Listener) context.Context { return serverCtx }
 	h := &serverHarness{
+		server:           server,
+		dataDirectory:    dataDirectory,
 		store:            store,
 		model:            model,
 		runtime:          rt,
@@ -1305,10 +1406,7 @@ type clientMessage struct {
 }
 
 // clientError 是响应里的错误。
-type clientError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
+type clientError = runtimeprotocol.JSONRPCError
 
 // newTestClient 创建后台读取响应与通知的协议客户端。
 func newTestClient(t *testing.T, conn *websocket.Conn) *testClient {
@@ -1463,5 +1561,49 @@ func writeTestSkill(t *testing.T, directory, name string) {
 	}
 	if err := os.WriteFile(path, []byte("---\nname: "+name+"\ndescription: "+name+" 的测试 Skill\n---\n"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResetToken(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		session bool
+	}{{"operator", false}, {"session", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "runtime-server.yaml")
+			if err := os.WriteFile(path, []byte("token: "+testToken+"\nserver_id: test\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			h := startTestServer(t, func(opt *runtimeserver.RuntimeServerOpt) { opt.ConnectionFile = path })
+			operator := h.dial(t)
+			operator.initialize(t)
+			if tc.session {
+				conv := operator.createConversation(t)
+				socket, _, err := h.dialWith(t, "/api/v1/openvaala", http.Header{"Authorization": {"Bearer " + sessiontoken.Issue(testToken, conv.ID, conv.RootSessionID)}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				scoped := newTestClient(t, socket)
+				scoped.initialize(t)
+				if result := scoped.call(t, "server/resetToken", nil); result.Error == nil {
+					t.Fatal("session reset operator token")
+				}
+				return
+			}
+			var result runtimeprotocol.ResetTokenResult
+			operator.callResult(t, "server/resetToken", nil, &result)
+			data, err := os.ReadFile(path)
+			if err != nil || result.Token == "" || !strings.Contains(string(data), result.Token) {
+				t.Fatalf("rotated credential missing: %v", err)
+			}
+			if _, res, err := h.dialWith(t, "/api/v1/openvaala?token="+testToken, nil); err == nil || res.StatusCode != 401 {
+				t.Fatal("old token still valid")
+			}
+			conn, _, err := h.dialWith(t, "/api/v1/openvaala?token="+result.Token, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newTestClient(t, conn).initialize(t)
+		})
 	}
 }

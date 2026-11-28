@@ -9,6 +9,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -36,6 +37,41 @@ func TestModelPickerSearch(t *testing.T) {
 			if d.newModel != "second/model" {
 				t.Fatalf("model=%q", d.newModel)
 			}
+		})
+	}
+}
+
+// TestExternalModelSelection 检查桌面模型控件显示快照和选项通知中的实际模型。
+func TestExternalModelSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantLabel string
+		updateID        defs.SessionID
+	}{
+		{"reading session update", "Large model", "s1"},
+		{"other session update", "Small model", "s2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDesktop()
+			d.readingTarget = readingTarget{ConversationID: "c1", SessionID: "s1"}
+			d.models.Models = []*defs.ModelDefinition{
+				{Ref: defs.ModelRef{ProviderID: "peer", ModelID: "small"}, DisplayName: "Small model"},
+				{Ref: defs.ModelRef{ProviderID: "peer", ModelID: "large"}, DisplayName: "Large model"},
+			}
+			root := runtime.SessionRuntimeInfo{Session: defs.Session{ID: "s1", AgentName: "peer", External: &defs.ExternalSession{}}}
+			d.handleClientEvent(&runtimeclient.ConversationSynced{ConversationID: "c1", Conversation: defs.Conversation{ID: "c1", RootSessionID: "s1"}, SessionInfos: []runtime.SessionRuntimeInfo{root}})
+			d.handleClientEvent(&runtimeclient.SessionSynced{ConversationID: "c1", SessionID: "s1", External: true,
+				Options: &defs.ExternalOptions{Model: &defs.ExternalOptionGroup{CurrentValue: "small"}}})
+			check := func(want string) {
+				t.Helper()
+				tester := ui.NewTester(d.view, 1280, 820)
+				if !tester.HasText(want) {
+					t.Errorf("missing %q in model controls: %q", want, tester.Texts())
+				}
+			}
+			check("Small model")
+			d.handleClientEvent(&runtimeclient.SessionExternalStateChanged{NotificationTarget: runtimeprotocol.NotificationTarget{ConversationID: "c1", SessionID: tc.updateID},
+				Options: defs.ExternalOptions{Model: &defs.ExternalOptionGroup{CurrentValue: "large"}}})
+			check(tc.wantLabel)
 		})
 	}
 }

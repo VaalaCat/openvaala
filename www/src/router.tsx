@@ -5,10 +5,15 @@ import { AppLayout } from "@/components/app-layout"
 
 // 按需加载页面模块，取其中名为 name 的导出
 function lazyPage<K extends string>(
-  load: () => Promise<Record<K, ComponentType>>,
+  load: () => Promise<Record<K, ComponentType> | undefined>,
   name: K
 ) {
-  return lazy(() => load().then((module) => ({ default: module[name] })))
+  // Vite 的加载错误已被接手时返回 undefined，保留 Suspense 和外层页面等候刷新。
+  return lazy(async () => {
+    const module = await load()
+    if (!module) return new Promise<never>(() => {})
+    return { default: module[name] }
+  })
 }
 
 const IndexPage = lazyPage(() => import("@/app/index"), "IndexPage")
@@ -16,6 +21,7 @@ const NewConversationPage = lazyPage(
   () => import("@/app/new-conversation"),
   "NewConversationPage"
 )
+const ContactsPage = lazyPage(() => import("@/app/contacts"), "ContactsPage")
 const WorkspacePage = lazyPage(
   () => import("@/components/workspace/workspace-page"),
   "WorkspacePage"
@@ -23,6 +29,18 @@ const WorkspacePage = lazyPage(
 const ProviderListPage = lazyPage(
   () => import("@/app/settings/providers"),
   "ProviderListPage"
+)
+const AgentListPage = lazyPage(
+  () => import("@/app/settings/agents"),
+  "AgentListPage"
+)
+const AgentCreatePage = lazyPage(
+  () => import("@/app/settings/agents"),
+  "AgentCreatePage"
+)
+const AgentEditPage = lazyPage(
+  () => import("@/app/settings/agents"),
+  "AgentEditPage"
 )
 const GeneralSettingsPage = lazyPage(
   () => import("@/app/settings/general"),
@@ -65,6 +83,15 @@ const SkillSettingsPage = lazyPage(
   "SkillSettingsPage"
 )
 
+const WorldAdminPage = lazyPage(
+  () => import("@/app/world-admin"),
+  "WorldAdminPage"
+)
+const WorldAdminSettingsPage = lazyPage(
+  () => import("@/app/settings/world-admin"),
+  "WorldAdminSettingsPage"
+)
+
 function RuntimeRoutes() {
   return (
     <ServerConnectionProvider>
@@ -78,10 +105,12 @@ export function AppRouter() {
     // 入口页不在 AppLayout 里，它的模块加载由这一层兜住
     <Suspense fallback={null}>
       <Routes>
+        <Route path="/world/admin" element={<WorldAdminPage />} />
         <Route element={<RuntimeRoutes />}>
           <Route path="/" element={<IndexPage />} />
           <Route path="/s/:serverID" element={<AppLayout />}>
             <Route index element={<NewConversationPage />} />
+            <Route path="contacts" element={<ContactsPage />} />
             <Route path="c/:conversationID" element={<WorkspacePage />}>
               <Route index element={null} />
               <Route path="sessions/:sessionID" element={null} />
@@ -94,11 +123,15 @@ export function AppRouter() {
               <Route path="providers" element={<ProviderListPage />} />
               <Route path="providers/new" element={<ProviderCreatePage />} />
               <Route path="providers/edit" element={<ProviderEditPage />} />
+              <Route path="agents" element={<AgentListPage />} />
+              <Route path="agents/new" element={<AgentCreatePage />} />
+              <Route path="agents/edit" element={<AgentEditPage />} />
               <Route path="executors" element={<ExecutorSettingsPage />} />
               <Route path="executors/new" element={<ExecutorCreatePage />} />
               <Route path="executors/edit" element={<ExecutorEditPage />} />
               <Route path="hooks" element={<HookSettingsPage />} />
               <Route path="skills" element={<SkillSettingsPage />} />
+              <Route path="world-admin" element={<WorldAdminSettingsPage />} />
             </Route>
           </Route>
         </Route>

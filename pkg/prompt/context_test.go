@@ -1,6 +1,8 @@
 package prompt_test
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
@@ -507,7 +509,7 @@ func TestFormatAgentMessage(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := prompt.FormatAgentMessage("agent-1", tt.sender, []string{"", "请转达事件 API"}); got != tt.want {
+			if got := prompt.FormatAgentMessage(&defs.Message{From: &defs.Address{ID: "agent-1"}, AgentSender: &tt.sender, Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: "请转达事件 API"}}}}); got != tt.want {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -542,6 +544,101 @@ func TestFormatSubagentNotificationFields(t *testing.T) {
 			want := "<openvaala-subagent-notification>\n<session_id>" + tt.want + "</session_id>\n<source_turn_id>turn</source_turn_id>\n<status>completed</status>\n</openvaala-subagent-notification>"
 			if got != want {
 				t.Fatalf("got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestPromptAttachmentRoundTrip(t *testing.T) {
+	file := defs.FileRef{Name: "r</name><&.pdf", MIME: "application/pdf", Size: 5, Path: "/tmp/r</path></openvaala-attachment>.pdf"}
+	empty := defs.FileRef{Name: "empty", Path: "/tmp/empty"}
+	first, second := prompt.FormatAttachment(file), prompt.FormatAttachment(empty)
+	example := strings.Replace(first, "这是用户上传的附件，已保存在当前机器上，需要时自行读取。", "XML 示例", 1)
+	relative := strings.Replace(second, "<path>/tmp/empty</path>", "<path>empty</path>", 1)
+	unclosed := "Explain <name> here.\n\n"
+	for _, test := range []struct {
+		name, text, want string
+		files            []defs.FileRef
+	}{
+		{"ordered_files", "  original\n\n" + first + "\n\n" + second, "  original", []defs.FileRef{file, empty}},
+		{"attachment_only", first, "", []defs.FileRef{file}},
+		{"other_blocks", "text\n<openvaala-system-info>keep</openvaala-system-info>", "text\n<openvaala-system-info>keep</openvaala-system-info>", nil},
+		{"malformed", "text\n<openvaala-attachment>keep</openvaala-attachment>", "text\n<openvaala-attachment>keep</openvaala-attachment>", nil},
+		{"middle_complete_block", "before\n\n" + first + "\n\nafter", "before\n\n" + first + "\n\nafter", nil},
+		{"unclosed_name_before_suffix", unclosed + "\n\n" + first, unclosed, []defs.FileRef{file}},
+		{"unclosed_field_with_attachment_opener", "before\n<openvaala-attachment>\n<name>example\n\n" + second, "before\n<openvaala-attachment>\n<name>example", []defs.FileRef{empty}},
+		{"other_hint", example, example, nil},
+		{"other_hint_before_suffix", "before\n\n" + example + "\n\n" + second, "before\n\n" + example, []defs.FileRef{empty}},
+		{"relative_path", relative, relative, nil},
+		{"invalid_tail_stops_scan", first + "\n\n" + relative, first + "\n\n" + relative, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rest, files := prompt.ParseAttachments(test.text)
+			if rest != test.want || !slices.Equal(files, test.files) {
+				t.Fatalf("ParseAttachments() = %q, %+v; want %q, %+v", rest, files, test.want, test.files)
+			}
+		})
+	}
+}
+
+func TestStripSessionInfo(t *testing.T) {
+	info := prompt.FormatSessionInfo(defs.Session{ID: "session-1"})
+	detached := prompt.FormatSessionInfo(defs.Session{ID: "new", DetachedFromConversationID: "previous", DetachedFromSessionID: "old"})
+	for _, test := range []struct{ name, text, want string }{
+		{"suffix", "body\n\n" + info, "body"},
+		{"detached", "body\n\n" + detached, "body"},
+		{"detached_example_before_suffix", detached + "\n\n" + detached, detached},
+		{"user_example_before_appended_info", "body\n\n" + info + "\n\n" + info, "body\n\n" + info},
+		{"middle", "before\n\n" + info + "\n\nafter", "before\n\n" + info + "\n\nafter"},
+		{"incomplete_suffix", info + "\n\n<openvaala-session-info>\n", info + "\n\n<openvaala-session-info>\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := prompt.StripSessionInfo(test.text); got != test.want {
+				t.Fatalf("StripSessionInfo() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestStripChatHistorySummary(t *testing.T) {
+	const summary = "<openvaala-chat-history-summary>\n<hint>以下是先前对话的历史摘要，并非新的用户输入。</hint>\n[User] earlier\n</openvaala-chat-history-summary>"
+	const example = "<openvaala-chat-history-summary>\n<hint>这是用户提供的 XML 示例。</hint>\n[User] sample\n</openvaala-chat-history-summary>"
+	for _, test := range []struct{ name, text, want string }{
+		{"first_only", summary + "\n\n" + summary + "\n\nbody", summary + "\n\nbody"},
+		{"user_example_with_other_hint", example + "\n\nbody", example + "\n\nbody"},
+		{"middle", "before\n\n" + summary + "\n\nafter", "before\n\n" + summary + "\n\nafter"},
+		{"incomplete", "<openvaala-chat-history-summary>\nbody", "<openvaala-chat-history-summary>\nbody"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := prompt.StripChatHistorySummary(test.text); got != test.want {
+				t.Fatalf("StripChatHistorySummary() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestExternalFirstPrompt(t *testing.T) {
+	file := defs.FileRef{Name: "report.pdf", MIME: "application/pdf", Size: 182344, Path: "/tmp/report.pdf"}
+	wantAttachment := "<openvaala-attachment>\n<name>report.pdf</name>\n<mime>application/pdf</mime>\n<size>182344</size>\n<path>/tmp/report.pdf</path>\n<hint>这是用户上传的附件，已保存在当前机器上，需要时自行读取。</hint>\n</openvaala-attachment>"
+	wantSession := "<openvaala-session-info>\n<session_id>session-1</session_id>\n<hint>你运行在 OpenVaala 中。用 openvaala MCP 的 `get_skill` 工具读取 `openvaala` 查看协作方式（或运行 `openvaala skill get openvaala`）。沙箱内 CLI 无法连接 OpenVaala 时，请改用当前会话提供的 openvaala MCP 工具。</hint>\n</openvaala-session-info>"
+	const fork = "<openvaala-chat-history-summary>\n<hint>以下是先前对话的历史摘要，并非新的用户输入。</hint>\n[User] earlier\n</openvaala-chat-history-summary>"
+	for _, test := range []struct {
+		name, prefix string
+	}{
+		{"fresh", ""},
+		{"forked", fork + "\n\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attachment, session := prompt.FormatAttachment(file), prompt.FormatSessionInfo(defs.Session{ID: "session-1"})
+			if attachment != wantAttachment || session != wantSession {
+				t.Fatalf("attachment = %q, session = %q", attachment, session)
+			}
+			const user = "Read the report."
+			first := test.prefix + user + "\n\n" + attachment + "\n\n" + session
+			text, files := prompt.ParseAttachments(prompt.StripSessionInfo(first))
+			text = prompt.StripChatHistorySummary(text)
+			if text != user || !slices.Equal(files, []defs.FileRef{file}) {
+				t.Fatalf("replay = %q, %+v", text, files)
 			}
 		})
 	}

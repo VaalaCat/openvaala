@@ -1,0 +1,12 @@
+defaultBaseImage: docker.io/vaalacat/openvaala-base:alpine3.22
+defaultPlatforms:
+  - linux/amd64
+  - linux/arm64
+builds:
+  - id: openvaala
+    main: ./cmd/openvaala
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/VaalaCat/openvaala/pkg/defs.buildVersion={{.Env.VERSION}}

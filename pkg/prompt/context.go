@@ -2,6 +2,8 @@ package prompt
 
 import (
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
@@ -15,6 +17,8 @@ const MaxStepsReachedInstructions = "本轮的模型调用次数已到上限，�
 
 // OmittedImageUnsupportedText 是模型不能接收图片时代替图片的文字。
 const OmittedImageUnsupportedText = "[图片已省略：当前模型不能接收图片]"
+
+const historySummaryHint = "以下是先前对话的历史摘要，并非新的用户输入。"
 
 // FormatToolResultImages 生成说明工具调用读到了哪些图片的系统信息块。
 func FormatToolResultImages(callID string, alts []string) string {
@@ -34,7 +38,7 @@ func FormatOmittedOlderImage(alt string, maxImages int) string {
 // FormatContextSummary 生成放进上下文的历史摘要块。
 func FormatContextSummary(summary defs.ContextSummary) string {
 	// 1. 在摘要正文前写明它是先前对话的摘要，不是新的用户输入。
-	return formatXMLBlock("openvaala-context-summary", "以下是先前对话的历史摘要，并非新的用户输入。\n"+summary.Text+"\n")
+	return formatXMLBlock("openvaala-context-summary", historySummaryHint+"\n"+summary.Text+"\n")
 }
 
 // FormatModelError 生成上一轮模型请求失败的通知。
@@ -199,14 +203,33 @@ func FormatSubagentNotification(sender defs.SessionID, notification defs.Subagen
 }
 
 // FormatAgentMessage 生成其他 Agent 发来的消息。
-func FormatAgentMessage(sender defs.SessionID, agentSender defs.AgentSender, textParts []string) string {
+func FormatAgentMessage(message *defs.Message) string {
+	sender, agentSender := message.From.ID, message.AgentSender
+	var textParts, contextParts []string
+	for _, block := range message.Content {
+		if block.Text == nil {
+			continue
+		}
+		if block.Text.IsContext {
+			contextParts = append(contextParts, block.Text.Text)
+		} else {
+			textParts = append(textParts, block.Text.Text)
+		}
+	}
+	if agentSender.DetachedConversationID != "" {
+		return formatXMLBlock("openvaala-system-info", joinTextParts(textParts))
+	}
 	// 1. 按发送方是父 Agent 还是子 Agent 选回复提示。
 	hint := "这条消息来自上级 Agent，不是用户。中途汇报进度或提问时，用 send_message 发给父 Agent，并显式设置 mode: \"steer\"，让父方在下一次模型请求前读到。最终回复会自动通知父 Agent，不必再重复发送。"
 	if agentSender.Relation == defs.AgentRelationChild {
 		hint = "这条消息来自你的子 Agent，不是用户。它提问或请你转达时，用 send_message 回复它；你的普通回复它看不到。"
 	}
 	// 2. 拼接非空消息，带上发送方 Session、任务名和回复提示。
-	return formatXMLBlock("openvaala-agent-message", joinTextParts(textParts),
+	prefix := ""
+	if len(contextParts) > 0 {
+		prefix = strings.Join(contextParts, "\n\n") + "\n\n"
+	}
+	return prefix + formatXMLBlock("openvaala-agent-message", joinTextParts(textParts),
 		xmlField{
 			name:  "session_id",
 			value: string(sender),
@@ -220,4 +243,99 @@ func FormatAgentMessage(sender defs.SessionID, agentSender defs.AgentSender, tex
 			value: hint,
 		},
 	)
+}
+
+const attachmentHint = "这是用户上传的附件，已保存在当前机器上，需要时自行读取。"
+const sessionInfoHint = "你运行在 OpenVaala 中。用 openvaala MCP 的 `get_skill` 工具读取 `openvaala` 查看协作方式（或运行 `openvaala skill get openvaala`）。沙箱内 CLI 无法连接 OpenVaala 时，请改用当前会话提供的 openvaala MCP 工具。"
+const detachedSessionInfoHint = "你已被用户转为独立对话，现在是主 Agent，没有父 Agent。你原来的子 Agent 留在原对话里。\n" + sessionInfoHint
+
+// FormatAttachment 生成用户文件附件的提示块。
+func FormatAttachment(file defs.FileRef) string {
+	// 1. 按顺序写入文件名、类型、大小、路径和读取提示。
+	return formatXMLBlock("openvaala-attachment", "",
+		xmlField{name: "name", value: file.Name},
+		xmlField{name: "mime", value: file.MIME},
+		xmlField{name: "size", value: strconv.FormatInt(file.Size, 10)},
+		xmlField{name: "path", value: file.Path},
+		xmlField{name: "hint", value: attachmentHint},
+	)
+}
+
+// ParseAttachments 去掉正文末尾连续的文件附件提示块，按原顺序返回附件。
+func ParseAttachments(text string) (rest string, files []defs.FileRef) {
+	// 1. 从末尾逐块还原并校验附件。
+	for {
+		prefix, body, found := cutTrailingXMLBlock(text, "openvaala-attachment")
+		if !found {
+			break
+		}
+		values, ok := parseXMLFields(body, "name", "mime", "size", "path", "hint")
+		if !ok || values[4] != attachmentHint {
+			break
+		}
+		size, err := strconv.ParseInt(values[2], 10, 64)
+		if err != nil {
+			break
+		}
+		file := defs.FileRef{Name: values[0], MIME: values[1], Size: size, Path: values[3]}
+		if err := (&defs.Content{Kind: defs.ContentFile, File: &file}).Validate(); err != nil {
+			break
+		}
+		files = append(files, file)
+		text = prefix
+	}
+	// 2. 恢复附件在原文中的顺序。
+	slices.Reverse(files)
+	return text, files
+}
+
+// FormatSessionInfo 生成外部会话首条输入携带的协作提示。
+func FormatSessionInfo(record defs.Session) string {
+	fields := []xmlField{{name: "session_id", value: string(record.ID)}}
+	hint := sessionInfoHint
+	if record.DetachedFromConversationID != "" {
+		fields = append(fields,
+			xmlField{name: "detached_from_conversation_id", value: string(record.DetachedFromConversationID)},
+			xmlField{name: "detached_from_session_id", value: string(record.DetachedFromSessionID)},
+		)
+		hint = detachedSessionInfoHint
+	}
+	return formatXMLBlock("openvaala-session-info", "", append(fields, xmlField{name: "hint", value: hint})...)
+}
+
+// StripSessionInfo 去掉正文末尾的一块会话协作提示。
+func StripSessionInfo(text string) string {
+	// 1. 校验末尾的一块会话 ID 和提示字段。
+	prefix, body, found := cutTrailingXMLBlock(text, "openvaala-session-info")
+	if !found {
+		return text
+	}
+	values, ok := parseXMLFields(body, "session_id", "hint")
+	if ok && values[0] != "" && values[1] == sessionInfoHint {
+		return prefix
+	}
+	values, ok = parseXMLFields(body, "session_id", "detached_from_conversation_id", "detached_from_session_id", "hint")
+	if ok && values[0] != "" && values[1] != "" && values[2] != "" && values[3] == detachedSessionInfoHint {
+		return prefix
+	}
+	return text
+}
+
+// StripChatHistorySummary 去掉首条输入开头的一块 fork 历史摘要。
+func StripChatHistorySummary(text string) string {
+	// 1. 核对首块的起止标签和固定提示，保留后续正文。
+	body, found := strings.CutPrefix(text, "<openvaala-chat-history-summary>\n<hint>"+historySummaryHint+"</hint>\n")
+	if !found {
+		return text
+	}
+	_, rest, closed := strings.Cut(body, "</openvaala-chat-history-summary>")
+	if !closed {
+		return text
+	}
+	return strings.TrimPrefix(rest, "\n\n")
+}
+
+// FormatChatHistorySummary 将历史摘要和固定阅读提示包成首条输入的前缀。
+func FormatChatHistorySummary(text string) string {
+	return formatXMLBlock("openvaala-chat-history-summary", text+"\n", xmlField{name: "hint", value: historySummaryHint})
 }

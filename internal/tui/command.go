@@ -3,6 +3,7 @@ package tui
 import (
 	"slices"
 	"strings"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
@@ -21,6 +22,10 @@ type command struct {
 	description string
 	// isSkill 是否是 Skill 候选？选中时只替换光标处的词，不执行命令。
 	isSkill bool
+	// isExternal 是否按普通输入向后端发送该命令？
+	isExternal bool
+	// requiresContacts 是否需要当前服务器启用联系人？
+	requiresContacts bool
 	// isAvailable 判断命令在当前界面状态下能不能用，不能用的不进候选。
 	isAvailable func(m *tuiModel) bool
 	// run 执行命令；argument 是命令名后面的文字（去掉首尾空白），不带参数的命令忽略它。
@@ -45,6 +50,20 @@ func newCommands() []command {
 			description: "恢复最近的对话",
 			isAvailable: isAlwaysAvailable,
 			run:         (*tuiModel).runResumeCommand,
+		},
+		{
+			name:             "contacts",
+			description:      "联系人",
+			requiresContacts: true,
+			isAvailable:      isAlwaysAvailable,
+			run:              (*tuiModel).runContactsCommand,
+		},
+		{
+			name:             "forward",
+			description:      "转发到联系人",
+			requiresContacts: true,
+			isAvailable:      isConversationOpen,
+			run:              (*tuiModel).runForwardCommand,
 		},
 		{
 			name:        "fork",
@@ -142,6 +161,23 @@ func newCommands() []command {
 	}
 }
 
+// newExternalCommands 按当前后端上报的候选替换同名命令，保留本地子 Agent 面板。
+func newExternalCommands(reported []defs.ExternalCommand) []command {
+	commands := slices.DeleteFunc(newCommands(), func(c command) bool { return c.name == "compact" })
+	for _, external := range reported {
+		if strings.EqualFold(external.Name, "agents") {
+			continue
+		}
+		cmd := command{name: external.Name, description: external.Description, argumentHint: external.InputHint, isExternal: true, isAvailable: isAlwaysAvailable}
+		if i := slices.IndexFunc(commands, func(c command) bool { return strings.EqualFold(c.name, cmd.name) }); i >= 0 {
+			commands[i] = cmd
+		} else {
+			commands = append(commands, cmd)
+		}
+	}
+	return commands
+}
+
 // getUsage 返回命令名称和参数提示组成的调用写法。
 func (c command) getUsage() string {
 	// 1. 不带参数时只返回斜杠名称，否则追加参数提示。
@@ -149,6 +185,11 @@ func (c command) getUsage() string {
 		return "/" + c.name
 	}
 	return "/" + c.name + " " + c.argumentHint
+}
+
+// isVisible 命令是否在当前服务器上显示？
+func (c command) isVisible(m *tuiModel) bool {
+	return !c.requiresContacts || m.worldStatus.Enabled
 }
 
 // isAlwaysAvailable 命令现在能用吗？随时可用的命令用它，总是返回能用。
@@ -175,12 +216,17 @@ func (m *tuiModel) getSlashMatches() []command {
 	if strings.HasPrefix(value, "/") && !strings.Contains(value, "\n") {
 		name, argument := splitSlashCommand(value)
 		for _, each := range m.commands {
-			isMatched := strings.HasPrefix(each.name, name)
+			commandName := strings.ToLower(each.name)
+			isMatched := strings.HasPrefix(commandName, name)
 			if argument != "" {
-				isMatched = each.argumentHint != "" && each.name == name
+				isMatched = (each.isExternal || each.argumentHint != "") && commandName == name
 			}
-			if isMatched && each.isAvailable(m) {
-				matches = append(matches, each)
+			if isMatched && each.isVisible(m) && each.isAvailable(m) {
+				if each.isExternal && commandName == name {
+					matches = slices.Insert(matches, 0, each)
+				} else {
+					matches = append(matches, each)
+				}
 			}
 		}
 	}
@@ -194,7 +240,7 @@ func (m *tuiModel) getSlashMatches() []command {
 		name := each.Name
 		explicit := strings.HasPrefix(prefix, "skill:")
 		for _, builtin := range m.commands {
-			if builtin.name == name {
+			if builtin.name == name && builtin.isVisible(m) {
 				explicit = true
 				break
 			}
@@ -229,6 +275,22 @@ func (m *tuiModel) handleSlashPopupKey(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 		start, end, _, _ := m.composer.getSlashToken()
 		m.composer.replaceSlashToken(start, end, "/"+matches[cursor].name+" ")
 		return true, nil
+	}
+	selected := matches[cursor]
+	// 后端命令只补全第一个词，保留原文空格、参数与粘贴内容。
+	if selected.isExternal && (msg.String() == "enter" || msg.String() == "tab") {
+		value := m.composer.getValue()
+		tail := strings.TrimLeftFunc(value, func(r rune) bool { return !unicode.IsSpace(r) })
+		completed := "/" + selected.name + tail
+		if msg.String() == "tab" && (completed != value || !m.sessionStatuses.isRootRunning()) {
+			if tail == "" && selected.argumentHint != "" {
+				completed += " "
+			}
+			m.composer.setValue(completed)
+			return true, nil
+		}
+		m.composer.setValue(completed)
+		return m.handleComposerKey(msg)
 	}
 	// 3. ↑ ↓ 移动选中项，Tab 补全命令名并保留参数，Enter 清空输入框后执行命令，Esc 关闭弹窗并保留草稿；其他按键交回输入框。
 	switch msg.String() {
@@ -293,6 +355,9 @@ func (m *tuiModel) getHelpLines() []string {
 	// 1. 列出命令、快捷键和说明。
 	lines := []string{"命令"}
 	for _, each := range m.commands {
+		if !each.isVisible(m) {
+			continue
+		}
 		name := each.getUsage()
 		if each.key != "" {
 			name += "（" + m.styles.hintKey.Render(each.key) + "）"
@@ -338,6 +403,16 @@ func (m *tuiModel) getHelpLines() []string {
 		lines = append(lines, "  "+padRight(m.styles.hintKey.Render(binding.key), 22)+m.styles.faint.Render(binding.action))
 	}
 	return lines
+}
+
+// runContactsCommand 打开联系人面板。
+func (m *tuiModel) runContactsCommand(string) tea.Cmd {
+	return m.openWorldPanel("")
+}
+
+// runForwardCommand 打开当前对话的转发面板。
+func (m *tuiModel) runForwardCommand(string) tea.Cmd {
+	return m.openWorldPanel(m.conversation.ID)
 }
 
 // runNewCommand 回到草稿并打印新对话标题。

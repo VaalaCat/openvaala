@@ -2,6 +2,7 @@ import type { Locator, Page } from "@playwright/test"
 import {
   expect,
   getComposer,
+  getNewConversationLink,
   getFirstVisibleTurn,
   getMessages,
   loadEarlierTurnsUntilFirst,
@@ -74,8 +75,7 @@ async function deleteFromList(
   conversationID: string
 ): Promise<void> {
   await page
-    .getByRole("listitem")
-    .filter({ has: page.locator(`a[href*="/c/${conversationID}"]`) })
+    .locator(`[data-conversation-id="${conversationID}"]`)
     .getByRole("button", { name: /的更多操作/ })
     .click()
   await page.getByRole("menuitem", { name: "删除", exact: true }).click()
@@ -83,14 +83,6 @@ async function deleteFromList(
     .getByRole("alertdialog")
     .getByRole("button", { name: "删除", exact: true })
     .click()
-}
-
-// 侧栏里的对话也可能名为「新对话」，新建入口指向当前服务器的首页。
-function getNewConversationLink(page: Page): Locator {
-  const path = new URL(page.url()).pathname.split("/c/")[0]
-  return page
-    .getByRole("link", { name: "新对话", exact: true })
-    .and(page.locator(`a[href="${path}"]`))
 }
 
 // 从左侧「新对话」入口进入新对话页，发出第一条消息

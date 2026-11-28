@@ -247,8 +247,18 @@ func (m *tuiModel) getStatusLines() []string {
 		parts = append(parts, getStateStyle(stateReconnecting, m.styles).Render("⚠ 重连中"+formatReconnectReason(m.connection)))
 	case m.sessionStatuses.isRootRunning():
 		parts = append(parts, m.formatRunningStatus())
-	case m.isModelListEmpty:
+	case m.shouldSuggestModelProvider:
 		parts = append(parts, m.styles.warning.Render("还没有模型，/provider 添加"))
+	}
+	if m.worldStatus.Enabled {
+		if m.worldStatus.Revoked {
+			_, domain, _ := strings.Cut(m.worldStatus.NodeAddr, "@")
+			parts = append(parts, m.styles.warning.Render("已被 "+domain+" 移出"))
+		} else if m.worldStatus.Connected {
+			parts = append(parts, getStateStyle(stateConnected, m.styles).Render("● 联系人在线"))
+		} else {
+			parts = append(parts, getStateStyle(stateReconnecting, m.styles).Render("● 联系人断线"))
+		}
 	}
 	// 2. 追加临时通知；没有内容时返回空，否则按宽度截断。
 	if m.notice.text != "" {
@@ -337,7 +347,7 @@ func (m *tuiModel) joinFooterParts(parts []styledText) string {
 func (m *tuiModel) formatFooterModel() string {
 	// 1. 没有根 Session 时显示草稿模型，没指定时是 Agent 默认模型。
 	root, found := m.sessionStatuses.getRoot()
-	if !found {
+	if !found || root.Session.External != nil {
 		return m.formatModelSelection(m.getCurrentModelSelection())
 	}
 	// 2. 所选模型与本轮模型不同时分别列出，否则只显示所选模型。

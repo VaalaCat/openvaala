@@ -317,8 +317,8 @@ func TestModelPanel(t *testing.T) {
 				h.typeText("/new")
 				h.press("enter")
 				h.send(modelSetMsg{
-					seq:     seq,
-					session: defs.Session{Model: defs.ModelSelection{Ref: gptX}},
+					seq:   seq,
+					model: defs.ModelSelection{Ref: gptX},
 				})
 				if h.model.notice.text != "" {
 					t.Fatalf("stale result showed notice %q", h.model.notice.text)

@@ -18,6 +18,9 @@ import (
 
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 	"gopkg.in/yaml.v3"
 )
 
@@ -65,6 +68,45 @@ func TestServeListenPrecedence(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestServeSessionToken 检查未配置令牌时签发的会话 Token 能完成握手并跨重启使用。
+func TestServeSessionToken(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	model := newServeTestModel(t)
+	listen := getFreeServeAddress(t)
+	configPath := newServeConfig(t, model.URL, listen, "")
+	serve := startTestServe(t, configPath, listen)
+	token := newTestServeSessionToken(t, listen, getTestRuntimeServerFile(t).Token)
+	for _, phase := range []string{"generated", "reused_after_restart"} {
+		t.Run(phase, func(t *testing.T) {
+			if phase == "reused_after_restart" {
+				if err := serve.stop(t); err != nil {
+					t.Fatal(err)
+				}
+				serve = startTestServe(t, configPath, listen)
+			}
+			file := getTestRuntimeServerFile(t)
+			if got := getServeServerID(t, listen, token); got != file.ServerID {
+				t.Fatalf("initialize server ID = %q, want %q", got, file.ServerID)
+			}
+		})
+	}
+	if err := serve.stop(t); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// newTestServeSessionToken 用操作者连接完成首轮，使签发令牌的根会话在重启后仍可读。
+func newTestServeSessionToken(t *testing.T, listen, secret string) string {
+	t.Helper()
+	client, stopClient := connectServeClient(t, listen, secret)
+	defer stopClient()
+	turn := runClientPrompts(t, client, "你好")[0]
+	if turn.Status != defs.TurnStatusCompleted {
+		t.Fatalf("turn finished = %+v, want completed", turn)
+	}
+	return sessiontoken.Issue(secret, turn.ConversationID, turn.SessionID)
 }
 
 // TestServe 检查 serve 启停、连接文件、令牌、重新加载和空闲退出。
@@ -543,7 +585,7 @@ func TestServe(t *testing.T) {
 				requireServeReload(t, configPath, "configuration reloaded\n", "")
 				client, stopClient := connectServeClient(t, listen, serveTestToken)
 				defer stopClient()
-				list, err := client.ListModels(t.Context(), "")
+				list, err := client.ListModels(t.Context(), &runtime.ListModelsRequest{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -626,14 +668,20 @@ func TestServe(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
-			model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = io.WriteString(w, modelTestResponse)
-			}))
-			defer model.Close()
+			model := newServeTestModel(t)
 			tt.run(t, model.URL)
 		})
 	}
+}
+
+func newServeTestModel(t *testing.T) *httptest.Server {
+	t.Helper()
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, modelTestResponse)
+	}))
+	t.Cleanup(model.Close)
+	return model
 }
 
 // requireServeStop 运行停止命令并检查输出或错误。
@@ -1015,5 +1063,34 @@ func waitServeReady(t *testing.T, listen string, serve *testServe) {
 			t.Fatalf("serve at %s is not ready: %v", listen, err)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestArchiveWorldServer(t *testing.T) {
+	for _, domain := range []string{"team", "team.example"} {
+		t.Run(domain, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "worldserver", "world.db")
+			run := func(name string) {
+				s, err := worldserver.NewWorldServer(worldserver.NewWorldServerOpt(name, path, "test-token"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				if err := s.Run(ctx); !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			}
+			run(domain)
+			if err := archiveWorldServer(dir, domain); err != nil {
+				t.Fatal(err)
+			}
+			run("next")
+			backups, _ := filepath.Glob(filepath.Join(dir, "worldserver.bak-"+domain+"-*", "world.db"))
+			if len(backups) != 1 {
+				t.Fatal(backups)
+			}
+		})
 	}
 }

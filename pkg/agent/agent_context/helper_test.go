@@ -1525,3 +1525,41 @@ func TestGetThresholdTokens(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeFilePrompt(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		file    *defs.FileRef
+		wantErr bool
+	}{
+		{"file_with_inline_image", &defs.FileRef{Name: "report.pdf", MIME: "application/pdf", Size: 3, Path: "/tmp/report.pdf"}, false},
+		{"missing_file", nil, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file := &defs.Content{Kind: defs.ContentFile, File: test.file}
+			item := &defs.Item{
+				ID: defs.NewItemID(), TurnID: contextTurnID, Kind: defs.ItemMessage,
+				Message: &defs.Message{
+					From:    &defs.Address{Kind: defs.IdentityUser},
+					Content: []*defs.Content{file, {Kind: defs.ContentImage, Image: &defs.ImageContent{DataURL: "data:image/png;base64,aGVsbG8="}}},
+				},
+			}
+			c := newAgentContext(t)
+			if err := c.Load(&agent_context.ContextLoadParam{Items: []*defs.Item{item}}); (err != nil) != test.wantErr {
+				t.Fatalf("Load() = %v", err)
+			}
+			if test.wantErr {
+				return
+			}
+			request, _, err := c.BuildModelRequest(nil)
+			if err != nil || len(request.Messages) != 1 {
+				t.Fatalf("BuildModelRequest() = %+v, %v", request, err)
+			}
+			blocks := request.Messages[0].Content
+			if len(blocks) != 2 || blocks[0].Type != llmkit.ContentTypeText || !strings.Contains(blocks[0].Text, "<path>/tmp/report.pdf</path>") ||
+				blocks[1].Type != llmkit.ContentTypeImage || blocks[1].MediaB64 != "aGVsbG8=" || file.Kind != defs.ContentFile || file.File != test.file {
+				t.Fatalf("blocks = %+v, source content = %+v", blocks, file)
+			}
+		})
+	}
+}

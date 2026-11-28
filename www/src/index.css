@@ -632,6 +632,11 @@
   color: var(--foreground);
 }
 
+/* Base UI 的嵌套模态框共用最外层遮罩。让被覆盖的父框也在这层遮罩下面。 */
+:is([role="dialog"], [role="alertdialog"])[data-nested-dialog-open] {
+  @apply z-40;
+}
+
 /* 菜单操作名称保持正文色，装饰图标次要；高亮与异常各自保持语义色。 */
 :is(
     [data-slot="dropdown-menu-item"],
@@ -766,4 +771,26 @@ textarea,
       background-color: var(--scrollbar-thumb-active);
     }
   }
+}
+
+/* 域管理表格共用标题、列间距和行分隔线。 */
+.world-admin-title {
+  @apply text-title font-semibold;
+  font-size: 1.125rem;
+}
+.world-admin-description {
+  @apply text-ui;
+  font-size: 0.8125rem;
+}
+.world-admin-table :is(th, td) {
+  @apply border-b px-3 whitespace-nowrap first:pl-0 last:pr-0;
+}
+.world-admin-table th {
+  @apply h-8;
+}
+.world-admin-table td {
+  @apply h-12 py-1;
+}
+.world-admin-table tbody tr:hover {
+  @apply bg-muted/50;
 }

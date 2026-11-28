@@ -477,7 +477,7 @@ func TestRuntimeEmbeddedSkills(t *testing.T) {
 				for _, info := range infos {
 					names = append(names, info.Name)
 				}
-				if !slices.Equal(names, []string{string(id), "shared"}) {
+				if !slices.Equal(names, []string{string(id), "openvaala", "shared"}) {
 					t.Fatalf("skills = %v", names)
 				}
 				watcher := h.subscribeSession(t, conv.ID, conv.RootSessionID)
@@ -1509,8 +1509,8 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 			name:          "no_models_until_one_is_added",
 			withoutModels: true,
 			run: func(t *testing.T, h *runtimeHarness) {
-				if _, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{AgentName: "assistant"}); !errors.Is(err, runtime.ErrNoModelConfigured) {
-					t.Fatalf("CreateConversation() error = %v, want %v", err, runtime.ErrNoModelConfigured)
+				if _, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{AgentName: "assistant"}); !errors.Is(err, conversation.ErrNoModelConfigured) {
+					t.Fatalf("CreateConversation() error = %v, want %v", err, conversation.ErrNoModelConfigured)
 				}
 				h.setDefinitions(t, testModelRef, newModel(h, testModelRef, "test"))
 				conv := h.create(t)
@@ -1633,8 +1633,8 @@ func TestRuntimeSetDefinitions(t *testing.T) {
 				restarted := startTestRuntime(t, h.store, h.model)
 				restarted.setDefinitions(t, defs.ModelRef{})
 				_, err := restarted.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: conv.ID})
-				if !errors.Is(err, runtime.ErrNoModelConfigured) {
-					t.Fatalf("OpenConversation() error = %v, want %v", err, runtime.ErrNoModelConfigured)
+				if !errors.Is(err, conversation.ErrNoModelConfigured) {
+					t.Fatalf("OpenConversation() error = %v, want %v", err, conversation.ErrNoModelConfigured)
 				}
 			},
 		},
@@ -3216,24 +3216,24 @@ func TestRuntimeGetSkills(t *testing.T) {
 	}{
 		{
 			name:      "draft",
-			wantNames: []string{"review"},
+			wantNames: []string{"openvaala", "review"},
 		},
 		{
 			name:         "persisted_conversation",
 			conversation: true,
-			wantNames:    []string{"review"},
+			wantNames:    []string{"openvaala", "review"},
 		},
 		{
 			name:         "running_conversation",
 			conversation: true,
 			running:      true,
-			wantNames:    []string{"review"},
+			wantNames:    []string{"openvaala", "review"},
 		},
 		{
 			name:         "reopened_runtime",
 			conversation: true,
 			reopen:       true,
-			wantNames:    []string{"review"},
+			wantNames:    []string{"openvaala", "review"},
 		},
 		{
 			name:    "unknown_agent",
@@ -3242,7 +3242,7 @@ func TestRuntimeGetSkills(t *testing.T) {
 		{
 			name:         "draft_scans_project_directory",
 			projectSkill: true,
-			wantNames:    []string{"proj", "review"},
+			wantNames:    []string{"openvaala", "proj", "review"},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3331,14 +3331,14 @@ func TestRuntimeListAgents(t *testing.T) {
 	}{
 		{
 			name: "initial_definitions",
-			want: []runtime.AgentInfo{{Name: "assistant", Description: "主 Agent", DefaultModel: defs.ModelRef{ProviderID: "test", ModelID: "test"}}},
+			want: []runtime.AgentInfo{{Name: "assistant", Type: defs.AgentTypeNative, Description: "主 Agent", DefaultModel: defs.ModelRef{ProviderID: "test", ModelID: "test"}}},
 		},
 		{
 			name:   "reload_replaces_agents_and_omits_unset_model",
 			reload: true,
 			want: []runtime.AgentInfo{
-				{Name: "assistant", Description: "主 Agent", DefaultModel: defs.ModelRef{ProviderID: "test", ModelID: "test"}},
-				{Name: "reviewer"},
+				{Name: "assistant", Type: defs.AgentTypeNative, Description: "主 Agent", DefaultModel: defs.ModelRef{ProviderID: "test", ModelID: "test"}},
+				{Name: "reviewer", Type: defs.AgentTypeNative},
 			},
 		},
 	}
@@ -3355,6 +3355,104 @@ func TestRuntimeListAgents(t *testing.T) {
 			got, err := h.rt.ListAgents(t.Context())
 			if err != nil || !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("ListAgents() = %+v, %v; want %+v", got, err, tt.want)
+			}
+		})
+	}
+}
+
+// externalRuntimeDefinitions 用真实 stdio 测试进程覆盖无原生模型时的创建和恢复。
+func externalRuntimeDefinitions(t *testing.T) *runtime.Definitions {
+	t.Helper()
+	peer := filepath.Join(t.TempDir(), "fakeacp")
+	if output, err := exec.Command("go", "build", "-o", peer, "../../internal/e2e/fakeacp").CombinedOutput(); err != nil {
+		t.Fatalf("build fakeacp: %v: %s", err, output)
+	}
+	return &runtime.Definitions{Executors: executor.NewConfigExecutorProvider([]executor.Executor{newLocalExecutor(t, defs.LocalExecutorID)}), Agents: []*agent.AgentDefinition{
+		{Name: "default"}, {Name: "codex-acp", Type: defs.AgentTypeACP, ACP: &defs.ACPCommand{Command: peer}},
+	}}
+}
+
+// TestExternalAgentListType 检查 Agent 列表公开执行类型，并按实际选择的 Agent 校验本机模型。
+func TestExternalAgentListType(t *testing.T) {
+	store := openRuntimeStore(t)
+	definitions := externalRuntimeDefinitions(t)
+	opt := runtime.NewRuntimeOpt(store.opt.Records, store.opt.Logs, definitions)
+	opt.DataDirectory = t.TempDir()
+	h := startTestRuntimeWithOpt(t, store, nil, opt)
+	agents, err := h.rt.ListAgents(t.Context())
+	if want := []runtime.AgentInfo{{Name: "default", Type: defs.AgentTypeNative}, {Name: "codex-acp", Type: defs.AgentTypeACP, Icon: "codex"}}; err != nil || !slices.Equal(agents, want) {
+		t.Fatalf("ListAgents() = %+v, %v; want %+v", agents, err, want)
+	}
+	for _, tt := range []struct {
+		agentName string
+		wantError error
+	}{
+		{agentName: "default", wantError: conversation.ErrNoModelConfigured},
+		{agentName: "codex-acp"},
+	} {
+		t.Run(tt.agentName, func(t *testing.T) {
+			record, err := h.rt.CreateConversation(t.Context(), &runtime.CreateConversationRequest{AgentName: tt.agentName})
+			if !errors.Is(err, tt.wantError) {
+				t.Fatalf("CreateConversation() error = %v, want %v", err, tt.wantError)
+			}
+			if tt.wantError != nil {
+				return
+			}
+			page, err := h.rt.ListSessions(t.Context(), &dao.ListSessionsRequest{ConversationID: record.ID, Limit: 1})
+			if err != nil || len(page.Items) != 1 || page.Items[0].ID != record.RootSessionID ||
+				page.Items[0].AgentName != tt.agentName || page.Items[0].Model != (defs.ModelSelection{}) {
+				t.Fatalf("ListSessions() = %+v, %v; want a root Session for %s without native model", page, err, tt.agentName)
+			}
+		})
+	}
+}
+
+// TestExternalAgentColdOpenAndFork 检查重开和分叉零本机模型的对话时，使用来源根 Agent 的执行类型。
+func TestExternalAgentColdOpenAndFork(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		wantError error
+	}{
+		{name: "default", wantError: conversation.ErrNoModelConfigured},
+		{name: "codex-acp"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openRuntimeStore(t)
+			definitions := externalRuntimeDefinitions(t)
+			root := defs.Session{ID: defs.NewSessionID(), ConversationID: defs.NewConversationID(), AgentName: tt.name}
+			if tt.name == "codex-acp" {
+				root.External = &defs.ExternalSession{AgentType: defs.AgentTypeACP, ExecutorID: defs.LocalExecutorID, Cwd: t.TempDir(), SessionID: "fake-session"}
+			}
+			if err := store.mutation.SetSession(t.Context(), root); err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantError == nil {
+				child := defs.Session{
+					ID: defs.NewSessionID(), ConversationID: root.ConversationID, AgentName: "default",
+					ParentSessionID: root.ID, ParentTurnID: defs.NewTurnID(), ParentCallID: "spawn",
+				}
+				if err := store.mutation.SetSession(t.Context(), child); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.mutation.SetConversation(t.Context(), defs.Conversation{ID: root.ConversationID, RootSessionID: root.ID}); err != nil {
+				t.Fatal(err)
+			}
+			opt := runtime.NewRuntimeOpt(store.opt.Records, store.opt.Logs, definitions)
+			opt.DataDirectory = t.TempDir()
+			h := startTestRuntimeWithOpt(t, store, nil, opt)
+			if _, err := h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: root.ConversationID}); !errors.Is(err, tt.wantError) {
+				t.Fatalf("OpenConversation() error = %v, want %v", err, tt.wantError)
+			}
+			forked, err := h.rt.ForkConversation(t.Context(), &runtime.ForkConversationRequest{ConversationID: root.ConversationID})
+			if !errors.Is(err, tt.wantError) {
+				t.Fatalf("ForkConversation() error = %v, want %v", err, tt.wantError)
+			}
+			if tt.wantError == nil {
+				page, err := h.rt.ListSessions(t.Context(), &dao.ListSessionsRequest{ConversationID: forked.ID, Limit: 1})
+				if err != nil || len(page.Items) != 1 || page.Items[0].AgentName != tt.name {
+					t.Fatalf("ListSessions() = %+v, %v; want a forked Session for %s", page, err, tt.name)
+				}
 			}
 		})
 	}
@@ -6952,6 +7050,57 @@ func TestRuntimeSavedConversationIdleStop(t *testing.T) {
 				// 全程不重新订阅：命令还在跑时到期不停，命令结束后到期自己停。
 				f.unsubscribe()
 				f.requireStaysOpen(t, idleTimeout)
+				f.waitClosed(t)
+			},
+		},
+		{
+			name:        "executor_exec_defers_reload_and_idle_stop",
+			idleTimeout: idleTimeout,
+			run: func(t *testing.T, f *savedIdleFixture) {
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				root := f.conv.ExecutorSettings.GetConversationDirectory()
+				started := filepath.Join(root, "exec-started")
+				done := make(chan error, 1)
+				go func() {
+					result, err := f.h.rt.Exec(ctx, &runtime.ExecutorExecRequest{
+						ConversationID: f.conv.ID, ExecutorID: defs.LocalExecutorID, Command: "bash",
+						Args: []string{"-c", ": > exec-started; while [[ ! -f exec-release ]]; do sleep 0.01; done; printf finished"},
+					})
+					if err == nil && (result.ExitCode != 0 || result.Stdout != "finished") {
+						err = fmt.Errorf("unexpected command result: %+v", result)
+					}
+					done <- err
+				}()
+				for {
+					if _, err := os.Stat(started); err == nil {
+						break
+					}
+					select {
+					case err := <-done:
+						t.Fatalf("exec exited before recording startup: %v", err)
+					case <-ctx.Done():
+						t.Fatal(ctx.Err())
+					case <-time.After(10 * time.Millisecond):
+					}
+				}
+				idle, err := f.h.rt.IsIdle(ctx)
+				if err != nil || idle {
+					t.Fatalf("IsIdle = %t, %v while executor/exec runs", idle, err)
+				}
+				definitions := newTestRuntimeOpt(f.h.store, f.h.model).Definitions
+				reload, err := f.h.rt.SetDefinitions(ctx, definitions)
+				if err != nil || !slices.Equal(reload.PendingConversationIDs, []defs.ConversationID{f.conv.ID}) {
+					t.Errorf("SetDefinitions = %+v, %v while executor/exec runs", reload, err)
+				}
+				f.unsubscribe()
+				f.requireStaysOpen(t, idleTimeout)
+				if err := os.WriteFile(filepath.Join(root, "exec-release"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
 				f.waitClosed(t)
 			},
 		},

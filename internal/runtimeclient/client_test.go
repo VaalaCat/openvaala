@@ -46,6 +46,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	"github.com/gin-gonic/gin"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -813,7 +814,7 @@ func TestClient(t *testing.T) {
 			name: "list_and_set_session_model",
 			run: func(t *testing.T, h *clientHarness) {
 				// 1. 查询模型列表并为新对话设置第二个模型和 high 强度。
-				list, err := h.client.ListModels(t.Context(), "assistant")
+				list, err := h.client.ListModels(t.Context(), &runtime.ListModelsRequest{AgentName: "assistant"})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -866,7 +867,7 @@ func TestClient(t *testing.T) {
 			run: func(t *testing.T, h *clientHarness) {
 				// 1. 查询 Agent，核对名称、说明和默认模型。
 				agents, err := h.client.ListAgents(t.Context())
-				want := []runtime.AgentInfo{{Name: "assistant", Description: "主 Agent", DefaultModel: defs.ModelRef{ProviderID: "test", ModelID: "test"}}}
+				want := []runtime.AgentInfo{{Name: "assistant", Type: defs.AgentTypeNative, Description: "主 Agent", DefaultModel: defs.ModelRef{ProviderID: "test", ModelID: "test"}}}
 				if err != nil || !reflect.DeepEqual(agents, want) {
 					t.Fatalf("agents = %+v, %v; want %+v", agents, err, want)
 				}
@@ -1496,7 +1497,7 @@ func TestClient(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(second.Sessions) != 1 || second.Sessions[0] != child || second.NextCursor != (dao.RecordCursor[defs.SessionID]{}) {
+				if len(second.Sessions) != 1 || !defs.IsSameSession(second.Sessions[0], child) || second.NextCursor != (dao.RecordCursor[defs.SessionID]{}) {
 					t.Fatalf("second page = %+v next %+v, want the child Session %+v and a zero cursor", second.Sessions, second.NextCursor, child)
 				}
 				if child.TaskName != "review" || child.ParentSessionID != conversation.RootSessionID {
@@ -2376,7 +2377,7 @@ func TestClientConversationSyncFailed(t *testing.T) {
 				if attempts := getReconnectAttempts(events); len(attempts) != 0 {
 					t.Fatalf("reconnect attempts = %v, want the connection kept", attempts)
 				}
-				if _, err := h.client.ListModels(t.Context(), ""); err != nil {
+				if _, err := h.client.ListModels(t.Context(), &runtime.ListModelsRequest{}); err != nil {
 					t.Fatal(err)
 				}
 				initializes := 0
@@ -2787,15 +2788,9 @@ func startClientHarness(t *testing.T, token string, configure ...func(*runtimese
 
 	// 3. 应用测试配置，将 Runtime 路由挂到 HTTP 服务并启动。
 	configurationCalls := make(clientTestCalls, 16)
-	serverOpt := &runtimeserver.RuntimeServerOpt{
-		Runtime: rt,
-		Token:   clientTestToken,
-		Configuration: &clientTestConfiguration{
-			definitions: opt.Definitions,
-			calls:       configurationCalls,
-		},
-		ModelCatalog: &clientTestModelCatalog{calls: configurationCalls},
-	}
+	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, clientTestToken)
+	serverOpt.Configuration = &clientTestConfiguration{definitions: opt.Definitions, calls: configurationCalls}
+	serverOpt.ModelCatalog = &clientTestModelCatalog{calls: configurationCalls}
 	for _, apply := range configure {
 		apply(serverOpt)
 	}
@@ -2910,6 +2905,7 @@ func (calls clientTestCalls) drain() []clientTestCall {
 // clientTestConfiguration 是测试用的 Configuration：把调用记进 calls；配置里只有 clientTestProvider，写方法和 Reload 返回 Runtime
 // 构造时的三类定义；和 config.ConfigFiles 一样，删除没有的 Provider 时返回 provider <id> is not configured。
 type clientTestConfiguration struct {
+	runtimeserver.Configuration
 	definitions *runtime.Definitions
 	calls       clientTestCalls
 }
@@ -3929,7 +3925,7 @@ func TestClientSkillSubmissionReplay(t *testing.T) {
 				ConversationID: conversation.ID,
 				AgentName:      "ignored",
 			})
-			if err != nil || len(list) != 1 || list[0].Name != "review" {
+			if err != nil || len(list) != 2 || list[0].Name != "openvaala" || list[1].Name != "review" {
 				t.Fatalf("list=%v err=%v", list, err)
 			}
 			body, _ := json.Marshal(list)
@@ -5099,7 +5095,7 @@ func TestClientRunningSubscriptionRecovery(t *testing.T) {
 					changed, ok := event.(*runtimeclient.RunningConversationsChanged)
 					return ok && !changed.IsKnown && changed.Err != nil
 				})
-				if _, err := client.ListModels(t.Context(), ""); err != nil {
+				if _, err := client.ListModels(t.Context(), &runtime.ListModelsRequest{}); err != nil {
 					t.Fatalf("subscription error stopped ordinary request: %v", err)
 				}
 			}
@@ -5223,7 +5219,7 @@ func TestClientInitializeTimeout(t *testing.T) {
 						if attempts.Load() != 2 {
 							t.Fatalf("attempts = %d", attempts.Load())
 						}
-						if _, err := client.ListModels(t.Context(), ""); err != nil {
+						if _, err := client.ListModels(t.Context(), &runtime.ListModelsRequest{}); err != nil {
 							t.Fatal(err)
 						}
 						return
@@ -5231,6 +5227,183 @@ func TestClientInitializeTimeout(t *testing.T) {
 				case <-deadline.C:
 					t.Fatal("initialize never timed out")
 				}
+			}
+		})
+	}
+}
+
+// TestExternalClientRestore 验证重连到同尾序的新库时，TUI 得到新页，桌面阅读器继续自行翻页。
+func TestExternalClientRestore(t *testing.T) {
+	for _, tt := range []struct {
+		name                      string
+		external, restoring, skip bool
+		wantAction                runtimeclient.SessionHistoryAction
+	}{
+		{"recent_page", true, false, false, runtimeclient.HistoryReplace},
+		{"desktop_reads_own_page", true, false, true, runtimeclient.HistoryReplace},
+		{"restoring", true, true, false, runtimeclient.HistoryWait},
+		{"native", false, false, true, runtimeclient.HistoryAppend},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var opened, pages atomic.Int32
+			client, connections := startProtocolClient(t, runtimeclient.ClientOpt{}, func(ctx context.Context, conn *websocket.Conn, req runtimeprotocol.JSONRPCRequest) bool {
+				var result any
+				switch req.Method {
+				case "conversation/open":
+					opened.Add(1)
+					result = runtimeprotocol.ConversationResult{Conversation: defs.Conversation{ID: "c1", RootSessionID: "s1"}}
+				case "conversation/subscribe":
+					record := defs.Session{ID: "s1"}
+					if tt.external {
+						record.External = &defs.ExternalSession{}
+					}
+					result = runtimeprotocol.SubscribeConversationResult{Sessions: []runtime.SessionRuntimeInfo{{Session: record}}}
+				case "session/subscribe":
+					snap := runtimeprotocol.SubscribeSessionResult{LastSavedOrdinal: 64}
+					if tt.restoring {
+						snap = runtimeprotocol.SubscribeSessionResult{Restoring: true}
+					}
+					result = snap
+				case "session/items/list":
+					pages.Add(1)
+					var p runtimeprotocol.ListItemsParams
+					if err := json.Unmarshal(req.Params, &p); err != nil || p.Cursor != 14 || p.Limit != 50 {
+						t.Errorf("page params=%s err=%v", req.Params, err)
+					}
+					items := make([]runtimeprotocol.LoggedItem, 50)
+					for i := range items {
+						items[i] = runtimeprotocol.LoggedItem{Ordinal: storage.Ordinal(15 + i), Item: &defs.Item{ID: defs.ItemID(fmt.Sprintf("%d-%d", opened.Load(), i))}}
+					}
+					result = runtimeprotocol.ListItemsResult{Items: items}
+				default:
+					return false
+				}
+				payload, _ := json.Marshal(runtimeprotocol.JSONRPCMessage{ID: req.ID, Result: result})
+				if err := conn.Write(ctx, websocket.MessageText, payload); err != nil && ctx.Err() == nil {
+					t.Error(err)
+				}
+				return true
+			})
+			waitProtocolEvent(t, client, func(e runtimeclient.ClientEvent) bool {
+				c, ok := e.(*runtimeclient.ConnectionChanged)
+				return ok && c.State == runtimeclient.ConnectionConnected
+			})
+			if _, err := client.OpenConversation(t.Context(), &runtimeclient.OpenConversationRequest{ConversationID: "c1", SkipHistory: tt.skip}); err != nil {
+				t.Fatal(err)
+			}
+			for round := 1; round <= 2; round++ {
+				if round == 2 {
+					(<-connections).CloseNow()
+				}
+				s := waitProtocolEvent(t, client, func(e runtimeclient.ClientEvent) bool { _, ok := e.(*runtimeclient.SessionSynced); return ok }).(*runtimeclient.SessionSynced)
+				if s.HistoryAction != tt.wantAction || s.External != tt.external || s.Restoring != tt.restoring || !tt.restoring && s.LastSavedOrdinal != 64 {
+					t.Fatalf("snapshot=%+v", s)
+				}
+				if tt.skip || tt.restoring {
+					if len(s.Items) != 0 || pages.Load() != 0 {
+						t.Fatalf("round %d: received %d items from %d unexpected reads", round, len(s.Items), pages.Load())
+					}
+				} else if len(s.Items) != 50 || string(s.Items[0].Item.ID) != fmt.Sprintf("%d-0", round) || pages.Load() != int32(round) {
+					t.Fatalf("round %d: items=%+v reads=%d", round, s.Items, pages.Load())
+				}
+			}
+		})
+	}
+}
+
+// TestExternalInitialRestoreFailure 验证首次快照前的 RPC 错误既能区分恢复失败，也保留原错误。
+func TestExternalInitialRestoreFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name, method, reason string
+		external, restoreErr bool
+	}{
+		{"open", "conversation/open", "external session cannot be restored: load declined", true, true},
+		{"external_subscribe", "session/subscribe", "external session has stopped", true, true},
+		{"native_subscribe", "session/subscribe", "session has stopped", false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := startProtocolClient(t, runtimeclient.ClientOpt{}, func(ctx context.Context, conn *websocket.Conn, req runtimeprotocol.JSONRPCRequest) bool {
+				reply := runtimeprotocol.JSONRPCMessage{ID: req.ID}
+				switch req.Method {
+				case tt.method:
+					reply.Error = &runtimeprotocol.JSONRPCError{Code: runtimeprotocol.ErrorCodeRuntime, Message: tt.reason}
+				case "conversation/subscribe":
+					record := defs.Session{ID: "s1"}
+					if tt.external {
+						record.External = &defs.ExternalSession{}
+					}
+					reply.Result = runtimeprotocol.SubscribeConversationResult{Sessions: []runtime.SessionRuntimeInfo{{Session: record}}}
+				default:
+					return false
+				}
+				payload, _ := json.Marshal(reply)
+				if err := conn.Write(ctx, websocket.MessageText, payload); err != nil && ctx.Err() == nil {
+					t.Error(err)
+				}
+				return true
+			})
+			waitProtocolEvent(t, client, func(e runtimeclient.ClientEvent) bool {
+				c, ok := e.(*runtimeclient.ConnectionChanged)
+				return ok && c.State == runtimeclient.ConnectionConnected
+			})
+			_, err := client.OpenConversation(t.Context(), &runtimeclient.OpenConversationRequest{ConversationID: "c1", SessionID: "s1"})
+			var rpcErr *runtimeclient.ResponseError
+			if !errors.As(err, &rpcErr) || rpcErr.Message != tt.reason || errors.Is(err, runtimeclient.ErrExternalSessionRestore) != tt.restoreErr {
+				t.Fatalf("open error=%v", err)
+			}
+		})
+	}
+}
+
+func TestWorldRPCUpdatesAndErrors(t *testing.T) {
+	client, connections := startProtocolClient(t, runtimeclient.ClientOpt{}, func(ctx context.Context, conn *websocket.Conn, req runtimeprotocol.JSONRPCRequest) bool {
+		if req.Method != "world/cancelMessage" {
+			return false
+		}
+		err := wsjson.Write(ctx, conn, runtimeprotocol.JSONRPCMessage{
+			ID: req.ID,
+			Error: &runtimeprotocol.JSONRPCError{
+				Code:    runtimeprotocol.ErrorCodeRuntime,
+				Message: "message is no longer cancellable",
+				Data:    &runtimeprotocol.JSONRPCErrorData{Code: "world_outbox_not_cancellable"},
+			},
+		})
+		if err != nil && ctx.Err() == nil {
+			t.Error(err)
+		}
+		return true
+	})
+	waitProtocolEvent(t, client, func(event runtimeclient.ClientEvent) bool {
+		change, ok := event.(*runtimeclient.ConnectionChanged)
+		return ok && change.State == runtimeclient.ConnectionConnected
+	})
+	_, err := client.CancelWorldMessage(t.Context(), "sent")
+	var response *runtimeclient.ResponseError
+	if !errors.As(err, &response) || response.Data == nil || response.Data.Code != "world_outbox_not_cancellable" ||
+		response.Message != "message is no longer cancellable" ||
+		response.Error() != "world_outbox_not_cancellable: message is no longer cancellable" {
+		t.Fatalf("cancel error = %v", err)
+	}
+
+	socket := <-connections
+	for _, tc := range []struct{ event, data string }{
+		{"status_changed", `true`},
+		{"peers_changed", `[{"address":"bob@example.test"}]`},
+		{"message_updated", `{"conversation_id":"c1","message_id":"m1"}`},
+	} {
+		t.Run(tc.event, func(t *testing.T) {
+			if err := wsjson.Write(t.Context(), socket, runtimeprotocol.JSONRPCMessage{
+				Method: "world/messageUpdated",
+				Params: map[string]any{"event": tc.event, "data": json.RawMessage(tc.data)},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			event := waitProtocolEvent(t, client, func(event runtimeclient.ClientEvent) bool {
+				_, ok := event.(*runtimeclient.WorldMessageUpdated)
+				return ok
+			}).(*runtimeclient.WorldMessageUpdated)
+			if event.Notification.Event != tc.event || string(event.Notification.Data) != tc.data {
+				t.Fatalf("world update = %+v", event.Notification)
 			}
 		})
 	}

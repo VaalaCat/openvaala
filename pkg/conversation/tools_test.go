@@ -30,8 +30,8 @@ func TestCollaborationToolDefinitions(t *testing.T) {
 		"list_executors": prompt.ListExecutorsDescription,
 		"spawn_agent": "将可独立执行的工作委派给一个直接子 Agent，子任务可以并行运行。" +
 			"message 应提供目标、必要材料和预期交付物；默认不继承历史，需要时明确设置 fork_turns。" +
-			"返回 session_id、task_name 和 accepted 表示首个任务已接收，不表示已经完成；子任务每个 Turn 结束后，结果以通知消息自动进入你的收件箱，在下一次模型请求前读入。" +
-			"需要暂停等待时使用 wait_agent，它只在新消息到达时唤醒、不返回正文。" + "可选 agent_name（省略时与当前 Agent 相同）：\n- assistant：主 Agent\n- worker：只读调查\n可选 model（省略时同一 Agent 继承你当前的模型，不同 Agent 使用它的默认模型）：\n- test/other（）：窗口 64000，reasoning_effort 可选 low|high，默认 low\n- test/test（）：窗口 0\n- test/third（）：窗口 0，reasoning_effort 可选 high|medium，默认 medium\n- test/worker-model（）：窗口 0",
+			"返回 session_id 和 input_item_id 表示首个任务已接收。默认在每轮结束时回报，notify_on_finish=false 关闭自动回报。" +
+			"需要等待子任务结果时使用 wait_agent，可读取最终正文。" + "可选 agent_name（省略时与当前 Agent 相同）：\n- assistant：主 Agent\n- worker：只读调查\n可选 model（省略时同一 Agent 继承你当前的模型，不同 Agent 使用它的默认模型）：\n- test/other（）：窗口 64000，reasoning_effort 可选 low|high，默认 low\n- test/test（）：窗口 0\n- test/third（）：窗口 0，reasoning_effort 可选 high|medium，默认 medium\n- test/worker-model（）：窗口 0",
 		"send_message": "向已知后代或直接父 Agent 发送任务、补充要求或信息；重开对话后，发到原 SessionID 会先续跑其未完成轮次。" +
 			"normal 安排新 Turn，忙碌时排队；steer 补充活动 Turn，在下一次模型请求前读入，无可接收 Turn 时自动按 normal 安排。" +
 			"进度汇报、提问和对当前任务的补充要求应显式设置 mode: \"steer\"；独立的后续任务用 normal。" +
@@ -40,14 +40,14 @@ func TestCollaborationToolDefinitions(t *testing.T) {
 		"interrupt_agent": "请求取消指定后代当前正在执行的 Turn。" +
 			"返回 cancel_requested 和选定的 turn_id，或无活动 Turn 时返回 no_active_turn；不等待取消完成。" +
 			"排队输入和它的子任务继续运行；可通过 wait_agent 或 list_agents 查看后续结果与状态。",
-		"list_agents": "使用空参数对象读取全部后代；sessions 中每项的 session 保存身份与父子关系，status 保存活动 Turn、排队数量和最近 Turn 状态，" +
+		"list_agents": "默认查询当前工作目录最近 24 小时内更新的非后台后代，最多 20 条。agents 中每项的 session 保存身份与父子关系，status 保存活动 Turn、排队数量和最近 Turn 状态，" +
 			"usage 是已保存 Turn 的累计 token 用量，context_window 是该 Session 所选模型的上下文窗口。" +
 			"使用 session.id 选择通信、等待或中断的目标；这是查询时的工作快照，不等待任务完成、不领取结果正文，也不启动历史任务。",
 		"read_session_history": "需要子任务的详细执行过程时，读取指定后代在 fork 之后自身已保存的消息、工具调用与结果。" +
 			"从最新内容向更早历史分页，每页 Items 按时间正序返回；使用非零 next_cursor 继续，为 0 时结束。" +
 			"返回资料省略加密推理、provider RawJSON 和图片 base64；查询不启动执行，也不影响结果通知。",
-		"wait_agent": "暂停当前工作，直到收到 steer 消息（Agent 消息或用户补充输入）、子任务结果通知或超时。normal 消息排队等待新 Turn，不会唤醒本次等待。" +
-			"返回 reason：user_steer、subagent_result、agent_message 或 timeout（同时存在时按此顺序），from 为发送消息的 Agent SessionID；不返回正文。" +
+		"wait_agent": "暂停当前工作，直到收到 steer 消息（Agent 消息或用户补充输入）、子任务结果通知或超时。排入下一轮的 Agent 回报也会唤醒等待。" +
+			"返回 reason：user_steer、subagent_result、agent_message 或 timeout（同时存在时按此顺序），from 为发送消息的 Agent SessionID，text 为子任务最终正文。" +
 			"可选 wait_for: \"subagent_result\" 优先返回已有未读补充；没有未读补充且没有运行中的后代时立即返回 no_running_subagents，可用 list_agents 查看状态。" +
 			"消息正文会在下一次模型请求中读入；省略参数默认等待 30 秒，超时不会取消子任务。",
 	}
@@ -57,7 +57,7 @@ func TestCollaborationToolDefinitions(t *testing.T) {
 	}{
 		{
 			name:   "spawn_agent",
-			fields: []string{"task_name", "message", "fork_turns", "agent_name", "model", "reasoning_effort"},
+			fields: []string{"task_name", "message", "fork_turns", "agent_name", "model", "reasoning_effort", "notify_on_finish", "initial_options", "labels", "background", "cwd", "executor_id"},
 		},
 		{
 			name:   "send_message",
@@ -71,7 +71,7 @@ func TestCollaborationToolDefinitions(t *testing.T) {
 			name:   "interrupt_agent",
 			fields: []string{"session_id"},
 		},
-		{name: "list_agents"},
+		{name: "list_agents", fields: []string{"session_id", "statuses", "cwd", "since_hours", "labels", "all", "limit"}},
 		{name: "list_executors", fields: []string{"refresh_tools"}},
 		{
 			name:   "read_session_history",
@@ -312,7 +312,7 @@ func TestListAgentsToolReportsUsageAndContextWindow(t *testing.T) {
 					Session       defs.Session     `json:"session"`
 					Usage         *defs.TokenUsage `json:"usage"`
 					ContextWindow *int             `json:"context_window"`
-				} `json:"sessions"`
+				} `json:"agents"`
 			}
 			decodeRequestToolResult(t, next, "list", &result)
 			next.reply <- modelResponse{text: "done"}

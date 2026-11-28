@@ -21,12 +21,14 @@ import (
 	"unicode/utf8"
 
 	"github.com/VaalaCat/openvaala/internal/config"
+	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor/tools"
 	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	acp "github.com/coder/acp-go-sdk"
@@ -115,6 +117,7 @@ func acpResponse(id json.RawMessage, result any, err error) acpMessage {
 	// 2. 有错误时清除结果并按错误类型设置错误码：协议错误原样返回，会话忙为 -32001，找不到对话为 -32602，其余为 -32603。
 	response.Result = nil
 	var protocolError *acpError
+	var responseError *runtimeclient.ResponseError
 	switch {
 	case errors.As(err, &protocolError):
 		response.Error = protocolError
@@ -128,6 +131,8 @@ func acpResponse(id json.RawMessage, result any, err error) acpMessage {
 			-32602,
 			"session not found",
 		}
+	case errors.As(err, &responseError) && responseError.Message == "cannot switch agent in an existing session":
+		response.Error = &acpError{-32602, responseError.Message}
 	default:
 		response.Error = &acpError{
 			-32603,
@@ -259,12 +264,12 @@ func getACPMessageUpdate(content *defs.Content, isUser bool) acp.SessionUpdate {
 	return acp.UpdateAgentMessage(block)
 }
 
-// getACPConfigOptions 生成编辑器里会话的模型、推理强度和 Executor 下拉选项。
-func getACPConfigOptions(models []*defs.ModelDefinition, selected defs.ModelSelection, executors []conversation.ExecutorDetails) []acp.SessionConfigOption {
+// getConfigOptions 生成编辑器里会话的模型、推理强度和 Executor 下拉选项。
+func (s *acpSession) getConfigOptions() []acp.SessionConfigOption {
 	// 1. 列出模型选项（没有显示名时用模型引用），找到当前选中的模型。
 	modelOptions := acp.SessionConfigSelectOptionsUngrouped{}
 	var selectedDefinition *defs.ModelDefinition
-	for _, model := range models {
+	for _, model := range s.models {
 		name := model.DisplayName
 		if name == "" {
 			name = model.Ref.String()
@@ -273,18 +278,25 @@ func getACPConfigOptions(models []*defs.ModelDefinition, selected defs.ModelSele
 			Name:  name,
 			Value: acp.SessionConfigValueId(model.Ref.String()),
 		})
-		if model.Ref == selected.Ref {
+		if model.Ref == s.selectedModel.Ref {
 			selectedDefinition = model
 		}
 	}
-	result := []acp.SessionConfigOption{{Select: &acp.SessionConfigOptionSelect{
-		Id:           "model",
-		Name:         "Model",
-		Type:         "select",
-		Category:     acp.Ptr(acp.SessionConfigOptionCategory("model")),
-		CurrentValue: acp.SessionConfigValueId(selected.Ref.String()),
-		Options:      acp.SessionConfigSelectOptions{Ungrouped: &modelOptions},
-	}}}
+	var result []acp.SessionConfigOption
+	if len(s.models) > 0 || s.externalAgent == "" {
+		var currentValue acp.SessionConfigValueId
+		if s.externalAgent == "" || s.selectedModel.Ref != (defs.ModelRef{}) {
+			currentValue = acp.SessionConfigValueId(s.selectedModel.Ref.String())
+		}
+		result = []acp.SessionConfigOption{{Select: &acp.SessionConfigOptionSelect{
+			Id:           "model",
+			Name:         "Model",
+			Type:         "select",
+			Category:     acp.Ptr(acp.SessionConfigOptionCategory("model")),
+			CurrentValue: currentValue,
+			Options:      acp.SessionConfigSelectOptions{Ungrouped: &modelOptions},
+		}}}
+	}
 	// 2. 所选模型支持推理强度时添加对应选项。
 	if selectedDefinition != nil && len(selectedDefinition.ReasoningEfforts) > 0 {
 		options := acp.SessionConfigSelectOptionsUngrouped{}
@@ -299,14 +311,14 @@ func getACPConfigOptions(models []*defs.ModelDefinition, selected defs.ModelSele
 			Name:         "Reasoning effort",
 			Type:         "select",
 			Category:     acp.Ptr(acp.SessionConfigOptionCategory("thought_level")),
-			CurrentValue: acp.SessionConfigValueId(selected.ReasoningEffort),
+			CurrentValue: acp.SessionConfigValueId(s.selectedModel.ReasoningEffort),
 			Options:      acp.SessionConfigSelectOptions{Ungrouped: &options},
 		}})
 	}
 	// 3. 存在 Executor 列表时添加选项，第一个 Executor 作为当前默认值；memory 不能当默认 Executor，不列出。
-	if len(executors) > 0 {
+	if len(s.executors) > 0 {
 		options := acp.SessionConfigSelectOptionsUngrouped{}
-		for _, details := range executors {
+		for _, details := range s.executors {
 			if details.Kind == defs.ExecutorKindMemory {
 				continue
 			}
@@ -323,7 +335,7 @@ func getACPConfigOptions(models []*defs.ModelDefinition, selected defs.ModelSele
 			Id:           "executor",
 			Name:         "Executor",
 			Type:         "select",
-			CurrentValue: acp.SessionConfigValueId(executors[0].ID),
+			CurrentValue: acp.SessionConfigValueId(s.executors[0].ID),
 			Options:      acp.SessionConfigSelectOptions{Ungrouped: &options},
 		}})
 	}
@@ -702,7 +714,7 @@ func isRuntimeServerFromCurrentExecutable(ctx context.Context, file RuntimeServe
 func isSameRuntimeServer(runtimeURL, fileURL string) bool {
 	// 1. 解析两个 URL，解析失败或端口不同时返回 false。
 	parsedRuntime, err := url.Parse(runtimeURL)
-	if err != nil {
+	if err != nil || strings.HasPrefix(parsedRuntime.Fragment, "world=") {
 		return false
 	}
 	parsedFile, err := url.Parse(fileURL)
@@ -721,7 +733,14 @@ func isSameRuntimeServer(runtimeURL, fileURL string) bool {
 func isTokenInURL(runtimeURL string) bool {
 	// 1. 解析 URL，检查查询参数里有没有 token。
 	parsed, err := url.Parse(runtimeURL)
-	return err == nil && parsed.Query().Has("token")
+	if err != nil {
+		return false
+	}
+	if strings.HasPrefix(parsed.Fragment, "world=") {
+		fields, _ := url.ParseQuery(parsed.EscapedFragment())
+		return fields.Get("token") != ""
+	}
+	return parsed.Query().Has("token")
 }
 
 // writeRuntimeServerNotice 本机 serve 由另一个可执行文件启动时，向 output 写一行提示。
@@ -746,4 +765,102 @@ func getPluginSourceText(record *config.PluginInstallRecord) string {
 		text += "@" + record.Ref
 	}
 	return text
+}
+
+// collaborationSource 返回已解析的协作来源。
+func collaborationSource(conn runtimeConnection) runtimeprotocol.CollaborationSource {
+	return runtimeprotocol.CollaborationSource{ConversationID: conn.ConversationID, SourceSessionID: conn.SessionID}
+}
+
+// formatSessionLabels 按键名顺序显示标签。
+func formatSessionLabels(labels map[string]string) string {
+	pairs := make([]string, 0, len(labels))
+	for _, key := range slices.Sorted(maps.Keys(labels)) {
+		pairs = append(pairs, key+"="+labels[key])
+	}
+	return strings.Join(pairs, ",")
+}
+
+// getSessionItemText 返回消息中可显示的普通文本。
+func getSessionItemText(item *defs.Item) string {
+	if item.Message == nil {
+		return ""
+	}
+	var text strings.Builder
+	for _, content := range item.Message.Content {
+		if content.Text != nil && !content.Text.IsContext {
+			text.WriteString(content.Text.Text)
+		}
+	}
+	return text.String()
+}
+
+// printSessionItem 打印一条日志的类型和可见内容。
+func printSessionItem(out io.Writer, row runtimeprotocol.LoggedItem) {
+	item := row.Item
+	text := getSessionItemText(item)
+	switch {
+	case item.ToolCall != nil:
+		text = item.ToolCall.Name + " " + item.ToolCall.Arguments
+	case item.ToolResult != nil:
+		text = string(item.ToolResult.Content)
+		if item.ToolResult.Error != nil {
+			text = item.ToolResult.Error.Message
+		}
+	}
+	fmt.Fprintf(out, "%d %s %s\n", row.Ordinal, item.Kind, strings.ReplaceAll(text, "\n", "\\n"))
+}
+
+// printInputAccepted 输出已接收的目标会话和输入 ID。
+func printInputAccepted(out io.Writer, sessionID defs.SessionID, inputID defs.ItemID) error {
+	_, err := fmt.Fprintf(out, "accepted session_id=%s input_item_id=%s\n", sessionID, inputID)
+	return err
+}
+
+func printSessionRecord(out io.Writer, record defs.Session) {
+	fmt.Fprintf(out, "%s agent=%s task=%q background=%t labels=%s", record.ID, record.AgentName, record.TaskName, record.Background, formatSessionLabels(record.Labels))
+	if record.DetachedConversationID != "" {
+		fmt.Fprintf(out, " detached_to=%s", record.DetachedConversationID)
+	}
+	fmt.Fprintln(out)
+}
+
+func printConversationIDs(out io.Writer, record defs.Conversation) {
+	fmt.Fprintf(out, "conversation_id=%s session_id=%s\n", record.ID, record.RootSessionID)
+}
+
+func getTurnFailure(status defs.TurnStatus, message string) error {
+	if status == defs.TurnStatusCompleted {
+		return nil
+	}
+	if message != "" {
+		return errors.New(message)
+	}
+	return fmt.Errorf("turn ended with status %s", status)
+}
+
+func parseSessionOption(text string) (defs.ExternalOptionSelection, error) {
+	key, value, hasValue := strings.Cut(text, "=")
+	kind, id, hasID := strings.Cut(key, ":")
+	if !hasValue || !hasID || kind == "" || value == "" {
+		return defs.ExternalOptionSelection{}, errors.New("expected kind:id=value")
+	}
+	return defs.ExternalOptionSelection{Kind: kind, ID: id, Value: value}, nil
+}
+
+func printSessionOptions(out io.Writer, options defs.ExternalOptions) {
+	groups := []*defs.ExternalOptionGroup{options.Model, options.Mode, options.Thought}
+	for i := range options.Others {
+		groups = append(groups, &options.Others[i])
+	}
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		values := make([]string, 0, len(group.Options))
+		for _, choice := range group.Options {
+			values = append(values, choice.Value)
+		}
+		fmt.Fprintf(out, "%s:%s=%s %s [%s]\n", group.Kind, group.ID, group.CurrentValue, group.Label, strings.Join(values, ","))
+	}
 }

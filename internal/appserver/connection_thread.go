@@ -292,6 +292,7 @@ func (t *connectionThread) open(ctx context.Context) (codexThread, error) {
 	// 1. 以 SkipHistory 打开对话并跟随指定 Session，暂存期间到达的事件。
 	record, err := callClient(ctx, t, func(ctx context.Context) (defs.Conversation, error) {
 		return t.client.OpenConversation(ctx, &runtimeclient.OpenConversationRequest{
+			WaitForHistory: true,
 			ConversationID: t.conversationID,
 			SessionID:      t.sessionID,
 			SkipHistory:    true,
@@ -342,14 +343,15 @@ func (t *connectionThread) newSessionTranslator() *codexItemTranslator {
 // newCodexThread 按对话记录、Session 详情和已报告状态创建 Thread。
 func (t *connectionThread) newCodexThread(record defs.Conversation, details conversation.SessionDetails) codexThread {
 	// 1. 使用 Session 所选模型；目录有对应模型时使用详情中的实际模型。
-	model := details.Session.Model
-	if details.Model != nil {
-		model.Ref = details.Model.Ref
+	if details.Session.External != nil {
+		details.Session.Model = t.selectedModel
+	} else if details.Model != nil {
+		details.Session.Model.Ref = details.Model.Ref
 	}
 	// 2. 根 Thread 填入归属目录、状态和临时标记。
 	status := newCodexThreadStatus(t.threadStatusType)
 	if t.isRootThread() {
-		thread := newCodexRootThread(record, model, t.pathMappings, t.isWindowsClient, status, t.version)
+		thread := newCodexRootThread(record, details.Session, t.pathMappings, t.isWindowsClient, status, t.version)
 		thread.Ephemeral = t.isEphemeral
 		return thread
 	}
@@ -357,7 +359,6 @@ func (t *connectionThread) newCodexThread(record defs.Conversation, details conv
 	sessionRecords := slices.DeleteFunc(t.getSessionRecords(), func(sessionRecord defs.Session) bool { return sessionRecord.ID == t.sessionID })
 	subAgents := getSubAgentSessions(record, append(sessionRecords, details.Session))
 	subAgent := subAgents[slices.IndexFunc(subAgents, func(subAgent subAgentSession) bool { return subAgent.record.ID == t.sessionID })]
-	subAgent.record.Model = model
 	return newCodexChildThread(record, subAgent, t.pathMappings, t.isWindowsClient, status, t.version)
 }
 
@@ -472,7 +473,11 @@ func (t *connectionThread) handleRequest(ctx context.Context, request connection
 		})
 		t.respond(ctx, "thread/name/set", request.requestID, codexEmptyObjectResult{}, err)
 	case *threadStatusRequested:
-		request.reply <- t.getSessionStatus(request.sessionID)
+		info := threadLiveInfo{status: t.getSessionStatus(request.sessionID)}
+		if request.sessionID == t.sessionID {
+			info.model = t.selectedModel
+		}
+		request.reply <- info
 	case *threadHistoryEndRequested:
 		request.reply <- t.historyEndOrdinal
 	default:
@@ -524,6 +529,7 @@ func (t *connectionThread) reopenConversation(ctx context.Context) error {
 	// 1. 重新打开跟随的 Session，成功后清除放弃标记。
 	_, err := callClient(ctx, t, func(ctx context.Context) (defs.Conversation, error) {
 		return t.client.OpenConversation(ctx, &runtimeclient.OpenConversationRequest{
+			WaitForHistory: true,
 			ConversationID: t.conversationID,
 			SessionID:      t.sessionID,
 		})
@@ -542,7 +548,7 @@ func (t *connectionThread) selectModel(ctx context.Context, model, effort *strin
 		return nil
 	}
 	catalog, err := callClient(ctx, t, func(ctx context.Context) (runtime.ModelList, error) {
-		return t.client.ListModels(ctx, "")
+		return t.client.ListModels(ctx, &runtime.ListModelsRequest{ConversationID: t.conversationID, SessionID: t.sessionID})
 	})
 	if err != nil {
 		return err
@@ -563,10 +569,20 @@ func (t *connectionThread) selectModel(ctx context.Context, model, effort *strin
 	}
 	index := slices.IndexFunc(catalog.Models, func(definition *defs.ModelDefinition) bool { return definition.Ref == selection.Ref })
 	if index < 0 {
-		return &codexError{
-			errorCodeInvalidParams,
-			fmt.Sprintf("model %s is not in the model catalog", selection.Ref),
+		record := t.conversationSessions[t.sessionID].Session
+		crossAgent := record.External != nil && selection.Ref.ProviderID != record.AgentName
+		if record.External == nil {
+			crossAgent, err = callClient(ctx, t, func(ctx context.Context) (bool, error) {
+				return runtimeclient.IsExternalModelProvider(ctx, t.client, selection.Ref.ProviderID)
+			})
+			if err != nil {
+				return err
+			}
 		}
+		if crossAgent {
+			return t.setSessionModel(ctx, selection)
+		}
+		return &codexError{errorCodeInvalidParams, fmt.Sprintf("model %s is not in the model catalog", selection.Ref)}
 	}
 	// 3. 校验强度；不支持强度选择的模型将 none 作为默认强度，其他不支持的强度返回 -32602。
 	definition := catalog.Models[index]
@@ -586,6 +602,11 @@ func (t *connectionThread) selectModel(ctx context.Context, model, effort *strin
 	if selection == t.selectedModel {
 		return nil
 	}
+	return t.setSessionModel(ctx, selection)
+}
+
+// setSessionModel 更新已跟随的目标会话。外部模型随驱动通知刷新，记录只保存原生选择。
+func (t *connectionThread) setSessionModel(ctx context.Context, selection defs.ModelSelection) error {
 	record, err := callClient(ctx, t, func(ctx context.Context) (defs.Session, error) {
 		return t.client.SetSessionModel(ctx, &runtimeclient.SetSessionModelRequest{
 			ConversationID: t.conversationID,
@@ -596,7 +617,9 @@ func (t *connectionThread) selectModel(ctx context.Context, model, effort *strin
 	if err != nil {
 		return err
 	}
-	t.selectedModel = record.Model
+	if record.External == nil {
+		t.selectedModel = record.Model
+	}
 	return nil
 }
 
@@ -707,7 +730,12 @@ func (t *connectionThread) handleClientEvent(ctx context.Context, event runtimec
 		}
 	case *runtimeclient.ConversationSyncFailed:
 		t.handleConversationSyncFailed(ctx, event)
+	case *runtimeclient.SessionExternalStateChanged:
+		t.selectedModel = defs.ModelSelection{Ref: runtimeclient.GetExternalModelRef(t.conversationSessions[t.sessionID].Session.AgentName, &event.Options)}
 	case *runtimeclient.SessionSynced:
+		if event.External {
+			t.selectedModel = defs.ModelSelection{Ref: runtimeclient.GetExternalModelRef(t.conversationSessions[t.sessionID].Session.AgentName, event.Options)}
+		}
 		t.handleSessionSynced(ctx, event)
 	case *runtimeclient.SessionStatusChanged:
 		t.handleSessionInfo(ctx, event.Info)
@@ -792,7 +820,9 @@ func (t *connectionThread) handleSessionInfo(ctx context.Context, info runtime.S
 		return
 	}
 	// 3. 跟随 Session 更新模型，状态变化时通知客户端。
-	t.selectedModel = info.Session.Model
+	if info.Session.External == nil {
+		t.selectedModel = info.Session.Model
+	}
 	statusType := getCodexThreadStatusType(info)
 	if t.threadStatusType != "" && statusType != t.threadStatusType {
 		t.notify(ctx, "thread/status/changed", codexThreadStatusChangedNotification{

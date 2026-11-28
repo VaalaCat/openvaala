@@ -166,7 +166,7 @@ func TestConversationRejectsInvalidConfiguration(t *testing.T) {
 		{kind: "no_agents"},
 		{
 			kind:    "no_models",
-			wantErr: "at least one model",
+			wantErr: "no model is configured",
 		},
 		{
 			kind:    "nil_agent",
@@ -390,7 +390,7 @@ func TestConversationRun(t *testing.T) {
 					text: "root busy",
 					hold: true,
 				}
-				if err := h.impl().sendMessage(t.Context(), h.record(t, h.c.GetRootSessionID()), &SendMessageParam{
+				if _, err := h.impl().sendMessage(t.Context(), h.record(t, h.c.GetRootSessionID()), &SendMessageParam{
 					SessionID: childID,
 					Mode:      session.SessionInputModeNormal,
 					Message:   "second task",
@@ -742,8 +742,9 @@ func TestConversationReconfigure(t *testing.T) {
 				if _, err := h.c.SetDefinitions(t.Context(), definitions); err != nil {
 					t.Fatalf("SetDefinitions() error = %v", err)
 				}
-				if !slices.ContainsFunc(h.c.GetSkills(), func(info skill.SkillInfo) bool { return info.Name == "added" }) {
-					t.Fatalf("GetSkills() = %+v, want added", h.c.GetSkills())
+				skills := getRootSkills(t, h.c)
+				if !slices.ContainsFunc(skills, func(info *skill.Skill) bool { return info.Name == "added" }) {
+					t.Fatalf("GetSessionSkills() = %+v, want added", skills)
 				}
 			},
 		},
@@ -878,7 +879,7 @@ func TestConversationReconfigure(t *testing.T) {
 						Model:     "test/other",
 					},
 				} {
-					if err := h.impl().sendMessage(t.Context(), h.record(t, rootID), param); err == nil || !strings.Contains(err.Error(), want) {
+					if _, err := h.impl().sendMessage(t.Context(), h.record(t, rootID), param); err == nil || !strings.Contains(err.Error(), want) {
 						t.Fatalf("sendMessage(%+v) error = %v, want error containing %q", param, err, want)
 					}
 				}
@@ -979,7 +980,7 @@ func TestConversationDeferredConfig(t *testing.T) {
 					t.Fatal(err)
 				}
 				h.impl().sessionRecords.Store(childID, record)
-				if err := h.impl().sendMessage(t.Context(), h.record(t, rootID), &SendMessageParam{
+				if _, err := h.impl().sendMessage(t.Context(), h.record(t, rootID), &SendMessageParam{
 					SessionID: childID, Mode: session.SessionInputModeNormal, Message: "child work",
 				}); err != nil {
 					t.Fatal(err)
@@ -1505,7 +1506,7 @@ func TestConversationReopenUsesSavedAgent(t *testing.T) {
 			model := newConversationModel(t)
 			c := createTestConversation(t, store, model)
 			h := startTestConversation(t, store, model, c)
-			childID, err := h.impl().spawnAgent(t.Context(), h.record(t, c.GetRootSessionID()), spawnCall("spawn-turn", "child"), &SpawnAgentParam{
+			childID, err := h.spawnForTest(t, h.record(t, c.GetRootSessionID()), spawnCall("spawn-turn", "child"), &SpawnAgentParam{
 				TaskName:  "survey",
 				Message:   "first task",
 				AgentName: "worker",
@@ -1532,7 +1533,7 @@ func TestConversationReopenUsesSavedAgent(t *testing.T) {
 				t.Fatal(err)
 			}
 			loadedHarness := startTestConversation(t, store, model, loaded)
-			if err := loadedHarness.impl().sendMessage(t.Context(), loadedHarness.record(t, loaded.GetRootSessionID()), &SendMessageParam{
+			if _, err := loadedHarness.impl().sendMessage(t.Context(), loadedHarness.record(t, loaded.GetRootSessionID()), &SendMessageParam{
 				SessionID: childID,
 				Mode:      session.SessionInputModeNormal,
 				Message:   "second task",
@@ -1599,7 +1600,7 @@ func TestConversationAgentTools(t *testing.T) {
 				h.input(t, session.SessionInputModeNormal, "list your tools")
 				request = receiveSessionRequest(t, model, id)
 			} else {
-				id, err = h.impl().spawnAgent(t.Context(), h.record(t, c.GetRootSessionID()), spawnCall("spawn-turn", "spawn"), &SpawnAgentParam{
+				id, err = h.spawnForTest(t, h.record(t, c.GetRootSessionID()), spawnCall("spawn-turn", "spawn"), &SpawnAgentParam{
 					TaskName:  "survey",
 					Message:   "read the notes",
 					AgentName: tt.agentName,
@@ -1616,7 +1617,7 @@ func TestConversationAgentTools(t *testing.T) {
 					t.Fatal(err)
 				}
 				h = startTestConversation(t, store, model, loaded)
-				if err := h.impl().sendMessage(t.Context(), h.record(t, loaded.GetRootSessionID()), &SendMessageParam{
+				if _, err := h.impl().sendMessage(t.Context(), h.record(t, loaded.GetRootSessionID()), &SendMessageParam{
 					SessionID: id,
 					Mode:      session.SessionInputModeNormal,
 					Message:   "read again",
@@ -1919,7 +1920,7 @@ func TestConversationAgentSkills(t *testing.T) {
 				h.input(t, session.SessionInputModeNormal, "use a skill")
 				request = receiveSessionRequest(t, model, id)
 			} else {
-				id, err = h.impl().spawnAgent(t.Context(), h.record(t, c.GetRootSessionID()), spawnCall("spawn-turn", "spawn"), &SpawnAgentParam{
+				id, err = h.spawnForTest(t, h.record(t, c.GetRootSessionID()), spawnCall("spawn-turn", "spawn"), &SpawnAgentParam{
 					TaskName:  "survey",
 					Message:   "use a skill",
 					AgentName: tt.agentName,
@@ -1936,7 +1937,7 @@ func TestConversationAgentSkills(t *testing.T) {
 					t.Fatal(err)
 				}
 				h = startTestConversation(t, store, model, loaded)
-				if err := h.impl().sendMessage(t.Context(), h.record(t, loaded.GetRootSessionID()), &SendMessageParam{
+				if _, err := h.impl().sendMessage(t.Context(), h.record(t, loaded.GetRootSessionID()), &SendMessageParam{
 					SessionID: id,
 					Mode:      session.SessionInputModeNormal,
 					Message:   "use it again",
@@ -2301,7 +2302,7 @@ func TestConversationReopenDoesNotReplay(t *testing.T) {
 			c := createTestConversation(t, store, model)
 			h := startTestConversation(t, store, model, c)
 			rootRecord := h.record(t, c.GetRootSessionID())
-			childID, err := h.impl().spawnAgent(t.Context(), rootRecord, spawnCall("spawn-turn", "child"), &SpawnAgentParam{
+			childID, err := h.spawnForTest(t, rootRecord, spawnCall("spawn-turn", "child"), &SpawnAgentParam{
 				TaskName: "review",
 				Message:  "saved task",
 			})
@@ -2313,7 +2314,7 @@ func TestConversationReopenDoesNotReplay(t *testing.T) {
 				request.reply <- modelResponse{text: "saved final"}
 				receiveSessionRequest(t, model, c.GetRootSessionID()).reply <- modelResponse{text: "saved root reply"}
 				h.nextTurnFinished(t)
-			} else if err := h.impl().sendMessage(t.Context(), rootRecord, &SendMessageParam{
+			} else if _, err := h.impl().sendMessage(t.Context(), rootRecord, &SendMessageParam{
 				SessionID: childID,
 				Mode:      session.SessionInputModeNormal,
 				Message:   "queued task",
@@ -2332,7 +2333,8 @@ func TestConversationReopenDoesNotReplay(t *testing.T) {
 			// 2. 检查重开和历史查询不产生模型请求，list_agents 返回保存的子 Session 状态。
 			requireNoModelRequest(t, model)
 			loadedHarness := startTestConversation(t, reopened, model, loaded)
-			agents, err := loadedHarness.impl().listAgents(t.Context(), loadedHarness.record(t, loaded.GetRootSessionID()))
+			listed, err := loadedHarness.c.ListAgents(t.Context(), loaded.GetRootSessionID(), &ListAgentsParam{})
+			agents := listed.Agents
 			var wantStatus defs.TurnStatus
 			if tt.completed {
 				wantStatus = defs.TurnStatusCompleted
@@ -2341,7 +2343,7 @@ func TestConversationReopenDoesNotReplay(t *testing.T) {
 				agents[0].Status.LastTurnID == "" || agents[0].Status.LastTurnStatus != wantStatus {
 				t.Fatalf("restored=%+v %v", agents, err)
 			}
-			history, err := loadedHarness.impl().readSessionHistory(t.Context(), loadedHarness.record(t, loaded.GetRootSessionID()), &SessionHistoryParam{
+			history, err := loaded.ReadSessionHistory(t.Context(), loaded.GetRootSessionID(), &SessionHistoryParam{
 				SessionID: childID,
 				Limit:     20,
 			})
@@ -2884,7 +2886,7 @@ func spawnResponse(callID, task, message string) modelResponse {
 func decodeSpawnAgentResult(t *testing.T, request modelRequest, callID string) defs.SessionID {
 	t.Helper()
 	// 1. 解码调用结果，检查 Status 为 accepted 且 SessionID 非空。
-	var result spawnAgentResult
+	var result SpawnAgentResult
 	decodeRequestToolResult(t, request, callID, &result)
 	if result.SessionID == "" || result.Status != "accepted" {
 		t.Fatalf("spawn_agent result=%+v", result)
@@ -3810,7 +3812,7 @@ func TestConversationGetSessionDetails(t *testing.T) {
 			if err != nil || !found {
 				t.Fatalf("GetSession() = %v, %v", found, err)
 			}
-			if got.ConversationID != created.GetID() || got.Title != "" || got.Session != wantSession {
+			if got.ConversationID != created.GetID() || got.Title != "" || !defs.IsSameSession(got.Session, wantSession) {
 				t.Fatalf("identity = %q %q %+v, want %q %q %+v", got.ConversationID, got.Title, got.Session, created.GetID(), "", wantSession)
 			}
 			if tt.wantModel == "" {
@@ -4109,8 +4111,8 @@ func TestConversationCreateWithModel(t *testing.T) {
 	}
 }
 
-// TestValidateConversationConfigModels 检查 Agent 的默认模型和压缩模型都在目录里、每个模型都带连接参数。
-func TestValidateConversationConfigModels(t *testing.T) {
+// TestConversationCreateChecksSelectedAgentModels 检查创建对话时所选原生 Agent 的模型和目录连接参数。
+func TestConversationCreateChecksSelectedAgentModels(t *testing.T) {
 	// 1. 准备默认模型不在目录里、压缩模型不在目录里和模型没有连接参数的情况。
 	model := &defs.ModelDefinition{
 		Ref: defs.ModelRef{
@@ -4121,10 +4123,11 @@ func TestValidateConversationConfigModels(t *testing.T) {
 		ContextWindow: 1000,
 	}
 	tests := []struct {
-		name    string
-		agents  []*agent.AgentDefinition
-		models  []*defs.ModelDefinition
-		wantErr string
+		name, agentName string
+		agents          []*agent.AgentDefinition
+		models          []*defs.ModelDefinition
+		requested       defs.ModelSelection
+		wantErr         string
 	}{
 		{
 			name: "valid",
@@ -4144,7 +4147,7 @@ func TestValidateConversationConfigModels(t *testing.T) {
 				},
 			}},
 			models:  []*defs.ModelDefinition{model},
-			wantErr: "test/gone",
+			wantErr: `agent "assistant" uses model test/gone, which is not configured`,
 		},
 		{
 			name: "missing_compact_model",
@@ -4157,7 +4160,25 @@ func TestValidateConversationConfigModels(t *testing.T) {
 				},
 			}},
 			models:  []*defs.ModelDefinition{model},
-			wantErr: "test/gone",
+			wantErr: `agent "assistant" uses compact model test/gone, which is not configured`,
+		},
+		{
+			name: "explicit_model_with_missing_default",
+			agents: []*agent.AgentDefinition{{
+				Name:  "assistant",
+				Model: defs.ModelRef{ProviderID: "test", ModelID: "gone"},
+			}},
+			models:    []*defs.ModelDefinition{model},
+			requested: defs.ModelSelection{Ref: model.Ref},
+			wantErr:   `agent "assistant" uses model test/gone, which is not configured`,
+		},
+		{
+			name:      "acp_with_unselected_native_agent",
+			agentName: "codex-acp",
+			agents: []*agent.AgentDefinition{
+				{Name: "assistant", Model: defs.ModelRef{ProviderID: "test", ModelID: "gone"}},
+				{Name: "codex-acp", Type: defs.AgentTypeACP, ACP: &defs.ACPCommand{Command: "codex-acp"}},
+			},
 		},
 		{
 			name: "model_without_target",
@@ -4169,15 +4190,57 @@ func TestValidateConversationConfigModels(t *testing.T) {
 			wantErr: "connection parameters",
 		},
 	}
-	// 2. 校验配置并核对错误内容。
+	// 2. 创建对话并核对错误内容；创建成功时重新打开已保存的对话。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := validateConversationConfig(t.Context(), &ConversationDefinitions{
-				Agents: tt.agents,
-				Models: tt.models,
-			}, nil, nil)
+			store := openConversationDAO(t)
+			opt := &ConversationOpt{
+				Query: store.query, Mutation: store.mutation, WithoutExecutors: true,
+				Definitions: &ConversationDefinitions{Agents: tt.agents, Models: tt.models},
+			}
+			agentName := tt.agentName
+			if agentName == "" {
+				agentName = "assistant"
+			}
+			created, err := CreateConversation(t.Context(), defs.NewConversationID(), agentName, tt.requested, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
 			if (tt.wantErr == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tt.wantErr)) {
-				t.Fatalf("validateConversationConfig() = %v, want error containing %q", err, tt.wantErr)
+				t.Fatalf("CreateConversation() error = %v, want error containing %q", err, tt.wantErr)
+			}
+			if err == nil {
+				if _, err := reopenTestConversation(t, created, opt); err != nil {
+					t.Fatalf("reopen Conversation: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestConversationRejectsInvalidAgentExecutionFields 检查 Go 调用方提交的 Agent 定义是否符合执行类型约束。
+func TestConversationRejectsInvalidAgentExecutionFields(t *testing.T) {
+	command := &defs.ACPCommand{Command: "codex-acp"}
+	ref := defs.ModelRef{ProviderID: "test", ModelID: "model"}
+	for _, tt := range []struct {
+		name       string
+		definition agent.AgentDefinition
+		wantError  string
+	}{
+		{name: "missing_command", definition: agent.AgentDefinition{Type: defs.AgentTypeACP}, wantError: "acp.command must not be empty"},
+		{name: "blank_command", definition: agent.AgentDefinition{Type: defs.AgentTypeACP, ACP: &defs.ACPCommand{Command: " "}}, wantError: "acp.command must not be empty"},
+		{name: "with_model", definition: agent.AgentDefinition{Type: defs.AgentTypeACP, ACP: command, Model: ref}, wantError: "acp agent must not configure model"},
+		{name: "with_compact_model", definition: agent.AgentDefinition{Type: defs.AgentTypeACP, ACP: command, CompactModel: ref}, wantError: "acp agent must not configure compact_model"},
+		{name: "with_instructions", definition: agent.AgentDefinition{Type: defs.AgentTypeACP, ACP: command, Instructions: "Be concise."}, wantError: "acp agent must not configure instructions"},
+		{name: "native_with_acp", definition: agent.AgentDefinition{ACP: command}, wantError: "native agent must not configure acp"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openConversationDAO(t)
+			tt.definition.Name = "assistant"
+			opt := &ConversationOpt{
+				Query: store.query, Mutation: store.mutation, WithoutExecutors: true,
+				Definitions: &ConversationDefinitions{Agents: []*agent.AgentDefinition{&tt.definition}},
+			}
+			_, err := CreateConversation(t.Context(), defs.NewConversationID(), "assistant", defs.ModelSelection{}, defs.ExecutorSettings{}, defs.ExecutorSettings{}, opt)
+			if err == nil || err.Error() != tt.wantError {
+				t.Fatalf("CreateConversation() error = %v, want %q", err, tt.wantError)
 			}
 		})
 	}
@@ -4247,7 +4310,7 @@ func TestConversationHookStartSource(t *testing.T) {
 
 			var childID defs.SessionID
 			if tt.isChild {
-				childID, err = h.impl().spawnAgent(t.Context(), h.record(t, rootID), spawnCall("spawn-turn", "child"), &SpawnAgentParam{
+				childID, err = h.spawnForTest(t, h.record(t, rootID), spawnCall("spawn-turn", "child"), &SpawnAgentParam{
 					TaskName: "survey",
 					Message:  "first task",
 				})
@@ -4274,7 +4337,7 @@ func TestConversationHookStartSource(t *testing.T) {
 						Mode:      session.SessionInputModeNormal,
 						Message:   "second task",
 					}
-					if err := h.impl().sendMessage(t.Context(), h.record(t, rootID), message); err != nil {
+					if _, err := h.impl().sendMessage(t.Context(), h.record(t, rootID), message); err != nil {
 						t.Fatal(err)
 					}
 					receiveSessionRequest(t, model, childID)

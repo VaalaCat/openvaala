@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/VaalaCat/openvaala/pkg/world"
 	"github.com/spf13/cobra"
 )
 
@@ -59,6 +60,10 @@ func GetWebUIURL(runtimeURL, token string) (string, error) {
 	connectionURL, err := url.Parse(runtimeURL)
 	if err != nil {
 		return "", fmt.Errorf("parse runtime server url: %w", err)
+	}
+	if strings.HasPrefix(connectionURL.Fragment, "world=") {
+		_, err := world.ParseRemoteAccessURL(runtimeURL)
+		return runtimeURL, err
 	}
 	if token == "" {
 		token = connectionURL.Query().Get("token")

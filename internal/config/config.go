@@ -27,15 +27,19 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/prompt"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/skill"
+	"github.com/VaalaCat/openvaala/pkg/world"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
 // Config 是加载好的应用设置，以及校验过的 Agent、模型、Executor、MCP server、hook 和插件定义；加载后只读，可以并发查询。
 type Config struct {
 	// DataDirectory 覆盖本机数据和运行状态的根目录。
-	DataDirectory string `mapstructure:"data_dir" yaml:"data_dir,omitempty" flag:"data-dir"`
+	DataDirectory string      `mapstructure:"data_dir" yaml:"data_dir,omitempty" flag:"data-dir"`
+	World         WorldConfig `mapstructure:"world" yaml:"world,omitempty"`
 	Agents        *struct {
 		Directory string `mapstructure:"directory" yaml:"directory" default:"agents" flag:"agents-dir"`
 	} `mapstructure:"agents" yaml:"agents"`
@@ -111,7 +115,7 @@ type Config struct {
 	// httpHeaders 是 http.headers 合并内置默认后的结果，加载后只读。
 	httpHeaders map[string]string
 	// agentDefinitions 是按名字索引的 Agent 配置，没有 default.yaml 时也有内置 default Agent；加载后只读。
-	agentDefinitions map[string]*AgentConfig
+	agentDefinitions map[string]*defs.AgentConfig
 	// models 是按引用索引的模型目录，加载后只读。
 	models map[defs.ModelRef]*defs.ModelDefinition
 	// executorDefinitions 是 executors/ 里按 ID 索引的 Executor，不含 local 和内置 Executor；加载后只读。
@@ -180,6 +184,10 @@ type LoadConfigOpt struct {
 	Flags *pflag.FlagSet
 	// ServerListen 是 serve --listen 显式指定的监听地址。
 	ServerListen *string
+	// WorldServerListen 是 world serve --listen 显式指定的监听地址。
+	WorldServerListen *string
+	// 是否通过 world serve 独立运行控制面或 relay？
+	WorldServe bool
 }
 
 // LoadConfig 加载应用设置，再加载各类运行定义。
@@ -229,7 +237,7 @@ func LoadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 		resolved.Home = home
 		opt = &resolved
 	}
-	path, explicit, err := GetConfigPath(opt.Home, opt.Path)
+	path, err := GetConfigPath(opt.Home, opt.Path)
 	if err != nil {
 		return nil, "", err
 	}
@@ -245,9 +253,9 @@ func LoadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 		return nil, "", err
 	}
 
-	// 3. 读取配置文件；默认文件缺失时沿用默认值，显式文件缺失时报错，读取后严格校验字段再合并。
+	// 3. 配置文件缺失时沿用默认值，存在时严格校验字段再合并。
 	payload, err := os.ReadFile(path)
-	if err != nil && (!errors.Is(err, os.ErrNotExist) || explicit) {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, "", &Error{
 			Path:   path,
 			Reason: "cannot read file",
@@ -274,6 +282,12 @@ func LoadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 	if opt.ServerListen != nil {
 		settings.Set("server.listen", *opt.ServerListen)
 	}
+	if opt.WorldServerListen != nil {
+		if strings.TrimSpace(*opt.WorldServerListen) == "" {
+			return nil, "", errors.New("world.server.listen must not be empty")
+		}
+		settings.Set("world.server.listen", *opt.WorldServerListen)
+	}
 	cfg := &Config{}
 	if err := settings.UnmarshalExact(cfg,
 		func(decoder *mapstructure.DecoderConfig) {
@@ -287,8 +301,14 @@ func LoadConfigSettings(opt *LoadConfigOpt) (*Config, string, error) {
 			Reason: "unknown field or invalid field type: " + err.Error(),
 		}
 	}
+	if (opt.WorldServe || cfg.World.Server.Enabled || cfg.World.Server.Domain != "") && cfg.World.Server.Listen == "" {
+		cfg.World.Server.Listen = "0.0.0.0:8791"
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, "", fmt.Errorf("%s: %w", path, err)
+	}
+	if opt.WorldServe && !cfg.World.Server.Enabled && cfg.World.GetRelayMode() == "off" {
+		return nil, "", errors.New("world serve has nothing to run: enable world.server or set world.relay_mode")
 	}
 	// 没写 http 组时 HTTP 为 nil，按没有用户 header 处理。
 	var userHeaders map[string]string
@@ -405,38 +425,80 @@ func (cfg *Config) Validate() error {
 	if _, err := getModelInputs(defaults.Capabilities.Input); err != nil {
 		return fmt.Errorf("models.defaults: %w", err)
 	}
+	// 6. 启用节点需要完整的注册信息，启用控制面需要域名。
+	node := cfg.World.Node
+	if node.Enabled && (strings.TrimSpace(node.Name) == "" || strings.TrimSpace(node.Domain) == "" || strings.TrimSpace(node.ServerURL) == "") {
+		return errors.New("world.node requires name, domain and server_url")
+	}
+	if cfg.World.Server.Enabled && strings.TrimSpace(cfg.World.Server.Domain) == "" {
+		return errors.New("world.server.domain must not be empty")
+	}
+	if len(cfg.World.RelayInstances) > 0 && cfg.World.GetRelayMode() != "public" {
+		return errors.New("world.relay_instances requires world.relay_mode public")
+	}
+	for i, base := range cfg.World.RelayInstances {
+		_, err := worldserver.ParseWorldBaseURL(base, true)
+		if err != nil {
+			return fmt.Errorf("world.relay_instances[%d] must be an HTTP or WebSocket URL", i)
+		}
+	}
+	switch cfg.World.GetRelayMode() {
+	case "off", "public":
+	case "domain":
+		if !cfg.World.Server.Enabled {
+			return errors.New(`world.relay_mode "domain" requires world.server.enabled`)
+		}
+	default:
+		return fmt.Errorf("invalid world.relay_mode %q", cfg.World.RelayMode)
+	}
+	for _, group := range []struct {
+		field string
+		urls  []string
+	}{
+		{"world.relays", cfg.World.Relays}, {"world.node.direct_urls", node.DirectURLs},
+	} {
+		for _, base := range group.urls {
+			if _, err := worldserver.ParseWorldBaseURL(base, true); err != nil {
+				return fmt.Errorf("invalid %s URL %q", group.field, base)
+			}
+		}
+	}
+	if cfg.World.WebURL != "" {
+		if _, err := world.ParseWebOrigin(cfg.World.WebURL); err != nil {
+			return fmt.Errorf("invalid world.web_url %q", cfg.World.WebURL)
+		}
+	}
+
 	return nil
 }
 
-// GetConfigPath 确定配置文件的绝对路径，并返回它是不是调用方或 OPENVAALA_CONFIG 显式指定的。
-func GetConfigPath(home, requested string) (string, bool, error) {
+// GetConfigPath 返回配置文件的绝对路径，依次使用调用方指定的路径、环境变量和默认路径。
+func GetConfigPath(home, requested string) (string, error) {
 	// 1. 取得主目录，必须是绝对路径。
 	if home == "" {
 		directory, err := os.UserHomeDir()
 		if err != nil {
-			return "", false, fmt.Errorf("cannot locate user directory: %w", err)
+			return "", fmt.Errorf("cannot locate user directory: %w", err)
 		}
 		home = directory
 	}
 	if !filepath.IsAbs(home) {
-		return "", false, errors.New("an absolute user directory is required")
+		return "", errors.New("an absolute user directory is required")
 	}
 	// 2. 优先用调用方给的路径，其次 OPENVAALA_CONFIG；环境变量设了但为空时报错。
-	explicit := requested != ""
 	if requested == "" {
 		if value, present := os.LookupEnv("OPENVAALA_CONFIG"); present {
 			if strings.TrimSpace(value) == "" {
-				return "", false, errors.New("OPENVAALA_CONFIG must not be empty")
+				return "", errors.New("OPENVAALA_CONFIG must not be empty")
 			}
-			requested, explicit = value, true
+			requested = value
 		}
 	}
 	// 3. 未指定时使用 ~/.config/openvaala/config.yaml，展开 ~ 并转为绝对路径。
 	if requested == "" {
 		requested = filepath.Join(home, ".config", "openvaala", "config.yaml")
 	}
-	path, err := filepath.Abs(expandPath(requested, home, "."))
-	return path, explicit, err
+	return filepath.Abs(expandPath(requested, home, "."))
 }
 
 // GetTelemetryLogLevel 返回配置中的日志最低级别。
@@ -454,7 +516,7 @@ func (cfg *Config) GetHTTPHeaders() map[string]string {
 }
 
 // GetAgent 按名字返回 Agent 配置的副本。
-func (cfg *Config) GetAgent(name string) (*AgentConfig, error) {
+func (cfg *Config) GetAgent(name string) (*defs.AgentConfig, error) {
 	// 1. 查找 Agent，没配置时返回错误，找到时返回副本。
 	definition, found := cfg.agentDefinitions[name]
 	if !found {
@@ -471,6 +533,7 @@ func (cfg *Config) GetAgentDefinitions() []*agent.AgentDefinition {
 		agentConfig := cfg.agentDefinitions[name]
 		definition := &agent.AgentDefinition{
 			Name:         agentConfig.Name,
+			Type:         agentConfig.Type,
 			Description:  agentConfig.Description,
 			Instructions: agentConfig.Instructions,
 			Model:        getModelRef(agentConfig.Model),
@@ -478,7 +541,10 @@ func (cfg *Config) GetAgentDefinitions() []*agent.AgentDefinition {
 			ToolNames:    agentConfig.Tools,
 			SkillNames:   agentConfig.Skills,
 			MCPServerIDs: agentConfig.MCPServers,
-			MaxSteps:     agentConfig.MaxSteps,
+			ACP:          agentConfig.ACP,
+		}
+		if agentConfig.MaxSteps != nil {
+			definition.MaxSteps = *agentConfig.MaxSteps
 		}
 		definitions = append(definitions, definition.Clone())
 	}
@@ -505,7 +571,7 @@ func (cfg *Config) getSortedModelRefs() []defs.ModelRef {
 }
 
 // getDefaultModel 取没写 model 的 Agent 使用的默认模型；模型目录为空时返回 nil。
-func (cfg *Config) getDefaultModel() (*AgentModelConfig, error) {
+func (cfg *Config) getDefaultModel() (*defs.AgentModelConfig, error) {
 	// 1. 配了 models.default_model 时，它必须能解析并且在模型目录里。
 	if cfg.Models.DefaultModel != "" {
 		ref, err := defs.ParseModelRef(cfg.Models.DefaultModel)
@@ -515,7 +581,7 @@ func (cfg *Config) getDefaultModel() (*AgentModelConfig, error) {
 		if _, found := cfg.models[ref]; !found {
 			return nil, fmt.Errorf("models.default_model: model %s is not configured", ref)
 		}
-		return &AgentModelConfig{
+		return &defs.AgentModelConfig{
 			Provider: ref.ProviderID,
 			Model:    ref.ModelID,
 		}, nil
@@ -525,7 +591,7 @@ func (cfg *Config) getDefaultModel() (*AgentModelConfig, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}
-	return &AgentModelConfig{
+	return &defs.AgentModelConfig{
 		Provider: refs[0].ProviderID,
 		Model:    refs[0].ModelID,
 	}, nil
@@ -781,11 +847,13 @@ func (cfg *Config) loadDefinitions(home string) error {
 	if err != nil {
 		return err
 	}
+	providerIDs := make(map[string]struct{}, len(providerFiles))
 	for _, path := range providerFiles {
 		provider, err := loadProviderDefinition(path)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
+		providerIDs[provider.ID] = struct{}{}
 		for modelID, model := range provider.Models {
 			definition, err := cfg.newModelDefinition(provider, modelID, model)
 			if err != nil {
@@ -847,7 +915,7 @@ func (cfg *Config) loadDefinitions(home string) error {
 	if err != nil {
 		return err
 	}
-	cfg.agentDefinitions = make(map[string]*AgentConfig)
+	cfg.agentDefinitions = make(map[string]*defs.AgentConfig)
 	agentFiles, err := getDefinitionFiles(cfg.Agents.Directory)
 	if err != nil {
 		return err
@@ -857,7 +925,11 @@ func (cfg *Config) loadDefinitions(home string) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
-		if definition.Model == nil {
+		if definition.Type == defs.AgentTypeACP {
+			if _, found := providerIDs[definition.Name]; found {
+				return fmt.Errorf("agent %s conflicts with model provider %s", definition.Name, definition.Name)
+			}
+		} else if definition.Model == nil {
 			definition.Model = defaultModel.Clone()
 		}
 		var model *defs.ModelDefinition
@@ -896,35 +968,84 @@ func (cfg *Config) loadDefinitions(home string) error {
 	return nil
 }
 
+// WorldNodeWithDefaults 补齐域内通告目标，不依赖宿主的 Agent 定义。
+func (cfg *Config) WorldNodeWithDefaults() WorldNodeConfig {
+	node := cfg.World.Node
+	// 1. 未通告目标时补齐默认 Agent，仅通告 default 且未指定默认目标时使用 default。
+	if len(node.AdvertiseTargets) == 0 {
+		node.DefaultTarget = cmp.Or(node.DefaultTarget, cfg.Run.AgentName)
+		node.AdvertiseTargets = []worldserver.AdvertisedTarget{{Name: node.DefaultTarget, Visibility: "domain"}}
+	} else if node.DefaultTarget == "" && len(node.AdvertiseTargets) == 1 && node.AdvertiseTargets[0].Name == "default" {
+		node.DefaultTarget = "default"
+	}
+	return node
+}
+
+// ValidateWorldRuntimeTargets 检查 Runtime 宿主是否配置了节点通告的 Agent。
+func (cfg *Config) ValidateWorldRuntimeTargets(node WorldNodeConfig) error {
+	if node.DefaultTarget != "" && cfg.agentDefinitions[node.DefaultTarget] == nil {
+		return fmt.Errorf("world.node.default_target: agent %q is not configured", node.DefaultTarget)
+	}
+	for _, target := range node.AdvertiseTargets {
+		if cfg.agentDefinitions[target.Name] == nil {
+			return fmt.Errorf("world.node.advertise_targets: agent %q is not configured", target.Name)
+		}
+	}
+	return nil
+}
+
 // newBuiltinDefaultAgent 创建内置 default Agent 配置。
-func newBuiltinDefaultAgent() *AgentConfig {
+func newBuiltinDefaultAgent() *defs.AgentConfig {
 	// 1. 填入内置名字、用途说明和指令；工具、skill 和 MCP server 不填，即全部可用。
-	return &AgentConfig{
+	return &defs.AgentConfig{
 		Name:         defaultAgentName,
+		Type:         defs.AgentTypeNative,
 		Description:  prompt.DefaultAgentDescription,
 		Instructions: prompt.DefaultAgentInstructions,
 	}
 }
 
 // loadAgentDefinition 读取并校验 Agent 文件。
-func loadAgentDefinition(path string) (*AgentConfig, error) {
-	// 1. default.yaml 从内置 default Agent 起步，其他文件从空配置起步，再读文件覆盖。
+func loadAgentDefinition(path string) (*defs.AgentConfig, error) {
+	// 1. 读取 Agent 类型，并为原生 default Agent 填入内置配置。
 	name := strings.TrimSuffix(filepath.Base(path), ".yaml")
-	definition := &AgentConfig{}
-	if name == defaultAgentName {
-		definition = newBuiltinDefaultAgent()
-	}
-	if err := readYAML(path, definition); err != nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
 		return nil, err
 	}
-	// 2. 检查名字和文件名一致、指令非空；模型引用没写 model 时填 default。
+	var fields map[string]yaml.Node
+	if err := yaml.Unmarshal(data, &fields); err != nil {
+		return nil, fmt.Errorf("%s: invalid YAML, field type or unknown field", path)
+	}
+	var agentType defs.AgentType
+	if field, found := fields["type"]; found {
+		if err := field.Decode(&agentType); err != nil {
+			return nil, fmt.Errorf("%s: invalid YAML, field type or unknown field", path)
+		}
+	}
+	definition := &defs.AgentConfig{}
+	if name == defaultAgentName {
+		definition.Name = name
+		if cmp.Or(agentType, defs.AgentTypeNative) == defs.AgentTypeNative {
+			definition = newBuiltinDefaultAgent()
+		}
+	}
+	if err := decodeYAML(bytes.NewReader(data), definition); err != nil {
+		return nil, fmt.Errorf("%s: invalid YAML, field type or unknown field", path)
+	}
+	definition.Type = cmp.Or(definition.Type, defs.AgentTypeNative)
+	// 2. 校验名称和执行类型专用字段。
 	if !isValidID(definition.Name) || definition.Name != name {
 		return nil, errors.New("agent name must be valid and match filename")
 	}
-	if strings.TrimSpace(definition.Instructions) == "" {
+	if err := agent.ValidateAgentExecutionType(definition.Type, definition.ACP, slices.Collect(maps.Keys(fields))...); err != nil {
+		return nil, err
+	}
+	if definition.Type == defs.AgentTypeNative && strings.TrimSpace(definition.Instructions) == "" {
 		return nil, errors.New("agent instructions must not be empty")
 	}
-	if definition.MaxSteps < 0 {
+	// 3. 校验每轮步数，模型引用没写 model 时填 default。
+	if definition.MaxSteps != nil && *definition.MaxSteps < 0 {
 		return nil, errors.New("agent max_steps must not be negative")
 	}
 	if definition.Model != nil && definition.Model.Model == "" {
@@ -1218,4 +1339,15 @@ func newHookDefinition(event defs.HookEventName, handler *HookHandlerConfig, hom
 		return nil, errors.New("on_failure must be allow or block")
 	}
 	return definition, nil
+}
+
+// GetRelayMode 根据本次是否启用控制面解析缺省模式。
+func (w WorldConfig) GetRelayMode() string {
+	if w.RelayMode != "" {
+		return w.RelayMode
+	}
+	if w.Server.Enabled {
+		return "domain"
+	}
+	return "off"
 }

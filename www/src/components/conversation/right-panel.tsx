@@ -38,11 +38,15 @@ const tabLabelKeys = {
 export function RightPanel({
   sync,
   isReady,
+  showBackground,
+  setShowBackground,
   onClose,
   debugTarget,
   messageRows,
 }: {
   sync: ConversationSync
+  showBackground: boolean
+  setShowBackground(value: boolean): void
   isReady: boolean
   onClose(): void
   debugTarget?: ItemDebugTarget
@@ -51,6 +55,12 @@ export function RightPanel({
   const { t } = useTranslation()
   const isMobile = useIsMobile()
   const tab = useStore($rightPanelTab)
+  const restoring = useStore(sync.$restoring)
+  const syncState = useStore(sync.$syncState)
+  const externalHistory = useStore(sync.$historyGeneration) > 0
+  if (tab === "turns" || tab === "debug")
+    isReady =
+      isReady && !restoring && (!externalHistory || syncState === "synced")
   const targetKey = isReady
     ? sync.conversationID + ":" + sync.getFollowedSessionID()
     : ""
@@ -104,7 +114,12 @@ export function RightPanel({
             className="min-h-0 overflow-y-auto p-3 text-body"
           >
             {isReady && tab === "agents" && (
-              <AgentsTree key={targetKey} sync={sync} />
+              <AgentsTree
+                key={targetKey}
+                sync={sync}
+                showBackground={showBackground}
+                setShowBackground={setShowBackground}
+              />
             )}
           </TabsContent>
           <TabsContent

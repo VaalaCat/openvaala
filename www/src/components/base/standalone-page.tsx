@@ -1,5 +1,6 @@
 import { useEffect, type ReactNode } from "react"
 import { LanguageSwitcher } from "@/components/base/language-switcher"
+import { cn } from "@/lib/utils"
 import {
   Card,
   CardContent,
@@ -11,10 +12,12 @@ import {
 // 没有左栏的居中卡片页，用于进入页面前的 token 输入、连接中、版本不一致提示和页面出错
 export function StandalonePage({
   title,
+  titleClassName,
   description,
   children,
 }: {
   title: string
+  titleClassName?: string
   description?: string
   children?: ReactNode
 }) {
@@ -27,7 +30,7 @@ export function StandalonePage({
         <CardHeader>
           <div className="flex items-start justify-between gap-2">
             <CardTitle>
-              <h1 className="text-title">{title}</h1>
+              <h1 className={cn("text-title", titleClassName)}>{title}</h1>
             </CardTitle>
             <LanguageSwitcher />
           </div>

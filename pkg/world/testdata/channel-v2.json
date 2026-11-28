@@ -1,0 +1,37 @@
+{
+  "encoding": "base64",
+  "cases": [
+    {
+      "purpose": "world",
+      "channel_id": "4OHi4+Tl5ufo6err7O3u7w==",
+      "dial_sign_seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "accept_sign_seed": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+      "dial_box_private": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=",
+      "accept_box_private": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8=",
+      "dial_ephemeral_private": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8=",
+      "accept_ephemeral_private": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8=",
+      "hello": "AgEB4OHi4+Tl5ufo6err7O3u7ymsuuFBvMrwsi4alNNNC8c2HlJtC/4SyJeUvJMilm3XST6C/HRGSlkmiBdiPSBTxeuOLMSpiLT+4XnsawENUx0DoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuHmmMe7eG/nJjxIDLN6t0OegeTmPx4a4jMhG7ImvhaUa51bcDSvyLuF1hxMoWc9a7bYxu0WVUaWldSNO7LWfsZV7gHAFXI4Xh+NE+3ynkcj1o4yEpFfmk7AaDnoKNgEdAg==",
+      "ready": "YFpyXSpK3+6xop4X7dYhwbdZPujNvESsbEq24vgF0jxnXdV07XeJMQs9LnaB83kLRmx3OxUh/s82V3lYNx6lL+gFGuGcNASZ6kc6PrHCIeOcdR3G5NunpB9l4xi2ADDAHVkzL0vSbE1PyFn4FL/23v1R7fVkNxztBOT/jeSBvwM=",
+      "dial_plaintext": "ZnJvbSBkaWFsZXI=",
+      "accept_plaintext": "ZnJvbSByZXNwb25kZXI=",
+      "dial_frame": "AQAAAAAAAAATtK1OoogM7dq6m/Iu6ztmTPAyxNlroFggXuM=",
+      "accept_frame": "AQAAAAAAAACTEQ14D3fCKia00hQKp5A6Zauy8ycCk5HjxJApI1k="
+    },
+    {
+      "purpose": "rpc",
+      "channel_id": "4OHi4+Tl5ufo6err7O3u7w==",
+      "dial_sign_seed": "",
+      "accept_sign_seed": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+      "dial_box_private": "",
+      "accept_box_private": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8=",
+      "dial_ephemeral_private": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8=",
+      "accept_ephemeral_private": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8=",
+      "hello": "AgIA4OHi4+Tl5ufo6err7O3u7ymsuuFBvMrwsi4alNNNC8c2HlJtC/4SyJeUvJMilm3XST6C/HRGSlkmiBdiPSBTxeuOLMSpiLT+4XnsawENUx0=",
+      "ready": "YFpyXSpK3+6xop4X7dYhwbdZPujNvESsbEq24vgF0jzuZfjXFMyHBssDw0vh0sZdB/U2pb9tSeQMiMXDzaC7FZIjGt51doMeTbV782GKW+rAWcf2p026tvyyLRd9h1YN",
+      "dial_plaintext": "ZnJvbSBkaWFsZXI=",
+      "accept_plaintext": "ZnJvbSByZXNwb25kZXI=",
+      "dial_frame": "AQAAAAAAAABZYzPM8+IfFyoTKnA5S5Ydv8sC7dIHX2HrSK4=",
+      "accept_frame": "AQAAAAAAAAAaCfrjUdLf441yshYEW1UhZOa0Dv/ZmAczqq5IIHs="
+    }
+  ]
+}

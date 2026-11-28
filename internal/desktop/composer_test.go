@@ -2,8 +2,6 @@ package desktop
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
 	"image"
 	"image/png"
 	"slices"
@@ -14,6 +12,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -74,6 +73,41 @@ func TestComposerInput(t *testing.T) {
 			}
 			if name == "newline" && draftText(draft.Content) != "line\ntwo" {
 				t.Fatalf("draft=%q", draftText(draft.Content))
+			}
+		})
+	}
+}
+
+// TestComposerSendAfterCompletion 在补全写回草稿后、输入框重绘前按回车，验证实际发送的正文。
+func TestComposerSendAfterCompletion(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		mods ui.Modifiers
+	}{{"send", 0}, {"queue", ui.Cmd}} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDesktop()
+			client := &historyPageClient{}
+			d.client, d.window, d.readingReady = client, &mygo.Window{}, true
+			d.readingTarget = readingTarget{ConversationID: "c1", SessionID: "root"}
+			key := draftKey{d.serverID, "c1"}
+			draft := &conversationDraft{Content: replaceDraftText(nil, "/stat")}
+			d.drafts[key] = draft
+			tester := ui.NewTester(func(c *ui.Context) {
+				text := draftText(draft.Content)
+				d.composerInput(c, key, draft, &text)
+			}, 400, 100)
+			if err := tester.Click("消息输入"); err != nil {
+				t.Fatal(err)
+			}
+			completed, _ := insertSlashSkillAt("/stat", "status", 5)
+			draft.Content = replaceDraftText(draft.Content, completed)
+			tester.Key(tt.mods, ui.KeyEnter)
+			d.tasks.Wait()
+			if len(client.inputs) != 1 {
+				t.Fatalf("submitted %d inputs, want 1", len(client.inputs))
+			}
+			if got := draftText(client.inputs[0].Content); got != "/status " {
+				t.Fatalf("submitted %q, want %q", got, "/status ")
 			}
 		})
 	}
@@ -257,29 +291,7 @@ func TestComposerRecallPreviousMessage(t *testing.T) {
 	}
 }
 
-// TestShowImageFailure 检查添加图片失败时 toast 的标题按原因本地化，详情保留文件名和原文。
-func TestShowImageFailure(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		err  error
-		want string
-	}{
-		{"not an image", fmt.Errorf("%w: /tmp/a.txt", errNotImage), "只能添加图片"},
-		{"too large", fmt.Errorf("%w: /tmp/big.png", errImageTooLarge), "图片超过 10 MiB"},
-		{"mixed keeps the most specific", errors.Join(errors.New("decode failed"), fmt.Errorf("%w: /tmp/a.txt", errNotImage)), "只能添加图片"},
-		{"decode failure", errors.New("png: invalid format"), "无法读取图片"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			d := testDesktop()
-			d.showImageFailure(tt.err)
-			if len(d.pendingToasts) != 1 || d.pendingToasts[0].Title != tt.want || d.pendingToasts[0].Description != tt.err.Error() {
-				t.Fatalf("toasts=%+v want title %q", d.pendingToasts, tt.want)
-			}
-		})
-	}
-}
-
-// TestComposerToolbarOrder 检查输入区工具栏左侧是添加图片，右侧依次为上下文圆环、模型、推理强度、工作位置、压缩和发送；
+// TestComposerToolbarOrder 检查输入区工具栏左侧是添加附件，右侧依次为上下文圆环、模型、推理强度、工作位置、压缩和发送；
 // 模型没有推理档位时不显示推理强度，输入区窄于 480 时推理强度和工作位置收进「更多」。
 func TestComposerToolbarOrder(t *testing.T) {
 	// 1. 用真实对话绘制输入区，按可访问名称比较控件的水平位置。
@@ -292,9 +304,9 @@ func TestComposerToolbarOrder(t *testing.T) {
 		want    []string
 		missing []string
 	}{
-		{"reasoning", reasoningModels, 1600, []string{"添加图片", "上下文用量", "模型", "推理强度", "工作位置", "压缩上下文", "发送"}, []string{"更多"}},
-		{"no reasoning levels", plainModels, 1600, []string{"添加图片", "上下文用量", "模型", "工作位置", "压缩上下文", "发送"}, []string{"推理强度", "更多"}},
-		{"narrow folds into more", reasoningModels, 440, []string{"添加图片", "上下文用量", "模型", "更多", "压缩上下文", "发送"}, []string{"推理强度"}},
+		{"reasoning", reasoningModels, 1600, []string{"添加附件", "上下文用量", "模型", "推理强度", "工作位置", "压缩上下文", "发送"}, []string{"更多"}},
+		{"no reasoning levels", plainModels, 1600, []string{"添加附件", "上下文用量", "模型", "工作位置", "压缩上下文", "发送"}, []string{"推理强度", "更多"}},
+		{"narrow folds into more", reasoningModels, 440, []string{"添加附件", "上下文用量", "模型", "更多", "压缩上下文", "发送"}, []string{"推理强度"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			d := testDesktop()

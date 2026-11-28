@@ -4,6 +4,7 @@ import {
   ErrorCodeInvalidParams,
   ErrorCodeSessionBusy,
   ErrorCodeSessionNotFound,
+  type JSONRPCErrorData,
 } from "./api/protocol.gen"
 
 // 客户端自己产生的错误码：连接已断开，请求没有得到回复。serve 的错误码都是 -32xxx
@@ -13,11 +14,18 @@ export const rpcConnectionLostCode = -1
 export class RpcError extends Error {
   code: number
   method: string
-  constructor(code: number, message: string, method: string) {
+  data?: JSONRPCErrorData
+  constructor(
+    code: number,
+    message: string,
+    method: string,
+    data?: JSONRPCErrorData
+  ) {
     super(message)
     this.name = "RpcError"
     this.code = code
     this.method = method
+    this.data = data
   }
 }
 

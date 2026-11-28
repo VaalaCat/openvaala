@@ -9,24 +9,39 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/externalagent"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
+	"github.com/VaalaCat/openvaala/pkg/world"
 	"github.com/google/uuid"
 )
 
 // Client 是 OpenVaala 协议的客户端：保持一条 WebSocket 连接，断线后退避重连，并恢复已打开对话的订阅与续传。
 type Client interface {
+	GetWorldStatus(context.Context) (world.NodeStatus, error)
+	ListWorldPeers(context.Context) (world.ListPeersResult, error)
+	SendWorldMessage(context.Context, world.SendMessageRequest) (world.WorldMessage, error)
+	ForwardWorldConversation(context.Context, world.ForwardRequest) (world.WorldMessage, error)
+	ListWorldMessages(context.Context, world.ListMessagesParams) (world.MessagePage, error)
+	CancelWorldMessage(context.Context, string) (world.WorldMessage, error)
+	ListWorldThreads(context.Context, world.ListThreadsParams) (world.ThreadPage, error)
+	SubscribeWorld(context.Context) error
+	UnsubscribeWorld(context.Context) error
+	GetWorldSettings(context.Context) (runtimeprotocol.GetWorldResult, error)
+	SetWorldSettings(context.Context, runtimeprotocol.SetWorldParams) (runtimeprotocol.SetWorldResult, error)
 	// Run 连接并保持连接直到 ctx 结束；返回前关闭 Events。只能调用一次。
 	// 认证失败（ErrUnauthorized）与 initialize 被拒绝时返回错误，不再重连；其他断线按退避重连。
 	Run(ctx context.Context) error
@@ -45,10 +60,45 @@ type Client interface {
 	// SetRPCLogPaused 暂停或恢复采集；不停止业务连接和事件。
 	SetRPCLogPaused(ctx context.Context, paused bool) (err error)
 
+	// SpawnSession 提交子会话的首条输入。
+	SpawnSession(ctx context.Context, params *runtimeprotocol.SpawnSessionParams) (conversation.SpawnAgentResult, error)
+	// SendSession 向目标会话提交消息。
+	SendSession(ctx context.Context, params *runtimeprotocol.SendSessionParams) (runtimeprotocol.SendSessionResult, error)
+	// WaitSession 等待来源会话收到消息。
+	WaitSession(ctx context.Context, params *runtimeprotocol.WaitSessionParams) (conversation.WaitAgentResult, error)
+	// StopSession 中断目标会话当前轮。
+	StopSession(ctx context.Context, params *runtimeprotocol.StopSessionParams) (runtimeprotocol.StopSessionResult, error)
+	// UpdateSession 更新会话名称、标签或后台状态。
+	UpdateSession(ctx context.Context, params *runtimeprotocol.UpdateSessionParams) (runtimeprotocol.SessionResult, error)
+	// DetachSession 将会话转为独立对话。
+	DetachSession(ctx context.Context, params *runtimeprotocol.SessionParams) (runtimeprotocol.ConversationResult, error)
+	// ImportSession 按外部会话 ID 导入。
+	ImportSession(ctx context.Context, params *runtime.ImportSessionRequest) (runtimeprotocol.ConversationResult, error)
+	// ListExternalSessions 查询外部会话目录。
+	ListExternalSessions(ctx context.Context, params *runtime.ExternalSessionsRequest) (runtime.ExternalSessionsResult, error)
+	// GetAgentOptions 读取指定工作位置和选择下的 ACP 选项。
+	GetAgentOptions(ctx context.Context, params *runtime.AgentOptionsRequest) (defs.ExternalOptions, error)
+	// PreviewExternalSession 读取待导入会话的首末用户消息。
+	PreviewExternalSession(ctx context.Context, params *runtime.ExternalSessionRequest) (externalagent.ExternalSessionPreview, error)
+	// UploadAttachment 将文件上传到对话所属的 Executor。
+	UploadAttachment(ctx context.Context, params *runtimeprotocol.UploadAttachmentParams) (defs.FileRef, error)
+	// Exec 在选定 Executor 上执行命令。
+	Exec(ctx context.Context, params *runtime.ExecutorExecRequest) (runtime.ExecutorExecResult, error)
+	// CaptureTerminal 读取近期终端纯文本。
+	CaptureTerminal(ctx context.Context, params *runtimeprotocol.TerminalCaptureParams) (runtimeprotocol.TerminalCaptureResult, error)
+	// GetSkill 读取 Skill 正文。
+	GetSkill(ctx context.Context, params *runtimeprotocol.GetSkillParams) (runtimeprotocol.GetSkillResult, error)
+	// SubscribeSession 直接订阅单个会话。
+	SubscribeSession(ctx context.Context, params *runtimeprotocol.SessionParams) (runtimeprotocol.SubscribeSessionResult, error)
+	// ReloadSession 重载外部会话。
+	ReloadSession(ctx context.Context, params *runtimeprotocol.SessionParams) error
+	// SetSessionOption 设置外部会话选项。
+	SetSessionOption(ctx context.Context, params *runtimeprotocol.SetSessionOptionParams) error
+
 	// CreateConversation 新建对话；Model 为零值时使用 Agent 的默认模型。
 	CreateConversation(ctx context.Context, request *CreateConversationRequest) (defs.Conversation, error)
 	// ListModels 返回模型目录（不含连接参数）与 agentName 的默认模型；agentName 为空时不返回默认模型。
-	ListModels(ctx context.Context, agentName string) (runtime.ModelList, error)
+	ListModels(ctx context.Context, request *runtime.ListModelsRequest) (runtime.ModelList, error)
 	// GetSkills 返回已有对话或草稿 Agent 的 Skill 补全目录；草稿按请求的 Executor 设置查。
 	GetSkills(ctx context.Context, request *GetSkillsRequest) ([]skill.SkillInfo, error)
 	// GetHooks 调 hook/list，返回 serve 当前配置的全部 hook，按配置顺序；没有 hook 时返回空。
@@ -59,6 +109,18 @@ type Client interface {
 	GetWorkspaceDirectories(ctx context.Context, request *GetWorkspaceDirectoriesRequest) (directories *conversation.WorkspaceDirectories, err error)
 	// ListAgents 调 agent/list，返回配置里的全部 Agent 名、说明和默认模型，按配置顺序。
 	ListAgents(ctx context.Context) ([]runtime.AgentInfo, error)
+	// ListAgentPresets 读取 Agent 设置可用的 ACP 预设。
+	ListAgentPresets(ctx context.Context) ([]agent.AgentPreset, error)
+	// GetAgent 读取 Agent 的配置原文。
+	GetAgent(ctx context.Context, name string) (defs.AgentConfig, error)
+	// SetAgent 保存完整 Agent 配置。
+	SetAgent(ctx context.Context, definition defs.AgentConfig) (runtime.SetDefinitionsResult, error)
+	// DeleteAgent 删除 Agent 配置。
+	DeleteAgent(ctx context.Context, name string) (runtime.SetDefinitionsResult, error)
+	// ListConversationExecutors 返回对话的执行环境和默认项。
+	ListConversationExecutors(ctx context.Context, params *runtimeprotocol.ListExecutorsParams) (runtimeprotocol.ListExecutorsResult, error)
+	// CallExecutorTool 调用来源会话的执行工具。
+	CallExecutorTool(ctx context.Context, params *runtimeprotocol.CallExecutorToolParams) (defs.ToolResult, error)
 	// ListExecutors 调 executor/list，返回全部 Executor 和它们的默认根目录。
 	ListExecutors(ctx context.Context) ([]conversation.ExecutorDetails, error)
 	// ListMCPServers 调 mcpServer/list，返回已打开的对话里各 Executor 上的 MCP 连接情况，读取不等待连接；
@@ -92,6 +154,8 @@ type Client interface {
 	// WriteTerminal 发出 terminal/input 通知，把键盘或粘贴的字节原样写进终端；写出后返回，不等待 serve 处理。
 	// 当前没有已连接的连接时立即返回 ErrConnectionLost，不等重连。
 	WriteTerminal(terminalID string, data []byte) (err error)
+	// SendTerminalInput 等待 serve 将输入写进终端。
+	SendTerminalInput(ctx context.Context, terminalID string, data []byte) error
 	// ResizeTerminal 发出 terminal/resize 通知，修改终端的行列数；送达规则同 WriteTerminal。
 	ResizeTerminal(terminalID string, rows, cols uint16) (err error)
 	// ListProviders 调 provider/list，返回 serve 配置里的全部 Provider（带 API key 原文）和模型配置的默认模型：models.default_model，
@@ -147,6 +211,8 @@ type Client interface {
 	GetSessionByID(ctx context.Context, sessionID defs.SessionID) (defs.Session, error)
 	// ListSessions 调 session/list，分页列出对话内的 Session 记录。
 	ListSessions(ctx context.Context, request *ListSessionsRequest) (ListSessionsResult, error)
+	// ReadSessionHistory 读取后代的本地历史。
+	ReadSessionHistory(ctx context.Context, params *runtimeprotocol.ReadSessionHistoryParams) (runtimeprotocol.ListItemsResult, error)
 	// ListItems 调 session/items/list，分页读取一个 Session 的日志。
 	ListItems(ctx context.Context, request *ListItemsRequest) (ListItemsResult, error)
 	// ListTurns 调 session/turns/list，按 TurnID 分页列出一个 Session 的 Turn。
@@ -187,7 +253,8 @@ type Client interface {
 
 // clientImpl 的连接和打开的对话只由 Run 的事件循环读写，调用方取连接、打开对话的请求和后台任务的结果都经 loopInputs 交给它。
 type clientImpl struct {
-	opt ClientOpt
+	peerDialer world.PeerDialer
+	opt        ClientOpt
 	// rpcSamples 只接收尽力采集的调试帧，队列拥塞只增加丢帧计数；网络任务不等待消费。
 	rpcSamples  chan RPCFrame
 	rpcDropped  atomic.Uint64
@@ -243,7 +310,9 @@ type openedConversation struct {
 	// sessionID 是跟随的 Session：打开请求指定的 SessionID，请求为空时首次同步完成后是对话记录里的根 Session。
 	sessionID defs.SessionID
 	// skipHistory 首次同步是否跳过已保存的历史？首次同步完成后置为 false。
-	skipHistory bool
+	skipHistory    bool
+	waitForHistory bool
+	restoring      bool
 	// lastSavedOrdinal 是跟随的 Session 已交付的最后流水号，重连后从它之后补齐。
 	lastSavedOrdinal storage.Ordinal
 	// isSyncing 同步任务是否还没完成？没完成时收到的通知暂存在 pendingNotifications。
@@ -258,6 +327,8 @@ type openedConversation struct {
 
 // ClientOpt 保存连接地址与 token，构造后只读。
 type ClientOpt struct {
+	// WorldTarget 是从远程访问链接解析出的节点。
+	WorldTarget *world.RemoteAccessTarget
 	// URL 是 OpenVaala 协议的 WebSocket 地址，例如 ws://127.0.0.1:8790/api/v1/openvaala。
 	URL string
 	// Token 非空时以 Authorization: Bearer 携带；URL 自带 ?token= 时可为空。
@@ -310,6 +381,16 @@ func NewClient(opt *ClientOpt) (Client, error) {
 		loopInputs:  make(chan clientLoopInput),
 		started:     make(chan struct{}, 1),
 		stopped:     make(chan struct{}),
+	}
+	if opt.WorldTarget == nil && strings.Contains(opt.URL, "#world=") {
+		target, err := world.ParseRemoteAccessURL(opt.URL)
+		if err != nil {
+			return nil, err
+		}
+		c.opt.WorldTarget = &target
+	}
+	if t := c.opt.WorldTarget; t != nil && t.Token != "" {
+		c.opt.Token = t.Token
 	}
 	c.runningSubscription = newGlobalSubscription(c, globalSubscriptionOpt[runtime.RunningConversations]{
 		SubscribeMethod:   "conversation/running/subscribe",
@@ -434,6 +515,10 @@ func (c *clientImpl) handleLoopInput(ctx context.Context, input clientLoopInput)
 		c.handleConnectionLost(ctx, input)
 	case *notificationReceived:
 		c.handleNotificationReceived(ctx, input)
+	case *conversationSubscriptionsRemoved:
+		if open := c.openedConversation; open != nil && open.syncGeneration == input.generation {
+			open.pendingNotifications = nil
+		}
 	case *syncFinished:
 		c.handleSyncFinished(ctx, input)
 	default:
@@ -448,6 +533,7 @@ func (c *clientImpl) CreateConversation(ctx context.Context, request *CreateConv
 	var result runtimeprotocol.ConversationResult
 	err := c.call(ctx, "conversation/create", &runtimeprotocol.CreateConversationParams{
 		AgentName:        request.AgentName,
+		InitialOptions:   request.InitialOptions,
 		Model:            request.Model,
 		ExecutorSettings: request.ExecutorSettings,
 		Environment:      request.Environment,
@@ -458,10 +544,10 @@ func (c *clientImpl) CreateConversation(ctx context.Context, request *CreateConv
 }
 
 // ListModels 读取模型目录和 Agent 的默认模型。
-func (c *clientImpl) ListModels(ctx context.Context, agentName string) (runtime.ModelList, error) {
+func (c *clientImpl) ListModels(ctx context.Context, request *runtime.ListModelsRequest) (runtime.ModelList, error) {
 	// 1. 请求模型列表并返回解码结果。
 	var result runtime.ModelList
-	err := c.call(ctx, "model/list", map[string]any{"agent_name": agentName}, &result)
+	err := c.call(ctx, "model/list", request, &result)
 	return result, err
 }
 
@@ -505,6 +591,35 @@ func (c *clientImpl) ListAgents(ctx context.Context) ([]runtime.AgentInfo, error
 	var result runtimeprotocol.ListAgentsResult
 	err := c.call(ctx, "agent/list", nil, &result)
 	return result.Agents, err
+}
+
+// ListAgentPresets 读取 Agent 设置可用的 ACP 预设。
+func (c *clientImpl) ListAgentPresets(ctx context.Context) ([]agent.AgentPreset, error) {
+	var result runtimeprotocol.ListAgentPresetsResult
+	err := c.call(ctx, "catalog/agents/list", nil, &result)
+	return result.Presets, err
+}
+
+func (c *clientImpl) GetAgent(ctx context.Context, name string) (defs.AgentConfig, error) {
+	return callResult[defs.AgentConfig](ctx, c, "agent/get", &runtimeprotocol.AgentNameParams{Name: name})
+}
+
+func (c *clientImpl) SetAgent(ctx context.Context, definition defs.AgentConfig) (runtime.SetDefinitionsResult, error) {
+	return callResult[runtime.SetDefinitionsResult](ctx, c, "agent/set", &runtimeprotocol.SetAgentParams{Definition: definition})
+}
+
+func (c *clientImpl) DeleteAgent(ctx context.Context, name string) (runtime.SetDefinitionsResult, error) {
+	return callResult[runtime.SetDefinitionsResult](ctx, c, "agent/delete", &runtimeprotocol.AgentNameParams{Name: name})
+}
+
+// ListConversationExecutors 读取对话中已装配的执行环境及其默认项。
+func (c *clientImpl) ListConversationExecutors(ctx context.Context, params *runtimeprotocol.ListExecutorsParams) (runtimeprotocol.ListExecutorsResult, error) {
+	return callResult[runtimeprotocol.ListExecutorsResult](ctx, c, "executor/list", params)
+}
+
+// CallExecutorTool 调用来源会话的执行工具。
+func (c *clientImpl) CallExecutorTool(ctx context.Context, params *runtimeprotocol.CallExecutorToolParams) (defs.ToolResult, error) {
+	return callResult[defs.ToolResult](ctx, c, "executor/tool", params)
 }
 
 // ListExecutors 读取全部 Executor 及其默认根目录。
@@ -604,6 +719,11 @@ func (c *clientImpl) WriteTerminal(terminalID string, data []byte) error {
 		TerminalID: terminalID,
 		Data:       data,
 	})
+}
+
+// SendTerminalInput 请求写入终端并等待 serve 响应。
+func (c *clientImpl) SendTerminalInput(ctx context.Context, terminalID string, data []byte) error {
+	return c.call(ctx, "terminal/input", &runtimeprotocol.TerminalInputParams{TerminalID: terminalID, Data: data}, nil)
 }
 
 // ResizeTerminal 把新的行列数告知 serve 上的终端。
@@ -787,6 +907,7 @@ func (c *clientImpl) ForkConversation(ctx context.Context, request *ForkConversa
 	// 1. 提交来源、截取点、模型、Executor 和环境变量设置，以及是否临时，返回新对话。
 	var result runtimeprotocol.ConversationResult
 	err := c.call(ctx, "conversation/fork", &runtimeprotocol.ForkConversationParams{
+		SourceSessionID:  request.SourceSessionID,
 		ConversationID:   request.ConversationID,
 		BeforeTurnID:     request.BeforeTurnID,
 		LastTurnID:       request.LastTurnID,
@@ -833,15 +954,23 @@ func (c *clientImpl) ListSessions(ctx context.Context, request *ListSessionsRequ
 	// 1. 提交分页条件，返回 Session 记录和下一页游标。
 	var result runtimeprotocol.ListSessionsResult
 	err := c.call(ctx, "session/list", &runtimeprotocol.ListSessionsParams{
-		ConversationID: request.ConversationID,
-		Order:          request.Order,
-		Cursor:         request.Cursor,
-		Limit:          request.Limit,
+		ConversationID:  request.ConversationID,
+		Filter:          request.Filter,
+		SourceSessionID: request.SourceSessionID,
+		Order:           request.Order,
+		Cursor:          request.Cursor,
+		Limit:           request.Limit,
 	}, &result)
 	return ListSessionsResult{
-		Sessions:   result.Sessions,
+		Sessions:      result.Sessions,
+		AppliedFilter: result.AppliedFilter, TotalMatched: result.TotalMatched, Truncated: result.Truncated, Hint: result.Hint,
 		NextCursor: result.NextCursor,
 	}, err
+}
+
+// ReadSessionHistory 读取后代在 fork 之后的本地历史。
+func (c *clientImpl) ReadSessionHistory(ctx context.Context, params *runtimeprotocol.ReadSessionHistoryParams) (runtimeprotocol.ListItemsResult, error) {
+	return callResult[runtimeprotocol.ListItemsResult](ctx, c, "session/history", params)
 }
 
 // ListItems 分页读取 Session 日志。
@@ -983,6 +1112,13 @@ func (c *clientImpl) call(ctx context.Context, method string, params any, result
 	return connection.call(ctx, method, params, result)
 }
 
+// callResult 返回已解码的 RPC 结果和调用错误。
+func callResult[T any](ctx context.Context, c *clientImpl, method string, params any) (T, error) {
+	var result T
+	err := c.call(ctx, method, params, &result)
+	return result, err
+}
+
 // notify 在已连接的连接上写出通知。
 func (c *clientImpl) notify(ctx context.Context, method string, params any) error {
 	// 1. 请求可用连接，不等待重连，未连接时返回 ErrConnectionLost。
@@ -1064,21 +1200,29 @@ func (c *clientImpl) startConnecting(ctx context.Context, delay time.Duration) {
 	connectionNumber := c.connectionNumber
 	// 2. 拨号和初始化在任务中执行，结果交回循环。
 	c.tasks.Go(func() {
-		connection, serverID, err := c.connect(ctx, connectionNumber)
+		connection, result, err := c.connect(ctx, connectionNumber)
 		if err != nil {
 			c.sendFromTask(ctx, &connectionFailed{err: err})
 			return
 		}
-		c.sendFromTask(ctx, &connectionReady{connection: connection, serverID: serverID})
+		c.sendFromTask(ctx, &connectionReady{connection: connection, InitializeResult: *result})
 	})
 }
 
-// connect 建立并初始化连接，返回连接和服务端 ID。
-func (c *clientImpl) connect(ctx context.Context, connectionNumber uint64) (*clientConnection, string, error) {
+// connect 建立并初始化连接，返回连接和服务端身份。
+func (c *clientImpl) connect(ctx context.Context, connectionNumber uint64) (*clientConnection, *runtimeprotocol.InitializeResult, error) {
 	// 1. 使用地址和 token 拨号。
-	conn, err := dialConnection(ctx, c.opt.URL, c.opt.Token)
+	conn, err := c.dialConnection(ctx, c.opt.URL, c.opt.Token, c.opt.WorldTarget)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
+	}
+	initializeCtx, stopInitialize := context.WithTimeout(ctx, dialTimeout)
+	defer stopInitialize()
+	if c.opt.WorldTarget != nil {
+		if err := authenticateWorldRPC(initializeCtx, conn, c.opt.Token); err != nil {
+			conn.Close()
+			return nil, nil, err
+		}
 	}
 	// 2. 创建连接读循环，结束后交付连接断开事件。
 	connection := newClientConnection(conn, c.loopInputs)
@@ -1096,21 +1240,19 @@ func (c *clientImpl) connect(ctx context.Context, connectionNumber uint64) (*cli
 	})
 	// 3. 发送 initialize；服务端拒绝时返回 ErrInitializeRejected，其他错误原样返回。
 	var result runtimeprotocol.InitializeResult
-	initializeCtx, stopInitialize := context.WithTimeout(ctx, dialTimeout)
-	defer stopInitialize()
 	err = connection.call(initializeCtx, runtimeprotocol.InitializeMethod, &runtimeprotocol.InitializeParams{
 		ClientInfo:      runtimeprotocol.ClientInfo{Name: "openvaala-tui"},
 		ProtocolVersion: runtimeprotocol.ProtocolVersion,
 	}, &result)
 	if err != nil {
-		_ = conn.CloseNow()
+		_ = conn.Close()
 		var protocolErr *ResponseError
 		if errors.As(err, &protocolErr) {
-			return nil, "", fmt.Errorf("%w: %w", ErrInitializeRejected, err)
+			return nil, nil, fmt.Errorf("%w: %w", ErrInitializeRejected, err)
 		}
-		return nil, "", err
+		return nil, nil, err
 	}
-	return connection, result.ServerID, nil
+	return connection, &result, nil
 }
 
 // handleConnectionRequested 回复可用连接，或登记等待重连的调用。
@@ -1139,8 +1281,9 @@ func (c *clientImpl) handleConnectionReady(ctx context.Context, input *connectio
 	// 2. 保存连接，交付连接成功事件并回复等待的调用。
 	c.connection = input.connection
 	c.emit(ctx, &ConnectionChanged{
-		State:    ConnectionConnected,
-		ServerID: input.serverID,
+		State:      ConnectionConnected,
+		ServerID:   input.ServerID,
+		ServerInfo: input.ServerInfo,
 	})
 	for _, waiter := range c.connectionWaiters {
 		waiter <- c.connection
@@ -1210,11 +1353,12 @@ func (c *clientImpl) handleConversationOpenRequested(ctx context.Context, input 
 	}
 	// 3. 保存新对话的跟随设置和响应通道。
 	c.openedConversation = &openedConversation{
-		id:          input.request.ConversationID,
-		environment: slices.Clone(input.request.Environment),
-		sessionID:   input.request.SessionID,
-		skipHistory: input.request.SkipHistory,
-		openReply:   input.reply,
+		id:             input.request.ConversationID,
+		environment:    slices.Clone(input.request.Environment),
+		sessionID:      input.request.SessionID,
+		skipHistory:    input.request.SkipHistory,
+		waitForHistory: input.request.WaitForHistory,
+		openReply:      input.reply,
 	}
 	// 4. 已连接时启动同步并退订原对话。
 	if c.connection != nil {
@@ -1237,7 +1381,13 @@ func (c *clientImpl) startSync(ctx context.Context, previous *openedConversation
 	open.syncGeneration = c.syncGeneration
 	open.pendingNotifications = nil
 	generation, connection, conversationID, fromOrdinal := c.syncGeneration, c.connection, open.id, open.lastSavedOrdinal
-	environment, sessionID, skipHistory := open.environment, open.sessionID, open.skipHistory
+	request := OpenConversationRequest{
+		ConversationID: conversationID,
+		SessionID:      open.sessionID,
+		Environment:    open.environment,
+		SkipHistory:    open.skipHistory,
+		WaitForHistory: open.waitForHistory,
+	}
 	// 3. 记录要退订的原对话，启动同步任务并交付结果。
 	var previousTarget *syncTarget
 	if previous != nil && previous.sessionID != "" {
@@ -1247,7 +1397,7 @@ func (c *clientImpl) startSync(ctx context.Context, previous *openedConversation
 		}
 	}
 	c.tasks.Go(func() {
-		result, err := syncConversation(syncCtx, connection, previousTarget, conversationID, sessionID, environment, fromOrdinal, skipHistory)
+		result, err := c.syncConversation(syncCtx, connection, previousTarget, request, fromOrdinal, generation)
 		c.sendFromTask(ctx, &syncFinished{
 			generation: generation,
 			result:     result,
@@ -1282,7 +1432,7 @@ func (c *clientImpl) handleSyncFinished(ctx context.Context, input *syncFinished
 			})
 		default:
 			if c.connection != nil {
-				_ = c.connection.conn.CloseNow()
+				_ = c.connection.conn.Close()
 			}
 			return
 		}
@@ -1293,32 +1443,50 @@ func (c *clientImpl) handleSyncFinished(ctx context.Context, input *syncFinished
 	// 3. 保存同步位置和跟随 Session，清零失败次数，交付对话与 Session 记录。
 	result := input.result
 	open.sessionID = result.sessionID
-	open.skipHistory = false
-	open.lastSavedOrdinal = result.lastSavedOrdinal
+	snapshot := result.snapshot
+	open.restoring = result.historyAction == HistoryWait
+	if !open.restoring {
+		open.lastSavedOrdinal = snapshot.LastSavedOrdinal
+	}
 	open.isSyncing = false
 	c.failedConnectAttempts = 0
-	c.emit(ctx, &ConversationSynced{
-		ConversationID: open.id,
-		Conversation:   result.conversation,
-		SessionInfos:   result.sessionInfos,
-	})
-	c.emit(ctx, &SessionSynced{
-		SessionID:        result.sessionID,
-		ConversationID:   open.id,
-		Items:            result.items,
-		StreamingItems:   result.streamingItems,
-		PendingInputs:    result.pendingInputs,
-		LastSavedOrdinal: result.lastSavedOrdinal,
-	})
-	// 4. 回复首次打开请求，再按到达顺序交付暂存通知。
-	if open.openReply != nil {
-		open.openReply <- conversationOpenResult{conversation: result.conversation}
-		open.openReply = nil
+	if !open.waitForHistory || !open.restoring {
+		c.emit(ctx, &ConversationSynced{
+			ConversationID: open.id,
+			Conversation:   result.conversation,
+			SessionInfos:   result.sessionInfos,
+		})
+		c.emit(ctx, &SessionSynced{
+			SessionID:        result.sessionID,
+			ConversationID:   open.id,
+			Items:            result.items,
+			StreamingItems:   snapshot.StreamingItems,
+			PendingInputs:    snapshot.PendingInputs,
+			LastSavedOrdinal: snapshot.LastSavedOrdinal,
+			HistoryAction:    result.historyAction,
+			Restoring:        open.restoring,
+			External:         result.historyAction != HistoryAppend,
+			Options:          snapshot.Options,
+			Capabilities:     snapshot.Capabilities,
+			Commands:         snapshot.Commands,
+		})
+		if result.historyAction == HistoryAppend {
+			open.skipHistory = false
+		}
+		open.waitForHistory = false
+		if open.openReply != nil {
+			open.openReply <- conversationOpenResult{conversation: result.conversation}
+			open.openReply = nil
+		}
 	}
+	// 4. 交付暂存通知，服务端主动关闭的新订阅在同步之后重建。
 	pending := open.pendingNotifications
 	open.pendingNotifications = nil
 	for _, notification := range pending {
 		c.deliverNotification(ctx, open, notification)
+		if open.isSyncing || c.openedConversation == nil {
+			break
+		}
 	}
 }
 
@@ -1326,6 +1494,15 @@ func (c *clientImpl) handleSyncFinished(ctx context.Context, input *syncFinished
 func (c *clientImpl) handleNotificationReceived(ctx context.Context, input *notificationReceived) {
 	// 1. 忽略旧连接通知，解码当前连接消息。
 	if input.connection != c.connection {
+		return
+	}
+	if input.message.Method == "world/messageUpdated" {
+		var update world.NodeNotification
+		if err := json.Unmarshal(input.message.Params, &update); err != nil {
+			telemetry.GetLogger(ctx).Warn("notification dropped", "rpc.method", input.message.Method, "error", err)
+			return
+		}
+		c.emit(ctx, &WorldMessageUpdated{Notification: update})
 		return
 	}
 	notification := &receivedNotification{method: input.message.Method}
@@ -1376,18 +1553,22 @@ func (c *clientImpl) handleNotificationReceived(ctx context.Context, input *noti
 		c.terminalsSubscription.handleNotification(ctx, notification.method, input.message.Params)
 		return
 	}
-	// 4. 忽略其他对话通知；同步期间暂存通知，旧订阅关闭时删除这个订阅暂存的通知。
+	// 4. 忽略其他对话通知，同步期间按接收顺序暂存通知。
 	open := c.openedConversation
+	if open == nil && notification.params.Subscription == "session" {
+		params := notification.params
+		switch notification.method {
+		case "subscription/closed":
+			c.emit(ctx, &SessionSubscriptionClosed{SessionID: params.SessionID, Reason: params.Reason})
+		default:
+			c.deliverContentNotification(ctx, notification, nil)
+		}
+		return
+	}
 	if open == nil || notification.params.ConversationID != open.id {
 		return
 	}
 	if open.isSyncing {
-		if notification.method == "subscription/closed" {
-			open.pendingNotifications = slices.DeleteFunc(open.pendingNotifications, func(pending *receivedNotification) bool {
-				return pending.params.Subscription == notification.params.Subscription
-			})
-			return
-		}
 		open.pendingNotifications = append(open.pendingNotifications, notification)
 		return
 	}
@@ -1399,28 +1580,41 @@ func (c *clientImpl) handleNotificationReceived(ctx context.Context, input *noti
 func (c *clientImpl) deliverNotification(ctx context.Context, open *openedConversation, notification *receivedNotification) {
 	// 1. 订阅被关闭时重新同步。
 	if notification.method == "subscription/closed" {
+		p := notification.params
+		if p.Subscription == "session" && p.SessionID != open.sessionID {
+			return
+		}
+		if open.restoring && p.Subscription == "session" && p.Reason != runtime.ErrSessionHistoryRestored.Error() {
+			err := &serverRuntimeError{message: p.Reason, sentinel: ErrExternalSessionRestore}
+			if open.openReply != nil {
+				open.openReply <- conversationOpenResult{err: err}
+			} else {
+				c.emit(ctx, &ConversationSyncFailed{ConversationID: open.id, Err: err})
+			}
+			c.openedConversation = nil
+			return
+		}
 		c.startSync(ctx, nil)
 		return
 	}
 	// 2. 按 Session 或对话订阅分派通知。
 	switch notification.params.Subscription {
 	case "session":
-		c.deliverContentNotification(ctx, open, notification)
+		if notification.params.SessionID == open.sessionID {
+			c.deliverContentNotification(ctx, notification, &open.lastSavedOrdinal)
+		}
 	case "conversation":
 		c.deliverStatusNotification(ctx, open, notification)
 	}
 }
 
 // deliverContentNotification 将跟随 Session 的内容通知转换为客户端事件。
-func (c *clientImpl) deliverContentNotification(ctx context.Context, open *openedConversation, notification *receivedNotification) {
+func (c *clientImpl) deliverContentNotification(ctx context.Context, notification *receivedNotification, lastSavedOrdinal *storage.Ordinal) {
 	// 1. 将 Item 开始、增量、完成和中断通知转为 ItemChanged。
 	params := notification.params
-	if params.SessionID != open.sessionID {
-		return
-	}
 	if eventType, found := itemEventTypes[notification.method]; found {
 		c.emit(ctx, &ItemChanged{SessionID: params.SessionID,
-			ConversationID: open.id,
+			ConversationID: params.ConversationID,
 			Type:           eventType,
 			TurnID:         params.TurnID,
 			ItemIndex:      params.ItemIndex,
@@ -1431,19 +1625,27 @@ func (c *clientImpl) deliverContentNotification(ctx context.Context, open *opene
 	}
 	// 2. 交付未发送过的已保存 Item、工具进度、hook 和 Turn 事件。
 	switch notification.method {
+	case "session/externalStateUpdated":
+		c.emit(ctx, &SessionExternalStateChanged{
+			NotificationTarget: runtimeprotocol.NotificationTarget{Subscription: runtimeprotocol.SubscriptionKindSession, ConversationID: params.ConversationID, SessionID: params.SessionID},
+			Options:            params.Options, Capabilities: params.Capabilities, Commands: params.Commands,
+		})
 	case "session/pendingInputsUpdated":
-		c.emit(ctx, &SessionPendingInputsChanged{SessionID: params.SessionID, ConversationID: open.id, PendingInputs: params.PendingInputs})
+		c.emit(ctx, &SessionPendingInputsChanged{SessionID: params.SessionID, ConversationID: params.ConversationID, PendingInputs: params.PendingInputs})
 	case "items/saved":
-		var items []runtimeprotocol.LoggedItem
-		for _, logged := range params.Items {
-			if logged.Ordinal > open.lastSavedOrdinal {
-				items = append(items, logged)
-				open.lastSavedOrdinal = logged.Ordinal
+		items := params.Items
+		if lastSavedOrdinal != nil {
+			items = nil
+			for _, logged := range params.Items {
+				if logged.Ordinal > *lastSavedOrdinal {
+					items = append(items, logged)
+					*lastSavedOrdinal = logged.Ordinal
+				}
 			}
 		}
 		if len(items) > 0 {
 			c.emit(ctx, &ItemsSaved{SessionID: params.SessionID,
-				ConversationID: open.id,
+				ConversationID: params.ConversationID,
 				TurnID:         params.TurnID,
 				Items:          items,
 			})
@@ -1451,7 +1653,7 @@ func (c *clientImpl) deliverContentNotification(ctx context.Context, open *opene
 	case "item/toolProgress":
 		if params.ToolProgress != nil {
 			c.emit(ctx, &ToolProgress{SessionID: params.SessionID,
-				ConversationID: open.id,
+				ConversationID: params.ConversationID,
 				TurnID:         params.TurnID,
 				ItemIndex:      params.ItemIndex,
 				Progress:       *params.ToolProgress,
@@ -1460,19 +1662,19 @@ func (c *clientImpl) deliverContentNotification(ctx context.Context, open *opene
 	case "hook/started", "hook/completed":
 		if params.HookRun != nil {
 			c.emit(ctx, &HookRunChanged{SessionID: params.SessionID,
-				ConversationID: open.id,
+				ConversationID: params.ConversationID,
 				TurnID:         params.TurnID,
 				Run:            params.HookRun,
 			})
 		}
 	case "turn/started":
 		c.emit(ctx, &TurnStarted{SessionID: params.SessionID,
-			ConversationID: open.id,
+			ConversationID: params.ConversationID,
 			TurnID:         params.TurnID,
 		})
 	case "turn/finished":
 		c.emit(ctx, &TurnFinished{SessionID: params.SessionID,
-			ConversationID: open.id,
+			ConversationID: params.ConversationID,
 			TurnID:         params.TurnID,
 			Status:         params.Status,
 			InputItemIDs:   params.InputItemIDs,
@@ -1507,15 +1709,13 @@ type syncTarget struct {
 }
 
 // syncConversation 打开对话，重建订阅，补齐日志并返回同步结果。
-func syncConversation(
+func (c *clientImpl) syncConversation(
 	ctx context.Context,
 	connection *clientConnection,
 	previous *syncTarget,
-	conversationID defs.ConversationID,
-	sessionID defs.SessionID,
-	environment []string,
+	request OpenConversationRequest,
 	fromOrdinal storage.Ordinal,
-	skipHistory bool,
+	generation int,
 ) (*syncResult, error) {
 	// 1. 退订原对话的状态和 Session 内容。
 	if previous != nil {
@@ -1524,10 +1724,11 @@ func syncConversation(
 		}
 	}
 	// 2. 使用请求环境变量打开对话。
+	conversationID := request.ConversationID
 	var read runtimeprotocol.ConversationResult
 	openParams := &runtimeprotocol.OpenConversationParams{
 		ConversationID: conversationID,
-		Environment:    environment,
+		Environment:    request.Environment,
 	}
 	if err := connection.call(ctx, "conversation/open", openParams, &read); err != nil {
 		return nil, err
@@ -1535,39 +1736,54 @@ func syncConversation(
 	// 3. 选择跟随的 Session，退订它的旧订阅并重新订阅对话状态；标题用订阅登记时的值。
 	target := &syncTarget{
 		conversationID: conversationID,
-		sessionID:      cmp.Or(sessionID, read.Conversation.RootSessionID),
+		sessionID:      cmp.Or(request.SessionID, read.Conversation.RootSessionID),
 	}
 	if err := unsubscribeConversation(ctx, connection, target); err != nil {
 		return nil, err
 	}
+	// 服务端在退订响应前发完旧通知。清理分界之后的通知都属于新订阅，包括紧邻快照的关闭。
+	c.sendFromTask(ctx, &conversationSubscriptionsRemoved{generation: generation})
 	var status runtimeprotocol.SubscribeConversationResult
 	if err := connection.call(ctx, "conversation/subscribe", map[string]any{"conversation_id": conversationID}, &status); err != nil {
 		return nil, err
 	}
 	read.Conversation.Title = status.Title
-	// 4. 订阅 Session 内容，取得已保存位置和生成中 Item。
-	var content runtimeprotocol.SubscribeSessionResult
+	// 4. 对话订阅已给出会话类型。外部会话在首份内容快照之前被拒绝，也应把恢复失败交给打开请求。
+	result := &syncResult{conversation: read.Conversation, sessionID: target.sessionID, sessionInfos: status.Sessions}
+	if slices.ContainsFunc(status.Sessions, func(info runtime.SessionRuntimeInfo) bool {
+		return info.Session.ID == target.sessionID && info.Session.External != nil
+	}) {
+		result.historyAction = HistoryReplace
+	}
 	sessionParams := map[string]any{"conversation_id": conversationID, "session_id": target.sessionID}
-	if err := connection.call(ctx, "session/subscribe", sessionParams, &content); err != nil {
+	if err := connection.call(ctx, "session/subscribe", sessionParams, &result.snapshot); err != nil {
+		var rpcErr *ResponseError
+		if result.historyAction == HistoryReplace && errors.As(err, &rpcErr) && !errors.Is(rpcErr, ErrExternalSessionRestore) {
+			err = fmt.Errorf("%w: %w", ErrExternalSessionRestore, err)
+		}
 		return nil, err
 	}
-	// 5. SkipHistory 为 true 时将起点改为订阅末尾，不补历史；否则补齐指定位置之后的日志，再返回对话、Session 状态和内容。
-	if skipHistory {
-		fromOrdinal = content.LastSavedOrdinal
+	// 5. 恢复中的快照立即交付。就绪后，外部会话从新库取最近一页，编辑器首次完整回放按订阅末尾分页。
+	content := result.snapshot
+	if content.Restoring {
+		result.historyAction = HistoryWait
+		return result, nil
 	}
-	items, err := listItemsBetween(ctx, connection, target, fromOrdinal, content.LastSavedOrdinal)
-	if err != nil {
-		return nil, err
+	if request.SkipHistory || content.LastSavedOrdinal == 0 {
+		return result, nil
 	}
-	return &syncResult{
-		conversation:     read.Conversation,
-		sessionID:        target.sessionID,
-		sessionInfos:     status.Sessions,
-		items:            items,
-		streamingItems:   content.StreamingItems,
-		pendingInputs:    content.PendingInputs,
-		lastSavedOrdinal: content.LastSavedOrdinal,
-	}, nil
+	limit := historyPageSize
+	if result.historyAction == HistoryReplace {
+		fromOrdinal = 0
+		if !request.WaitForHistory {
+			// 外部库中每个 Item 占一个连续序号，以快照末尾为界取最近 50 条。
+			limit = 50
+			fromOrdinal = content.LastSavedOrdinal - min(content.LastSavedOrdinal, storage.Ordinal(limit))
+		}
+	}
+	var err error
+	result.items, err = listItemsBetween(ctx, connection, target, fromOrdinal, content.LastSavedOrdinal, limit)
+	return result, err
 }
 
 // unsubscribeConversation 退订对话状态和跟随的 Session 内容。
@@ -1582,7 +1798,7 @@ func unsubscribeConversation(ctx context.Context, connection *clientConnection, 
 }
 
 // listItemsBetween 按流水号正序读取 from 之后、到 to 为止的 Session 日志。
-func listItemsBetween(ctx context.Context, connection *clientConnection, target *syncTarget, from, to storage.Ordinal) ([]runtimeprotocol.LoggedItem, error) {
+func listItemsBetween(ctx context.Context, connection *clientConnection, target *syncTarget, from, to storage.Ordinal, limit int) ([]runtimeprotocol.LoggedItem, error) {
 	// 1. 从起点之后分页读取日志。
 	items := []runtimeprotocol.LoggedItem{}
 	for cursor := from; cursor < to; {
@@ -1591,7 +1807,7 @@ func listItemsBetween(ctx context.Context, connection *clientConnection, target 
 			"conversation_id": target.conversationID,
 			"session_id":      target.sessionID,
 			"cursor":          cursor,
-			"limit":           historyPageSize,
+			"limit":           limit,
 		}
 		if err := connection.call(ctx, "session/items/list", params, &page); err != nil {
 			return nil, err
@@ -1618,6 +1834,7 @@ func (c *clientImpl) GetSkills(ctx context.Context, request *GetSkillsRequest) (
 	err := c.call(ctx, "skill/list", &runtimeprotocol.ListSkillsParams{
 		ConversationID:   request.ConversationID,
 		AgentName:        request.AgentName,
+		Query:            request.Query,
 		ExecutorSettings: request.ExecutorSettings,
 	}, &result)
 	return result, err
@@ -1692,4 +1909,132 @@ func (c *clientImpl) SubscribeRunningConversations(ctx context.Context) error {
 func (c *clientImpl) SubscribeTerminals(ctx context.Context) error {
 	// 1. 交给运行中终端的订阅登记。
 	return c.terminalsSubscription.subscribe(ctx)
+}
+
+// SpawnSession 提交子会话的首条输入。
+func (c *clientImpl) SpawnSession(ctx context.Context, params *runtimeprotocol.SpawnSessionParams) (conversation.SpawnAgentResult, error) {
+	return callResult[conversation.SpawnAgentResult](ctx, c, "session/spawn", params)
+}
+
+// SendSession 向目标会话提交消息。
+func (c *clientImpl) SendSession(ctx context.Context, params *runtimeprotocol.SendSessionParams) (runtimeprotocol.SendSessionResult, error) {
+	return callResult[runtimeprotocol.SendSessionResult](ctx, c, "session/send", params)
+}
+
+// WaitSession 等待来源会话收到消息。
+func (c *clientImpl) WaitSession(ctx context.Context, params *runtimeprotocol.WaitSessionParams) (conversation.WaitAgentResult, error) {
+	return callResult[conversation.WaitAgentResult](ctx, c, "session/wait", params)
+}
+
+// StopSession 中断目标会话当前轮。
+func (c *clientImpl) StopSession(ctx context.Context, params *runtimeprotocol.StopSessionParams) (runtimeprotocol.StopSessionResult, error) {
+	return callResult[runtimeprotocol.StopSessionResult](ctx, c, "session/stop", params)
+}
+
+// UpdateSession 更新会话名称、标签或后台状态。
+func (c *clientImpl) UpdateSession(ctx context.Context, params *runtimeprotocol.UpdateSessionParams) (runtimeprotocol.SessionResult, error) {
+	return callResult[runtimeprotocol.SessionResult](ctx, c, "session/update", params)
+}
+
+// DetachSession 将会话转为独立对话。
+func (c *clientImpl) DetachSession(ctx context.Context, params *runtimeprotocol.SessionParams) (runtimeprotocol.ConversationResult, error) {
+	return callResult[runtimeprotocol.ConversationResult](ctx, c, "session/detach", params)
+}
+
+// ImportSession 按外部会话 ID 导入。
+func (c *clientImpl) ImportSession(ctx context.Context, params *runtime.ImportSessionRequest) (runtimeprotocol.ConversationResult, error) {
+	return callResult[runtimeprotocol.ConversationResult](ctx, c, "session/import", params)
+}
+
+// ListExternalSessions 查询外部会话目录。
+func (c *clientImpl) ListExternalSessions(ctx context.Context, params *runtime.ExternalSessionsRequest) (runtime.ExternalSessionsResult, error) {
+	return callResult[runtime.ExternalSessionsResult](ctx, c, "agent/listSessions", params)
+}
+
+// GetAgentOptions 读取 ACP 草稿的选项。
+func (c *clientImpl) GetAgentOptions(ctx context.Context, params *runtime.AgentOptionsRequest) (defs.ExternalOptions, error) {
+	return callResult[defs.ExternalOptions](ctx, c, "agent/getOptions", params)
+}
+
+// PreviewExternalSession 读取外部会话预览。
+func (c *clientImpl) PreviewExternalSession(ctx context.Context, params *runtime.ExternalSessionRequest) (externalagent.ExternalSessionPreview, error) {
+	return callResult[externalagent.ExternalSessionPreview](ctx, c, "agent/previewSession", params)
+}
+
+// UploadAttachment 返回目标 Executor 上的附件引用。
+func (c *clientImpl) UploadAttachment(ctx context.Context, params *runtimeprotocol.UploadAttachmentParams) (defs.FileRef, error) {
+	return callResult[defs.FileRef](ctx, c, "attachment/upload", params)
+}
+
+// Exec 在选定 Executor 上执行命令。
+func (c *clientImpl) Exec(ctx context.Context, params *runtime.ExecutorExecRequest) (runtime.ExecutorExecResult, error) {
+	return callResult[runtime.ExecutorExecResult](ctx, c, "executor/exec", params)
+}
+
+// CaptureTerminal 读取近期终端纯文本。
+func (c *clientImpl) CaptureTerminal(ctx context.Context, params *runtimeprotocol.TerminalCaptureParams) (runtimeprotocol.TerminalCaptureResult, error) {
+	return callResult[runtimeprotocol.TerminalCaptureResult](ctx, c, "terminal/capture", params)
+}
+
+// GetSkill 读取 Skill 正文。
+func (c *clientImpl) GetSkill(ctx context.Context, params *runtimeprotocol.GetSkillParams) (runtimeprotocol.GetSkillResult, error) {
+	return callResult[runtimeprotocol.GetSkillResult](ctx, c, "skill/get", params)
+}
+
+// SubscribeSession 直接订阅单个会话。
+func (c *clientImpl) SubscribeSession(ctx context.Context, params *runtimeprotocol.SessionParams) (runtimeprotocol.SubscribeSessionResult, error) {
+	return callResult[runtimeprotocol.SubscribeSessionResult](ctx, c, "session/subscribe", params)
+}
+
+// ReloadSession 重载外部会话。
+func (c *clientImpl) ReloadSession(ctx context.Context, params *runtimeprotocol.SessionParams) error {
+	return c.call(ctx, "session/reload", params, nil)
+}
+
+// SetSessionOption 设置外部会话选项。
+func (c *clientImpl) SetSessionOption(ctx context.Context, params *runtimeprotocol.SetSessionOptionParams) error {
+	return c.call(ctx, "session/setOption", params, nil)
+}
+
+func (c *clientImpl) GetWorldSettings(ctx context.Context) (runtimeprotocol.GetWorldResult, error) {
+	return callResult[runtimeprotocol.GetWorldResult](ctx, c, "config/getWorld", &runtimeprotocol.EmptyParams{})
+}
+func (c *clientImpl) SetWorldSettings(ctx context.Context, p runtimeprotocol.SetWorldParams) (runtimeprotocol.SetWorldResult, error) {
+	return callResult[runtimeprotocol.SetWorldResult](ctx, c, "config/setWorld", &p)
+}
+
+func (c *clientImpl) GetWorldStatus(ctx context.Context) (world.NodeStatus, error) {
+	return callResult[world.NodeStatus](ctx, c, "world/getStatus", &runtimeprotocol.EmptyParams{})
+}
+
+func (c *clientImpl) ListWorldPeers(ctx context.Context) (world.ListPeersResult, error) {
+	return callResult[world.ListPeersResult](ctx, c, "world/listPeers", &runtimeprotocol.EmptyParams{})
+}
+
+func (c *clientImpl) SendWorldMessage(ctx context.Context, params world.SendMessageRequest) (world.WorldMessage, error) {
+	return callResult[world.WorldMessage](ctx, c, "world/sendMessage", &params)
+}
+
+func (c *clientImpl) ForwardWorldConversation(ctx context.Context, params world.ForwardRequest) (world.WorldMessage, error) {
+	return callResult[world.WorldMessage](ctx, c, "world/forward", &params)
+}
+
+func (c *clientImpl) ListWorldMessages(ctx context.Context, params world.ListMessagesParams) (world.MessagePage, error) {
+	return callResult[world.MessagePage](ctx, c, "world/listMessages", &params)
+}
+
+func (c *clientImpl) CancelWorldMessage(ctx context.Context, params string) (world.WorldMessage, error) {
+	return callResult[world.WorldMessage](ctx, c, "world/cancelMessage", &runtimeprotocol.WorldMessageParams{MessageID: params})
+}
+
+func (c *clientImpl) ListWorldThreads(ctx context.Context, params world.ListThreadsParams) (world.ThreadPage, error) {
+	return callResult[world.ThreadPage](ctx, c, "world/listThreads", &params)
+}
+
+func (c *clientImpl) SubscribeWorld(ctx context.Context) error {
+	return c.call(ctx, "world/subscribe", &runtimeprotocol.EmptyParams{}, nil)
+}
+
+func (c *clientImpl) UnsubscribeWorld(ctx context.Context) error {
+	return c.call(ctx, "world/unsubscribe", &runtimeprotocol.EmptyParams{}, nil)
 }

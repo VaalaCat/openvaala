@@ -223,7 +223,7 @@ func (d *Desktop) conversationRowView(c *ui.Context, conv defs.Conversation, now
 func (d *Desktop) openConversationFromList(conv defs.Conversation) {
 	// 1. 未保存的设置草稿先确认，确认后由确认框继续导航。
 	d.conversationHighlight = ""
-	if d.isProviderDirty() {
+	if d.isProviderDirty() || d.isWorldDirty() {
 		d.confirm = confirmation{Kind: "navigate-conversation", Conversation: conv}
 		d.confirmOpen = true
 		return
@@ -278,7 +278,7 @@ func (d *Desktop) requestDelete(conv defs.Conversation) {
 // startNewConversation 离开设置页并打开空白新对话；未保存的 Provider 原文需要确认放弃。
 func (d *Desktop) startNewConversation() {
 	// 1. 未保存的设置草稿先确认，确认后由确认框继续导航。
-	if d.isProviderDirty() {
+	if d.isProviderDirty() || d.isWorldDirty() {
 		d.confirm = confirmation{Kind: "navigate-conversation"}
 		d.confirmOpen = true
 		return
@@ -369,9 +369,44 @@ func (d *Desktop) openConversation(conversationID defs.ConversationID, sessionID
 	// 2. 新目标立即移除旧数据，输入控件保持同一位置。
 	d.readingTarget = readingTarget{ServerID: d.serverID, ConversationID: conversationID, SessionID: sessionID, Request: d.readingTarget.Request + 1}
 	d.readingReady = false
-	d.items = nil
 	d.sessionInfos = nil
+	d.externalModel = defs.ModelRef{}
+	d.externalOptions, d.externalCommands, d.externalCapabilities = nil, nil, nil
+	d.draftProbe, d.importDialog = nil, nil
+	d.externalMoreOpen = false
+	if d.conversation.ID != conversationID {
+		d.backgroundExpanded = false
+	}
+	d.models, d.modelsLoaded = runtime.ModelList{}, false
 	d.conversation = selected
+	d.historyRestoring = false
+	d.resetHistoryPage()
+	delete(d.unreadConversations, conversationID)
+	d.pendingInputs.Inputs = nil
+	d.modelLoading = false
+	d.composerFocusRequested = true
+	if conversationID == "" {
+		d.models, d.modelsLoaded = runtime.ModelList{}, false
+		d.loadModels(d.readingTarget)
+		return
+	}
+	if d.client == nil {
+		return
+	}
+	d.readingCtx, d.cancelReading = context.WithCancel(d.ctx)
+	d.historyLoading = true
+	request := readingRequested{Context: d.readingCtx, Target: d.readingTarget, Client: d.client}
+	// 3. 只保留最新待执行目标；同一任务顺序调用 Client.OpenConversation。
+	select {
+	case <-d.readingRequests:
+	default:
+	}
+	d.readingRequests <- request
+}
+
+// resetHistoryPage 移除上一份阅读历史及其关联的游标、选择与详情。
+func (d *Desktop) resetHistoryPage() {
+	d.items = nil
 	d.itemCursor = 0
 	d.historyError = nil
 	d.historyLoading = false
@@ -388,31 +423,9 @@ func (d *Desktop) openConversation(conversationID defs.ConversationID, sessionID
 	d.inspectedTurn = ""
 	d.messageList = &ui.ListState{}
 	d.messageMenuItem, d.turnJumpRequested = viewItem{}, ""
-	delete(d.unreadConversations, conversationID)
-	d.pendingInputs.Inputs = nil
-	d.modelLoading = false
-	d.composerFocusRequested = true
-	if conversationID == "" {
-		d.models, d.modelsLoaded = runtime.ModelList{}, false
-		d.loadModels(d.readingTarget)
-		return
-	}
-	if d.client == nil {
-		return
-	}
-	readingContext, cancel := context.WithCancel(d.ctx)
-	d.cancelReading = cancel
-	d.historyLoading = true
-	request := readingRequested{Context: readingContext, Target: d.readingTarget, Client: d.client}
-	// 3. 只保留最新待执行目标；同一任务顺序调用 Client.OpenConversation。
-	select {
-	case <-d.readingRequests:
-	default:
-	}
-	d.readingRequests <- request
 }
 
-// runReadingRequests 顺序执行最新阅读目标的订阅与最近页查询。
+// runReadingRequests 顺序打开阅读目标，最近的历史页由就绪快照触发读取。
 func (d *Desktop) runReadingRequests() {
 	// 1. 旧请求取消后才允许下一个 Open 进入 Client。
 	for {
@@ -424,40 +437,26 @@ func (d *Desktop) runReadingRequests() {
 				continue
 			}
 			target := request.Target
-			conv, err := request.Client.OpenConversation(request.Context, &runtimeclient.OpenConversationRequest{ConversationID: target.ConversationID, SessionID: target.SessionID, SkipHistory: true})
+			_, err := request.Client.OpenConversation(request.Context, &runtimeclient.OpenConversationRequest{ConversationID: target.ConversationID, SessionID: target.SessionID, SkipHistory: true})
 			if err != nil {
-				d.window.Update(func() {
-					if d.closed || d.readingTarget.Request != target.Request {
-						return
-					}
-					d.historyLoading = false
-					d.historyError = err
-				})
-				continue
+				d.window.Update(func() { d.handleReadingFailed(target, err) })
 			}
-			if target.SessionID == "" {
-				target.SessionID = conv.RootSessionID
-			}
-			page, err := request.Client.ListItems(request.Context, &runtimeclient.ListItemsRequest{ConversationID: target.ConversationID, SessionID: target.SessionID, Order: storage.DirectionDesc, Limit: 50})
-			d.window.Update(func() {
-				if d.closed || d.readingTarget.Request != target.Request {
-					return
-				}
-				d.historyLoading = false
-				d.historyError = err
-				if err == nil {
-					d.mergeSavedItems(page.Items, false)
-					d.itemCursor = page.NextCursor
-				}
-				d.loadModels(d.readingTarget)
-				d.loadVisibleTurns()
-				d.loadPanel(d.getShownRightPanelID())
-			})
 		}
 	}
 }
 
-// loadHistory 在顶部追加更早记录并保留 List 的稳定键锚点。
+// handleReadingFailed 将打开请求或订阅返回的错误保留在当前聊天区，直到用户重新打开。
+func (d *Desktop) handleReadingFailed(target readingTarget, err error) {
+	if d.closed || d.readingTarget.Request != target.Request {
+		return
+	}
+	d.readingReady = false
+	d.historyRestoring = false
+	d.historyLoading = false
+	d.historyError = err
+}
+
+// loadHistory 倒序读取最近一页或当前游标之前的一页。
 func (d *Desktop) loadHistory() {
 	// 1. 一次只请求一页，失败可重试同一游标。
 	if d.historyLoading || d.client == nil || !d.readingReady {
@@ -465,23 +464,26 @@ func (d *Desktop) loadHistory() {
 	}
 	d.historyLoading = true
 	d.historyError = nil
-	target, client, cursor := d.readingTarget, d.client, d.itemCursor
+	ctx, target, client, cursor := d.readingCtx, d.readingTarget, d.client, d.itemCursor
 	d.tasks.Go(func() {
-		page, err := client.ListItems(d.ctx, &runtimeclient.ListItemsRequest{ConversationID: target.ConversationID, SessionID: target.SessionID, Cursor: cursor, Limit: 50, Order: storage.DirectionDesc})
-		d.window.Update(func() {
-			if d.closed || d.readingTarget.Request != target.Request {
-				return
-			}
-			d.historyLoading = false
-			d.historyError = err
-			if err != nil {
-				return
-			}
-			d.mergeSavedItems(page.Items, false)
-			d.itemCursor = page.NextCursor
-			d.loadVisibleTurns()
-		})
+		page, err := client.ListItems(ctx, &runtimeclient.ListItemsRequest{ConversationID: target.ConversationID, SessionID: target.SessionID, Cursor: cursor, Limit: 50, Order: storage.DirectionDesc})
+		d.window.Update(func() { d.handleHistoryPage(target, page, err) })
 	})
+}
+
+// handleHistoryPage 仅接收当前历史库的分页结果，保留请求发出后收到的实时条目。
+func (d *Desktop) handleHistoryPage(target readingTarget, page runtimeclient.ListItemsResult, err error) {
+	if d.closed || d.readingTarget != target || !d.readingReady {
+		return
+	}
+	d.historyLoading = false
+	d.historyError = err
+	if err != nil {
+		return
+	}
+	d.mergeSavedItems(page.Items, false)
+	d.itemCursor = page.NextCursor
+	d.loadVisibleTurns()
 }
 
 // mergeSavedItems 将保存记录与实时条目按 Item 身份合并。
@@ -657,7 +659,9 @@ func (d *Desktop) conversationView(c *ui.Context) {
 					}
 				})
 			}
-			if d.historyLoading {
+			if d.historyRestoring {
+				kit.InlineHintWith(c, d.t("restoring.external.history"), true, kit.InlineHintOpt{Inset: kit.GetTheme(c).Space(4)})
+			} else if d.historyLoading {
 				kit.InlineHintWith(c, d.t("loading.history"), true, kit.InlineHintOpt{Inset: kit.GetTheme(c).Space(4)})
 			}
 			d.itemsView(c)
@@ -749,6 +753,9 @@ func (d *Desktop) conversationTitleView(c *ui.Context) {
 	}
 	var titleText ui.Element
 	button.Children(func() {
+		if agent := d.getExternalAgent(); agent != nil {
+			ui.Icon(c, agentBrandIcon(agent.Icon)).Size(16, 16).Margin(0, 4, 0, 0)
+		}
 		titleText = t.TextRole(ui.Text(c, title), kit.TextUI).SingleLine().Shrink(1).MinWidth(0).TextColor(color).Font(d.preferences.TitleFont)
 	})
 	hint := d.t("rename.conversation")
@@ -756,6 +763,9 @@ func (d *Desktop) conversationTitleView(c *ui.Context) {
 		hint = title + "\n" + hint
 	}
 	kit.Tooltip(c, button, hint)
+	if menu := d.externalSessionMenu(d.getSessionInfo().Session); len(menu) > 0 {
+		d.handleMenuClosed(kit.ContextMenu(c, button, menu))
+	}
 	if button.Clicked() {
 		d.titleEditingID, d.titleDraft = d.conversation.ID, d.conversation.Title
 		d.titleFocusRequested, d.titleWasFocused = true, false
@@ -803,8 +813,14 @@ func (d *Desktop) sessionCrumbsView(c *ui.Context) {
 	ui.Row(c.Key("session-crumbs")).Grow(1).Shrink(1).MinWidth(0).Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
 		for index, crumb := range crumbs {
 			if index == len(crumbs)-1 {
+				if agent := d.getExternalAgent(); agent != nil {
+					ui.Icon(c, agentBrandIcon(agent.Icon)).Size(16, 16)
+				}
 				current := t.TextRole(ui.Text(c, crumb.Name), kit.TextUI).SingleLine().Shrink(1).MinWidth(0).Font(d.preferences.TitleFont)
 				kit.Tooltip(c, current, crumb.Name)
+				if menu := d.externalSessionMenu(d.getSessionInfo().Session); len(menu) > 0 {
+					d.handleMenuClosed(kit.ContextMenu(c, current, menu))
+				}
 				continue
 			}
 			link := ui.ButtonBase(c.Key("crumb-" + string(crumb.SessionID))).Shrink(1).MinWidth(0).Height(t.Metrics.ControlHeight).Padding(0).Radius(0).AlignItems(ui.Center).Label(crumb.Name)
@@ -844,12 +860,19 @@ func (d *Desktop) loadModels(target readingTarget) {
 			return
 		}
 	}
-	d.modelLoading = true
+	params := runtime.ListModelsRequest{AgentName: agentName, ConversationID: target.ConversationID, SessionID: target.SessionID}
+	if target.ConversationID == "" {
+		params.ExecutorID, params.Cwd = d.newExecutor, d.newDirectory
+		d.draftCatalogLocation = runtime.ExternalAgentLocation{AgentName: agentName, ExecutorID: params.ExecutorID, Cwd: params.Cwd}
+	}
+	d.modelRequest++
+	sequence := d.modelRequest
+	d.modelLoading = !d.modelsLoaded
 	client := d.client
 	d.tasks.Go(func() {
-		models, err := client.ListModels(d.ctx, agentName)
+		models, err := client.ListModels(d.ctx, &params)
 		d.window.Update(func() {
-			if d.closed || d.readingTarget.Request != target.Request {
+			if d.closed || sequence != d.modelRequest || d.readingTarget.Request != target.Request {
 				return
 			}
 			if target.ConversationID == "" && d.newAgent != agentName {
@@ -872,6 +895,14 @@ const composerFoldWidth float32 = 480
 func (d *Desktop) sessionControls(c *ui.Context, composer ui.Element) {
 	// 1. 新目标未同步时保留中性禁用控件。
 	info := d.getSessionInfo()
+	agent := d.getExternalAgent()
+	if d.readingTarget.ConversationID == "" && d.client != nil && d.connectionState == runtimeclient.ConnectionConnected {
+		location := runtime.ExternalAgentLocation{AgentName: d.newAgent, ExecutorID: d.newExecutor, Cwd: d.newDirectory}
+		if location != d.draftCatalogLocation && d.newAgent != "" {
+			d.loadModels(d.readingTarget)
+		}
+		d.probeDraftOptions(agent, false)
+	}
 	model, effort := d.getModelSelection()
 	ready := d.connectionState == runtimeclient.ConnectionConnected && !d.modelLoading
 	if d.readingTarget.ConversationID != "" {
@@ -889,7 +920,7 @@ func (d *Desktop) sessionControls(c *ui.Context, composer ui.Element) {
 		if d.readingTarget.ConversationID != "" {
 			d.contextRingView(c, info, ready)
 		}
-		modelSelect := kit.Select(c.Key("model"), &model, kit.SelectOpt{Options: getModelOptions(d.models.Models, d.t("agent.default")), Label: d.t("model"), Placeholder: d.t("model"), Searchable: true, SearchPlaceholder: d.t("filter.provider.model"), Disabled: !ready})
+		modelSelect := d.modelSelect(c, &model, agent, ready)
 		hint := getModelTooltip(d.models.Models, model, d.t("agent.default"))
 		if !ready {
 			hint = d.t("loading")
@@ -904,7 +935,9 @@ func (d *Desktop) sessionControls(c *ui.Context, composer ui.Element) {
 		if modelSelect.Changed() {
 			setModel(model, effort)
 		}
-		if isFolded {
+		if agent != nil {
+			d.externalSessionControls(c, composer, agent)
+		} else if isFolded {
 			d.moreControls(c, composer, efforts, effort, ready, func(next string) { setModel(model, next) })
 		} else {
 			if len(efforts) > 0 {
@@ -931,9 +964,26 @@ func (d *Desktop) sessionControls(c *ui.Context, composer ui.Element) {
 // getModelSelection 返回输入区当前的模型和推理强度：已有对话取根 Session 的选择，新对话取表单里的；空模型表示 Agent 默认。
 func (d *Desktop) getModelSelection() (model, effort string) {
 	if d.readingTarget.ConversationID == "" {
+		if agent := d.getExternalAgent(); agent != nil {
+			ref, _ := defs.ParseModelRef(d.newModel)
+			if ref.ModelID == "" || ref.ModelID == "default" {
+				current := runtimeclient.GetExternalModelRef(agent.Name, d.externalOptions)
+				if current.ModelID != "" {
+					return current.String(), ""
+				}
+				return agent.Name + "/default", ""
+			}
+		}
 		return d.newModel, d.newEffort
 	}
-	selection := d.getSessionInfo().Session.Model
+	record := d.getSessionInfo().Session
+	selection := record.Model
+	if record.External != nil {
+		if d.externalModel.ModelID == "" {
+			return record.AgentName + "/default", ""
+		}
+		selection = defs.ModelSelection{Ref: d.externalModel}
+	}
 	if selection.Ref != (defs.ModelRef{}) {
 		model = selection.Ref.String()
 	}
@@ -943,7 +993,17 @@ func (d *Desktop) getModelSelection() (model, effort string) {
 // setModelSelection 保存模型和推理强度：新对话记在表单里，已有对话写入 Session。
 func (d *Desktop) setModelSelection(model, effort string) {
 	if d.readingTarget.ConversationID == "" {
+		if model != d.newModel {
+			d.draftOptions = nil
+		}
 		d.newModel, d.newEffort = model, effort
+		return
+	}
+	if d.getSessionInfo().Session.External != nil {
+		ref, err := defs.ParseModelRef(model)
+		if err == nil {
+			d.changeExternalOption(defs.ExternalOptionSelection{Kind: "model", Value: ref.ModelID})
+		}
 		return
 	}
 	d.setSessionModel(model, effort)

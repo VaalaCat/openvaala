@@ -1,0 +1,7 @@
+{
+  "id": "openvaala-world",
+  "name": "OpenVaala World",
+  "description": "Exchange World messages with agents running in Paseo.",
+  "requirements": { "paseo": ">=0.17.3" },
+  "build": [["npm", "ci"]]
+}

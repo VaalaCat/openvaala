@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,7 +13,9 @@ import (
 
 	"github.com/VaalaCat/mygo-kit"
 	"github.com/VaalaCat/openvaala/internal/cli"
+	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
+	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
@@ -23,6 +26,8 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
+	"github.com/VaalaCat/openvaala/pkg/world"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 	"github.com/egoist/mygo"
 	_ "github.com/egoist/mygo/locales/zh-Hans"
 	"github.com/egoist/mygo/ui"
@@ -39,6 +44,8 @@ type Desktop struct {
 	connectGeneration             uint64
 	tasks                         sync.WaitGroup
 	client                        runtimeclient.Client
+	localServer                   remoteServer
+	serverMenuOpen                bool
 	serverOverride                *remoteServer
 	defaultRemote                 *remoteServer
 	startTargetError              error
@@ -85,14 +92,27 @@ type Desktop struct {
 	composerFocusRequested        bool
 	dialogWasOpen                 bool
 	readingRequests               chan readingRequested
+	readingCtx                    context.Context
 	cancelReading                 context.CancelFunc
 	readingTarget                 readingTarget
 	conversation                  defs.Conversation
 	sessionInfos                  []runtime.SessionRuntimeInfo
+	externalModel                 defs.ModelRef
+	externalOptions               *defs.ExternalOptions
+	externalCommands              []defs.ExternalCommand
+	externalCapabilities          *defs.ExternalCapabilities
+	draftProbe                    *runtime.AgentOptionsRequest
+	draftOptions                  []defs.ExternalOptionSelection
+	externalMoreOpen              bool
+	backgroundExpanded            bool
+	importDialog                  *sessionImportDialog
+	modelRequest                  uint64
+	draftCatalogLocation          runtime.ExternalAgentLocation
 	items                         []viewItem
 	toolProgress                  map[string]string
 	itemCursor                    storage.Ordinal
 	readingReady                  bool
+	historyRestoring              bool
 	historyLoading                bool
 	historyError                  error
 	messageList                   *ui.ListState
@@ -167,6 +187,14 @@ type Desktop struct {
 	providers                     []defs.ProviderConfig
 	defaultModel                  defs.ModelRef
 	modelDefaults                 defs.ModelDefaults
+	agentRows                     []agentSettingsRow
+	agentPresets                  []agent.AgentPreset
+	agentPresetQuery              string
+	agentModels                   []*defs.ModelDefinition
+	agentDraft                    *agentSettingsDraft
+	agentBaseline                 agentSettingsDraft
+	agentSaving                   bool
+	agentError                    error
 	providerDraft                 *providerDraft
 	providerBaseline              *providerDraft
 	providerLoading               bool
@@ -225,6 +253,22 @@ type Desktop struct {
 	// closingTerminalIDs 是 terminal/close 请求还没返回的终端，运行列表不把它们加回成标签。
 	openingTerminalRequests int
 	closingTerminalIDs      []string
+
+	connectedServer     cli.RuntimeServerConnection
+	worldStatus         world.NodeStatus
+	cancelWorldSettings context.CancelFunc
+	worldSaved          *runtimeprotocol.GetWorldResult
+	worldDraft          config.WorldSettings
+	worldInviteCode     string
+	worldNewTarget      worldserver.AdvertisedTarget
+	worldNewDirectURL   string
+	worldEditPage       bool
+	worldNewRelay       string
+	worldQR             ui.ImageSource
+	worldSaving         bool
+	worldRestarting     bool
+	worldChangeOpen     bool
+	worldError          error
 }
 
 // DesktopOpt 指定本机服务启动参数、可选远端启动目标、可选偏好文件路径和图片下载带的 header。
@@ -256,6 +300,17 @@ func (d *Desktop) Run(ctx context.Context) error {
 		return nil
 	}
 	d.ctx, d.cancel = context.WithCancel(context.WithoutCancel(ctx))
+	d.localServer.ID = localServerID
+	d.localServer.Name, _ = os.Hostname()
+	if cfg := d.opt.RuntimeServerStart.Config; cfg != nil {
+		d.localServer.URL = "ws://" + cfg.Server.Listen
+		if cfg.World.RemoteAccess.Name != "" {
+			d.localServer.Name = cfg.World.RemoteAccess.Name
+		}
+		if n := cfg.World.Node; n.ServerURL != "" {
+			d.localServer.NodeAddr = new(n.Name + "@" + n.Domain)
+		}
+	}
 	d.readingRequests = make(chan readingRequested, 1)
 	d.tasks.Go(d.runReadingRequests)
 	d.preferences = defaultPreferences()
@@ -408,6 +463,7 @@ func (d *Desktop) view(c *ui.Context) {
 	d.confirmationView(c)
 	d.imagePreviewView(c)
 	d.workLocationDialog(c)
+	d.importSessionView(c)
 	d.serversDialogView(c)
 	// 通知先入队再画宿主；ShowToast 自己请求下一帧，窗口空闲时通知也能立刻出现。
 	for _, toast := range d.pendingToasts {
@@ -421,7 +477,14 @@ func (d *Desktop) view(c *ui.Context) {
 		d.window.Close()
 	}
 	// 4. 任何弹窗从打开变为关闭的那一帧，焦点回到输入框；命令面板里选了自己要焦点的命令（搜索、终端、重命名）时除外。
-	dialogOpen := d.confirmOpen || d.locationOpen || d.serversDialogOpen || d.confirmExit || d.imagePreviewOpen || d.commandPaletteOpen
+	changeWorldTitle := d.t("world.change")
+	if d.worldStatus.Revoked {
+		changeWorldTitle = d.t("world.rejoin")
+	}
+	if d.worldChangeOpen && kit.DialogWith(c, &d.worldChangeOpen, kit.DialogOpt{Title: changeWorldTitle, ConfirmLabel: d.t("world.join"), ConfirmDisabled: !d.canJoinWorld()}, func() { d.worldJoinFields(c) }) {
+		d.confirmWorldSave(true)
+	}
+	dialogOpen := d.worldChangeOpen || d.importDialog != nil || d.confirmOpen || d.locationOpen || d.serversDialogOpen || d.confirmExit || d.imagePreviewOpen || d.commandPaletteOpen
 	if d.dialogWasOpen && !dialogOpen && !focusedByCommand {
 		d.composerFocusRequested = true
 	}
@@ -486,7 +549,7 @@ func (d *Desktop) statusLeftView(c *ui.Context) {
 			label = d.t("connection.failed")
 		}
 	}
-	// 3. 可点击的服务器状态触发器：显示「● 本机 · 已连接 ▾」，点击弹出快捷切换菜单。
+	// 3. 可点击的服务器状态触发器：显示服务器名与状态点，点击弹出快捷切换菜单。
 	serverLabel := d.getActiveServerLabel()
 	trigger := ui.ButtonBase(c.Key("server-status-menu")).Shrink(1).Height(t.Metrics.CompactHeight).Padding(0, t.Space(2)).Gap(t.Space(1) + 2).AlignItems(ui.Center).Radius(t.Metrics.Radius).Label(d.t("server.switch.menu") + " · " + serverLabel + " · " + label)
 	trigger.Draw(func(p *ui.Painter, r ui.Rect) {
@@ -497,22 +560,20 @@ func (d *Desktop) statusLeftView(c *ui.Context) {
 	trigger.Children(func() {
 		kit.StatusDot(c, color)
 		ui.Text(c, serverLabel).SingleLine().Shrink(1).TextColor(t.Colors.Text)
-		ui.Text(c, "·").SingleLine().Shrink(0).TextColor(t.Colors.Muted)
-		ui.Text(c, label).SingleLine().Shrink(0).TextColor(t.Colors.Muted)
 		ui.Icon(c, kit.IconChevronDown).Size(kit.IconSizeSmall, kit.IconSizeSmall).TextColor(t.Colors.Muted)
 	})
 	if d.connectionError != nil {
 		kit.Tooltip(c, trigger, d.connectionError.Error())
-	} else if target, isLocal := d.getActiveServerTarget(); !isLocal && target != nil {
-		kit.Tooltip(c, trigger, target.URL)
+	} else {
+		kit.Tooltip(c, trigger, label)
 	}
-	kit.MenuButton(c, trigger, d.getServerMenuItems())
+	d.serverMenuView(c, trigger)
 }
 
 // isUnsavedWorkPresent 是否有尚未应用的设置或未发送内容？
 func (d *Desktop) isUnsavedWorkPresent() bool {
 	// 1. 检查完整设置草稿与全部对话草稿。
-	if d.isProviderDirty() || d.isExecutorDirty() {
+	if d.isProviderDirty() || d.isExecutorDirty() || d.isAgentDirty() || d.isWorldDirty() {
 		return true
 	}
 	for _, draft := range d.drafts {
@@ -526,7 +587,7 @@ func (d *Desktop) isUnsavedWorkPresent() bool {
 // getErrorText 返回本地化的错误说明；没有对应说明的错误在「操作失败」后附上原文，表单校验、终端屏幕这类没有详情位置的地方才看得到原因。
 func (d *Desktop) getErrorText(err error) string {
 	text := d.getErrorMessage(err)
-	if text == d.t("error.operation.failed") {
+	if text == d.t("error.operation.failed") || errors.Is(err, runtimeclient.ErrExternalSessionRestore) {
 		text += "：" + err.Error()
 	}
 	return text

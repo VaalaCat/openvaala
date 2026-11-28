@@ -1,3 +1,4 @@
+import { hostname } from "node:os"
 import { devices } from "@playwright/test"
 import {
   chooseDefaultWorkLocation,
@@ -124,20 +125,22 @@ test("model_controls_fit_text_and_preserve_composer_actions", async ({
             await expect(control).toHaveCSS("font-weight", "400")
           }
           if (name === "DS") {
-            const labels = [name, effort]
-            for (const label of labels) {
-              const control = label === name ? model : effortControl
-              const gap = await control
-                .getByText(label, { exact: true })
-                .evaluate((node) => {
-                  const range = document.createRange()
-                  range.selectNodeContents(node)
-                  const next = node.nextElementSibling!
-                  return (
-                    next.getBoundingClientRect().left -
-                    range.getBoundingClientRect().right
-                  )
-                })
+            const modelText = model.getByText(name, { exact: true })
+            const effortText = effortControl.getByText(effort, { exact: true })
+            const pairs = [
+              [modelText, compact ? effortText : model.locator("svg").last()],
+              [effortText, effortControl.locator("svg").last()],
+            ]
+            for (const [text, next] of pairs) {
+              const right = await text.evaluate((node) => {
+                const range = document.createRange()
+                range.selectNodeContents(node)
+                return Math.min(
+                  range.getBoundingClientRect().right,
+                  node.getBoundingClientRect().right
+                )
+              })
+              const gap = (await next.boundingBox())!.x - right
               expect(gap).toBeGreaterThanOrEqual(5)
               expect(gap).toBeLessThanOrEqual(9)
             }
@@ -466,7 +469,7 @@ test("mobile_server_moves_to_sidebar_and_title_yields", async ({
         positions.push(title.getBoundingClientRect().x)
         servers.push(
           [
-            ...document.querySelectorAll('button[aria-label="本页 · 已连接"]'),
+            ...document.querySelectorAll('button[aria-label$=" · 已连接"]'),
           ].map((node) => {
             let opacity = 1
             for (
@@ -501,17 +504,17 @@ test("mobile_server_moves_to_sidebar_and_title_yields", async ({
       expect(x).toBeLessThanOrEqual(56 + 0.1)
     }
     await expect(
-      sidebar.getByRole("button", { name: "本页 · 已连接", exact: true })
+      sidebar.getByRole("button", { name: `${hostname()} · 已连接`, exact: true })
     ).toBeVisible()
     await expect(
-      page.getByRole("button", { name: "本页 · 已连接", exact: true })
+      page.getByRole("button", { name: `${hostname()} · 已连接`, exact: true })
     ).toHaveCount(1)
 
     // 2. 关闭抽屉后入口恢复到顶栏，不留下额外可访问的连接按钮。
     await page.keyboard.press("Escape")
     await expect(sidebar).toHaveCount(0)
     await expect(
-      page.getByRole("button", { name: "本页 · 已连接", exact: true })
+      page.getByRole("button", { name: `${hostname()} · 已连接`, exact: true })
     ).toHaveCount(1)
     await expect.poll(getTitleX).toBeCloseTo(positions[0], 0)
   }
@@ -545,10 +548,7 @@ test("confirmation_and_toast_keep_roles_and_fit_short_viewports", async ({
   await fixture.openApp(page)
   await startConversation(page, "弹窗排版")
   const conversationID = page.url().split("/c/")[1]
-  const row = page
-    .getByRole("listitem")
-    .filter({ has: page.locator(`a[href*="/c/${conversationID}"]`) })
-    .filter({ has: page.getByRole("button", { name: /的更多操作/ }) })
+  const row = page.locator(`[data-conversation-id="${conversationID}"]`)
   await row.getByRole("button", { name: /的更多操作/ }).click()
   await page.getByRole("menuitem", { name: "改名", exact: true }).click()
   const rename = page.getByRole("dialog", { name: "改名", exact: true })
@@ -676,6 +676,7 @@ test(
     await expect(drawer).toBeVisible()
     await drawer.getByRole("searchbox", { name: "搜索模型" }).fill("local")
     await expect(drawer.getByRole("button", { name: /default/ })).toBeVisible()
+    await expect(drawer.getByRole("group", { name: "更多选项" })).toHaveCount(0)
     await expect(drawer.getByRole("combobox")).toHaveCount(0)
     await drawer.getByRole("button", { name: /default/ }).click()
     await expect(
@@ -708,6 +709,47 @@ test(
     ).toBeVisible()
   }
 )
+
+test("mobile_model_drawer_applies_external_options_to_the_conversation", async ({
+  page,
+  fixture,
+}) => {
+  await fixture.withExternalAgent(
+    [],
+    async () => {
+      await fixture.openApp(page)
+      const model = page.getByRole("button", { name: "模型", exact: true })
+      const more = page.getByRole("button", { name: "更多", exact: true })
+      await expect(model).toContainText("small")
+      await expect(more).toHaveCount(0)
+
+      await model.click()
+      const drawer = page.getByRole("dialog", { name: "模型", exact: true })
+      const options = drawer.getByRole("group", { name: "更多选项" })
+      const mode = options.getByRole("combobox", { name: "Mode", exact: true })
+      await expect(mode).toContainText("Plan")
+      await expect(
+        options.getByRole("combobox", { name: "secondary" })
+      ).toBeVisible()
+      await mode.click()
+      await page.getByRole("option", { name: "Code", exact: true }).click()
+      await expect(mode).toContainText("Code")
+      await drawer.getByRole("button", { name: "关闭模型选择" }).click()
+
+      await startConversation(page, "使用手机选定的模式")
+      await expect(
+        getMessages(page).getByText("OK", { exact: true })
+      ).toBeVisible()
+      await page.setViewportSize({ width: 1280, height: 844 })
+      await more.click()
+      await expect(
+        page.getByRole("combobox", { name: "Mode", exact: true })
+      ).toContainText("Code")
+    },
+    true,
+    "default"
+  )
+})
 
 test(
   "sub_session_keeps_model_context_controls_without_input_or_compaction",

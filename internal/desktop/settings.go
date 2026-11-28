@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/VaalaCat/mygo-kit"
@@ -14,7 +15,7 @@ import (
 )
 
 // settingsPages 是设置导航的页面顺序。
-var settingsPages = []string{"general", "providers", "executors", "hooks", "skills"}
+var settingsPages = []string{"general", "providers", "agents", "executors", "hooks", "skills", "world"}
 
 // settingControlWidth 是设置行右侧下拉和输入控件的统一宽度。
 const settingControlWidth = 200
@@ -22,7 +23,7 @@ const settingControlWidth = 200
 // navigate 切换设置页面；未保存 Provider 或 Executor 原文需要确认放弃。
 func (d *Desktop) navigate(page string) {
 	// 1. 页面变更前检查编辑草稿。
-	if page != d.page && (d.isProviderDirty() || d.isExecutorDirty()) {
+	if page != d.page && (d.isProviderDirty() || d.isExecutorDirty() || d.isAgentDirty() || d.isWorldDirty()) {
 		d.confirm = confirmation{Kind: "navigate", Page: page}
 		d.confirmOpen = true
 		return
@@ -52,6 +53,16 @@ func (d *Desktop) navigate(page string) {
 	if page == "" && d.sidebarDrawerOpenedBySettings {
 		d.closeSidebarDrawer()
 	}
+	if page != d.page {
+		if d.cancelWorldSettings != nil {
+			d.cancelWorldSettings()
+			d.cancelWorldSettings = nil
+		}
+		d.worldSaved = nil
+		d.worldRestarting = false
+		d.worldChangeOpen = false
+		d.worldSaving = false
+	}
 	d.page = page
 	d.settingsRequest++
 	d.settingsLoading = false
@@ -62,6 +73,10 @@ func (d *Desktop) navigate(page string) {
 // loadSettingsPage 读取页面需要的服务端数据。
 func (d *Desktop) loadSettingsPage(page string) {
 	switch page {
+	case "world":
+		d.loadWorldSettings()
+	case "agents":
+		d.loadAgentSettings()
 	case "providers":
 		d.catalogRequested, d.catalogError = false, nil
 		d.loadProviders()
@@ -83,7 +98,7 @@ func (d *Desktop) getSettingsPageTitle(page string) string {
 func (d *Desktop) settingsNavView(c *ui.Context) {
 	// 1. 标题栏：返回按钮在最左，其后是「设置」。
 	t := kit.GetTheme(c)
-	icons := map[string]*ui.SVG{"general": kit.IconSettings, "providers": kit.IconServerCog, "executors": kit.IconTerminal, "hooks": kit.IconWebhook, "skills": kit.IconBookOpen}
+	icons := map[string]*ui.SVG{"general": kit.IconSettings, "providers": kit.IconServerCog, "agents": kit.IconBot, "executors": kit.IconTerminal, "hooks": kit.IconWebhook, "skills": kit.IconBookOpen, "world": kit.IconServerCog}
 	ui.Column(c).Fill().Gap(0).Children(func() {
 		kit.HeaderWith(c, d.t("settings"), kit.HeaderOpt{Inset: t.Space(1), Leading: func() {
 			if kit.IconButtonTip(c.Key("settings-back"), kit.IconChevronLeft, d.t("settings.back")).Clicked() {
@@ -132,10 +147,14 @@ func (d *Desktop) settingsView(c *ui.Context) {
 			kit.InlineHint(c, d.t("loading"), true)
 		}
 		switch d.page {
+		case "world":
+			d.worldSettingsView(c)
 		case "general":
 			d.generalSettingsView(c)
 		case "providers":
 			d.providersView(c)
+		case "agents":
+			d.agentsSettingsView(c)
 		case "executors":
 			d.executorsSettingsView(c)
 		case "hooks":
@@ -161,8 +180,13 @@ func (d *Desktop) settingsView(c *ui.Context) {
 		}
 	}
 	if revert {
-		if d.page == "providers" {
+		if d.page == "world" {
+			d.resetWorldDraft()
+		} else if d.page == "providers" {
 			d.providerDraft = cloneProviderDraft(d.providerBaseline)
+		} else if d.page == "agents" {
+			d.setAgentDraft(d.agentBaseline.definition, d.agentBaseline.editingName)
+			d.agentError = nil
 		} else if d.page == "executors" {
 			d.executorDraft = cloneExecutorDraft(d.executorBaseline)
 			d.executorTestSuccess = ""
@@ -171,33 +195,48 @@ func (d *Desktop) settingsView(c *ui.Context) {
 		}
 	}
 	if apply {
-		if d.page == "providers" {
+		if d.page == "world" {
+			d.confirmWorldSave(false)
+		} else if d.page == "providers" {
 			d.saveProvider()
+		} else if d.page == "agents" {
+			d.saveAgentSettings(d.agentDraft)
 		} else if d.page == "executors" {
 			d.saveExecutor()
 		}
 	}
 }
 
-// settingsActionsView 绘制页头右侧的操作：模型服务页与 Executor 页的新增、撤销、测试、应用，以及每页都有的重载配置。
+// settingsActionsView 绘制当前设置页右侧的配置和草稿操作。
 func (d *Desktop) settingsActionsView(c *ui.Context, apply, revert *bool) {
-	// 1. 模型服务页：新增服务；有草稿时再加撤销与应用，应用在可提交时是主按钮。
+	// 1. 模型服务和 Agent 都把新增、撤销和保存放在页头，草稿可以提交时突出主按钮。
+	draftActions := func(saving, changedOrNew bool, saveLabel string) {
+		if kit.Button(c, d.t("revert")).Disabled(saving).Clicked() {
+			*revert = true
+		}
+		canApply := d.client != nil && !d.clientStopped && !saving && changedOrNew
+		applyButton := kit.Button
+		if canApply {
+			applyButton = kit.PrimaryButton
+		}
+		if applyButton(c.Key("apply"), saveLabel).Disabled(!canApply).Clicked() {
+			*apply = true
+		}
+	}
 	if d.page == "providers" {
 		if kit.Button(c, d.t("add.provider")).Clicked() {
 			d.openProvider(defs.ProviderConfig{Protocol: "openai_chat"}, "", "")
 		}
 		if d.providerDraft != nil {
-			if kit.Button(c, d.t("revert")).Disabled(d.providerSaving).Clicked() {
-				*revert = true
-			}
-			canApply := d.client != nil && !d.clientStopped && !d.providerSaving && (d.isProviderDirty() || d.providerDraft.EditingID == "")
-			applyButton := kit.Button
-			if canApply {
-				applyButton = kit.PrimaryButton
-			}
-			if applyButton(c.Key("apply"), d.t("apply")).Disabled(!canApply).Clicked() {
-				*apply = true
-			}
+			draftActions(d.providerSaving, d.isProviderDirty() || d.providerDraft.EditingID == "", d.t("apply"))
+		}
+	}
+	if d.page == "agents" {
+		if kit.Button(c, d.t("agent.add")).Disabled(d.agentSaving || d.settingsLoading || d.settingsError != nil).Clicked() {
+			d.openAgentSettings("")
+		}
+		if d.agentDraft != nil {
+			draftActions(d.agentSaving, d.isAgentDirty() || d.agentDraft.editingName == "", d.t("agent.save"))
 		}
 	}
 	// 2. Executor 页：新增 SSH Executor；编辑草稿时提供撤销、测试连接与应用。
@@ -227,8 +266,18 @@ func (d *Desktop) settingsActionsView(c *ui.Context, apply, revert *bool) {
 			}
 		}
 	}
-	// 3. 重载配置在每页都有。
-	if kit.Button(c, d.t("reload.configuration")).Disabled(d.client == nil).Clicked() {
+	if d.isWorldDirty() && !d.worldRestarting {
+		t := kit.GetTheme(c)
+		t.TextRole(ui.Text(c, d.t("world.dirty")), kit.TextCaption).TextColor(t.Colors.Muted)
+		if kit.Button(c, d.t("world.discard")).Disabled(d.worldSaving).Clicked() {
+			*revert = true
+		}
+		if kit.PrimaryButton(c, d.t("world.save")).Disabled(d.worldSaving).Clicked() {
+			*apply = true
+		}
+	}
+	// 3. World 通过保存并重启应用设置，其他页提供重载配置。
+	if d.page != "world" && kit.Button(c, d.t("reload.configuration")).Disabled(d.client == nil).Clicked() {
 		d.reloadConfiguration()
 	}
 }
@@ -273,6 +322,43 @@ func (d *Desktop) configNoteView(c *ui.Context) {
 func (d *Desktop) settingSelectView(c *ui.Context, key, label string, value *string, opt kit.SelectOpt) bool {
 	opt.Label, opt.Placeholder, opt.Bordered = label, label, true
 	return kit.Select(c.Key(key), value, opt).Width(settingControlWidth).Changed()
+}
+
+// keyValueSection 按行编辑键值。删除后聚焦下一行的名称，末行删除后聚焦添加按钮。
+func (d *Desktop) keyValueSection(c *ui.Context, title string, rows *[]*keyValueDraft, opt keyValueSectionOpt) {
+	removed := -1
+	kit.SettingSection(c, title, func() {
+		for i, row := range *rows {
+			kit.SettingRow(c.Key(row), "", "", func() {
+				name := kit.TextInput(c.Key("name"), &row.Name).Label(d.t("header.name")).Placeholder(d.t("header.name")).Width(opt.nameWidth)
+				if removed >= 0 && i == removed+1 {
+					name.Focus()
+				}
+				kit.TextInput(c.Key("value"), &row.Value).Label(d.t("header.value")).Placeholder(d.t("header.value")).Width(opt.valueWidth)
+				var remove ui.Element
+				if opt.removeIcon != nil {
+					remove = kit.IconButtonTip(c.Key("remove"), opt.removeIcon, opt.removeLabel)
+				} else {
+					remove = kit.Button(c.Key("remove"), opt.removeLabel)
+				}
+				if remove.Clicked() {
+					removed = i
+				}
+			})
+		}
+		kit.SettingRow(c.Key("add"), opt.addTitle, opt.addHint, func() {
+			add := kit.Button(c, opt.addLabel)
+			if removed >= 0 && removed == len(*rows)-1 {
+				add.Focus()
+			}
+			if add.Clicked() {
+				*rows = append(*rows, &keyValueDraft{})
+			}
+		})
+	})
+	if removed >= 0 {
+		*rows = slices.Delete(*rows, removed, removed+1)
+	}
 }
 
 // generalSettingsView 即时应用本机外观并非阻塞保存。
@@ -482,8 +568,15 @@ func (d *Desktop) confirmationView(c *ui.Context) {
 	// 1. 弹窗不依赖已隐藏的列表行；标题和确认按钮随确认类型变化。
 	opt := kit.DialogOpt{Title: d.t("discard.unsaved.changes"), ConfirmLabel: d.t("discard"), ConfirmDisabled: d.confirmPending}
 	switch d.confirm.Kind {
+	case "world-save", "world-join":
+		if d.confirmOpen {
+			opt.Title, opt.Description, opt.ConfirmLabel = d.t("world.confirm"), d.worldRestartWarning(), d.t("world.save")
+		}
 	case "delete-conversation":
 		opt.Title, opt.ConfirmLabel, opt.Danger = fmt.Sprintf(d.t("delete.conversation.confirm"), d.confirm.Name), d.t("delete"), true
+	case "delete-agent":
+		opt.Title, opt.ConfirmLabel, opt.Danger = fmt.Sprintf(d.t("agent.delete.confirm"), d.confirm.Name), d.t("delete"), true
+		opt.Description = d.t("agent.delete.warning")
 	case "delete-provider":
 		opt.Title, opt.ConfirmLabel, opt.Danger = fmt.Sprintf(d.t("delete.provider.confirm"), d.confirm.ProviderID), d.t("delete"), true
 	case "delete-executor":
@@ -516,6 +609,16 @@ func (d *Desktop) confirmationView(c *ui.Context) {
 func (d *Desktop) submitConfirmation() {
 	// 1. 离开只放弃设置草稿，不丢其他对话输入。
 	request := d.confirm
+	if request.Kind == "world-save" || request.Kind == "world-join" {
+		d.saveWorldSettings(request.Kind == "world-join")
+		return
+	}
+	if request.Kind == "select-agent" {
+		d.agentDraft = nil
+		d.confirmOpen = false
+		d.openAgentSettings(request.Name)
+		return
+	}
 	if request.Kind == "select-provider" {
 		d.providerDraft = nil
 		d.providerBaseline = nil
@@ -531,6 +634,8 @@ func (d *Desktop) submitConfirmation() {
 		return
 	}
 	if request.Kind == "switch-server" {
+		d.worldSaved = nil
+		d.agentDraft = nil
 		d.providerDraft = nil
 		d.providerBaseline = nil
 		d.executorDraft = nil
@@ -540,6 +645,8 @@ func (d *Desktop) submitConfirmation() {
 		return
 	}
 	if request.Kind == "navigate" || request.Kind == "navigate-conversation" {
+		d.worldSaved = nil
+		d.agentDraft = nil
 		d.providerDraft = nil
 		d.providerBaseline = nil
 		d.executorDraft = nil
@@ -571,6 +678,8 @@ func (d *Desktop) submitConfirmation() {
 		switch request.Kind {
 		case "delete-conversation":
 			err = client.DeleteConversation(d.ctx, &runtimeclient.DeleteConversationRequest{ConversationID: request.Conversation.ID})
+		case "delete-agent":
+			_, err = client.DeleteAgent(d.ctx, request.Name)
 		case "delete-provider":
 			_, err = client.DeleteProvider(d.ctx, request.ProviderID)
 		case "delete-executor":
@@ -592,6 +701,20 @@ func (d *Desktop) submitConfirmation() {
 			d.confirmOpen = false
 			d.loadConversations(true)
 			d.showConfirmationSuccess(request)
+			if request.Kind == "delete-agent" {
+				d.agentDraft = nil
+				if d.newAgent == request.Name {
+					d.newAgent = "default"
+				}
+				if strings.HasPrefix(d.newModel, request.Name+"/") && slices.ContainsFunc(d.agentRows, func(row agentSettingsRow) bool {
+					return row.info.Name == request.Name && row.info.Type.IsExternal()
+				}) {
+					d.newModel, d.newEffort = "", ""
+				}
+				d.loadAgentSettings()
+				d.loadAgents()
+				d.loadModels(d.readingTarget)
+			}
 			if request.Kind == "delete-provider" {
 				d.providerDraft = nil
 				d.providerBaseline = nil
@@ -623,6 +746,8 @@ func (d *Desktop) showConfirmationSuccess(request confirmation) {
 		d.showSuccess(d.t("conversation.renamed"), d.renameText)
 	case "withdraw":
 		d.showSuccess(d.t("input.withdrawn"), request.Name)
+	case "delete-agent":
+		d.showSuccess(d.t("agent.deleted"), request.Name)
 	case "delete-provider":
 		d.showSuccess(d.t("provider.deleted"), request.ProviderID)
 	case "delete-executor":

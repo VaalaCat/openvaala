@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -16,6 +17,26 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	schemavalidator "github.com/santhosh-tekuri/jsonschema/v6"
 )
+
+// GetConversationAttachmentDirectory 按目标 Executor 种类解析附件目录。SSH 从已有工作区读取 home，本机直接使用数据目录。
+func GetConversationAttachmentDirectory(ctx context.Context, ws workspace.Workspace, definition *defs.ExecutorDefinition, dataDirectory string, conversationID defs.ConversationID) (string, error) {
+	root := dataDirectory
+	switch definition.Kind {
+	case defs.ExecutorKindLocal:
+		if !filepath.IsAbs(root) {
+			return "", errors.New("local attachments require an absolute data directory")
+		}
+	case defs.ExecutorKindSSH:
+		home, err := ws.GetHomeDirectory(ctx)
+		if err != nil {
+			return "", err
+		}
+		root = filepath.Join(home, ".cache", "openvaala")
+	default:
+		return "", fmt.Errorf("executor %q does not support attachments", definition.ID)
+	}
+	return filepath.Join(root, "attachments", string(conversationID)), nil
+}
 
 // dropUndeclaredArguments 删除 schema 未声明的顶层参数。
 func dropUndeclaredArguments(schema *schemavalidator.Schema, document any) {

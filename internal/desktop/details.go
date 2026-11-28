@@ -11,6 +11,7 @@ import (
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	"github.com/egoist/mygo/ui"
@@ -151,7 +152,16 @@ func (d *Desktop) debugPanel(c *ui.Context) {
 func (d *Desktop) agentsTreeView(c *ui.Context) {
 	// 1. 深度从真实父 Session 链计算。
 	t := kit.GetTheme(c)
+	hidden := 0
 	for _, info := range orderedSessionInfos(d.sessionInfos) {
+		record := info.Session
+		if record.Background {
+			hidden++
+			if !d.backgroundExpanded {
+				continue
+			}
+		}
+
 		depth := 0
 		parent := info.Session.ParentSessionID
 		seen := map[defs.SessionID]bool{}
@@ -172,27 +182,137 @@ func (d *Desktop) agentsTreeView(c *ui.Context) {
 		if info.LastTurnStatus != "" {
 			meta += " · " + string(info.LastTurnStatus)
 		}
+		title := d.getSessionName(record.ID)
+		var labels []string
+		for k, v := range record.Labels {
+			labels = append(labels, k+"="+v)
+		}
+		slices.Sort(labels)
+		description := strings.Join(labels, " ")
+		icon := kit.IconBot
+		if record.External != nil {
+			icon = d.sessionBrandIcon(record.AgentName)
+		}
+		detached := record.DetachedConversationID != ""
+		if detached {
+			icon = nil
+			title = "○  " + title + " ↗"
+		}
+		menu := d.externalSessionMenu(record)
+		var actions func()
+		if len(menu) > 0 {
+			actions = func() {
+				d.handleMenuClosed(kit.MenuButton(c, kit.IconButtonTip(c, kit.IconEllipsis, d.t("session.actions")), menu))
+			}
+		}
 		row := kit.ListRow(c.Key(info.Session.ID), kit.ListRowOpt{
-			Icon:     kit.IconBot,
-			Title:    d.getSessionName(info.Session.ID),
+			Icon: icon, Actions: actions, Description: description,
+			Title:    title,
 			Selected: info.Session.ID == d.readingTarget.SessionID,
 			Depth:    depth,
 			Trailing: func() {
 				if info.State == session.SessionStateRunning {
 					kit.Spinner(c, kit.IconSizeDefault).Label(d.t("running"))
 				}
-				t.TextRole(ui.Text(c, info.Session.AgentName).SingleLine().Shrink(1).MinWidth(0), kit.TextCaption).TextColor(t.Colors.Placeholder)
+				if !detached {
+					t.TextRole(ui.Text(c, info.Session.AgentName).SingleLine().Shrink(1).MinWidth(0), kit.TextCaption).TextColor(t.Colors.Placeholder)
+				}
 				t.TextRole(ui.Text(c, fmt.Sprintf("↑%s ↓%s", tokenNumber(info.Usage.Input), tokenNumber(info.Usage.Output))).SingleLine().Shrink(0), kit.TextToken).TextColor(t.Colors.Muted)
 				if info.State != session.SessionStateIdle && info.State != session.SessionStateRunning {
 					t.TextRole(ui.Text(c, d.getSessionStateLabel(info.State)).SingleLine().Shrink(0), kit.TextCaption).TextColor(t.Colors.Placeholder)
 				}
 			},
 		}).FillWidth().Label("Session " + string(info.Session.ID))
-		kit.Tooltip(c, row, fmt.Sprintf("%s · %s %s · %s %s", meta, d.t("input.tokens"), tokenNumber(info.Usage.Input), d.t("output.tokens"), tokenNumber(info.Usage.Output)))
+		hint := fmt.Sprintf("%s · %s %s · %s %s", meta, d.t("input.tokens"), tokenNumber(info.Usage.Input), d.t("output.tokens"), tokenNumber(info.Usage.Output))
+		if description != "" {
+			hint += "\n" + description
+		}
+		if detached {
+			hint = d.t("session.detached") + "\n" + description
+		}
+		if record.Background {
+			row.TextColor(t.Colors.Muted)
+		}
+		kit.Tooltip(c, row, hint)
+		if len(menu) > 0 {
+			d.handleMenuClosed(kit.ContextMenu(c, row, menu))
+		}
 		if row.Clicked() {
-			d.openSession(info.Session.ID)
+			if detached {
+				d.openConversation(record.DetachedConversationID, "")
+			} else {
+				d.openSession(record.ID)
+			}
 		}
 	}
+	if hidden > 0 {
+		label := fmt.Sprintf(d.t("background.agents"), hidden)
+		button := ui.ButtonBase(c.Key("background-agents")).Height(t.Metrics.ControlHeight).Padding(0, 12).Background(ui.Transparent).Justify(ui.Start).AlignItems(ui.Center).Label(label)
+		color := t.Colors.Muted
+		if button.Hovered() {
+			color = t.Colors.Text
+		}
+		button.Children(func() { t.TextRole(ui.Text(c, label), kit.TextCaption).TextColor(color) })
+		if button.Clicked() {
+			d.backgroundExpanded = !d.backgroundExpanded
+		}
+	}
+}
+
+func (d *Desktop) sessionBrandIcon(name string) *ui.SVG {
+	for _, a := range d.agents {
+		if a.Name == name {
+			return agentBrandIcon(a.Icon)
+		}
+	}
+	return kit.IconBot
+}
+
+// externalSessionMenu 供会话树与当前会话标题共用，转出后的记录只保留跳转。
+func (d *Desktop) externalSessionMenu(record defs.Session) []kit.MenuItem {
+	if record.External == nil || record.DetachedConversationID != "" {
+		return nil
+	}
+	client := d.client
+	params := runtimeprotocol.SessionParams{ConversationID: record.ConversationID, SessionID: record.ID}
+	menu := []kit.MenuItem{{Title: d.t("reload.agent"), Icon: kit.IconRefresh, OnSelect: func() { d.reloadExternalSession(params) }}}
+	if record.ParentSessionID != "" {
+		menu = append(menu, kit.MenuItem{Title: d.t("detach.session"), Icon: kit.IconGitFork, OnSelect: func() {
+			d.tasks.Go(func() {
+				_, err := client.DetachSession(d.ctx, &params)
+				d.window.Update(func() {
+					if d.closed || d.client != client {
+						return
+					}
+					if err != nil {
+						d.showFailure(err)
+						return
+					}
+					d.loadConversations(true)
+				})
+			})
+		}})
+	}
+	return menu
+}
+
+func (d *Desktop) reloadExternalSession(params runtimeprotocol.SessionParams) {
+	client := d.client
+	d.tasks.Go(func() {
+		err := client.ReloadSession(d.ctx, &params)
+		d.window.Update(func() {
+			if d.closed || d.client != client {
+				return
+			}
+			if err != nil {
+				d.showFailure(err)
+				return
+			}
+			if d.isReading(params.ConversationID, params.SessionID) {
+				d.openConversation(params.ConversationID, params.SessionID)
+			}
+		})
+	})
 }
 
 // getSessionStateLabel 返回非空闲 Session 状态的本地化短词。

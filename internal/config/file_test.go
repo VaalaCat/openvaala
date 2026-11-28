@@ -21,6 +21,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/skill"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 )
 
 func TestReloadKeepsServeMemoryDirectory(t *testing.T) {
@@ -1585,5 +1586,185 @@ Host bare-alias
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ListSSHConfigHosts() = %+v, want %+v", got, want)
+	}
+}
+
+func TestConfigFilesAgents(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		steps      *int
+	}{
+		{name: "replace"},
+		{name: "invalid steps", want: "acp agent must not configure max_steps", steps: new(2)},
+		{name: "explicit zero steps", want: "acp agent must not configure max_steps", steps: new(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			files := config.NewConfigFiles(&config.LoadConfigOpt{Home: home})
+			value := defs.AgentConfig{Name: "codex", Type: defs.AgentTypeACP, ACP: &defs.ACPCommand{Command: "codex-acp"}}
+			if _, err := files.SetAgent(t.Context(), value); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(home, ".config", "openvaala", "agents", "codex.yaml")
+			original, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value.Description, value.MaxSteps = "updated", tc.steps
+			_, err = files.SetAgent(t.Context(), value)
+			if tc.want != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("SetAgent = %v", err)
+				}
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != string(original) {
+					t.Fatalf("restored file = %q, %v", data, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := files.GetAgent(t.Context(), value.Name)
+				if err != nil || !reflect.DeepEqual(got, &value) {
+					t.Fatalf("GetAgent = %+v, %v; want %+v", got, err, value)
+				}
+				if _, err := files.DeleteAgent(t.Context(), value.Name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := files.DeleteAgent(t.Context(), "default"); err == nil || err.Error() != "agent default cannot be deleted" {
+				t.Fatalf("DeleteAgent default = %v", err)
+			}
+		})
+	}
+}
+
+func TestGetAgentReadsRequestedFile(t *testing.T) {
+	home := t.TempDir()
+	files := config.NewConfigFiles(&config.LoadConfigOpt{Home: home})
+	directory := filepath.Join(home, ".config", "openvaala")
+	writeDefinitionFiles(t, directory, map[string]string{
+		"agents/broken.yaml": "[",
+		"agents/peer.yaml":   "name: peer\ninstructions: prompt\n",
+		"outside.yaml":       "name: outside\ninstructions: prompt\n",
+	})
+	for _, tc := range []struct {
+		name, wantErr string
+	}{
+		{name: "peer"},
+		{name: "default"},
+		{name: "broken", wantErr: "invalid YAML"},
+		{name: "missing", wantErr: `agent "missing" is not configured`},
+		{name: "../outside", wantErr: `agent "../outside" is not configured`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := files.GetAgent(t.Context(), tc.name)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("GetAgent(%q) error = %v, want %q", tc.name, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got.Name != tc.name || got.Instructions == "" {
+				t.Fatalf("GetAgent(%q) = %+v, %v", tc.name, got, err)
+			}
+		})
+	}
+	writeDefinitionFiles(t, directory, map[string]string{"agents/default.yaml": "instructions: override\n"})
+	if got, err := files.GetAgent(t.Context(), "default"); err != nil || got.Instructions != "override" {
+		t.Fatalf("GetAgent(default) = %+v, %v; want override", got, err)
+	}
+}
+
+func TestSetWorldAdminTokenOnFirstStart(t *testing.T) {
+	for _, path := range []string{"config.yaml", "new-directory/config.yaml"} {
+		t.Run(path, func(t *testing.T) {
+			home := t.TempDir()
+			opt := &config.LoadConfigOpt{Home: home, Path: filepath.Join(home, path)}
+			const token = "first-start-admin-token"
+			if err := config.NewConfigFiles(opt).SetWorldAdminToken(token); err != nil {
+				t.Fatal(err)
+			}
+			cfg, _, err := config.LoadConfigSettings(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.World.Server.AdminToken != token {
+				t.Fatalf("admin token was not saved to %s", opt.Path)
+			}
+		})
+	}
+}
+
+func TestSaveWorldSettings(t *testing.T) {
+	for _, mode := range []string{"edit", "join", "unknown default", "unknown target", "invalid visibility"} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "config.yaml")
+			const original = "# main config\nworld:\n  node:\n    name: old\n    domain: old.example\n    server_url: https://old.example\n    direct_urls:\n      - https://old.example/node # retained address\n  server:\n    admin_token: secret\n    domain: team # retain comment\nserver:\n  listen: 127.0.0.1:9999\n"
+			if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+				t.Fatal(err)
+			}
+			files := config.NewConfigFiles(&config.LoadConfigOpt{Path: path, Home: home})
+			settings, err := files.GetWorldSettings()
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings.Node.Name, settings.Node.Domain, settings.Node.ServerURL = "forged", "forged", "forged"
+			settings.Server.Domain = "updated"
+			settings.Server.IsDatabaseCreated = true
+			var join *worldserver.RegisterNodeResponse
+			wantError := ""
+			switch mode {
+			case "join":
+				join = &worldserver.RegisterNodeResponse{NodeName: "two", Domain: "new.example"}
+				settings.Node.Enabled = true
+			case "unknown default":
+				settings.Node.DefaultTarget = "unknown"
+				wantError = "unknown agent unknown in world settings"
+			case "unknown target":
+				settings.Node.AdvertiseTargets = []worldserver.AdvertisedTarget{{Name: "missing", Visibility: "domain"}}
+				wantError = "unknown agent missing in world settings"
+			case "invalid visibility":
+				settings.Node.AdvertiseTargets = []worldserver.AdvertisedTarget{{Name: "default", Visibility: "private"}}
+				wantError = "invalid exposed world target"
+			}
+			update, err := files.PrepareWorldSettings(settings, join != nil)
+			if err == nil {
+				err = files.SaveWorldSettings(update, join, "https://new.example")
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), wantError) || string(data) != original {
+					t.Fatalf("%v, config: %s", err, data)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, keep := range []string{"# main config", "# retain comment", "# retained address", "admin_token: secret", "127.0.0.1:9999"} {
+				if !strings.Contains(string(data), keep) {
+					t.Fatalf("lost %s in %s", keep, data)
+				}
+			}
+			got, err := files.GetWorldSettings()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Server.IsDatabaseCreated || got.Server.Domain != "updated" {
+				t.Fatal(got)
+			}
+			if join != nil {
+				if got.Node.Name != "two" || got.Node.Domain != "new.example" || got.Node.ServerURL != "https://new.example" {
+					t.Fatal(got)
+				}
+			} else if got.Node.Name != "old" || got.Node.Domain != "old.example" || got.Node.ServerURL != "https://old.example" {
+				t.Fatal(got)
+			}
+		})
 	}
 }

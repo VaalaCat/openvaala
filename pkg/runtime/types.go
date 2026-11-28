@@ -11,6 +11,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
+	"github.com/VaalaCat/openvaala/pkg/externalagent"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/session"
@@ -18,6 +19,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
 	"github.com/VaalaCat/openvaala/pkg/terminal"
+	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
 )
 
 // ── Runtime 错误 ──
@@ -37,9 +39,6 @@ var ErrSessionNotFound = errors.New("session not found")
 // ErrSubscriberTooSlow 表示订阅者的缓冲已满，订阅被关闭；调用方用最后看到的位置重新订阅。
 var ErrSubscriberTooSlow = errors.New("subscriber is too slow")
 
-// ErrNoModelConfigured 是没有任何模型时新建对话返回的错误。
-var ErrNoModelConfigured = errors.New("no model is configured; run openvaala to set up a model provider")
-
 // errConversationAlreadyOpen 是登记新装配的实例时，同一对话已有运行实例的错误；回复里同时带上运行中的那个实例。
 var errConversationAlreadyOpen = errors.New("conversation is already open")
 
@@ -47,10 +46,16 @@ var errConversationAlreadyOpen = errors.New("conversation is already open")
 // 客户端收到后重新订阅、增量同步。
 var ErrConversationReconfigured = errors.New("conversation reconfigured")
 
+// ErrSessionHistoryRestored 通知恢复期间的订阅读取已完成回放的历史。
+var ErrSessionHistoryRestored = errors.New("session history restored")
+
 // ── Runtime 请求参数 ──
 
 // CreateConversationRequest 是新建对话的参数：用哪个 Agent、什么模型、哪些 Executor 和环境变量；对话建好后立即启动。
 type CreateConversationRequest struct {
+	forkSummary    string
+	forkedFromID   defs.ConversationID
+	InitialOptions []defs.ExternalOptionSelection
 	// ConversationID 是调用方指定的新对话 ID；为空时由 Runtime 生成。不检查是否重复。
 	ConversationID defs.ConversationID
 	// AgentName 是根 Session 使用的 Agent 名。
@@ -113,13 +118,19 @@ type Definitions struct {
 
 // ListModelsRequest 查询模型目录；AgentName 为空时不返回 Agent 默认模型。
 type ListModelsRequest struct {
-	AgentName string
+	AgentName      string              `json:"agent_name,omitempty"`
+	ConversationID defs.ConversationID `json:"conversation_id,omitempty"`
+	SessionID      defs.SessionID      `json:"session_id,omitempty"`
+	ExecutorID     string              `json:"executor_id,omitempty"`
+	Cwd            string              `json:"cwd,omitempty"`
 }
 
-// GetSkillsRequest 指定查哪里的 Skill：有 ConversationID 时查这个已打开对话；还没有对话时按 AgentName 和 ExecutorSettings 查草稿。
+// GetSkillsRequest 指定查哪里的 Skill：有 ConversationID 时查对话，指定 SourceSessionID 时按需打开；还没有对话时按 AgentName 和 ExecutorSettings 查草稿。
 type GetSkillsRequest struct {
-	ConversationID defs.ConversationID
-	AgentName      string
+	SourceSessionID defs.SessionID
+	Query           string
+	ConversationID  defs.ConversationID
+	AgentName       string
 	// ExecutorSettings 只在没有 ConversationID 时用：草稿对话按它找默认 Executor 扫项目目录和主目录。
 	ExecutorSettings defs.ExecutorSettings
 }
@@ -146,6 +157,8 @@ type OpenTerminalRequest struct {
 	Rows, Cols uint16
 	// ConversationID 为空时只有原生客户端的 Dock 显示这个终端。
 	ConversationID defs.ConversationID
+	// UseConversationExecutor 为 true 时只允许使用所属对话已装配的 Executor。
+	UseConversationExecutor bool
 }
 
 // GetWorkspaceDirectoriesRequest 指定 Executor、待列出的目录和相对路径基准。
@@ -180,7 +193,8 @@ type SetConversationTitleRequest struct {
 
 // ForkConversationRequest 把已保存的对话根 Session 复制到某一轮为止，成为一个新对话并打开；还在运行的轮次只复制已保存的部分。
 type ForkConversationRequest struct {
-	ConversationID defs.ConversationID
+	SourceSessionID defs.SessionID
+	ConversationID  defs.ConversationID
 	// ForkedConversationID 是调用方指定的分叉出的新对话 ID；为空时由 Runtime 生成。不检查是否重复。
 	ForkedConversationID defs.ConversationID
 	// BeforeTurnID 复制到这一轮之前（不含），回退重来用；LastTurnID 复制到这一轮（含）。
@@ -266,6 +280,15 @@ type ListItemsRequest struct {
 	Limit          int
 }
 
+// UploadAttachmentRequest 指定附件所属对话、目标 Executor 和原始文件。
+type UploadAttachmentRequest struct {
+	ConversationID defs.ConversationID
+	ExecutorID     string
+	Name           string
+	MIME           string
+	Data           []byte
+}
+
 // ListTurnsRequest 分页读取一个 Session 的 Turn 记录；ConversationID 用来选这个对话的存储，分页字段与 dao.ListTurnsRequest 相同。
 type ListTurnsRequest struct {
 	ConversationID defs.ConversationID
@@ -320,7 +343,9 @@ func (*runningConversationRequested) isRuntimeRequest() {}
 
 // conversationStartRequested 由新建、打开、未打开时改设置或分叉在装配好实例后发出，请求 Runtime 登记并启动。
 type conversationStartRequested struct {
-	instance conversation.Conversation
+	// rootCreated 只在新建外部对话时接收首次恢复和绑定保存结果。
+	rootCreated chan<- error
+	instance    conversation.Conversation
 	// unsavedStore 是没保存的对话的内存库；从共用库打开时为 nil。
 	unsavedStore *unsavedConversationStore
 	// executorSettings 非 nil 时，Runtime 登记前先把它写进对话记录。
@@ -387,6 +412,16 @@ type runningConversationsRequested struct {
 }
 
 func (*runningConversationsRequested) isRuntimeRequest() {}
+
+// optionsProbeRequested 由模型列表或显式选项查询发出，Runtime 在自己的生命周期内合并同位置的在途探测。
+type optionsProbeRequested struct {
+	definitions *runtimeDefinitions
+	probe       externalAgentProbe
+	request     AgentOptionsRequest
+	reply       chan *optionsProbeResult
+}
+
+func (*optionsProbeRequested) isRuntimeRequest() {}
 
 // definitionsChangeRequested 由 SetDefinitions 触发：事件循环换上新定义，回复运行表里全部对话（含正在退出的）的列表，
 // 由 SetDefinitions 逐个更新对话。
@@ -457,6 +492,9 @@ func (*terminalsUnsubscribeRequested) isRuntimeRequest() {}
 
 // runtimeDefinitions 是 Runtime 当前的定义和两个索引，构造后只读，reload 时整份替换。
 type runtimeDefinitions struct {
+	// 外部驱动持有定义级选项缓存，随这套定义一同替换。
+	externalProviders syncmap.SyncMap[string, externalagent.ExternalAgentProvider]
+	optionProbes      syncmap.SyncMap[string, *optionsProbeResult]
 	// conversationDefinitions 是交给对话的整份定义（Agent、模型目录、MCP server、hook、Executor、共用 skill），建一次、各对话共用；
 	// 对话只给其中至少一个 Agent 会用到的 MCP server 建连接；各套对话配置自行创建 Hooks。
 	conversationDefinitions *conversation.ConversationDefinitions
@@ -512,6 +550,8 @@ const subscriptionBufferSize = 256
 
 // SessionSubscription 是一个 Session 的内容订阅。
 type SessionSubscription struct {
+	Restoring     bool
+	ExternalState *session.SessionExternalStateUpdated
 	// LastSavedOrdinal 是订阅时已转发的最后一条已保存日志的流水号；它及之前的日志用 ListItems 补齐。
 	LastSavedOrdinal storage.Ordinal
 	// StreamingItems 是订阅时该 Session 活动 Turn 中已开始、尚未保存的 Item，按首次出现顺序，带 ItemIndex：
@@ -593,7 +633,7 @@ type RunningTerminal struct {
 	ConversationID defs.ConversationID
 }
 
-// SessionRuntimeInfo 是一个 Session 的运行信息，可直接用 == 比较；runtimeConversation 在它有变化时发给对话订阅者，
+// SessionRuntimeInfo 是一个 Session 的运行信息；runtimeConversation 在它有变化时发给对话订阅者，
 // 例如 Session 启停、Turn 开始或结束、用量和上下文占用变化、换模型。
 type SessionRuntimeInfo struct {
 	Session        defs.Session         `json:"session"`
@@ -685,8 +725,10 @@ type ModelList struct {
 
 // AgentInfo 是 ListAgents 返回的一个 Agent 的公开说明，不含系统指令。
 type AgentInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	Name        string         `json:"name"`
+	Type        defs.AgentType `json:"type"`
+	Description string         `json:"description,omitempty"`
+	Icon        string         `json:"icon,omitempty"`
 	// DefaultModel 是 Agent 的默认模型；Agent 没有指定默认模型时为零值。
 	DefaultModel defs.ModelRef `json:"default_model,omitzero"`
 }
@@ -715,6 +757,8 @@ func (*subscribeRequested) isRuntimeConversationRequest() {}
 
 // subscribeReply 是登记结果和登记时一并取出的初始信息。
 type subscribeReply struct {
+	restoring     bool
+	externalState *session.SessionExternalStateUpdated
 	// contentStream、lastSavedOrdinal、streamingItems 只在内容订阅时有值：事件通道、续传位置和生成中 Item。
 	contentStream *subscriptionStream[conversation.ConversationEvent]
 	// statusStream、title、sessions 只在对话订阅时有值：事件通道、已保存的标题和全部 Session 的运行信息。
@@ -798,3 +842,63 @@ type recordRequested struct {
 }
 
 func (*recordRequested) isRuntimeConversationRequest() {}
+
+// ── Executor 命令请求与结果 ──
+
+// ExecutorExecRequest 指定执行机器、工作目录和逐项参数。
+type ExecutorExecRequest struct {
+	ConversationID defs.ConversationID `json:"conversation_id,omitempty"`
+	ExecutorID     string              `json:"executor_id"`
+	Cwd            string              `json:"cwd,omitempty"`
+	Command        string              `json:"command"`
+	Args           []string            `json:"args,omitempty"`
+}
+type ExecutorExecResult struct {
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
+
+// ── 外部 Agent 查询与导入 ──
+
+// ExternalAgentLocation 指定 Agent 定义以及外部进程使用的工作位置。
+type ExternalAgentLocation struct {
+	AgentName  string `json:"agent_name"`
+	ExecutorID string `json:"executor_id,omitempty"`
+	Cwd        string `json:"cwd,omitempty"`
+}
+type AgentOptionsRequest struct {
+	ExternalAgentLocation
+	Selections []defs.ExternalOptionSelection `json:"selections,omitempty"`
+	Refresh    bool                           `json:"refresh,omitempty"`
+}
+type ExternalSessionsRequest struct {
+	ExternalAgentLocation
+	Query  string `json:"query,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
+}
+type ExternalSessionsResult struct {
+	Sessions   []externalagent.ExternalSessionInfo `json:"sessions"`
+	NextCursor string                              `json:"next_cursor,omitempty"`
+}
+type ExternalSessionRequest struct {
+	ExternalAgentLocation
+	ExternalSessionID string `json:"external_session_id"`
+}
+type ImportSessionRequest struct {
+	ExternalSessionRequest
+	Title string `json:"title,omitempty"`
+}
+
+// externalAgentProbe 保存一处已解析的探测位置；工作区只在实际执行协议请求时打开。
+type externalAgentProbe struct {
+	agentType defs.AgentType
+	ExternalAgentLocation
+	provider externalagent.ExternalAgentProvider
+	executor executor.Executor
+}
+
+type optionsProbeResult struct {
+	done    chan struct{}
+	options defs.ExternalOptions
+}

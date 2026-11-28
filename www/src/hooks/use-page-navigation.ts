@@ -16,13 +16,22 @@ export function usePageNavigation(
   >()
   const parentLabel = parent?.label
   const parentPath = parent?.to
+  const parentIcon = parent?.icon
+  const parentTooltip = parent?.tooltip
   const parentsKey = JSON.stringify(parents)
   useLayoutEffect(() => {
     setNavigation?.({
       locationKey: key,
       title,
       parents: parentsKey ? JSON.parse(parentsKey) : undefined,
-      parent: parentLabel ? { label: parentLabel, to: parentPath } : undefined,
+      parent: parentLabel
+        ? {
+            label: parentLabel,
+            to: parentPath,
+            icon: parentIcon,
+            tooltip: parentTooltip,
+          }
+        : undefined,
       onTitleClick,
     })
   }, [
@@ -30,6 +39,8 @@ export function usePageNavigation(
     title,
     parentLabel,
     parentPath,
+    parentIcon,
+    parentTooltip,
     parentsKey,
     onTitleClick,
     setNavigation,

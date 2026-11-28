@@ -1,4 +1,10 @@
+import {
+  parseWorldLink,
+  connectionBudget,
+  type WorldTarget,
+} from "./world-transport"
 import { persistentAtom } from "@nanostores/persistent"
+import type { InitializeResult } from "./protocol.gen"
 import { ServerConnection } from "./server-connection"
 
 // 浏览器记住的一个 serve；包含页面默认 serve 与用户添加的远端 serve
@@ -6,24 +12,24 @@ export interface ServerEntry {
   // ws(s)://host:port/api/v1/openvaala
   url: string
   token: string
-  // 用户自定义的显示名称，省略时按 host 展示
+  // 保存的服务器名，可由用户指定。
   name?: string
   // initialize 返回后记下
   serverID?: string
+  publicKey?: string
+  // 最近一次 world/getStatus 返回的节点地址。
+  nodeAddr?: string
 }
 
 export type ParseServerInputError =
-  | "required"
-  | "invalid"
-  | "unsupportedScheme"
-  | "missingHost"
+  "required" | "invalid" | "unsupportedScheme" | "missingHost"
 
 export type ParseServerInputResult =
   | {
       ok: true
       url: string
       token: string
-      defaultName: string
+      worldTarget?: WorldTarget
       extractedToken: boolean
     }
   | {
@@ -36,6 +42,7 @@ export type ServerTestResult =
   | {
       ok: false
       reason: "unauthorized" | "incompatible" | "unreachable" | "timeout"
+      detail?: string
     }
 
 const runtimeServerWSPath = "/api/v1/openvaala"
@@ -59,6 +66,12 @@ function parseServers(value: string): ServerEntry[] {
         const entry: ServerEntry = {
           url: parsed.url,
           token: parsed.token,
+          ...(parsed.worldTarget
+            ? { publicKey: parsed.worldTarget.public_key }
+            : {}),
+          ...(typeof raw.nodeAddr === "string"
+            ? { nodeAddr: raw.nodeAddr }
+            : {}),
         }
         if (typeof raw.name === "string" && raw.name.trim())
           entry.name = raw.name.trim()
@@ -107,6 +120,16 @@ export function parseServerInput(
   const candidate = trimmed.includes("://") ? trimmed : `ws://${trimmed}`
   let parsed: URL
   try {
+    if (trimmed.includes("#world=")) {
+      const { target, url, token } = parseWorldLink(trimmed)
+      return {
+        ok: true,
+        url,
+        token: token || fallbackToken.trim(),
+        worldTarget: target,
+        extractedToken: !!token,
+      }
+    }
     parsed = new URL(candidate)
   } catch {
     return { ok: false, error: "invalid" }
@@ -137,18 +160,26 @@ export function parseServerInput(
     ok: true,
     url: parsed.toString(),
     token: extracted || fallbackToken.trim(),
-    defaultName: parsed.host,
     extractedToken: Boolean(extracted),
   }
 }
 
-// 提取服务器地址的 host[:port] 供展示，解析失败时回退原文
-export function getServerHost(rawURL: string): string {
-  try {
-    return new URL(rawURL).host || rawURL
-  } catch {
-    return rawURL
+// 连接档案分别展示服务器名字与地址；还未连接过时使用链接公布的入口。
+export function getServerDisplay(
+  server: Pick<ServerEntry, "url" | "name" | "nodeAddr">
+) {
+  let endpointURL = server.url
+  let name = server.name
+  let address = server.nodeAddr
+  if (server.url.includes("#world=")) {
+    const { target } = parseWorldLink(server.url)
+    endpointURL = target.entries.direct_urls?.[0] ?? target.entries.relays![0]
+    name ||= target.name
+    if (address === undefined && target.node && target.domain)
+      address = target.node + "@" + target.domain
   }
+  const endpoint = new URL(endpointURL)
+  return { name: name || endpoint.hostname, address: address || endpoint.host }
 }
 
 // 保存某个 serve 的 token；已有这一项就只换 token
@@ -170,20 +201,33 @@ export function upsertServer(input: {
   token: string
   name?: string
 }): void {
-  const matchURL = input.previousURL ?? input.url
-  const name = input.name?.trim() || undefined
   const servers = $servers.get()
-  const existing = servers.find((server) => server.url === matchURL)
+  const parsed = parseServerInput(input.url, input.token)
+  if (!parsed.ok) return
+  const key = parsed.worldTarget?.public_key
+  const existing =
+    servers.find((server) => server.url === input.previousURL) ??
+    servers.find((server) =>
+      key ? server.publicKey === key : server.url === parsed.url
+    )
+  const matchURL = existing?.url ?? parsed.url
+  const sameServer = key ? key === existing?.publicKey : matchURL === parsed.url
+  const name = input.name === undefined ? existing?.name : input.name.trim()
   const nextEntry: ServerEntry = {
-    url: input.url,
-    token: input.token,
+    url: parsed.url,
+    token: parsed.token,
+    ...(key ? { publicKey: key } : {}),
     ...(name ? { name } : {}),
-    ...(existing?.serverID && matchURL === input.url
+    ...(matchURL === parsed.url ? { nodeAddr: existing?.nodeAddr } : {}),
+    ...(existing?.serverID && sameServer
       ? { serverID: existing.serverID }
       : {}),
   }
   const filtered = servers.filter(
-    (server) => server.url !== matchURL && server.url !== input.url
+    (server) =>
+      server.url !== matchURL &&
+      server.url !== parsed.url &&
+      (!key || server.publicKey !== key)
   )
   const existingIndex = servers.findIndex((server) => server.url === matchURL)
   if (existingIndex >= 0) {
@@ -193,8 +237,8 @@ export function upsertServer(input: {
   } else {
     $servers.set([...filtered, nextEntry])
   }
-  if (input.previousURL && $activeServerURL.get() === input.previousURL)
-    $activeServerURL.set(input.url)
+  if ($activeServerURL.get() === matchURL && matchURL !== parsed.url)
+    $activeServerURL.set(parsed.url)
 }
 
 // 删除一条远端服务器档案；如果它正是当前活跃服务器，自动退回默认页服务器
@@ -208,25 +252,49 @@ export function setActiveServerURL(url: string, pageURL: string): void {
   $activeServerURL.set(!url || url === pageURL ? "" : url)
 }
 
-// 记下 initialize 返回的 server_id
-export function saveServerID(url: string, serverID: string): void {
+// 点选当前服务器时沿用这条连接重连，选择其他服务器时切换目标。
+export function connectToServer(
+  url: string,
+  pageURL: string,
+  connection?: ServerConnection
+): void {
+  if (connection?.entry.url === url) connection.reconnect()
+  else setActiveServerURL(url, pageURL)
+}
+
+// 握手后记下服务端身份；本页使用 Runtime 的名字，远端保留已保存或链接指定的名字。
+export function saveServerIdentity(
+  entry: ServerConnection["entry"],
+  result: InitializeResult
+): void {
   $servers.set(
-    $servers
-      .get()
-      .map((server) => (server.url === url ? { ...server, serverID } : server))
+    $servers.get().map((server) => {
+      if (server.url !== entry.url) return server
+      const hasSavedName =
+        server.url !== getPageServerURL(window.location) &&
+        (server.name || entry.worldTarget?.name)
+      return {
+        ...server,
+        serverID: result.server_id,
+        name: hasSavedName ? server.name : result.server_info.name,
+      }
+    })
   )
+}
+
+export function saveServerNodeAddress(url: string, nodeAddr: string): void {
+  const servers = $servers.get()
+  if (servers.some((s) => s.url === url && s.nodeAddr !== nodeAddr))
+    $servers.set(servers.map((s) => (s.url === url ? { ...s, nodeAddr } : s)))
 }
 
 // 用独立临时连接测试目标地址的连通性、Token 和协议版本，结束后立即断开，不影响当前主连接
 export function testServerConnection(
-  entry: Pick<ServerEntry, "url" | "token">,
-  timeoutMs = 10_000
+  entry: Extract<ParseServerInputResult, { ok: true }>,
+  timeoutMs = connectionBudget(entry.worldTarget)
 ): Promise<ServerTestResult> {
   return new Promise((resolve) => {
-    const connection = new ServerConnection({
-      url: entry.url,
-      token: entry.token,
-    })
+    const connection = new ServerConnection(entry)
     let settled = false
     const cleanups: (() => void)[] = []
     const finish = (result: ServerTestResult) => {
@@ -236,16 +304,19 @@ export function testServerConnection(
       for (const cleanup of cleanups) cleanup()
       resolve(result)
     }
-    const timer = setTimeout(() => finish({ ok: false, reason: "timeout" }), timeoutMs)
+    const timer = setTimeout(
+      () => finish({ ok: false, reason: "timeout" }),
+      timeoutMs
+    )
     cleanups.push(
-      connection.$state.listen((state) => {
+      connection.$status.listen(({ state, reason }) => {
         if (state === "connected") finish({ ok: true })
         else if (state === "unauthorized")
           finish({ ok: false, reason: "unauthorized" })
         else if (state === "incompatible")
           finish({ ok: false, reason: "incompatible" })
         else if (state === "reconnecting")
-          finish({ ok: false, reason: "unreachable" })
+          finish({ ok: false, reason: "unreachable", detail: reason })
       })
     )
     cleanups.push(connection.run())

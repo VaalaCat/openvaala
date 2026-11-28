@@ -8,10 +8,15 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
+	"github.com/VaalaCat/openvaala/pkg/session"
+	"github.com/VaalaCat/openvaala/pkg/storage"
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -114,7 +119,7 @@ func TestConnectionBanner(t *testing.T) {
 	}
 }
 
-// TestConnectionStatusBar 检查状态栏只显示连接状态：圆点加简短状态文字，没有错误原文，也没有「重试」（重试只在对话区横幅里）。
+// TestConnectionStatusBar 检查状态栏只显示服务器名字，按钮的无障碍名称保留连接状态。
 func TestConnectionStatusBar(t *testing.T) {
 	const raw = "dial tcp: connection refused"
 	for _, tt := range []struct {
@@ -130,6 +135,7 @@ func TestConnectionStatusBar(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			d := testDesktop()
+			d.localServer = remoteServer{ID: localServerID, Name: "Workstation", URL: "ws://localhost:8790"}
 			tt.prepare(d)
 			tester := ui.NewTester(d.view, 1280, 820)
 			tester.SetLocale("zh-Hans")
@@ -140,8 +146,8 @@ func TestConnectionStatusBar(t *testing.T) {
 				t.Fatalf("status bar not found: %q", texts)
 			}
 			bar := texts[start:]
-			if !slices.Contains(bar, tt.wantStatus) || slices.Contains(bar, "重试") || slices.ContainsFunc(bar, func(s string) bool { return strings.Contains(s, raw) }) {
-				t.Fatalf("status bar texts %q, want %q only", bar, tt.wantStatus)
+			if !slices.Contains(bar, "切换服务器 · Workstation · "+tt.wantStatus) || !slices.Contains(bar, "Workstation") || slices.Contains(bar, "localhost:8790") || slices.Contains(bar, "重试") || slices.ContainsFunc(bar, func(s string) bool { return strings.Contains(s, raw) }) {
+				t.Fatalf("status bar texts %q, want server name with accessible status %q", bar, tt.wantStatus)
 			}
 		})
 	}
@@ -199,6 +205,30 @@ func TestDesktopSwitchServer(t *testing.T) {
 	}
 }
 
+// TestSwitchServerWithAgentDraft 检查切服先确认是否放弃未保存的 Agent 配置。
+func TestSwitchServerWithAgentDraft(t *testing.T) {
+	for _, dirty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dirty=%t", dirty), func(t *testing.T) {
+			d := testDesktop()
+			d.preferencesPath = filepath.Join(t.TempDir(), "preferences.json")
+			d.setAgentDraft(defs.AgentConfig{Name: "worker"}, "worker")
+			if dirty {
+				d.agentDraft.definition.Description = "unsaved"
+			}
+			d.switchServer("remote-1")
+			if dirty {
+				if !d.confirmOpen || d.confirm.Kind != "switch-server" || d.agentDraft == nil || d.preferences.ActiveServer == "remote-1" {
+					t.Fatal("switch discarded the Agent draft before confirmation")
+				}
+				d.submitConfirmation()
+			}
+			if d.preferences.ActiveServer != "remote-1" || d.agentDraft != nil {
+				t.Fatal("switch did not clear the previous server's Agent draft")
+			}
+		})
+	}
+}
+
 // TestServersDialogPasteAndSave 检查「管理服务器」弹窗粘贴 openvaala web 链接时自动拆出 URL 与 Token，并可保存。
 func TestServersDialogPasteAndSave(t *testing.T) {
 	d := testDesktop()
@@ -208,11 +238,153 @@ func TestServersDialogPasteAndSave(t *testing.T) {
 	d.serverForm.Name = "云端 GPU"
 	d.serverForm.URL = "https://gpu.vaala.dev/web/v1/#token=paste-secret"
 	d.handleServerAddressChanged()
-	if d.serverForm.URL != "wss://gpu.vaala.dev/api/v1/openvaala" || d.serverForm.Token != "paste-secret" || !d.serverForm.TokenAutoFilled {
+	if d.serverForm.URL != "wss://gpu.vaala.dev/api/v1/openvaala" || d.serverForm.Token != "paste-secret" {
 		t.Fatalf("form after paste = %+v", d.serverForm)
 	}
 	d.saveServerForm(false)
 	if len(d.preferences.RemoteServers) != 1 || d.preferences.RemoteServers[0].Name != "云端 GPU" || d.preferences.RemoteServers[0].Token != "paste-secret" {
 		t.Fatalf("saved servers = %+v", d.preferences.RemoteServers)
+	}
+}
+
+// historyPageClient 记录桌面阅读器自己发出的分页请求。
+type historyPageClient struct {
+	runtimeclient.Client
+	requests []runtimeclient.ListItemsRequest
+	opened   chan runtimeclient.OpenConversationRequest
+	inputs   []runtimeclient.SubmitInputRequest
+}
+
+func (c *historyPageClient) ListItems(_ context.Context, request *runtimeclient.ListItemsRequest) (runtimeclient.ListItemsResult, error) {
+	c.requests = append(c.requests, *request)
+	return runtimeclient.ListItemsResult{}, nil
+}
+
+func (c *historyPageClient) OpenConversation(_ context.Context, request *runtimeclient.OpenConversationRequest) (defs.Conversation, error) {
+	c.opened <- *request
+	return defs.Conversation{ID: request.ConversationID, RootSessionID: "s1"}, nil
+}
+
+func (c *historyPageClient) SubmitInput(_ context.Context, request *runtimeclient.SubmitInputRequest) (defs.ItemID, error) {
+	c.inputs = append(c.inputs, *request)
+	return "queued", nil
+}
+
+// TestExternalClientRestore 验证外部库更换时重新读桌面倒序页，以及等待、失败时的聊天视图。
+func TestExternalClientRestore(t *testing.T) {
+	for _, action := range []string{"cold_open", "ready_same_tail", "restoring_then_ready", "restoring_then_failure", "native_incremental"} {
+		t.Run(action, func(t *testing.T) {
+			d := testDesktop()
+			client := &historyPageClient{}
+			d.client = client
+			d.readingCtx = t.Context()
+			d.window = &mygo.Window{}
+			d.conversation = defs.Conversation{ID: "c1", RootSessionID: "s1"}
+			d.readingTarget = readingTarget{ConversationID: "c1", SessionID: "s1"}
+			if action == "cold_open" {
+				d.ctx, d.cancel = context.WithCancel(t.Context())
+				d.readingRequests = make(chan readingRequested, 1)
+				client.opened = make(chan runtimeclient.OpenConversationRequest, 1)
+				d.tasks.Go(d.runReadingRequests)
+				d.openConversation("c1", "s1")
+				request := <-client.opened
+				d.cancel()
+				d.tasks.Wait()
+				if !request.SkipHistory || len(client.requests) != 0 {
+					t.Fatalf("open=%v premature pages=%v", request, client.requests)
+				}
+				return
+			}
+			snapshot := runtimeclient.SessionSynced{ConversationID: "c1", SessionID: "s1", External: action != "native_incremental", LastSavedOrdinal: 53}
+			if snapshot.External {
+				snapshot.HistoryAction = runtimeclient.HistoryReplace
+			}
+			d.handleClientEvent(&snapshot)
+			d.tasks.Wait()
+			want := runtimeclient.ListItemsRequest{ConversationID: "c1", SessionID: "s1", Order: storage.DirectionDesc, Limit: 50}
+			if !slices.Equal(client.requests, []runtimeclient.ListItemsRequest{want}) {
+				t.Fatalf("first ready requests=%v", client.requests)
+			}
+			client.requests = nil
+			oldTarget := d.readingTarget
+			d.handleHistoryPage(oldTarget, runtimeclient.ListItemsResult{
+				Items:      []runtimeprotocol.LoggedItem{{Ordinal: 53, Item: &defs.Item{ID: "old-tail"}}, {Ordinal: 3, Item: &defs.Item{ID: "outside"}}},
+				NextCursor: 3,
+			}, nil)
+			if strings.HasPrefix(action, "restoring") {
+				waiting := runtimeclient.SessionSynced{ConversationID: "c1", SessionID: "s1", External: true, Restoring: true, HistoryAction: runtimeclient.HistoryWait}
+				d.handleClientEvent(&waiting)
+				d.loadHistory()
+				d.tasks.Wait()
+				if d.readingReady || d.itemCursor != 3 || len(client.requests) != 0 {
+					t.Fatalf("restoring ready=%v cursor=%d requests=%v", d.readingReady, d.itemCursor, client.requests)
+				}
+				render := func() string {
+					tester := ui.NewTester(d.conversationView, 800, 600)
+					tester.SetLocale("zh-Hans")
+					return strings.Join(tester.Texts(), " ")
+				}
+				if view := render(); !strings.Contains(view, "正在从外部 Agent 恢复历史") {
+					t.Fatalf("restoring view=%s", view)
+				}
+				// 恢复中的会话仍可接收输入，历史读取独立等待 Ready。
+				key := draftKey{d.serverID, d.conversation.ID}
+				d.drafts[key] = &conversationDraft{Content: []*defs.Content{{Kind: defs.ContentText, Text: &defs.TextContent{Text: "during restoration"}}}}
+				d.submitDraft(key, session.SessionInputModeNormal)
+				d.tasks.Wait()
+				if len(client.inputs) != 1 || client.inputs[0].ConversationID != "c1" {
+					t.Fatalf("restoring submissions=%v", client.inputs)
+				}
+				if action == "restoring_then_failure" {
+					d.handleClientEvent(&runtimeclient.ConversationSyncFailed{ConversationID: "c1", Err: errors.New("peer refused history")})
+					d.loadHistory()
+					if view := render(); !strings.Contains(view, "peer refused history") || strings.Contains(view, "正在从外部") || d.readingReady || d.historyLoading || len(client.requests) != 0 {
+						t.Fatalf("failed view=%s requests=%v", view, client.requests)
+					}
+					return
+				}
+			}
+			d.handleClientEvent(&snapshot)
+			d.tasks.Wait()
+			if !snapshot.External {
+				if len(client.requests) != 0 || len(d.items) != 2 || d.itemCursor != 3 {
+					t.Fatalf("native requests=%v items=%v", client.requests, d.items)
+				}
+				return
+			}
+			if !slices.Equal(client.requests, []runtimeclient.ListItemsRequest{want}) || len(d.items) != 0 || d.itemCursor != 0 {
+				t.Fatalf("requests=%v items=%v cursor=%d", client.requests, d.items, d.itemCursor)
+			}
+			// 窗口主线程先收到新实时条目，再收到当前页和上一代的分页回调。
+			d.mergeSavedItems([]runtimeprotocol.LoggedItem{{Ordinal: 54, Item: &defs.Item{ID: "live"}}}, true)
+			page := runtimeclient.ListItemsResult{Items: []runtimeprotocol.LoggedItem{{Ordinal: 53, Item: &defs.Item{ID: "new-tail"}}}, NextCursor: 53}
+			d.handleHistoryPage(d.readingTarget, page, nil)
+			d.handleHistoryPage(oldTarget, runtimeclient.ListItemsResult{}, errors.New("late response"))
+			if len(d.items) != 2 || d.items[0].Item.ID != "new-tail" || d.items[1].Item.ID != "live" || d.itemCursor != 53 || d.historyError != nil {
+				t.Fatalf("page=%v cursor=%d err=%v", d.items, d.itemCursor, d.historyError)
+			}
+		})
+	}
+}
+
+// TestExternalInitialRestoreFailure 验证首次打开失败时保留所选会话和服务端原文，迟到的历史页不能覆盖原因。
+func TestExternalInitialRestoreFailure(t *testing.T) {
+	for _, method := range []string{"conversation/open", "session/subscribe"} {
+		t.Run(method, func(t *testing.T) {
+			d := testDesktop()
+			d.conversation = defs.Conversation{ID: "c7", RootSessionID: "s7"}
+			d.readingTarget = readingTarget{ConversationID: "c7", SessionID: "s7", Request: 1}
+			d.historyLoading = true
+			cause := "external session cannot be restored: executor archive not found"
+			err := fmt.Errorf("%s: %w", method, &runtimeclient.ResponseError{Code: runtimeprotocol.ErrorCodeRuntime, Message: cause})
+			d.handleReadingFailed(d.readingTarget, err)
+			tester := ui.NewTester(d.conversationView, 1000, 600)
+			d.handleHistoryPage(d.readingTarget, runtimeclient.ListItemsResult{}, nil)
+			tester.Advance(time.Minute)
+			text := strings.Join(tester.Texts(), " ")
+			if d.readingTarget.ConversationID != "c7" || d.readingReady || d.historyLoading || !strings.Contains(text, cause) {
+				t.Fatalf("target=%+v view=%s", d.readingTarget, text)
+			}
+		})
 	}
 }

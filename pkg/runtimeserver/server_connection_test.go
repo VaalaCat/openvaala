@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,9 +15,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -730,5 +735,103 @@ func isMethodTimes(method string, times int) func(clientMessage) bool {
 			seen++
 		}
 		return seen >= times
+	}
+}
+
+// TestExternalDetachedCaller 检查已经初始化的连接在转出后按来源记录统一拒绝请求。
+func TestExternalDetachedCaller(t *testing.T) {
+	h, operator, record := startExternalSpawnTest(t, defs.ACPCommand{Command: buildServerFakeACP(t), Args: []string{"-prompt", "wait-cancel"}})
+	var child conversation.SpawnAgentResult
+	operator.callResult(t, "session/spawn", map[string]any{
+		"conversation_id": record.ID, "agent_name": "external", "task_name": "check", "message": "work", "notify_on_finish": false,
+	}, &child)
+	token := sessiontoken.Issue(testToken, record.ID, child.SessionID)
+	conn, _, err := h.dialWith(t, "/api/v1/openvaala", http.Header{"Authorization": {"Bearer " + token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := newTestClient(t, conn)
+	scoped.initialize(t)
+	var grandchild conversation.SpawnAgentResult
+	scoped.callResult(t, "session/spawn", map[string]any{
+		"conversation_id": record.ID, "agent_name": "external", "task_name": "follow up", "message": "work", "notify_on_finish": false,
+	}, &grandchild)
+	var detached runtimeprotocol.ConversationResult
+	operator.callResult(t, "session/detach", sessionTarget(record, child.SessionID), &detached)
+	want := fmt.Sprintf("session detached to conversation %s, new session %s. This session has left the conversation. You can no longer operate on it here. To continue, use the new conversation.", detached.Conversation.ID, detached.Conversation.RootSessionID)
+	// 父链仍指向旧会话；授权必须先于后代请求的参数校验。
+	for _, tc := range []struct {
+		method string
+		params any
+	}{
+		{"agent/list", nil},
+		{"session/items/list", map[string]any{"conversation_id": record.ID, "session_id": grandchild.SessionID, "limit": "invalid"}},
+		{"session/update", map[string]any{"conversation_id": record.ID, "session_id": grandchild.SessionID, "labels": "invalid"}},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			reply := scoped.call(t, tc.method, tc.params)
+			if reply.Error == nil || reply.Error.Message != want {
+				t.Fatalf("%s: error %+v, want %q", tc.method, reply.Error, want)
+			}
+		})
+	}
+}
+
+type testMessageConn struct {
+	in, out chan []byte
+}
+
+func (c testMessageConn) ReadMessage(ctx context.Context) ([]byte, error) {
+	select {
+	case b := <-c.in:
+		return b, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (c testMessageConn) WriteMessage(ctx context.Context, b []byte) error {
+	select {
+	case c.out <- b:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (c testMessageConn) Close() error { return nil }
+
+func TestWorldRPCTokenAndLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name, first string
+		ok          bool
+	}{
+		{"missing", "{}", false}, {"malformed", "{", false}, {"bad", `{"token":"wrong"}`, false},
+		{"operator", fmt.Sprintf(`{"token":%q}`, testToken), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := startTestServer(t)
+			conn := testMessageConn{make(chan []byte, 2), make(chan []byte, 2)}
+			conn.in <- []byte(tc.first)
+			done := make(chan error, 1)
+			go func() { done <- h.server.ServeWorldRPC(t.Context(), conn) }()
+			want := `{"error":"unauthorized"}`
+			if tc.ok {
+				want = `{"ok":true}`
+			}
+			if got := string(<-conn.out); got != want {
+				t.Fatalf("authentication = %s", got)
+			}
+			if tc.ok {
+				conn.in <- []byte(fmt.Sprintf(`{"id":1,"method":"initialize","params":{"protocol_version":%q}}`, runtimeprotocol.ProtocolVersion))
+				if got := string(<-conn.out); !strings.Contains(got, `"result"`) {
+					t.Fatal(got)
+				}
+				h.cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("connection did not exit")
+			}
+		})
 	}
 }

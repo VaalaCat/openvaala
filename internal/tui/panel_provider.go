@@ -1214,7 +1214,7 @@ func (p *providerPanel) getProvidersFetch(m *tuiModel) func(ctx context.Context)
 // getModelListAfterWrite 查询配置写入后的 Agent 模型目录，查询失败时返回 nil。
 func getModelListAfterWrite(ctx context.Context, client runtimeclient.Client, agentName string) *runtime.ModelList {
 	// 1. 读取模型目录；查询失败只返回 nil，写入结果照常算成功。
-	list, err := client.ListModels(ctx, agentName)
+	list, err := client.ListModels(ctx, &runtime.ListModelsRequest{AgentName: agentName})
 	if err != nil {
 		return nil
 	}

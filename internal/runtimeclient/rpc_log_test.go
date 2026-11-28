@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	ovruntime "github.com/VaalaCat/openvaala/pkg/runtime"
 	"runtime"
 	"sync"
 	"testing"
@@ -26,7 +27,7 @@ func TestClientRPCLog(t *testing.T) {
 			waitProtocolEvent(t, client, isConnectionState(runtimeclient.ConnectionConnected))
 			firstConnection := <-connections
 			for range 12 {
-				if _, err := client.ListModels(ctx, ""); err != nil {
+				if _, err := client.ListModels(ctx, &ovruntime.ListModelsRequest{}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -58,7 +59,7 @@ func TestClientRPCLog(t *testing.T) {
 			}
 			frames[0].Payload[0] = '!'
 			for range 3 {
-				if _, err := client.ListModels(ctx, ""); err != nil {
+				if _, err := client.ListModels(ctx, &ovruntime.ListModelsRequest{}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -86,7 +87,7 @@ func TestClientRPCLog(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitProtocolEvent(t, client, isConnectionState(runtimeclient.ConnectionConnected))
-			if _, err := client.ListModels(ctx, ""); err != nil {
+			if _, err := client.ListModels(ctx, &ovruntime.ListModelsRequest{}); err != nil {
 				t.Fatal(err)
 			}
 			reconnected, err := client.GetRPCFrames(ctx)
@@ -127,7 +128,7 @@ func TestClientRPCLogOverload(t *testing.T) {
 			})
 			waitProtocolEvent(t, client, isConnectionState(runtimeclient.ConnectionConnected))
 			// 2. 采样不能阻塞响应；读取记录后观察最新丢帧计数，不把日志当成完整捕获。
-			if _, err := client.ListModels(ctx, ""); err != nil {
+			if _, err := client.ListModels(ctx, &ovruntime.ListModelsRequest{}); err != nil {
 				t.Fatal(err)
 			}
 			frames, err := client.GetRPCFrames(ctx)
@@ -176,7 +177,7 @@ func TestClientRPCLogConcurrentAccess(t *testing.T) {
 				var err error
 				switch operation {
 				case "request":
-					_, err = client.ListModels(ctx, "")
+					_, err = client.ListModels(ctx, &ovruntime.ListModelsRequest{})
 				case "read":
 					var frames []runtimeclient.RPCFrame
 					frames, err = client.GetRPCFrames(ctx)

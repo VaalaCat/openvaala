@@ -1,7 +1,7 @@
 import { OverflowTooltip } from "@/components/base/overflow-tooltip"
 import { useStore } from "@nanostores/react"
 import { useTranslation } from "react-i18next"
-import { Link } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { useIsSessionLinked } from "@/components/conversation/session-link-context"
 import { useServerConnection } from "@/components/server-connection-provider"
 import type { ConversationSync } from "@/lib/api/conversation-sync"
@@ -30,7 +30,8 @@ export function SessionLink({
   const name = info
     ? getSessionName(info, t("conversation.session.root"))
     : sessionID
-  if (!isLinked)
+  const detached = info?.session.detached_conversation_id
+  if (!isLinked && !detached)
     return (
       <OverflowTooltip
         render={<span className={cn("max-w-48 min-w-0 truncate", className)} />}
@@ -41,11 +42,13 @@ export function SessionLink({
   return (
     <OverflowTooltip
       render={
-        <Link
+        <NavigationButton
           to={
-            isRoot
-              ? getConversationPath(serverID, sync.conversationID)
-              : getSessionPath(serverID, sync.conversationID, sessionID)
+            detached
+              ? getConversationPath(serverID, detached)
+              : isRoot
+                ? getConversationPath(serverID, sync.conversationID)
+                : getSessionPath(serverID, sync.conversationID, sessionID)
           }
           className={cn("max-w-48 min-w-0 truncate text-link", className)}
         />

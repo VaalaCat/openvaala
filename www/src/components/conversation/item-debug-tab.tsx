@@ -27,6 +27,7 @@ export function ItemDebugTab({
 }) {
   const { t } = useTranslation()
   const connection = useServerConnection()
+  const historyGeneration = useStore(sync.$historyGeneration)
   const turnViews = useStore(sync.$turns)
   // 1. 复用消息区的同一份 Turn 查询，不为调试加载更早的历史。
   const turns = useQuery(
@@ -34,7 +35,8 @@ export function ItemDebugTab({
       connection,
       sync.conversationID,
       sync.getFollowedSessionID(),
-      rows.flatMap((row) => (row.kind === "turn" ? [row.turnID] : []))
+      rows.flatMap((row) => (row.kind === "turn" ? [row.turnID] : [])),
+      historyGeneration
     )
   )
   if (!target) return <ListEmpty title={t("conversation.debug.empty")} />

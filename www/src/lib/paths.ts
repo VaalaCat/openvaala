@@ -5,6 +5,19 @@ export function getServerPath(serverID: string): string {
   return "/s/" + serverID
 }
 
+export type ContactsTab = "contacts" | "messages" | "threads"
+
+export function getContactsPath(
+  serverID: string,
+  { tab, peer }: { tab?: ContactsTab; peer?: string } = {}
+): string {
+  const query = new URLSearchParams()
+  if (tab && tab !== "contacts") query.set("tab", tab)
+  if (peer) query.set("peer", peer)
+  const path = getServerPath(serverID) + "/contacts"
+  return query.size ? `${path}?${query}` : path
+}
+
 // 对话的主 Session 页
 export function getConversationPath(
   serverID: string,
@@ -29,10 +42,12 @@ export type SettingsSection =
   | "general"
   | "appearance"
   | "providers"
+  | "agents"
   | "executors"
   | "hooks"
   | "skills"
   | "archived"
+  | "world-admin"
 
 // 页面跳转只保留侧栏搜索词。
 export function getConversationListSearch(search: string): string {

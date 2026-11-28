@@ -35,8 +35,8 @@ func TestFormatSpawnAgentDescription(t *testing.T) {
 	}
 	const instructions = "将可独立执行的工作委派给一个直接子 Agent，子任务可以并行运行。" +
 		"message 应提供目标、必要材料和预期交付物；默认不继承历史，需要时明确设置 fork_turns。" +
-		"返回 session_id、task_name 和 accepted 表示首个任务已接收，不表示已经完成；子任务每个 Turn 结束后，结果以通知消息自动进入你的收件箱，在下一次模型请求前读入。" +
-		"需要暂停等待时使用 wait_agent，它只在新消息到达时唤醒、不返回正文。"
+		"返回 session_id 和 input_item_id 表示首个任务已接收。默认在每轮结束时回报，notify_on_finish=false 关闭自动回报。" +
+		"需要等待子任务结果时使用 wait_agent，可读取最终正文。"
 	for _, tt := range []struct {
 		name   string
 		agents []prompt.AgentEntry

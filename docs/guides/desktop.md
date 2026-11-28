@@ -31,7 +31,7 @@ If no model provider is configured yet, add one in **Settings → Model provider
 
 ## How it relates to the runtime server
 
-Both interfaces use the local runtime server, starting it if needed, so they share all conversations with the terminal UI, the web UI in your browser, your editor and Codex:
+By default, both interfaces use the local runtime server, starting it if needed, so they share all conversations with the terminal UI, the web UI in your browser, your editor and Codex:
 
 <!-- scene: shared-progress | Every client streams the same conversation -->
 ```text
@@ -50,7 +50,7 @@ A runtime server started by the desktop app keeps running after you close the wi
 
 Closing a window does not stop anything you have sent: running turns continue and may keep using your model provider's quota. Terminals opened in the native interface's terminal panel keep running too, and come back in the terminal panel the next time you start the app.
 
-The desktop app always connects to the runtime server on this machine. To work against a server elsewhere, use the [terminal UI](terminal.md) with `--url`, or open that server's [web UI](web.md) in a browser.
+On the target machine, enable **Settings → World → Remote access**, then save and restart. Scan the QR code on another device or run `openvaala app --url '<remote access link>'`. The desktop app saves the connection and token for future use from the server list.
 
 ## WebView and native
 

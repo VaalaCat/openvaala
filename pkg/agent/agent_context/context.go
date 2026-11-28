@@ -125,7 +125,7 @@ func (c *agentContextImpl) Load(param *ContextLoadParam) error {
 		return err
 	}
 	// 2. 克隆历史并替换指令。
-	c.items = cloneItems(param.Items)
+	c.items = defs.CloneItems(param.Items)
 	c.system = param.System
 	clear(c.textTokenCounts)
 	clear(c.reasoningTokenCounts)

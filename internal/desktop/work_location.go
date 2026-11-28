@@ -58,7 +58,7 @@ func (d *Desktop) loadAgents() {
 	d.tasks.Go(func() {
 		agents, err := client.ListAgents(d.ctx)
 		d.window.Update(func() {
-			if d.closed {
+			if d.closed || d.client != client {
 				return
 			}
 			d.agents, d.agentsError = agents, err
@@ -174,10 +174,14 @@ func (d *Desktop) newAgentField(c *ui.Context) {
 	}
 	// 2. 下拉选项是 Agent 名，说明取所选 Agent。
 	names := make([]string, len(d.agents))
+	selected := d.newAgent
+	if external := d.getExternalAgent(); external != nil {
+		selected = external.Name
+	}
 	description := ""
 	for index, agent := range d.agents {
 		names[index] = agent.Name
-		if agent.Name == d.newAgent {
+		if agent.Name == selected {
 			description = agent.Description
 			if agent.DefaultModel != (defs.ModelRef{}) {
 				description += " · " + agent.DefaultModel.String()
@@ -185,8 +189,11 @@ func (d *Desktop) newAgentField(c *ui.Context) {
 		}
 	}
 	kit.Field(c, kit.FieldOpt{Label: d.t("agent"), Description: description}, func() ui.Element {
-		agent := kit.Select(c.Key("new-agent"), &d.newAgent, kit.SelectOpt{Options: selectOptions(names, names), Label: d.t("agent"), Placeholder: d.t("agent"), Searchable: true, SearchPlaceholder: d.t("filter.agents"), Bordered: true})
+		agent := kit.Select(c.Key("new-agent"), &selected, kit.SelectOpt{Options: selectOptions(names, names), Label: d.t("agent"), Placeholder: d.t("agent"), Searchable: true, SearchPlaceholder: d.t("filter.agents"), Bordered: true})
 		if agent.Changed() {
+			d.newAgent = selected
+			d.newModel, d.newEffort = "", ""
+			d.draftOptions = nil
 			d.loadModels(d.readingTarget)
 		}
 		return agent

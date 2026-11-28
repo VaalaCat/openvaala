@@ -3,6 +3,8 @@ package defs
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"reflect"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -10,6 +12,65 @@ import (
 
 	"github.com/VaalaCat/llmkit"
 )
+
+// IsSameSession 两条 Session 记录的字段是否相同？
+func IsSameSession(a, b Session) bool {
+	// 1. 比较记录字段、外部恢复信息与标签内容。
+	return a.ID == b.ID && a.UpdatedAt == b.UpdatedAt && a.ConversationID == b.ConversationID &&
+		a.AgentName == b.AgentName && a.TaskName == b.TaskName && a.ParentSessionID == b.ParentSessionID &&
+		a.ParentTurnID == b.ParentTurnID && a.ParentCallID == b.ParentCallID && a.Model == b.Model &&
+		reflect.DeepEqual(a.External, b.External) && maps.Equal(a.Labels, b.Labels) && a.Background == b.Background &&
+		a.DetachedConversationID == b.DetachedConversationID && a.DetachedFromConversationID == b.DetachedFromConversationID &&
+		a.DetachedFromSessionID == b.DetachedFromSessionID && a.SuppressFinishReport == b.SuppressFinishReport
+}
+
+// WithDetachOriginHint 在转出会话的协作越界错误中说明原对话的操作范围。
+func (s Session) WithDetachOriginHint(err error) error {
+	if s.DetachedFromConversationID == "" {
+		return err
+	}
+	return fmt.Errorf("%w. This session was detached from conversation %s and can no longer operate on sessions there.", err, s.DetachedFromConversationID)
+}
+
+// Clone 复制 ACP 命令及其参数和环境变量。
+func (command *ACPCommand) Clone() *ACPCommand {
+	// 1. 复制启动配置，未配置时返回 nil。
+	if command == nil {
+		return nil
+	}
+	return &ACPCommand{
+		Command: command.Command, Args: slices.Clone(command.Args), Env: maps.Clone(command.Env),
+		ParamOverwrite:          cloneACPParams(command.ParamOverwrite),
+		EphemeralParamOverwrite: cloneACPParams(command.EphemeralParamOverwrite),
+	}
+}
+
+func cloneACPParams(params map[string]map[string]any) map[string]map[string]any {
+	copy := maps.Clone(params)
+	for method, fields := range copy {
+		copy[method] = cloneACPValue(fields).(map[string]any)
+	}
+	return copy
+}
+
+func cloneACPValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		copy := maps.Clone(v)
+		for k, item := range v {
+			copy[k] = cloneACPValue(item)
+		}
+		return copy
+	case []any:
+		copy := slices.Clone(v)
+		for i, item := range v {
+			copy[i] = cloneACPValue(item)
+		}
+		return copy
+	default:
+		return value
+	}
+}
 
 // TruncateConversationTitle 截取对话标题，最多保留 256 个 Unicode 字符。
 func TruncateConversationTitle(title string) string {
@@ -44,6 +105,15 @@ func toolCallFromLLMKit(modelCall *llmkit.ToolCall) (*ToolCall, error) {
 	call := &ToolCall{}
 	call.FromLLMKit(modelCall)
 	return call, nil
+}
+
+// CloneItems 深拷贝切片和每条 Item，保留 nil 切片和 nil 元素。
+func CloneItems(items []*Item) []*Item {
+	copies := slices.Clone(items)
+	for i, item := range copies {
+		copies[i] = item.Clone()
+	}
+	return copies
 }
 
 // Clone 复制 Item 及全部载荷。
@@ -114,15 +184,20 @@ func (message *Message) Clone() *Message {
 
 // Clone 复制消息内容。
 func (content *Content) Clone() *Content {
-	// 1. nil 返回 nil，否则复制内容种类及文本、图片载荷。
+	// 1. 复制内容种类及各类载荷。
 	if content == nil {
 		return nil
 	}
-	return &Content{
+	cloned := &Content{
 		Kind:  content.Kind,
 		Text:  content.Text.Clone(),
 		Image: content.Image.Clone(),
 	}
+	if content.File != nil {
+		file := *content.File
+		cloned.File = &file
+	}
+	return cloned
 }
 
 // Clone 复制文本内容。
@@ -521,3 +596,39 @@ var GetBuildVersion = sync.OnceValue(func() string {
 	}
 	return info.Main.Version
 })
+
+// Clone 复制 Agent 配置。
+func (definition *AgentConfig) Clone() *AgentConfig {
+	// 1. nil 原样返回，否则复制模型引用、工具、skill、MCP server 列表和 ACP 启动命令。
+	if definition == nil {
+		return nil
+	}
+	clone := &AgentConfig{
+		Name:         definition.Name,
+		Type:         definition.Type,
+		Description:  definition.Description,
+		Instructions: definition.Instructions,
+		Model:        definition.Model.Clone(),
+		CompactModel: definition.CompactModel.Clone(),
+		Tools:        slices.Clone(definition.Tools),
+		Skills:       slices.Clone(definition.Skills),
+		MCPServers:   slices.Clone(definition.MCPServers),
+		ACP:          definition.ACP.Clone(),
+	}
+	if definition.MaxSteps != nil {
+		clone.MaxSteps = new(*definition.MaxSteps)
+	}
+	return clone
+}
+
+// Clone 复制 Agent 的模型引用。
+func (reference *AgentModelConfig) Clone() *AgentModelConfig {
+	// 1. nil 原样返回，否则复制 Provider 和模型名。
+	if reference == nil {
+		return nil
+	}
+	return &AgentModelConfig{
+		Provider: reference.Provider,
+		Model:    reference.Model,
+	}
+}

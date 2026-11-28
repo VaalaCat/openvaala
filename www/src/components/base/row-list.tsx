@@ -1,5 +1,5 @@
 import type { ReactNode } from "react"
-import { Link } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { cn } from "@/lib/utils"
 
 // 带外框、行间有分隔线的列表，子元素是 RowListItem 或自己排版的 <li>
@@ -20,15 +20,15 @@ export function RowListItem({
   if (!to) return <li className={rowClassName}>{children}</li>
   return (
     <li>
-      <Link
+      <NavigationButton
         to={to}
         className={cn(
           rowClassName,
-          "outline-none hover:bg-muted focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+          "w-full outline-none hover:bg-muted focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
         )}
       >
         {children}
-      </Link>
+      </NavigationButton>
     </li>
   )
 }

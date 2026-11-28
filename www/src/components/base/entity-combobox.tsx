@@ -36,6 +36,7 @@ export type EntityOption = {
   id: string
   label: string
   description?: string
+  icon?: ReactNode
   disabled?: boolean
 }
 export type EntitySelection =
@@ -250,6 +251,7 @@ export function EntityCombobox(
                 disabled={known.get(value)?.disabled}
                 className="min-h-8 min-w-0 text-table"
               >
+                {known.get(value)?.icon}
                 <OverflowTooltip render={<span className="min-w-0 truncate" />}>
                   {known.get(value)?.label ?? value}
                 </OverflowTooltip>

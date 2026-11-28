@@ -244,59 +244,40 @@ func TestLoadConfigRejectsInvalidInput(t *testing.T) {
 	}
 }
 
-// TestLoadConfigPathAndIsolation 验证配置文件的选择：OPENVAALA_CONFIG 生效，显式路径优先于它，显式路径不存在时报错，前一次加载不影响后一次。
+// TestLoadConfigPathAndIsolation 验证路径选择的优先级，缺失文件只使用默认设置，每次加载互相独立。
 func TestLoadConfigPathAndIsolation(t *testing.T) {
-	// 1. 在同一临时目录写入 first.yaml、second.yaml，用 OPENVAALA_CONFIG 指向 first.yaml。
 	directory := t.TempDir()
 	for _, name := range []string{"first.yaml", "second.yaml"} {
 		if err := os.WriteFile(filepath.Join(directory, name), []byte("run:\n  agent_name: "+name+"\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Setenv("OPENVAALA_CONFIG", filepath.Join(directory, "first.yaml"))
-	tests := []struct {
-		name          string
-		path          string
-		wantAgentName string
-		wantErr       bool
+	missing := filepath.Join(directory, "missing.yaml")
+	for _, tc := range []struct {
+		name, env, path, wantAgent string
+		missing                    bool
 	}{
-		{
-			name:          "environment_path",
-			wantAgentName: "first.yaml",
-		},
-		{
-			name:          "explicit_path_overrides_environment",
-			path:          "~/second.yaml",
-			wantAgentName: "second.yaml",
-		},
-		{
-			name:    "explicit_missing_file",
-			path:    filepath.Join(directory, "missing.yaml"),
-			wantErr: true,
-		},
-		{
-			name:          "previous_load_does_not_change_selection",
-			wantAgentName: "first.yaml",
-		},
-	}
-	// 2. 按顺序逐个加载，比较选中的配置文件或错误。
-	for _, tt := range tests {
-		t.Run(tt.name,
-			func(t *testing.T) {
-				loaded, err := config.LoadConfig(&config.LoadConfigOpt{
-					Home: directory,
-					Path: tt.path,
-				})
-				if (err != nil) != tt.wantErr {
-					t.Fatalf("LoadConfig() error = %v, wantErr %v", err, tt.wantErr)
+		{name: "environment_path", env: "first.yaml", wantAgent: "first.yaml"},
+		{name: "explicit_path_overrides_environment", env: "first.yaml", path: "~/second.yaml", wantAgent: "second.yaml"},
+		{name: "explicit_missing_file", env: "first.yaml", path: missing, wantAgent: "default", missing: true},
+		{name: "missing_environment_file", env: "missing.yaml", wantAgent: "default", missing: true},
+		{name: "previous_load_does_not_change_selection", env: "first.yaml", wantAgent: "first.yaml"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OPENVAALA_CONFIG", filepath.Join(directory, tc.env))
+			cfg, err := config.LoadConfig(&config.LoadConfigOpt{Home: directory, Path: tc.path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Run.AgentName != tc.wantAgent {
+				t.Fatalf("agent name = %q, want %q", cfg.Run.AgentName, tc.wantAgent)
+			}
+			if tc.missing {
+				if _, err := os.Stat(missing); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("config after load: stat error = %v, want file absent", err)
 				}
-				if tt.wantErr {
-					return
-				}
-				if loaded.Run.AgentName != tt.wantAgentName {
-					t.Fatalf("agent name = %q, want %q", loaded.Run.AgentName, tt.wantAgentName)
-				}
-			})
+			}
+		})
 	}
 }
 
@@ -900,6 +881,88 @@ func TestConfigDefinitionsValidateAllAgentReferences(t *testing.T) {
 	}
 }
 
+// TestExternalAgentConfig 检查外部 Agent 的配置、默认值和 Provider 名称冲突。
+func TestExternalAgentConfig(t *testing.T) {
+	const acp = "type: acp\nacp:\n  command: codex-acp\n  args: [--stdio]\n  env: {MODE: test}\n"
+	const nativeProvider = "id: local\nbase_url: https://example.com\nmodels: {test: {}}\n"
+	for _, tt := range []struct {
+		name, agentName, fields, wantError string
+		providers                          map[string]string
+		omitName                           bool
+	}{
+		{name: "acp_only", agentName: "codex-acp", fields: acp},
+		{name: "acp_default", agentName: "default", fields: acp, providers: map[string]string{"models/local.yaml": nativeProvider}, omitName: true},
+		{name: "unknown_param_overwrite", agentName: "codex-acp", fields: acp + "  param_overwrite: {session/delete: {}}\n", wantError: "unknown ACP method session/delete in param_overwrite"},
+		{name: "unknown_ephemeral_param_overwrite", agentName: "codex-acp", fields: acp + "  ephemeral_param_overwrite: {session/delete: {}}\n", wantError: "unknown ACP method session/delete in ephemeral_param_overwrite"},
+		{name: "missing_command", agentName: "codex-acp", fields: "type: acp\nacp: {}\n", wantError: "acp.command"},
+		{name: "with_model", agentName: "codex-acp", fields: acp + "model: {provider: local}\n", wantError: "model"},
+		{name: "with_compact_model", agentName: "codex-acp", fields: acp + "compact_model: {provider: local}\n", wantError: "compact_model"},
+		{name: "with_instructions", agentName: "codex-acp", fields: acp + "instructions: Be concise.\n", wantError: "instructions"},
+		{name: "native_with_acp", agentName: "default", fields: "type: native\nacp: {command: codex-acp}\n", wantError: "acp"},
+		{name: "implicit_native_with_acp", agentName: "default", fields: "acp: {command: codex-acp}\n", wantError: "acp"},
+		{
+			name: "provider_conflict", agentName: "codex-acp", fields: acp,
+			providers: map[string]string{"models/codex-acp.yaml": strings.Replace(nativeProvider, "id: local", "id: codex-acp", 1)},
+			wantError: "agent codex-acp conflicts with model provider codex-acp",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := t.TempDir()
+			body := tt.fields
+			if !tt.omitName {
+				body = "name: " + tt.agentName + "\n" + body
+			}
+			writeDefinitionFiles(t, directory, map[string]string{
+				"config.yaml":                      "{}\n",
+				"agents/" + tt.agentName + ".yaml": body,
+			})
+			writeDefinitionFiles(t, directory, tt.providers)
+			cfg, err := config.LoadConfig(&config.LoadConfigOpt{Home: directory, Path: filepath.Join(directory, "config.yaml")})
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("LoadConfig() error = %v, want %q", err, tt.wantError)
+				}
+				if tt.name == "provider_conflict" && err.Error() != tt.wantError {
+					t.Fatalf("LoadConfig() error = %q, want %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			configured, err := cfg.GetAgent(tt.agentName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if configured.Type != defs.AgentTypeACP || configured.ACP == nil || configured.Instructions != "" || configured.Model != nil || configured.CompactModel != nil {
+				t.Fatalf("Agent config = %+v, want ACP without native defaults", configured)
+			}
+			configured.ACP.Args[0] = "changed"
+			configured.ACP.Env["MODE"] = "changed"
+			definitions := cfg.GetAgentDefinitions()
+			for _, definition := range definitions {
+				if definition.Name != tt.agentName {
+					if definition.Type != defs.AgentTypeNative || definition.Model != (defs.ModelRef{}) {
+						t.Fatalf("built-in Agent definition = %+v, want native without model", definition)
+					}
+					continue
+				}
+				if definition.Type != defs.AgentTypeACP || definition.ACP == nil || definition.ACP.Command != "codex-acp" ||
+					!slices.Equal(definition.ACP.Args, []string{"--stdio"}) || definition.ACP.Env["MODE"] != "test" {
+					t.Fatalf("Agent definition = %+v, ACP = %+v", definition, definition.ACP)
+				}
+				clone := definition.Clone()
+				clone.ACP.Command = "changed"
+				clone.ACP.Args[0] = "changed"
+				clone.ACP.Env["MODE"] = "changed"
+				if definition.ACP.Command != "codex-acp" || definition.ACP.Args[0] != "--stdio" || definition.ACP.Env["MODE"] != "test" {
+					t.Fatalf("cloned ACP mutated its source: %+v", definition.ACP)
+				}
+			}
+		})
+	}
+}
+
 // TestConfigDefinitionsLoadAllModelsAndIsolateSnapshots 验证 Agent 没引用的模型也会加载，两次加载的结果互不影响。
 func TestConfigDefinitionsLoadAllModelsAndIsolateSnapshots(t *testing.T) {
 	// 1. 准备第二次加载前换上的 Provider 文件。
@@ -1025,6 +1088,10 @@ func TestLoadConfigDefaultsDoNotCreateFiles(t *testing.T) {
 				cfg, err := config.LoadConfig(opt)
 				if err != nil {
 					t.Fatal(err)
+				}
+				settings, err := yaml.Marshal(cfg)
+				if err != nil || strings.Contains(string(settings), "world:") {
+					t.Fatalf("default configuration contains world settings: %s (%v)", settings, err)
 				}
 				if cfg.Run.AgentName != "default" ||
 					cfg.Plugins.Directory != filepath.Join(home, ".config/openvaala/plugins") ||
@@ -4214,6 +4281,166 @@ func TestConfigConversationIdleTimeout(t *testing.T) {
 			}
 			if cfg.Server.ConversationIdleTimeout != tt.want {
 				t.Fatalf("Server.ConversationIdleTimeout = %v, want %v", cfg.Server.ConversationIdleTimeout, tt.want)
+			}
+		})
+	}
+}
+
+// TestWorldConfig 检查启用条件、Agent 引用和默认通告目标。
+func TestWorldConfig(t *testing.T) {
+	// 1. 在同一组 Agent 定义上加载各配置组合。
+	const node = "enabled: true, name: office, domain: example.test, server_url: http://example.test"
+	for _, tc := range []struct{ name, settings, wantErr, target string }{
+		{"disabled", "{}", "", ""},
+		{"disabled_node", "node: {default_target: missing}", "", ""},
+		{"missing_name", "node: {enabled: true, domain: example.test, server_url: http://example.test}", "name", ""},
+		{"missing_domain", "node: {enabled: true, name: office, server_url: http://example.test}", "domain", ""},
+		{"missing_server_url", "node: {enabled: true, name: office, domain: example.test}", "server_url", ""},
+		{"missing_server_domain", "server: {enabled: true}", "world.server.domain", ""},
+		{"missing_default_agent", "node: {" + node + ", default_target: missing}", "world.node.default_target", ""},
+		{"missing_advertised_agent", "node: {" + node + ", advertise_targets: [{name: missing, visibility: domain}]}", "world.node.advertise_targets", ""},
+		{"configured_default_agent", "node: {" + node + "}", "", "assistant"},
+		{"explicit_default", "node: {" + node + ", default_target: default}", "", "default"},
+		{"advertises_only_default", "node: {" + node + ", advertise_targets: [{name: default, visibility: domain}]}", "", "default"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// 1. 从磁盘加载，检查引用错误或开放范围。
+			dir := t.TempDir()
+			writeDefinitionFiles(t, dir, map[string]string{"config.yaml": "run: {agent_name: assistant}\nworld:\n  " + tc.settings + "\n", "agents/assistant.yaml": "name: assistant\ninstructions: Be concise."})
+			cfg, err := config.LoadConfig(&config.LoadConfigOpt{Home: dir, Path: filepath.Join(dir, "config.yaml")})
+			var nodeCfg config.WorldNodeConfig
+			if err == nil && cfg.World.Node.Enabled {
+				nodeCfg = cfg.WorldNodeWithDefaults()
+				err = cfg.ValidateWorldRuntimeTargets(nodeCfg)
+			}
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("load = %v, want %s", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.target == "" {
+				if cfg.World.Node.Enabled || cfg.World.Server.Enabled {
+					t.Fatal("unexpected enabled world")
+				}
+				return
+			}
+			targets := nodeCfg.AdvertiseTargets
+			if nodeCfg.DefaultTarget != tc.target || len(targets) != 1 || targets[0].Name != tc.target || targets[0].Visibility != "domain" {
+				t.Fatalf("node = %+v", nodeCfg)
+			}
+		})
+	}
+}
+
+func TestLoadWorldRelayMode(t *testing.T) {
+	for _, tc := range []struct {
+		name, file, flag string
+		worldServe       bool
+		want, wantErr    string
+	}{
+		{name: "serve defaults to off", want: "off"},
+		{name: "cluster", file: "relay_mode: public, relay_instances: [ws://one.test, wss://two.test/prefix]", want: "public"},
+		{name: "cluster requires public", file: "relay_mode: off, relay_instances: [wss://one.test]", wantErr: "world.relay_instances requires world.relay_mode public"},
+		{name: "cluster accepts https", file: "relay_mode: public, relay_instances: [ws://one.test, https://two.test]", want: "public"},
+		{name: "cluster requires host", file: "relay_mode: public, relay_instances: [ws:///bad]", wantErr: "world.relay_instances[0] must be an HTTP or WebSocket URL"},
+		{name: "control plane defaults to domain", file: "server: {enabled: true, domain: home.test}", worldServe: true, want: "domain"},
+		{name: "control plane with relay disabled in file", file: "server: {enabled: true, domain: home.test}, relay_mode: off", worldServe: true, want: "off"},
+		{name: "control plane with relay disabled by flag", file: "server: {enabled: true, domain: home.test}, relay_mode: domain", flag: "--relay-mode=off", worldServe: true, want: "off"},
+		{name: "public relay from file", file: "relay_mode: public", worldServe: true, want: "public"},
+		{name: "flag overrides file before validation", file: "relay_mode: domain", flag: "--relay-mode=public", worldServe: true, want: "public"},
+		{name: "explicit off overrides public", file: "relay_mode: public", flag: "--relay-mode=off", want: "off"},
+		{name: "invalid flag", flag: "--relay-mode=other", wantErr: `invalid world.relay_mode "other"`},
+		{name: "domain requires control plane", flag: "--relay-mode=domain", worldServe: true, wantErr: `world.relay_mode "domain" requires world.server.enabled`},
+		{name: "world serve without a role", worldServe: true, wantErr: "world serve has nothing to run: enable world.server or set world.relay_mode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "config.yaml")
+			writeDefinitionFiles(t, home, map[string]string{"config.yaml": "world: {" + tc.file + "}\n"})
+			flags := pflag.NewFlagSet("serve", pflag.ContinueOnError)
+			flags.String("relay-mode", "", "")
+			if tc.flag != "" {
+				if err := flags.Parse([]string{tc.flag}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, _, err := config.LoadConfigSettings(&config.LoadConfigOpt{Home: home, Path: path, Flags: flags, WorldServe: tc.worldServe})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("got %v, want %s", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.World.GetRelayMode(); got != tc.want {
+				t.Fatalf("relay mode = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWorldRelaySettings(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, relay, web, direct string
+		server                         bool
+		effective, wantErr             string
+	}{
+		{"disabled default", "", "", "", "", false, "off", ""}, {"control default", "", "", "", "", true, "domain", ""},
+		{"explicit off", "off", "", "", "", true, "off", ""}, {"domain", "domain", "", "", "", true, "domain", ""},
+		{"relay only", "public", "wss://relay.test/base", "https://web.test", "", false, "public", ""},
+		{"requires control", "domain", "", "", "", false, "", `world.relay_mode "domain" requires world.server.enabled`},
+		{"invalid mode", "other", "", "", "", false, "", "world.relay_mode"},
+		{"missing host", "", "wss:///path", "", "", false, "", "world.relays"},
+		{"relay query", "", "ws://relay.test/a?b=c", "", "", false, "", "world.relays"},
+		{"web path", "", "", "https://web.test/tools", "", false, "", "world.web_url"},
+		{"web scheme", "", "", "wss://web.test", "", false, "", "world.web_url"},
+		{"direct prefix", "", "", "", "wss://node.test/prefix", false, "off", ""},
+		{"direct query", "", "", "", "https://node.test/?q=x", false, "", "world.node.direct_urls"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "config.yaml")
+			writeDefinitionFiles(t, home, map[string]string{"config.yaml": "world: {}\n"})
+			opt := &config.LoadConfigOpt{Path: path, Home: home}
+			files := config.NewConfigFiles(opt)
+			settings, err := files.GetWorldSettings()
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings.Server.Enabled, settings.Server.Domain = tc.server, "example.test"
+			settings.RelayMode, settings.WebURL = tc.mode, tc.web
+			if tc.direct != "" {
+				settings.Node.DirectURLs = []string{tc.direct}
+			}
+			if tc.relay != "" {
+				settings.Relays = []string{tc.relay}
+			}
+			update, err := files.PrepareWorldSettings(settings, false)
+			if err == nil {
+				err = files.SaveWorldSettings(update, nil, "")
+			}
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("save: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.LoadConfig(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := files.GetWorldSettings()
+			if err != nil || got.RelayMode != tc.mode || got.WebURL != tc.web || !slices.Equal(got.Relays, settings.Relays) || cfg.World.GetRelayMode() != tc.effective {
+				t.Fatalf("reload: %+v %v", got, err)
 			}
 		})
 	}

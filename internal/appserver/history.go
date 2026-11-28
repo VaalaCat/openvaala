@@ -38,7 +38,7 @@ func (c *appServerConnection) readThread(ctx context.Context, params codexThread
 	if err != nil {
 		return nil, getCodexError(err, params.ThreadID)
 	}
-	result := codexThreadReadResult{Thread: newCodexHistoryThread(thread, sessions, c.pathMappings, c.isWindowsClient, c.getThreadStatus(ctx, thread.threadID), c.version)}
+	result := codexThreadReadResult{Thread: newCodexHistoryThread(thread, sessions, c.pathMappings, c.isWindowsClient, c.getThreadLiveInfo(ctx, thread.threadID), c.version)}
 	// 2. 请求包含 Turn 时读取完整历史，不截到实时推送起点。
 	if params.IncludeTurns {
 		if result.Thread.Turns, err = c.readThreadTurns(ctx, thread.conversation.ID, thread.sessionID, sessions, nil); err != nil {
@@ -96,9 +96,9 @@ func (c *appServerConnection) listRootThreads(ctx context.Context, params codexT
 	// 3. 本页存在未记录模型的根 Session 时，查询一次 Agent 默认模型。
 	var defaultModel defs.ModelRef
 	if slices.ContainsFunc(page.Conversations, func(entry dao.ConversationListEntry) bool {
-		return entry.RootSession.Model.Ref == (defs.ModelRef{})
+		return entry.RootSession.External == nil && entry.RootSession.Model.Ref == (defs.ModelRef{})
 	}) {
-		models, err := c.client.ListModels(ctx, c.agentName)
+		models, err := c.client.ListModels(ctx, &runtime.ListModelsRequest{AgentName: c.agentName})
 		if err != nil {
 			return codexThreadListResult{}, err
 		}
@@ -110,12 +110,15 @@ func (c *appServerConnection) listRootThreads(ctx context.Context, params codexT
 		result.NextCursor = newThreadListCursor(page.NextCursor)
 	}
 	for _, entry := range page.Conversations {
-		model := entry.RootSession.Model
-		if model.Ref == (defs.ModelRef{}) {
-			model.Ref = defaultModel
+		live := c.getThreadLiveInfo(ctx, string(entry.Conversation.ID))
+		root := entry.RootSession
+		if root.External != nil {
+			root.Model = live.model
+		} else if root.Model.Ref == (defs.ModelRef{}) {
+			root.Model.Ref = defaultModel
 		}
-		result.Data = append(result.Data, newCodexRootThread(entry.Conversation, model, c.pathMappings, c.isWindowsClient,
-			c.getThreadStatus(ctx, string(entry.Conversation.ID)), c.version))
+		result.Data = append(result.Data, newCodexRootThread(entry.Conversation, root, c.pathMappings, c.isWindowsClient,
+			live.status, c.version))
 	}
 	return result, nil
 }
@@ -153,8 +156,11 @@ func (c *appServerConnection) listSubAgentThreads(ctx context.Context, params co
 	subAgents := getSubAgentSessionsUnder(getSubAgentSessions(ancestor.conversation, sessions), ancestor.sessionID, isChildrenOnly)
 	page, nextCursor := getSubAgentSessionsPage(subAgents, cursor, direction, limit)
 	for _, subAgent := range page {
-		status := c.getThreadStatus(ctx, string(subAgent.record.ID))
-		result.Data = append(result.Data, newCodexChildThread(ancestor.conversation, subAgent, c.pathMappings, c.isWindowsClient, status, c.version))
+		live := c.getThreadLiveInfo(ctx, string(subAgent.record.ID))
+		if subAgent.record.External != nil {
+			subAgent.record.Model = live.model
+		}
+		result.Data = append(result.Data, newCodexChildThread(ancestor.conversation, subAgent, c.pathMappings, c.isWindowsClient, live.status, c.version))
 	}
 	result.NextCursor = nextCursor
 	return result, nil
@@ -367,8 +373,8 @@ func (c *appServerConnection) getHistoryThread(ctx context.Context, threadID str
 	}, nil
 }
 
-// getThreadStatus 查询本连接跟随的 Thread 或其已知子 Session 的状态。
-func (c *appServerConnection) getThreadStatus(ctx context.Context, threadID string) codexThreadStatus {
+// getThreadLiveInfo 查询本连接跟随的 Thread 或其已知子 Session 的状态。
+func (c *appServerConnection) getThreadLiveInfo(ctx context.Context, threadID string) threadLiveInfo {
 	// 1. 优先查已加载 Thread，未跟随的子 Thread 转向已加载根 Thread 查询。
 	thread, sessionID := c.loadedThreads[threadID], defs.SessionID(threadID)
 	if thread != nil {
@@ -378,14 +384,14 @@ func (c *appServerConnection) getThreadStatus(ctx context.Context, threadID stri
 	}
 	// 2. 查不到时返回 notLoaded，否则向 Thread 请求状态；Thread 收下请求后立即回复。
 	if thread == nil {
-		return newCodexThreadStatus(codexThreadStatusNotLoaded)
+		return threadLiveInfo{status: newCodexThreadStatus(codexThreadStatusNotLoaded)}
 	}
 	request := &threadStatusRequested{
 		sessionID: sessionID,
-		reply:     make(chan codexThreadStatus, 1),
+		reply:     make(chan threadLiveInfo, 1),
 	}
 	if err := c.sendThreadRequest(ctx, thread, request); err != nil {
-		return newCodexThreadStatus(codexThreadStatusNotLoaded)
+		return threadLiveInfo{status: newCodexThreadStatus(codexThreadStatusNotLoaded)}
 	}
 	return <-request.reply
 }
@@ -448,15 +454,15 @@ func (c *appServerConnection) readSessions(ctx context.Context, conversationID d
 		request.Cursor = page.NextCursor
 	}
 	// 2. 记录都已带模型时返回，否则查询 Agent 默认模型并填入零值选择。
-	if !slices.ContainsFunc(sessions, func(record defs.Session) bool { return record.Model.Ref == (defs.ModelRef{}) }) {
+	if !slices.ContainsFunc(sessions, func(record defs.Session) bool { return record.External == nil && record.Model.Ref == (defs.ModelRef{}) }) {
 		return sessions, nil
 	}
-	models, err := c.client.ListModels(ctx, c.agentName)
+	models, err := c.client.ListModels(ctx, &runtime.ListModelsRequest{AgentName: c.agentName})
 	if err != nil {
 		return nil, err
 	}
 	for index := range sessions {
-		if sessions[index].Model.Ref == (defs.ModelRef{}) {
+		if sessions[index].External == nil && sessions[index].Model.Ref == (defs.ModelRef{}) {
 			sessions[index].Model.Ref = models.AgentDefaultModel
 		}
 	}

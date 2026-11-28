@@ -8,18 +8,18 @@ import {
   useState,
 } from "react"
 import {
-  Link,
   Navigate,
   Outlet,
   useLocation,
   useMatch,
   useParams,
 } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { useTranslation } from "react-i18next"
 import { useQuery } from "@tanstack/react-query"
 import { useStore } from "@nanostores/react"
 import { AnimatePresence, LayoutGroup, motion } from "motion/react"
-import { PlusIcon, SettingsIcon } from "lucide-react"
+import { MailIcon, PlusIcon, SettingsIcon, UsersIcon } from "lucide-react"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -56,14 +56,23 @@ import {
 import { ConversationList } from "@/components/conversation-list/conversation-list"
 import { useServerConnection } from "@/components/server-connection-provider"
 import { ServerConnectionControl } from "@/components/server-connection-control"
+import { WorldIconWithStatus } from "@/components/world/contact-list"
+import {
+  $servers,
+  getServerDisplay,
+  saveServerNodeAddress,
+} from "@/lib/api/servers"
+import type { WorldStatus } from "@/lib/api/world"
 import type { ConversationID } from "@/lib/api/protocol.gen"
 import { $isSidebarOpen } from "@/lib/appearance/preferences"
 import {
+  getContactsPath,
   getConversationListSearch,
   getServerPath,
   getSettingsPath,
 } from "@/lib/paths"
 import { conversationOptions } from "@/lib/query/conversation"
+import { WorldStatusContext, useWorldConnection } from "@/lib/query/world"
 import { cn } from "@/lib/utils"
 import {
   getWorkLocationSettings,
@@ -84,6 +93,12 @@ export function AppLayout() {
   const [pageActionsTarget, setPageActionsTarget] =
     useState<HTMLDivElement | null>(null)
   const activeServerID = connection.getServerID()
+  const worldStatusState = useWorldConnection(connection)
+  const nodeAddress = worldStatusState.status?.node_addr
+  useEffect(() => {
+    if (nodeAddress !== undefined)
+      saveServerNodeAddress(connection.entry.url, nodeAddress)
+  }, [connection, nodeAddress])
   const page = navigation?.locationKey === location.key ? navigation : undefined
   const title = page?.title ?? t("common.loading")
   const parent = page?.parent
@@ -120,7 +135,10 @@ export function AppLayout() {
         open={isSidebarOpen}
         onOpenChange={(open) => $isSidebarOpen.set(open)}
       >
-        <AppSidebar conversationID={conversationRoute?.params.conversationID} />
+        <AppSidebar
+          conversationID={conversationRoute?.params.conversationID}
+          worldStatus={worldStatusState.status}
+        />
         {/* 页面区填满可见区域，只有下面的内容区滚动。 */}
         <SidebarInset className="h-full min-h-0 min-w-0">
           <header className="relative z-10 flex h-10 shrink-0 items-center gap-2 border-b bg-background px-4">
@@ -156,24 +174,56 @@ export function AppLayout() {
                       {/* 窄屏只留最近的父级 */}
                       <BreadcrumbItem
                         className={cn(
-                          index === 0 ? "shrink-0" : "min-w-0",
+                          index === 0 && ancestor.icon !== "mail"
+                            ? "shrink-0"
+                            : "min-w-0",
                           index < parents.length - 1 && "hidden md:inline-flex"
                         )}
                       >
-                        {ancestor.to ? (
+                        {ancestor.icon === "mail" && ancestor.to ? (
+                          <Tooltip>
+                            <TooltipTrigger
+                              render={
+                                <BreadcrumbLink
+                                  className="inline-flex max-w-48 min-w-0 items-center gap-1 text-link color-muted"
+                                  render={<NavigationButton to={ancestor.to} />}
+                                />
+                              }
+                            >
+                              <MailIcon
+                                className="size-3.5 shrink-0"
+                                aria-hidden
+                              />
+                              <span className="min-w-0 truncate">
+                                {ancestor.label}
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent className="text-caption wrap-anywhere">
+                              {ancestor.tooltip ?? ancestor.label}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : ancestor.to ? (
                           <OverflowTooltip
                             data-slot="breadcrumb-link"
                             render={
                               <BreadcrumbLink
                                 className="max-w-48 truncate text-link color-muted"
-                                render={<Link to={ancestor.to} />}
+                                render={<NavigationButton to={ancestor.to} />}
                               />
                             }
                           >
                             {ancestor.label}
                           </OverflowTooltip>
                         ) : (
-                          <span className="color-muted">{ancestor.label}</span>
+                          <span className="inline-flex min-w-0 items-center gap-1 color-muted">
+                            {ancestor.icon === "mail" && (
+                              <MailIcon
+                                className="size-3.5 shrink-0"
+                                aria-hidden
+                              />
+                            )}
+                            <span className="truncate">{ancestor.label}</span>
+                          </span>
                         )}
                       </BreadcrumbItem>
                       <BreadcrumbSeparator
@@ -231,7 +281,12 @@ export function AppLayout() {
               fallback={<Skeleton className="m-4 h-64" />}
             >
               <PageActionsTargetContext.Provider value={pageActionsTarget}>
-                <Outlet context={setNavigation} />
+                <WorldStatusContext.Provider
+                  key={connection.entry.url}
+                  value={worldStatusState}
+                >
+                  <Outlet context={setNavigation} />
+                </WorldStatusContext.Provider>
               </PageActionsTargetContext.Provider>
             </Suspense>
           </div>
@@ -258,11 +313,25 @@ function MobileServerConnectionControl() {
 
 // 左栏显示 serve 连接状态、新对话入口、未归档对话和设置入口；
 // 正在看对话时，新对话入口带上这个对话的工作位置作为新对话页的预填。
-function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
+function AppSidebar({
+  conversationID,
+  worldStatus,
+}: {
+  conversationID?: ConversationID
+  worldStatus?: WorldStatus
+}) {
   const { t } = useTranslation()
-  const { setOpenMobile, isMobile, openMobile, toggleSidebar } = useSidebar()
+  const { setOpenMobile, isMobile, openMobile, state, toggleSidebar } =
+    useSidebar()
   const connection = useServerConnection()
   const { pathname, search } = useLocation()
+  const contactsPath = getContactsPath(connection.getServerID())
+  const connected = useStore(connection.$state) === "connected"
+  const contactsConnected =
+    worldStatus?.enabled === true && worldStatus.connected && connected
+  const contactsStatusLabel = t(
+    contactsConnected ? "world.connected" : "world.disconnected"
+  )
   const viewedConversation = useQuery({
     ...conversationOptions(connection, conversationID ?? ""),
     enabled: !!conversationID,
@@ -273,7 +342,10 @@ function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
           preset: getWorkLocationSettings(viewedConversation.data.conversation),
         }
       : undefined
-  const serveName = window.location.host
+  const servers = useStore($servers)
+  const serveName = getServerDisplay(
+    servers.find((s) => s.url === connection.entry.url) ?? connection.entry
+  ).name
   // 收起的桌面左栏靠 tooltip 显示名字；手机抽屉里不包 tooltip，
   // 否则抽屉打开时获得焦点的按钮带着隐藏的 tooltip，第一次 Esc 只关掉它
   const getTooltip = (label: string) =>
@@ -298,7 +370,9 @@ function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
           </div>
           <SidebarMenuButton
             className="min-w-0 flex-1 pl-0 text-ui group-data-[collapsible=icon]:hidden"
-            render={<Link to={getServerPath(connection.getServerID())} />}
+            render={
+              <NavigationButton to={getServerPath(connection.getServerID())} />
+            }
             onClick={() => setOpenMobile(false)}
           >
             <span className="truncate">{serveName}</span>
@@ -312,7 +386,7 @@ function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
               <SidebarMenuButton
                 className="text-ui"
                 render={
-                  <Link
+                  <NavigationButton
                     to={{
                       pathname: getServerPath(connection.getServerID()),
                       search: getConversationListSearch(search),
@@ -327,9 +401,43 @@ function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
                 <span>{t("conversationList.newConversation")}</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
+            {worldStatus?.enabled && (
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  className="overflow-visible text-ui"
+                  isActive={pathname === contactsPath}
+                  render={
+                    <NavigationButton
+                      to={{
+                        pathname: contactsPath,
+                        search: getConversationListSearch(search),
+                      }}
+                    />
+                  }
+                  aria-label={t("world.contacts")}
+                  aria-description={contactsStatusLabel}
+                  tooltip={
+                    state === "collapsed"
+                      ? getTooltip(t("world.contacts"))
+                      : undefined
+                  }
+                  onClick={() => setOpenMobile(false)}
+                >
+                  <WorldIconWithStatus
+                    icon={<UsersIcon className="size-4" />}
+                    online={contactsConnected}
+                    label={contactsStatusLabel}
+                    ringClassName="ring-sidebar"
+                  />
+                  <span className="min-w-0 truncate group-data-[collapsible=icon]:hidden">
+                    {t("world.contacts")}
+                  </span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            )}
           </SidebarMenu>
         </SidebarGroup>
-        <ConversationList />
+        <ConversationList worldStatus={worldStatus} />
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu>
@@ -337,7 +445,7 @@ function AppSidebar({ conversationID }: { conversationID?: ConversationID }) {
             <SidebarMenuButton
               className="text-ui"
               render={
-                <Link
+                <NavigationButton
                   to={{
                     pathname: getSettingsPath(
                       connection.getServerID(),

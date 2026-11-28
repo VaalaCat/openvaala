@@ -1,9 +1,31 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-page-role="runtime">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>OpenVaala</title>
+    <script>
+      // 白屏时等同源页面重新可达，再为这个历史条目刷新一次。
+      async function recoverPageModules() {
+        if (document.querySelector("#root main") || history.state?.retriedModules) return
+        history.replaceState({ ...history.state, retriedModules: true }, "")
+        for (let delay = 1000; ; delay = Math.min(delay * 2, 10000)) {
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          if (document.querySelector("#root main")) return
+          const reachable = await fetch(location.pathname, {
+            cache: "no-store",
+          }).then((response) => response.ok, () => false)
+          if (reachable) {
+            if (!document.querySelector("#root main")) location.reload()
+            return
+          }
+        }
+      }
+      addEventListener("error", (event) => {
+        if (event.target instanceof HTMLScriptElement && event.target.type === "module")
+          recoverPageModules()
+      }, true)
+    </script>
   </head>
   <body>
     <div id="root"></div>

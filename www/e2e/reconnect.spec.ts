@@ -1,4 +1,7 @@
+import { hostname } from "node:os"
 import {
+  captureExternalUI,
+  chooseExternalModel,
   expect,
   getComposer,
   getMessages,
@@ -27,8 +30,10 @@ test("manual_reconnect_preserves_content_and_draft", async ({
   await fixture.openApp(page)
   await startConversation(page, "连接入口检查")
   await expect(getMessages(page).getByText("ok", { exact: true })).toBeVisible()
-  const control = page.getByRole("button", { name: /^本页 · / })
-  await expect(control).toHaveAccessibleName("本页 · 已连接")
+  const control = page.getByRole("button", {
+    name: / · (?:已连接|正在连接|已断开)/,
+  })
+  await expect(control).toHaveAccessibleName(`${hostname()} · 已连接`)
   await expect(control).toHaveCSS("height", "32px")
   const serverPaths = await control.locator("svg").innerHTML()
   await control.hover()
@@ -39,8 +44,7 @@ test("manual_reconnect_preserves_content_and_draft", async ({
   // 2. 断线只集中到服务器入口，消息／草稿继续可读写，不伪造空列表。
   mode = "hold"
   await liveSocket!.close()
-  const reconnect = page.getByRole("button", { name: "重连", exact: true })
-  await expect(control).toHaveAccessibleName("本页 · 已断开，正在重连")
+  await expect(control).toHaveAccessibleName(`${hostname()} · 已断开，正在重连`)
   await expect(
     page.getByRole("img", { name: "已断开，正在重连" })
   ).toBeVisible()
@@ -51,10 +55,30 @@ test("manual_reconnect_preserves_content_and_draft", async ({
     page.getByRole("button", { name: "发送", exact: true })
   ).toBeDisabled()
   await control.click()
-  await reconnect.focus()
-  await reconnect.press("Enter")
-  const pending = page.getByRole("button", { name: "正在重连", exact: true })
-  await expect(pending).toBeDisabled()
+  const selectedServer = page.getByRole("menuitemradio", { checked: true })
+  const address = new URL(fixture.state.url).host
+  await expect(selectedServer).toHaveAccessibleName(
+    `${hostname()} ${address} · 已断开`
+  )
+  await expect(
+    page.getByRole("menuitem", { name: "重连", exact: true })
+  ).toHaveCount(0)
+  const manage = page.getByRole("menuitem", { name: "管理服务器…" })
+  const [nameX, manageX] = await selectedServer
+    .or(manage)
+    .evaluateAll((items) =>
+      items.map((item) => {
+        const range = document.createRange()
+        range.selectNodeContents(
+          document.createTreeWalker(item, NodeFilter.SHOW_TEXT).nextNode()!
+        )
+        return range.getBoundingClientRect().x
+      })
+    )
+  expect(nameX).toBe(manageX)
+  await selectedServer.focus()
+  await selectedServer.press("Enter")
+  await expect(selectedServer).toBeDisabled()
   await expect(control).toHaveAttribute("aria-busy", "true")
   await page.mouse.move(1276, 80)
   await expect(control).toHaveAttribute("aria-busy", "true")
@@ -68,12 +92,16 @@ test("manual_reconnect_preserves_content_and_draft", async ({
 
   // 3. 本次失败即停止旋转，下一次点击跳过退避并恢复原数据。
   await heldSocket!.close()
-  await expect(reconnect).toBeVisible()
-  await expect(reconnect).toBeEnabled()
+  await expect(selectedServer).toBeEnabled()
+  await manage.click()
+  const manager = page.getByRole("dialog", { name: "管理服务器" })
+  const offlineRow = manager.getByRole("button", { name: /已断开/ })
+  await expect(offlineRow).toContainText(address)
+  await expect(offlineRow).toHaveAccessibleDescription("连接")
   mode = "allow"
-  await reconnect.click()
-  await expect(control).toHaveAccessibleName("本页 · 已连接")
-  await page.keyboard.press("Escape")
+  await offlineRow.click()
+  await expect(manager).toBeHidden()
+  await expect(control).toHaveAccessibleName(`${hostname()} · 已连接`)
   await expect(control).toHaveAttribute("aria-busy", "false")
   await expect(getComposer(page)).toHaveValue(draft)
   await expect(
@@ -288,3 +316,189 @@ test(
     await expect(page.getByRole("link", { name: "断开期间新建" })).toBeVisible()
   }
 )
+
+test("external_restoring_then_failed_and_reloaded", async ({
+  page,
+  fixture,
+}) => {
+  const { writeFile, rm } = await import("node:fs/promises")
+  const gate = fixture.state.workspaceDirectory + "/load-gate"
+  const fail = fixture.state.workspaceDirectory + "/fail-load"
+  await fixture.withExternalAgent(
+    ["-load-gate", gate, "-fail-load-file", fail],
+    async () => {
+      await fixture.openApp(page)
+      await chooseExternalModel(page)
+      await startConversation(page, "恢复历史")
+      await expect(
+        getMessages(page).getByText("OK", { exact: true })
+      ).toBeVisible()
+      await writeFile(fail, "fail")
+      await fixture.restart()
+      await expect(page.getByText("正在从外部 Agent 恢复历史")).toBeVisible()
+      await getComposer(page).fill("等待恢复")
+      await expect(
+        page.getByRole("button", { name: "发送", exact: true })
+      ).toBeEnabled()
+      await captureExternalUI(page, "restoring")
+      await writeFile(gate, "ready")
+      await expect(page.getByText("恢复失败", { exact: true })).toBeVisible()
+      await expect(
+        page.getByText(/fixture partial replay/).first()
+      ).toBeVisible()
+      const composer = getComposer(page)
+      await expect(composer).toHaveValue("等待恢复")
+      await composer.fill("")
+      await expect(composer).toHaveAttribute(
+        "placeholder",
+        "输入消息，/ 选择命令"
+      )
+      const reload = page
+        .getByRole("alert")
+        .getByRole("button", { name: "重载 Agent" })
+      await expect(reload).toBeVisible()
+      await captureExternalUI(page, "restore-failed")
+      await rm(fail)
+      await reload.click()
+      await expect(
+        getMessages(page).getByText("latest", { exact: true })
+      ).toBeVisible()
+    }
+  )
+})
+
+for (const asset of ["index", "world-admin"]) {
+  test(`cold_start_recovers_when_the_${asset}_module_loses_network`, async ({
+    page,
+    context,
+    fixture,
+  }) => {
+    let documents = 0
+    page.on("request", (request) => {
+      if (request.resourceType() === "document") documents++
+    })
+    // 首次恢复探测也等到离线失败，此时仍须停在原文档。
+    const offlineProbe = page.waitForEvent(
+      "requestfailed",
+      (request) =>
+        request.resourceType() === "fetch" &&
+        new URL(request.url()).pathname === new URL(page.url()).pathname
+    )
+    await page.route(
+      new RegExp(`/assets/${asset}-[\\w-]+\\.js$`),
+      async (route) => {
+        await context.setOffline(true)
+        await route.abort("internetdisconnected")
+      },
+      { times: 1 }
+    )
+    await page.goto(fixture.state.url + "/web/v1/world/admin", {
+      waitUntil: "commit",
+    })
+    await offlineProbe
+    expect(documents).toBe(1)
+    await context.setOffline(false)
+    await expect(page.getByLabel("管理令牌")).toBeVisible()
+    expect(documents).toBe(2)
+  })
+}
+
+test("loaded_page_waits_for_click_to_refresh_after_chunk_404", async ({
+  page,
+  fixture,
+}) => {
+  let documents = 0
+  page.on("request", (request) => {
+    if (request.resourceType() === "document") documents++
+  })
+  const { longConversationID } = await fixture.seed({
+    conversations: 0,
+    longConversationTurns: 1,
+  })
+  await page.clock.install()
+  await fixture.openApp(page)
+  await expect(getComposer(page)).toBeVisible()
+  const refresh = page.getByRole("button", { name: "页面已更新，点击刷新" })
+  for (const [link, chunk] of [
+    [
+      page
+        .locator(`[data-conversation-id="${longConversationID}"]`)
+        .getByRole("link"),
+      "workspace-page",
+    ],
+    [page.getByRole("link", { name: "设置", exact: true }), "general"],
+  ] as const) {
+    const url = new RegExp(`/assets/${chunk}-[\\w-]+\\.js$`)
+    await page.route(url, (route) => route.fulfill({ status: 404 }))
+    const missing = page.waitForResponse(url)
+    await link.click()
+    expect((await missing).status()).toBe(404)
+    await expect(refresh).toBeVisible()
+    await page.unroute(url)
+  }
+  await page.clock.fastForward(10_000)
+  await expect(
+    page.getByRole("link", { name: "设置", exact: true })
+  ).toBeVisible()
+  expect(documents).toBe(1)
+  await refresh.click()
+  await expect(
+    page.getByRole("tab", { name: "通用", selected: true })
+  ).toBeVisible()
+  await expect(refresh).toHaveCount(0)
+  expect(documents).toBe(2)
+})
+
+for (const interrupted of ["conversation/list", "session/items/list"]) {
+  test(`reconnect_after_interrupting_${interrupted}`, async ({
+    page,
+    fixture,
+  }) => {
+    const { longConversationID } = await fixture.seed({
+      conversations: 0,
+      longConversationTurns: 1,
+    })
+    let dropped = false
+    const subscriptions: string[][] = []
+    let documents = 0
+    page.on("request", (request) => {
+      if (request.resourceType() === "document") documents++
+    })
+    await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
+      const server = socket.connectToServer()
+      const methods: string[] = []
+      subscriptions.push(methods)
+      socket.onMessage(async (frame) => {
+        const { method } = JSON.parse(String(frame))
+        if (method === interrupted && !dropped) {
+          dropped = true
+          await socket.close()
+          await server.close()
+          return
+        }
+        if (
+          method === "conversation/subscribe" ||
+          method === "session/subscribe"
+        )
+          methods.push(method)
+        server.send(frame)
+      })
+    })
+    await fixture.openApp(page)
+    await page
+      .locator(`[data-conversation-id="${longConversationID}"]`)
+      .getByRole("link")
+      .click()
+    for (const text of ["长对话第 1 轮", "ok"])
+      await expect(
+        getMessages(page).getByText(text, { exact: true })
+      ).toHaveCount(1)
+    expect(dropped).toBe(true)
+    expect(documents).toBe(1)
+    expect(subscriptions).toHaveLength(2)
+    expect(subscriptions[1]).toEqual([
+      "conversation/subscribe",
+      "session/subscribe",
+    ])
+  })
+}

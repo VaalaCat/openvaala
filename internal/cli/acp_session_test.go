@@ -1309,7 +1309,8 @@ func TestACPConfigOptions(t *testing.T) {
 	// 2. 生成设置选项，检查 executor 下拉框的当前值、选项和描述。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			options := getACPConfigOptions(models, defs.ModelSelection{Ref: models[0].Ref}, tt.executors)
+			s := acpSession{models: models, selectedModel: defs.ModelSelection{Ref: models[0].Ref}, executors: tt.executors}
+			options := s.getConfigOptions()
 			index := slices.IndexFunc(options, func(option acp.SessionConfigOption) bool { return option.Select.Id == "executor" })
 			if tt.wantValues == nil {
 				if index >= 0 {
@@ -1867,4 +1868,43 @@ func (r *acpSyncRefusingRuntime) SubscribeSession(ctx context.Context, request *
 func (r *acpSyncRefusingRuntime) closeSessionSubscription() {
 	// 1. 调用保存的取消函数。
 	(*r.cancelSessionSubscription.Load())()
+}
+
+// TestInboundACPExternalModelUpdates 验证编辑器按外部驱动的实际报告刷新模型选择器。
+func TestInboundACPExternalModelUpdates(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		group     *defs.ExternalOptionGroup
+		wantValue string
+	}{
+		{name: "no_model_group"},
+		{name: "no_current_value", group: &defs.ExternalOptionGroup{Options: []defs.ExternalOptionChoice{{Value: "x", Label: "External X"}}}},
+		{name: "backend_selection", group: &defs.ExternalOptionGroup{CurrentValue: "x", Options: []defs.ExternalOptionChoice{{Value: "x", Label: "External X"}}}, wantValue: "peer/x"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			outgoing := make(chan acpMessage, 1)
+			s := &acpSession{externalAgent: "peer", isOpenDelivered: true, outgoing: outgoing}
+			if err := s.handleClientEvent(t.Context(), &runtimeclient.SessionExternalStateChanged{Options: defs.ExternalOptions{Model: tt.group}}); err != nil {
+				t.Fatal(err)
+			}
+			var n acp.SessionNotification
+			if err := json.Unmarshal((<-outgoing).Params, &n); err != nil {
+				t.Fatal(err)
+			}
+			opts := n.Update.ConfigOptionUpdate.ConfigOptions
+			if tt.group == nil {
+				if len(opts) != 0 {
+					t.Fatalf("unexpected options: %+v", opts)
+				}
+				return
+			}
+			if len(opts) != 1 || opts[0].Select == nil || opts[0].Select.Id != "model" || string(opts[0].Select.CurrentValue) != tt.wantValue {
+				t.Fatalf("model option = %+v", opts)
+			}
+			choices := *opts[0].Select.Options.Ungrouped
+			if len(choices) != 1 || choices[0].Value != "peer/x" || choices[0].Name != "External X" {
+				t.Fatalf("choices = %+v", choices)
+			}
+		})
+	}
 }

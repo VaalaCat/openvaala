@@ -1,3 +1,7 @@
+import { useQuery } from "@tanstack/react-query"
+import { useServerConnection } from "@/components/server-connection-provider"
+import { agentCatalogOptions } from "@/lib/query/agent-settings"
+import { BrandIcon } from "@/components/base/brand-icon"
 import type { ComponentProps } from "react"
 import {
   BotIcon,
@@ -25,8 +29,31 @@ export function WorkspaceTabIcon({
 }: {
   workspace: TabWorkspace
   tabID: string
-} & ComponentProps<"svg">) {
-  const kind = useStore(workspace.$tabs)[tabID]?.kind
+} & ComponentProps<"svg"> & { "data-tab-closable"?: boolean }) {
+  const tab = useStore(workspace.$tabs)[tabID]
+  const kind = tab?.kind
+  const sync = workspace.getConversationSync(tabID) ?? workspace.getRootSync()
+  const root = useStore(sync.$rootSessionID)
+  const sessionID = tab?.kind === "sub-agent" ? tab.sessionID : root
+  const session = useStore(sync.$sessions, { keys: [sessionID ?? ""] })[
+    sessionID ?? ""
+  ]?.session
+  const agents = useQuery(agentCatalogOptions(useServerConnection()))
+  if (kind !== "terminal" && session?.external)
+    return (
+      <span
+        data-tab-closable={props["data-tab-closable"]}
+        className="inline-flex"
+      >
+        <BrandIcon
+          className={props.className}
+          icon={
+            agents.data?.agents?.find((a) => a.name === session.agent_name)
+              ?.icon ?? ""
+          }
+        />
+      </span>
+    )
   if (!kind) return null
   const Icon = tabIcons[kind]
   return <Icon {...props} />

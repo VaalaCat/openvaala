@@ -32,7 +32,7 @@ func TestSessionQueryAndMutationSetGet(t *testing.T) {
 	}
 	got, found, err := query.GetSession(t.Context(), "test-conversation", session.ID)
 	session.UpdatedAt = got.UpdatedAt
-	if err != nil || !found || got.UpdatedAt == 0 || got != session {
+	if err != nil || !found || got.UpdatedAt == 0 || !defs.IsSameSession(got, session) {
 		t.Fatalf("GetSession() = %+v, %v, %v, want %+v", got, found, err, session)
 	}
 	// 2. 覆盖任务名并回读，再检查缺失记录和空 ID 错误。
@@ -42,10 +42,10 @@ func TestSessionQueryAndMutationSetGet(t *testing.T) {
 	}
 	got, found, err = query.GetSession(t.Context(), "test-conversation", session.ID)
 	session.UpdatedAt = got.UpdatedAt
-	if err != nil || !found || got.UpdatedAt == 0 || got != session {
+	if err != nil || !found || got.UpdatedAt == 0 || !defs.IsSameSession(got, session) {
 		t.Fatalf("GetSession() after replacement = %+v, %v, %v, want %+v", got, found, err, session)
 	}
-	if got, found, err := query.GetSession(t.Context(), "test-conversation", "missing"); err != nil || found || got != (defs.Session{}) {
+	if got, found, err := query.GetSession(t.Context(), "test-conversation", "missing"); err != nil || found || !defs.IsSameSession(got, defs.Session{}) {
 		t.Fatalf("GetSession(missing) = %+v, %v, %v", got, found, err)
 	}
 	if err := mutation.SetSession(t.Context(), defs.Session{TaskName: "missing ID"}); err == nil {
@@ -116,16 +116,17 @@ func TestSessionQueryGetSessionByID(t *testing.T) {
 		{
 			name:      "root_session_before_first_input",
 			sessionID: rootBeforeInput.ID,
+			want:      rootBeforeInput, wantFound: true,
 		},
 	}
-	// 2. 检查找到两个子 Session，缺失和未写 Item 的 Session 返回未找到。
+	// 2. 检查找到两个子 Session，未写 Item 的根 Session 仍可读，缺失 ID 返回未找到。
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, found, err := query.GetSessionByID(t.Context(), tt.sessionID)
 			if tt.wantFound {
 				tt.want.UpdatedAt = got.UpdatedAt
 			}
-			if err != nil || found != tt.wantFound || got != tt.want || (found && got.UpdatedAt == 0) {
+			if err != nil || found != tt.wantFound || !defs.IsSameSession(got, tt.want) || (found && got.UpdatedAt == 0) {
 				t.Fatalf("GetSessionByID(%s) = %+v, %v, %v, want %+v, %v", tt.sessionID, got, found, err, tt.want, tt.wantFound)
 			}
 		})
@@ -291,8 +292,78 @@ func TestSessionPersistsAcrossReopen(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 	got, found, err := query.GetSession(t.Context(), "test-conversation", want.ID)
 	want.UpdatedAt = got.UpdatedAt
-	if err != nil || !found || got.UpdatedAt == 0 || got != want {
+	if err != nil || !found || got.UpdatedAt == 0 || !defs.IsSameSession(got, want) {
 		t.Fatalf("GetSession() after reopen = %+v, %v, %v, want %+v", got, found, err, want)
+	}
+}
+
+// TestExternalSessionRecordRoundTrip 检查 SQLite 重开和从文件日志重建索引后的外部会话记录。
+func TestExternalSessionRecordRoundTrip(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		rebuild bool
+	}{
+		{name: "reopen_index"},
+		{name: "rebuild_from_log", rebuild: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			open := func(index string) (storagesqlite.Database, *dao.DAOOpt) {
+				database, err := storagesqlite.OpenDatabase(storagesqlite.NewDatabaseOpt(filepath.Join(root, index), dao.RecordNamespaces()...))
+				if err != nil {
+					t.Fatal(err)
+				}
+				logs, err := storagefile.NewLogStorage(storagefile.NewLogStorageOpt(filepath.Join(root, "logs")))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return database, dao.NewDAOOpt(database.Record(), logs)
+			}
+			record := defs.Session{
+				ID: defs.NewSessionID(), ConversationID: defs.NewConversationID(), AgentName: "codex-acp",
+				External: &defs.ExternalSession{
+					AgentType: defs.AgentTypeACP, ExecutorID: "remote", SessionID: "acp-123", Cwd: "/repo",
+					Metadata: map[string]any{"restore": map[string]any{"tags": []any{"a", "b"}}},
+				},
+				Labels: map[string]string{"project": "openvaala"}, Background: true,
+				DetachedConversationID: defs.NewConversationID(), SuppressFinishReport: true,
+			}
+			database, opt := open("records.db")
+			_, mutation, err := dao.NewDAO(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := mutation.SetSession(t.Context(), record); err != nil {
+				t.Fatal(err)
+			}
+			if err := mutation.SetConversation(t.Context(), defs.Conversation{ID: record.ConversationID, RootSessionID: record.ID}); err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			index := "records.db"
+			if tt.rebuild {
+				index = "rebuilt.db"
+			}
+			database, opt = open(index)
+			t.Cleanup(func() { _ = database.Close() })
+			if tt.rebuild {
+				if result, err := dao.RebuildMetadataIndex(t.Context(), opt); err != nil || result.RebuiltConversations != 1 {
+					t.Fatalf("RebuildMetadataIndex() = %+v, %v", result, err)
+				}
+			}
+			query, _, err := dao.NewDAO(opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := query.GetSession(t.Context(), record.ConversationID, record.ID)
+			record.UpdatedAt = got.UpdatedAt
+			if err != nil || !found || got.UpdatedAt == 0 || !defs.IsSameSession(got, record) {
+				t.Fatalf("GetSession() = %+v, %v, %v; want %+v", got, found, err, record)
+			}
+		})
 	}
 }
 
@@ -573,7 +644,7 @@ func TestSessionMutationDeleteFailureKeepsSession(t *testing.T) {
 			}
 			got, found, err := query.GetSession(t.Context(), "test-conversation", session.ID)
 			session.UpdatedAt = got.UpdatedAt
-			if err != nil || !found || got.UpdatedAt == 0 || got != session {
+			if err != nil || !found || got.UpdatedAt == 0 || !defs.IsSameSession(got, session) {
 				t.Fatalf("GetSession() after failed delete = %+v, %v, %v", got, found, err)
 			}
 			turns, err := query.ListTurns(t.Context(), dao.ListTurnsRequest{

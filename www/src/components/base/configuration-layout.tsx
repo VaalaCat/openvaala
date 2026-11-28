@@ -1,4 +1,4 @@
-import { Children, useState, type ReactNode } from "react"
+import { Children, useId, useState, type ReactNode } from "react"
 import { ChevronRightIcon } from "lucide-react"
 import {
   Collapsible,
@@ -10,36 +10,60 @@ import { Separator } from "@/components/ui/separator"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
-// 设置表单的一节：标题行右边放操作和摘要；有内容时标题可以折叠内容，默认展开
+// 设置表单的一节：点标题或摘要折叠内容，右侧操作独立。
 export function ConfigurationLayout({
+  id,
   title,
   actions,
   summary,
+  open,
+  onOpenChange,
   children,
 }: {
+  id?: string
   title: ReactNode
   actions?: ReactNode
   summary?: ReactNode
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
   children?: ReactNode
 }) {
-  const [expanded, setExpanded] = useState(true)
+  const [localOpen, setLocalOpen] = useState(true)
+  const expanded = open ?? localOpen
+  const titleID = useId()
+  const summaryID = useId()
   const hasBody = Children.toArray(children).length > 0
+  const details = summary && (
+    <span
+      id={summaryID}
+      className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1 text-right text-caption wrap-anywhere whitespace-normal color-muted"
+    >
+      {summary}
+    </span>
+  )
   return (
     <Collapsible
+      id={id}
       open={expanded}
-      onOpenChange={setExpanded}
+      onOpenChange={onOpenChange ?? setLocalOpen}
       className="configuration-section min-w-0 border"
     >
       <FieldSet className="min-w-0 gap-0">
-        <FieldLegend className="sr-only">{title}</FieldLegend>
-        <div className="flex w-full items-center gap-2 p-3">
+        <FieldLegend id={titleID} className="sr-only">
+          {title}
+        </FieldLegend>
+        <div
+          className={cn("flex w-full items-center", !hasBody && "gap-2 p-3")}
+        >
           {hasBody ? (
             <CollapsibleTrigger
+              aria-labelledby={titleID}
+              aria-describedby={summary ? summaryID : undefined}
               render={
                 <Button
                   type="button"
                   variant="ghost"
-                  className="configuration-trigger min-w-0 justify-start text-section"
+                  className="configuration-trigger h-auto min-h-12 min-w-0 flex-1 justify-start gap-2 px-3 py-2 text-left text-section"
                 />
               }
             >
@@ -49,21 +73,27 @@ export function ConfigurationLayout({
                   expanded && "rotate-90"
                 )}
               />
-              <span className="truncate">{title}</span>
+              <span className="max-w-1/2 shrink-0 whitespace-normal">
+                {title}
+              </span>
+              {details}
             </CollapsibleTrigger>
           ) : (
-            <span className="min-w-0 truncate text-section">{title}</span>
+            <>
+              <span className="min-w-0 flex-1 truncate text-section">{title}</span>
+              {details}
+            </>
           )}
-          <div className="ml-auto flex min-w-0 items-center gap-2">
-            {actions && (
-              <div className="flex shrink-0 items-center gap-2">{actions}</div>
-            )}
-            {summary && (
-              <span className="truncate text-caption color-muted">
-                {summary}
-              </span>
-            )}
-          </div>
+          {actions && (
+            <div
+              className={cn(
+                "flex shrink-0 items-center gap-2",
+                hasBody && "pr-3"
+              )}
+            >
+              {actions}
+            </div>
+          )}
         </div>
         {hasBody && (
           <CollapsibleContent

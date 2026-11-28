@@ -1,4 +1,7 @@
+import { hostname } from "node:os"
 import {
+  captureExternalUI,
+  chooseExternalModel,
   expect,
   expectShimmer,
   expandTurnProcess,
@@ -14,6 +17,7 @@ import {
   type ModelReply,
 } from "./fixture"
 import type { Locator, Page } from "@playwright/test"
+import { readFile } from "node:fs/promises"
 import type {
   ListItemsResult,
   ListTurnsResult,
@@ -76,17 +80,17 @@ test("icon_help_and_truncated_title_tooltips_follow_real_state_without_native_ti
   // 1. 新对话页的图标按钮：悬停和键盘聚焦都出提示，不叠加原生 title。
   await page.setViewportSize({ width: 1280, height: 844 })
   await fixture.openApp(page)
-  const addImage = page.getByRole("button", { name: "添加图片", exact: true })
+  const addImage = page.getByRole("button", { name: "添加附件", exact: true })
   await addImage.hover()
   const tooltip = page.locator('[data-slot="tooltip-content"]:visible')
-  await expect(tooltip).toHaveText("添加图片")
+  await expect(tooltip).toHaveText("添加附件")
   await expect(tooltip).toHaveCSS("font-size", "12px")
   await expect(tooltip).toHaveCSS("line-height", "16px")
   await expect(addImage).not.toHaveAttribute("title")
   await page.mouse.move(0, 0)
   await expect(tooltip).toBeHidden()
   await addImage.focus()
-  await expect(tooltip).toHaveText("添加图片")
+  await expect(tooltip).toHaveText("添加附件")
   await page.keyboard.press("Escape")
   await expect(tooltip).toBeHidden()
   await expect(addImage).toBeFocused()
@@ -109,10 +113,8 @@ test("icon_help_and_truncated_title_tooltips_follow_real_state_without_native_ti
   await short.hover()
   await expect(tooltip).toHaveCount(0)
   const conversationID = page.url().split("/c/")[1]
-  const row = page
-    .getByRole("listitem")
-    .filter({ has: page.locator(`a[href*="/c/${conversationID}"]`) })
-    .filter({ has: page.getByRole("button", { name: /的更多操作/ }) })
+  const row = page.locator(`[data-conversation-id="${conversationID}"]`)
+  await expect(row.locator("button button")).toHaveCount(0)
   await row.getByRole("button", { name: /的更多操作/ }).click()
   await page.getByRole("menuitem", { name: "改名", exact: true }).click()
   const dialog = page.getByRole("dialog", { name: "改名", exact: true })
@@ -143,7 +145,7 @@ test("tooltip_waits_600ms_cancels_and_sidebar_tooltip_hits_only_time_text", asyn
     exact: true,
   })
   await expect(copy).toBeVisible()
-  const addImage = page.getByRole("button", { name: "添加图片", exact: true })
+  const addImage = page.getByRole("button", { name: "添加附件", exact: true })
   const tooltip = page.locator('[data-slot="tooltip-content"]:visible')
   await page.clock.install()
   await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000))
@@ -168,7 +170,7 @@ test("tooltip_waits_600ms_cancels_and_sidebar_tooltip_hits_only_time_text", asyn
   await page.clock.runFor(599)
   await expect(tooltip).toHaveCount(0)
   await page.clock.runFor(1)
-  await expect(tooltip).toHaveText("添加图片")
+  await expect(tooltip).toHaveText("添加附件")
   await addImage.click()
   await page.clock.runFor(700)
   await expect(tooltip).toHaveCount(0)
@@ -444,8 +446,10 @@ test("turn_divider_lines_and_item_actions_align", async ({ page, fixture }) => {
     await divider.scrollIntoViewIfNeeded()
     const lines = divider.locator('[data-slot="separator"]')
     await expect(lines).toHaveCount(2)
-    const left = (await lines.first().boundingBox())!
-    const right = (await lines.last().boundingBox())!
+    // 同一帧读取两侧位置，滚动中的两个帧之间会有纵向位移。
+    const [left, right] = await lines.evaluateAll((nodes) =>
+      nodes.map((node) => node.getBoundingClientRect().toJSON())
+    )
     expect(left.width).toBeGreaterThanOrEqual(24)
     expect(right.width).toBeGreaterThanOrEqual(24)
     expect(Math.abs(left.width - right.width)).toBeLessThanOrEqual(1)
@@ -688,7 +692,7 @@ test("disclosure_lines_follow_icon_centers_and_preserve_reading", async ({
     )
 })
 
-test("image_preview_is_shared_by_draft_message_and_markdown", async ({
+test("draft_message_and_markdown_images_open_full_preview", async ({
   page,
   fixture,
 }) => {
@@ -767,12 +771,11 @@ test("image_preview_is_shared_by_draft_message_and_markdown", async ({
   await expect(
     messages.getByRole("button", { name: "预览图片 重试图片", exact: true })
   ).toBeVisible()
-  // 消息图片和 Markdown 图片打开的是同一个 Dialog：桌面用消息图片，手机用 Markdown 图片，
-  // 手机全屏，Esc恢复焦点与阅读位置。
-  for (const { width, name } of [
-    { width: 1280, name: "预览图片 wide.png" },
-    { width: 390, name: "预览图片 Markdown宽图" },
-  ]) {
+  // 桌面打开已发送的原图，手机打开 Markdown 图片。
+  await expect(
+    messages.getByRole("img", { name: "wide.png", exact: true })
+  ).toBeVisible()
+  for (const width of [1280, 390]) {
     await page.setViewportSize({ width, height: 844 })
     // 视口变化后等布局和滚动位置连续几帧不变，再记录打开前的阅读位置。
     await scroller.evaluate(async (node) => {
@@ -784,12 +787,16 @@ test("image_preview_is_shared_by_draft_message_and_markdown", async ({
         last = now
       }
     })
-    const trigger = messages.getByRole("button", { name, exact: true })
+    const trigger = messages.getByRole("button", {
+      name: width === 1280 ? "预览图片 wide.png" : "预览图片 Markdown宽图",
+      exact: true,
+    })
     await trigger.scrollIntoViewIfNeeded()
     await trigger.click({ trial: true })
     const before = await scroller.evaluate((node) => node.scrollTop)
     await trigger.click()
     await expect(dialog).toBeVisible()
+    if (width === 1280) await captureExternalUI(page, "message-image-preview")
     const bounds = (await dialog.boundingBox())!
     if (width === 390) {
       await expect
@@ -1550,7 +1557,7 @@ test("history_pagination_recovers_after_connection_error_without_reloading_page"
 
   // 2. 重连后继续上翻，连接错误不留下隐形的分页锁。
   await expect(
-    page.getByRole("button", { name: "本页 · 已连接", exact: true })
+    page.getByRole("button", { name: `${hostname()} · 已连接`, exact: true })
   ).toBeVisible({ timeout: 20_000 })
   await expect(
     page.getByRole("button", { name: "发送", exact: true })
@@ -1611,8 +1618,8 @@ test("user_message_copies_only_typed_text_while_running", async ({
     userItem.getByRole("button", { name: "附带材料", exact: true })
   ).toBeVisible()
   await expect(
-    userItem.getByRole("button", {
-      name: "预览图片 复制检查图片",
+    userItem.getByRole("img", {
+      name: "复制检查图片",
       exact: true,
     })
   ).toBeVisible()
@@ -1665,7 +1672,7 @@ test("user_message_copies_only_typed_text_while_running", async ({
     { ...image, image: { ...image.image, alt: "只有图片" } },
   ])
   const imageItem = messages.locator("[data-item-key]").filter({
-    has: page.getByRole("button", { name: "预览图片 只有图片", exact: true }),
+    has: page.getByRole("img", { name: "只有图片", exact: true }),
   })
   await expect(imageItem).toBeVisible()
   await expect(
@@ -2118,3 +2125,375 @@ for (const scenario of [
     ).toHaveCount(1)
   })
 }
+
+test("external_zero_models_options_commands_and_attachments", async ({
+  page,
+  fixture,
+}) => {
+  await fixture.withExternalAgent(
+    [],
+    async () => {
+      const creates: import("../src/lib/api/protocol.gen").CreateConversationParams[] =
+        []
+      const catalog: import("../src/lib/api/protocol.gen").ListModelsParams[] =
+        []
+      let optionRefreshes = 0
+      page.on("websocket", (ws) =>
+        ws.on("framesent", (frame) => {
+          const request = JSON.parse(String(frame.payload))
+          if (request.method === "conversation/create")
+            creates.push(request.params)
+          if (request.method === "model/list") catalog.push(request.params)
+          if (request.method === "agent/getOptions" && request.params.refresh)
+            optionRefreshes++
+        })
+      )
+      await fixture.openApp(page)
+      await chooseExternalModel(page)
+      await expect(
+        page.getByRole("button", { name: "更多", exact: true })
+      ).toBeVisible()
+      const picker = page.getByLabel("模型", { exact: true }).first()
+      await picker.click()
+      await expect.poll(() => optionRefreshes).toBeGreaterThan(0)
+      await captureExternalUI(page, "model-picker")
+      await page.getByRole("option", { name: /large/ }).click()
+      const effort = page.getByRole("combobox", { name: /high/ })
+      const more = page.getByRole("button", { name: "更多", exact: true })
+      const mode = page.getByRole("combobox", { name: "Mode", exact: true })
+      await expect(effort).toBeVisible()
+      await more.click()
+      for (const control of [effort, more, mode]) {
+        await expect(control).toHaveCSS("font-size", "14px")
+        await expect(control).toHaveCSS("height", "32px")
+      }
+      await captureExternalUI(page, "more")
+      await mode.click()
+      const code = page.getByRole("option", { name: "Code", exact: true })
+      await expect(code).toHaveCSS("font-size", "14px")
+      await code.click()
+      await expect(
+        page.getByRole("combobox", { name: "Mode", exact: true })
+      ).toContainText("Code")
+      await page.keyboard.press("Escape")
+      await startConversation(page, "检查会话选项")
+      await expect(
+        getMessages(page).getByText("OK", { exact: true })
+      ).toBeVisible()
+      expect(creates).toHaveLength(1)
+      expect(creates[0].model?.ref).toEqual({
+        provider_id: "codex-acp",
+        model_id: "large",
+      })
+      expect(creates[0].initial_options).toEqual([
+        expect.objectContaining({ kind: "mode", value: "code" }),
+      ])
+      expect(
+        catalog.some((request) => request.conversation_id && request.session_id)
+      ).toBe(true)
+      await picker.click()
+      await expect(
+        page.getByText("codex-acp", { exact: true }).last()
+      ).toBeVisible()
+      await expect(page.getByRole("option", { name: /local/ })).toHaveCount(0)
+      await page.keyboard.press("Escape")
+      await getComposer(page).fill("/")
+      const status = page.getByRole("option", { name: /\/status/ })
+      await expect(status).toBeVisible()
+      await expect(page.getByRole("option", { name: /\/btw/ })).toHaveCount(0)
+      await expect(
+        page.getByRole("option", { name: /display-check/ })
+      ).toHaveCount(0)
+      const commandIcon = status.locator("[style*=mask]")
+      await expect(commandIcon).toHaveCSS("width", "16px")
+      await expect(commandIcon).toBeVisible()
+      await captureExternalUI(page, "slash")
+      await status.click()
+      await expect(getComposer(page)).toHaveValue("/status ")
+      const files = Array.from({ length: 9 }, (_, i) => ({
+        name: "project-report-" + i + ".txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("report"),
+      }))
+      await page.locator("input[type=file]").setInputFiles([
+        ...files,
+        {
+          name: "icon.png",
+          mimeType: "image/png",
+          buffer: await readFile(
+            new URL("../../resources/icon.png", import.meta.url)
+          ),
+        },
+      ])
+      const strip = page.locator("form [data-attachment-strip]")
+      await expect(strip.getByText(files[8].name)).toBeAttached()
+      await expect(
+        page.getByRole("button", { name: "发送", exact: true })
+      ).toBeEnabled()
+      await expect(strip).toHaveAttribute("data-overflow", "left")
+      await strip.hover()
+      await page.mouse.wheel(0, -240)
+      await expect(strip).toHaveAttribute("data-overflow", "both")
+      await captureExternalUI(page, "attachment-overflow")
+      await getComposer(page).press("Enter")
+      const messageStrip = getMessages(page).locator("[data-attachment-strip]")
+      await expect(messageStrip.getByText(files[0].name)).toBeVisible()
+      await expect(messageStrip.getByRole("img")).toHaveCount(1)
+      await expect(getMessages(page)).not.toContainText("<openvaala-")
+      await messageStrip.evaluate((node) => {
+        node.scrollLeft = node.scrollWidth
+      })
+      await captureExternalUI(page, "message-attachments")
+    },
+    true
+  )
+})
+
+test("running_external_slash_interrupts_without_steer_support", async ({
+  page,
+  fixture,
+}) => {
+  await fixture.withExternalAgent(["-prompt", "wait-cancel"], async () => {
+    const modes: string[] = []
+    page.on("websocket", (ws) =>
+      ws.on("framesent", (frame) => {
+        const request = JSON.parse(String(frame.payload))
+        if (request.method === "conversation/submitInput")
+          modes.push(request.params.mode)
+      })
+    )
+    await fixture.openApp(page)
+    await chooseExternalModel(page)
+    await startConversation(page, "等待插话")
+    await expect(
+      page.getByRole("button", { name: "中断", exact: true })
+    ).toBeVisible()
+    await getComposer(page).fill("/")
+    await page.getByRole("option", { name: /\/status/ }).click()
+    await page.getByRole("button", { name: "发送", exact: true }).click()
+    await expect(
+      getMessages(page).getByText("/status", { exact: true })
+    ).toBeVisible()
+    expect(modes.at(-1)).toBe("interrupt")
+    await page.getByRole("button", { name: "中断", exact: true }).click()
+  })
+})
+
+test("conversation_files_upload_on_selection_and_reject_oversized_drops", async ({
+  page,
+  fixture,
+}) => {
+  let uploads = 0
+  let release = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
+    const server = socket.connectToServer()
+    socket.onMessage(async (frame) => {
+      const request = JSON.parse(String(frame))
+      if (request.method === "attachment/upload") {
+        uploads++
+        await gate
+      }
+      server.send(frame)
+    })
+  })
+  await fixture.openApp(page)
+  await startConversation(page, "先建立对话")
+  const composer = getComposer(page)
+  await composer.fill("本轮附件")
+  await composer.evaluate((node) => {
+    const data = new DataTransfer()
+    data.items.add(
+      new File([new Uint8Array(10 * 1024 * 1024 + 1)], "oversized.zip", {
+        type: "application/zip",
+      })
+    )
+    node.dispatchEvent(
+      new DragEvent("drop", { bubbles: true, dataTransfer: data })
+    )
+  })
+  await expect(page.getByText("文件超过 10MB", { exact: true })).toBeVisible()
+  expect(uploads).toBe(0)
+  await page.getByRole("button", { name: "移除附件「oversized.zip」" }).click()
+  await composer.evaluate((node) => {
+    const data = new DataTransfer()
+    data.items.add(new File(["notes"], "notes.txt", { type: "text/plain" }))
+    node.dispatchEvent(
+      new ClipboardEvent("paste", { bubbles: true, clipboardData: data })
+    )
+  })
+  await expect.poll(() => uploads).toBe(1)
+  const send = page.getByRole("button", { name: "发送", exact: true })
+  await expect(send).toBeDisabled()
+  release()
+  await expect(send).toBeEnabled()
+  await send.click()
+  const card = getMessages(page).getByText("notes.txt", { exact: true })
+  await expect(card).toBeVisible()
+  await card.hover()
+  await expect(
+    page.locator('[data-slot="tooltip-content"]:visible')
+  ).toContainText("/attachments/" + page.url().split("/c/")[1] + "/")
+  expect(uploads).toBe(1)
+})
+
+test("new_draft_files_upload_only_on_send_to_final_conversation", async ({
+  page,
+  fixture,
+}) => {
+  await fixture.withExternalAgent([], async () => {
+    const requests: { method: string; params: Record<string, unknown> }[] = []
+    page.on("websocket", (ws) =>
+      ws.on("framesent", (frame) => {
+        const rpc = JSON.parse(String(frame.payload))
+        if (
+          [
+            "conversation/create",
+            "attachment/upload",
+            "conversation/submitInput",
+          ].includes(rpc.method)
+        )
+          requests.push(rpc)
+      })
+    )
+    await fixture.openApp(page)
+    await page.locator("input[type=file]").setInputFiles({
+      name: "draft.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("draft"),
+    })
+    const draftStrip = page.locator("form [data-attachment-strip]")
+    await expect(
+      draftStrip.getByText("draft.txt", { exact: true })
+    ).toBeVisible()
+    await expect(draftStrip.locator(".lucide-file-text")).toBeVisible()
+    await chooseExternalModel(page)
+    const directory = page.getByRole("combobox", {
+      name: "工作目录",
+      exact: true,
+    })
+    await directory.fill(fixture.state.workspaceDirectory + "/manual")
+    await page.keyboard.press("Escape")
+    await getComposer(page).fill("按最终位置上传")
+    expect(requests).toHaveLength(0)
+    await captureExternalUI(page, "new-draft-file")
+    await getComposer(page).press("Enter")
+    const file = getMessages(page).getByText("draft.txt", { exact: true })
+    await expect(file).toBeVisible()
+    expect(requests.map((r) => r.method)).toEqual([
+      "conversation/create",
+      "attachment/upload",
+      "conversation/submitInput",
+    ])
+    expect(requests[0].params.model).toMatchObject({
+      ref: { provider_id: "codex-acp" },
+    })
+    expect(JSON.stringify(requests[0].params.executor_settings)).toContain(
+      fixture.state.workspaceDirectory + "/manual"
+    )
+    expect(requests[1].params.conversation_id).toBe(
+      requests[2].params.conversation_id
+    )
+    await expect(
+      getMessages(page).getByRole("button", { name: /draft.txt/ })
+    ).toHaveCount(0)
+  })
+})
+
+test("implicit_default_acp_uses_external_controls_and_commands", async ({
+  page,
+  fixture,
+}) => {
+  await fixture.withExternalAgent(
+    [],
+    async () => {
+      const probes: string[] = []
+      page.on("websocket", (ws) =>
+        ws.on("framesent", (frame) => {
+          const rpc = JSON.parse(String(frame.payload))
+          if (rpc.method === "agent/getOptions")
+            probes.push(rpc.params.agent_name)
+        })
+      )
+      await fixture.openApp(page)
+      await expect(
+        page.getByRole("button", { name: "导入已有会话" })
+      ).toBeVisible()
+      await expect(
+        page.getByLabel("模型", { exact: true }).first()
+      ).toContainText("small")
+      await expect(
+        page.getByRole("button", { name: "更多", exact: true })
+      ).toBeVisible()
+      expect(probes).toContain("default")
+      const composer = getComposer(page)
+      await expect(composer).toHaveAttribute(
+        "placeholder",
+        "输入消息，/ 选择命令"
+      )
+      await composer.fill("/")
+      await expect(
+        page.getByRole("option", { name: /display-check/ })
+      ).toHaveCount(0)
+      await captureExternalUI(page, "default-acp")
+      await startConversation(page, "默认 ACP")
+      await expect(
+        getMessages(page).getByText("OK", { exact: true })
+      ).toBeVisible()
+    },
+    true,
+    "default"
+  )
+})
+
+test("new_draft_retries_only_failed_files_in_the_created_conversation", async ({
+  page,
+  fixture,
+}) => {
+  const calls: string[] = []
+  let failUpload = true
+  await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
+    const server = socket.connectToServer()
+    socket.onMessage((frame) => {
+      const request = JSON.parse(String(frame))
+      if (request.method === "conversation/create") calls.push("create")
+      if (request.method === "attachment/upload") {
+        calls.push(request.params.name)
+        if (failUpload && request.params.name === "second.txt") {
+          failUpload = false
+          socket.send(
+            JSON.stringify({
+              id: request.id,
+              error: { code: -32000, message: "upload interrupted" },
+            })
+          )
+          return
+        }
+      }
+      server.send(frame)
+    })
+  })
+  await fixture.openApp(page)
+  await page
+    .locator("input[type=file]")
+    .setInputFiles(
+      ["first.txt", "second.txt"].map((name) => ({
+        name,
+        mimeType: "text/plain",
+        buffer: Buffer.from(name),
+      }))
+    )
+  await getComposer(page).fill("上传重试")
+  const send = page.getByRole("button", { name: "发送", exact: true })
+  await send.click()
+  await expect(page.locator("form [data-attachment-strip]")).toContainText(
+    "upload interrupted"
+  )
+  await send.click()
+  await expect(
+    getMessages(page).getByText("second.txt", { exact: true })
+  ).toBeVisible()
+  expect(calls).toEqual(["create", "first.txt", "second.txt", "second.txt"])
+})

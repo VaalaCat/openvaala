@@ -87,7 +87,11 @@ func (m *tuiModel) getExpandedLines() []string {
 	if m.conversation != nil {
 		header = m.formatConversationHeader(*m.conversation)
 	}
-	return m.expandView.getContentLines(m.transcript, header)
+	lines := m.expandView.getContentLines(m.transcript, header)
+	if hint := m.getHistoryRestoreHint(); hint != "" {
+		lines = append(lines, hint)
+	}
+	return lines
 }
 
 // getContentLines 生成展开历史的内容行：标题在前，各历史单元按顺序渲染，已结束的单元缓存渲染结果。

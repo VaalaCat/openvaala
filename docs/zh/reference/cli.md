@@ -13,6 +13,13 @@ openvaala acp                      通过 stdio 以 ACP 协议服务一个编辑
 openvaala app-server               以 Codex app-server 协议服务 Codex 客户端
 openvaala codex [-- CODEX_ARGS]    打开连着 OpenVaala 的 Codex 终端界面
 openvaala codex app [directory]    打开连着 OpenVaala 的 Codex 桌面版（macOS）
+openvaala session                  管理会话
+openvaala agent                    列举 Agent 和选项
+openvaala executor                 列举 Executor 和运行工具
+openvaala exec                     在 Executor 上运行命令
+openvaala terminal                 管理交互终端
+openvaala skill                    列举、搜索及读取 skill
+openvaala mcp-bridge               为 Agent 进程转发 stdio MCP，通常由 Agent 自动调用
 openvaala reindex                  重建对话索引
 openvaala plugin <subcommand>      安装和管理插件
 openvaala config <subcommand>      初始化、查看和校验配置
@@ -43,6 +50,8 @@ openvaala help [command]           显示帮助
 - `--url <ws-url>`：要连接的 Runtime 服务，例如 `ws://10.0.0.5:8790/api/v1/openvaala`。
 
 没有 `--url` 时用 `client.url`；也没有时用本机的 Runtime 服务，没在运行就在后台启动它。由 `tui`、`acp`、`app-server` 或 `codex` 这样启动的服务，在最后一个客户端断开、也没有任务在运行之后，大约十秒自动退出。由 `web` 或桌面端启动的服务会一直运行，直到你停掉它。token 和路径映射见[配置 → client](../configuration/overview.md#client)。
+
+`session`、`agent`、`executor`、`exec`、`terminal` 和 `skill` 也接受 `--url` 和 `--token`。省略参数时分别读取 `OPENVAALA_URL` 和 `OPENVAALA_TOKEN`。`OPENVAALA_CONVERSATION_ID` 和 `OPENVAALA_SESSION_ID` 提供协作上下文。支持 `--conversation` 的命令可以用它覆盖环境变量中的对话 ID。
 
 ## tui
 
@@ -128,6 +137,49 @@ openvaala codex app [directory]
 ```
 
 只支持 macOS。在 `directory`（默认当前目录）里，以 OpenVaala 为后端打开已安装的 Codex 桌面版，然后返回。请先退出 Codex 应用。不会修改任何 Codex 配置，也不会替你安装应用。
+
+## session
+
+会话 CLI 与本地 `openvaala` MCP 工具提供等价的协作能力。使用注入的会话 Token 时，两种方式采用相同的对话和会话权限。在 Codex 等带网络沙箱的 Agent 中，如果 CLI 连不上 OpenVaala，请使用 `openvaala` MCP 工具。没有来源会话时，操作者可用 `spawn` 创建独立对话。
+
+- `openvaala session spawn <prompt>` 对应 `spawn_agent`。用 `--agent <name>` 选 Agent，`--model <provider/model>` 选模型，`--reasoning-effort <value>` 指定原生模型的推理强度。可重复传 `--initial-option <kind:id=value>` 设置外部 Agent 的启动选项。用 `--executor <id>`、`--cwd <path>`、`--task <name>`、`--label <key=value>`、`--background` 设置工作位置和会话信息。派生子会话时，`--fork-turns <none|all|n>` 选择继承的已结束轮次，`--notify-on-finish=false` 关闭完成回报。
+- `openvaala session send <session-id> <prompt>` 对应 `send_message`。用 `--prompt-file <path>` 可改从本机文件读取正文。`--mode <normal|steer>` 选择排队开轮或补充活动轮，`--interrupt` 中断活动轮后再发送。`--model <provider/model>` 和 `--reasoning-effort <value>` 在发送前更新后代的模型选择。
+- `spawn` 和 `send` 默认等到本轮结束并打印最终正文。加 `--no-wait` 时，输入一被接收就打印会话和输入 ID。
+- `openvaala session ls [--conversation <id>]` 对应 `list_agents`。用 `--session-id <id>`、`--status <idle,running,stopping,stopped>`、`--cwd <path>`（`*` 表示所有目录）、`--since-hours <n>`（默认 24，0 表示不限）或 `--label <key=value>` 筛选。用 `--all` 包括后台会话，`--limit <n>` 设置条数。
+- `openvaala session logs <session-id> [--limit <n>] [--cursor <n>]` 对应 `read_session_history`。把输出的 `next_cursor` 传给 `--cursor` 可读更早一页。有来源会话时，只查看后代在分叉之后产生的历史。
+- `openvaala session wait [session-id] [--timeout <秒数>] [--wait-for subagent_result]` 对应 `wait_agent`。省略 ID 时等待来源会话。指定 `subagent_result` 后，如果没有未读消息也没有运行中的后代，会立即返回。
+- `openvaala session stop <session-id>` 对应 `interrupt_agent`，请求取消活动轮。
+- `openvaala session option <session-id> [--set <kind:id=value>]` 查看或修改外部选项，对应 `get_agent_options`、`set_agent_option`。`openvaala session reload <session-id>` 重启外部驱动，对应 `reload_agent`。
+- `openvaala session inspect <session-id>` 看详情，`session attach <session-id>` 跟随实时输出，`session open <session-id>` 在 Web 界面打开会话。
+- `openvaala session update <session-id> [--task-name <name>] [--label <key=value>] [--background=<bool>]` 更新会话信息。`session detach <session-id>` 将外部子会话转为独立对话。
+- `openvaala session import --agent <name> [--executor <id>] [--cwd <path>]` 列出外部会话。用 `--query <文本>` 搜索标题和目录，用 `--cursor <游标>` 读取下一页。传入外部会话 ID 时导入该会话。
+
+## agent
+
+- `openvaala agent ls` 列出已配置的 Agent，对应 `list_agent_definitions`。
+- `openvaala agent options <agent-name>` 查看定义支持的外部选项，对应 `get_agent_options`。
+
+## executor 与 exec
+
+- `openvaala executor ls [--conversation <id>] [--refresh-tools]` 对应 `list_executors`，列出 Executor 并给对话的默认工作 Executor 标上 `(default)`。刷新工具表只对原生模型的活动轮生效。
+- `openvaala exec --executor <id> [--conversation <id>] [--cwd <path>] -- <command> [args...]` 运行一次命令并打印输出。相对工作目录从所选 Executor 的工作区根目录解析。
+- `openvaala executor tool <name> [arguments-json] [--conversation <id>]` 调用本地 MCP 暴露的同一套工作区和命令工具，使用相同的 JSON 参数和默认值。例如 `openvaala executor tool read_file '{"path":"README.md","offset":1,"limit":20}'`。工具是否可用取决于来源会话及其 Executor。
+
+## terminal
+
+- `openvaala terminal ls` 列出运行中的终端，对应 `terminal_list`。
+- `openvaala terminal open [--executor <id>] [--cwd <path>] [--rows <n>] [--cols <n>]` 打开终端并打印 ID，对应 `terminal_open`。
+- `openvaala terminal send <terminal-id> <keys>` 原样发送按键文本，对应 `terminal_send_keys`。提交命令时要包含换行。
+- `openvaala terminal capture <terminal-id> [--lines <n>]` 输出最近若干行并去除 ANSI 控制序列，对应 `terminal_capture`。
+- `openvaala terminal close <terminal-id>` 关闭终端，对应 `terminal_close`。
+
+## skill
+
+- `openvaala skill list [--agent <name>]` 列出可用 skill，对应 `list_skills`。
+- `openvaala skill search <query> [--agent <name>]` 按名称和描述搜索，对应 `search_skills`。
+- `openvaala skill get <name> [file] [--agent <name>]` 读取 `SKILL.md` 或该 skill 目录内的相对路径，对应 `get_skill`。例如 `openvaala skill get openvaala zh/reference/cli.md`。
+
+操作者可以用 `--agent` 选择可用 skill 的范围。会话 Token 始终使用调用方 Agent 配置的 skill 和内置的 `openvaala` skill。
 
 ## reindex
 

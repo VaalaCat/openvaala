@@ -133,7 +133,7 @@ func TestNewConversationConfig(t *testing.T) {
 			},
 		},
 		{
-			// executor_ids 里的 Executor 全被删出配置：没有默认 Executor，对话照样能打开，Skill 只有共用的。
+			// executor_ids 里的 Executor 全被删出配置：没有默认 Executor，对话照样能打开，可以使用共用和内置 Skill。
 			name: "stored_scope_without_executors_keeps_shared_skills",
 			run: func(t *testing.T, f *environmentFixture) {
 				writeTestSkills(t, filepath.Join(f.localDirectory, ".agents", "skills"), "project-skill")
@@ -147,8 +147,8 @@ func TestNewConversationConfig(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if got, skills := getExecutorIDs(t, c), getSkillPaths(c); len(got) != 0 || !reflect.DeepEqual(skills, map[string]string{"shared-skill": "/shared/shared-skill/SKILL.md"}) {
-					t.Fatalf("executors = %v, skills = %v; want none and only the shared skill", got, skills)
+				if got, skills := getExecutorIDs(t, c), getSkillPaths(t, c); len(got) != 0 || !reflect.DeepEqual(skills, map[string]string{"openvaala": "/skills/openvaala/SKILL.md", "shared-skill": "/shared/shared-skill/SKILL.md"}) {
+					t.Fatalf("executors = %v, skills = %v; want no executors and the shared and builtin skills", got, skills)
 				}
 			},
 		},
@@ -203,8 +203,9 @@ func TestNewConversationConfig(t *testing.T) {
 						Path:        "/shared/shared/SKILL.md",
 					},
 				}
-				got := getSkillPaths(f.create(t, defs.ExecutorSettings{}))
+				got := getSkillPaths(t, f.create(t, defs.ExecutorSettings{}))
 				want := map[string]string{
+					"openvaala": "/skills/openvaala/SKILL.md",
 					"same":      filepath.Join(projectSkills, "same", "SKILL.md"),
 					"shared":    "/shared/shared/SKILL.md",
 					"home-only": filepath.Join(f.home, ".agents", "skills", "home-only", "SKILL.md"),
@@ -223,10 +224,10 @@ func TestNewConversationConfig(t *testing.T) {
 				writeTestSkills(t, filepath.Join(f.home, ".claude", "skills"), "home-skill")
 				c := f.create(t, defs.ExecutorSettings{DefaultExecutorID: "extra"})
 				got := make(map[string]string)
-				for _, info := range c.GetSkills() {
+				for _, info := range getRootSkills(t, c) {
 					got[info.Name] = info.Executor
 				}
-				if want := map[string]string{"project-skill": "extra", "home-skill": "extra"}; !reflect.DeepEqual(got, want) {
+				if want := map[string]string{"openvaala": "openvaala", "project-skill": "extra", "home-skill": "extra"}; !reflect.DeepEqual(got, want) {
 					t.Fatalf("skill executors = %v, want %v", got, want)
 				}
 			},
@@ -236,8 +237,8 @@ func TestNewConversationConfig(t *testing.T) {
 			name: "builtin_default_skips_home",
 			run: func(t *testing.T, f *environmentFixture) {
 				writeTestSkills(t, filepath.Join(f.home, ".agents", "skills"), "home-skill")
-				if got := getSkillPaths(f.create(t, defs.ExecutorSettings{DefaultExecutorID: "openvaala"})); len(got) != 0 {
-					t.Fatalf("skills = %v, want none", got)
+				if got := getSkillPaths(t, f.create(t, defs.ExecutorSettings{DefaultExecutorID: "openvaala"})); !reflect.DeepEqual(got, map[string]string{"openvaala": "/skills/openvaala/SKILL.md"}) {
+					t.Fatalf("skills = %v, want only the builtin skill", got)
 				}
 			},
 		},
@@ -255,7 +256,7 @@ func TestNewConversationConfig(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if executors, skills := getRootDetails(t, c).Executors, c.GetSkills(); len(executors) != 0 || len(skills) != 0 {
+				if executors, skills := getRootDetails(t, c).Executors, getRootSkills(t, c); len(executors) != 0 || len(skills) != 0 {
 					t.Fatalf("executors = %+v, skills = %+v; want none", executors, skills)
 				}
 			},
@@ -1048,11 +1049,21 @@ func getExecutorIDs(t *testing.T, c Conversation) []string {
 	return ids
 }
 
+func getRootSkills(t *testing.T, c Conversation) []*skill.Skill {
+	t.Helper()
+	skills, err := c.GetSessionSkills(c.GetRootSessionID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return skills
+}
+
 // getSkillPaths 提取对话可用 Skill 的路径。
-func getSkillPaths(c Conversation) map[string]string {
+func getSkillPaths(t *testing.T, c Conversation) map[string]string {
+	t.Helper()
 	// 1. 以 Skill 名为键，记下 SKILL.md 路径。
 	paths := make(map[string]string)
-	for _, info := range c.GetSkills() {
+	for _, info := range getRootSkills(t, c) {
 		paths[info.Name] = info.Path
 	}
 	return paths

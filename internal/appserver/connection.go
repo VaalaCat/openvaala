@@ -14,6 +14,7 @@ import (
 
 	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
+	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/session"
@@ -434,14 +435,14 @@ func (c *appServerConnection) getInitializeResult() codexInitializeResult {
 // listModels 读取并转换 Codex 模型列表。
 func (c *appServerConnection) listModels(ctx context.Context) (codexModelListResult, error) {
 	// 1. 读取 Agent 模型目录，空目录返回 -32603 和 ErrNoModelConfigured 原文。
-	list, err := c.client.ListModels(ctx, c.agentName)
+	list, err := c.client.ListModels(ctx, &runtime.ListModelsRequest{AgentName: c.agentName})
 	if err != nil {
 		return codexModelListResult{}, err
 	}
 	if len(list.Models) == 0 {
 		return codexModelListResult{}, &codexError{
 			errorCodeInternal,
-			runtime.ErrNoModelConfigured.Error(),
+			conversation.ErrNoModelConfigured.Error(),
 		}
 	}
 	// 2. 转换全部模型并标记 Agent 默认模型。
@@ -455,7 +456,7 @@ func (c *appServerConnection) listModels(ctx context.Context) (codexModelListRes
 // readConfig 返回客户端默认模型、Provider 和执行权限设置。
 func (c *appServerConnection) readConfig(ctx context.Context, params codexConfigReadParams) (codexConfigReadResult, error) {
 	// 1. 读取模型目录，整理 Provider 列表。
-	list, err := c.client.ListModels(ctx, c.agentName)
+	list, err := c.client.ListModels(ctx, &runtime.ListModelsRequest{AgentName: c.agentName})
 	if err != nil {
 		return codexConfigReadResult{}, err
 	}
@@ -561,7 +562,7 @@ func (c *appServerConnection) getRequestedModel(ctx context.Context, model, effo
 	if err != nil {
 		return defs.ModelSelection{}, nil
 	}
-	list, err := c.client.ListModels(ctx, "")
+	list, err := c.client.ListModels(ctx, &runtime.ListModelsRequest{})
 	if err != nil {
 		return defs.ModelSelection{}, err
 	}
@@ -694,6 +695,17 @@ func (c *appServerConnection) startThread(ctx context.Context, requestID json.Ra
 	var err error
 	if request.Model, err = c.getRequestedModel(ctx, params.Model, params.Config.ModelReasoningEffort); err != nil {
 		return nil, err
+	}
+	if request.Model.Ref == (defs.ModelRef{}) {
+		if ref, parseErr := defs.ParseModelRef(params.Model); parseErr == nil {
+			external, err := runtimeclient.IsExternalModelProvider(ctx, c.client, ref.ProviderID)
+			if err != nil {
+				return nil, err
+			}
+			if external {
+				request.Model.Ref = ref
+			}
+		}
 	}
 	// 3. 创建对话，开始跟随并等待首次同步。
 	record, err := c.client.CreateConversation(ctx, request)
@@ -1063,7 +1075,7 @@ func (c *appServerConnection) setThreadArchived(ctx context.Context, requestID j
 		conversation: record,
 		sessionID:    record.RootSessionID,
 	}
-	result := codexThreadUnarchiveResult{Thread: newCodexHistoryThread(thread, sessions, c.pathMappings, c.isWindowsClient, c.getThreadStatus(ctx, params.ThreadID), c.version)}
+	result := codexThreadUnarchiveResult{Thread: newCodexHistoryThread(thread, sessions, c.pathMappings, c.isWindowsClient, c.getThreadLiveInfo(ctx, params.ThreadID), c.version)}
 	c.send(ctx, newCodexResponse(requestID, result, nil))
 	c.sendNotification(ctx, "thread/unarchived", codexThreadIDNotification{ThreadID: params.ThreadID})
 	return codexResponseHandedOver{}, nil

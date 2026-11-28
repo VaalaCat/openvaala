@@ -78,7 +78,7 @@ type panelResultMsg struct {
 	err   error
 }
 
-// modelListLoadedMsg 由每次连上、改过配置后拉取模型目录的命令在 ListModels 返回后发出。
+// modelListLoadedMsg 由 TUI 在连接或配置变更后查询模型目录时发出。
 type modelListLoadedMsg struct {
 	list runtime.ModelList
 	err  error
@@ -99,9 +99,11 @@ type skillListLoadedMsg struct {
 
 // modelSetMsg 由切换模型的命令在 SetSessionModel 返回后发出；seq 与 modelSetSeq 不同时结果已过时。
 type modelSetMsg struct {
-	seq     int
-	session defs.Session
-	err     error
+	seq                   int
+	model                 defs.ModelSelection
+	previousExternalModel defs.ModelRef
+	external              bool
+	err                   error
 }
 
 // executorsLoadedMsg 由每次连上时拉取 Executor 列表的命令在 ListExecutors 返回后发出。

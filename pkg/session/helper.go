@@ -13,6 +13,19 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/turn"
 )
 
+// ValidateContextItems 检查整批上下文能否分给下一轮。
+func ValidateContextItems(items []*defs.Item) error {
+	for _, item := range items {
+		if item == nil || item.ID == "" || item.TurnID != "" || item.ModelCallID != "" {
+			return errors.New("context item requires an unassigned item")
+		}
+		if err := item.ValidateContextItem(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // cloneInputItems 复制一组原消息和 skill Item。
 func cloneInputItems(items []*defs.Item) []*defs.Item {
 	// 1. 按原顺序复制各条 Item。
@@ -187,6 +200,19 @@ func getUnhandedTurnInputs(inputs *defs.SessionTurnInputs, rows []dao.LoggedItem
 		return inputs, nil
 	}
 	return remaining, nil
+}
+
+// validateSessionInput 校验收到的消息尚未分配轮次、模式有效。
+func validateSessionInput(input *SessionInput) error {
+	// 1. 校验输入标识、模式和消息内容。
+	if input == nil || input.Item == nil || input.Item.ID == "" || input.Item.TurnID != "" || input.Item.ModelCallID != "" {
+		return errors.New("session input requires an unassigned item")
+	}
+	if input.Mode != SessionInputModeNormal && input.Mode != SessionInputModeSteer && input.Mode != SessionInputModeIdleOnly &&
+		input.Mode != SessionInputModeInterrupt {
+		return errors.New("invalid session input mode")
+	}
+	return input.Item.ValidateInputMessage()
 }
 
 // isAgentInputGroup 该输入组是否来自 Agent？

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/VaalaCat/openvaala/internal/cli"
@@ -74,7 +75,7 @@ func (f *desktopCommandFlags) runAppCommand(command *cobra.Command, _ []string) 
 		ConfigFlags: configFlags,
 		IdleTimeout: 0,
 	}
-	if f.Native {
+	if f.Native || strings.Contains(startTarget.URL, "#world=") {
 		var headers map[string]string
 		if cfg != nil {
 			headers = cfg.GetHTTPHeaders()

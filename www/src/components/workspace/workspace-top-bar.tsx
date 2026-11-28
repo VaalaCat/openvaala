@@ -7,27 +7,43 @@ import { useCallback, useState } from "react"
 import {
   ChevronDownIcon,
   EllipsisIcon,
+  ForwardIcon,
   PanelRightCloseIcon,
   PanelRightOpenIcon,
 } from "lucide-react"
 import { useStore } from "@nanostores/react"
-import { useQueryClient, type InfiniteData } from "@tanstack/react-query"
+import {
+  useQuery,
+  useQueryClient,
+  type InfiniteData,
+} from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
 import { PageActions } from "@/components/base/page-layout"
 import { RenameConversationDialog } from "@/components/conversation-list/rename-conversation-dialog"
 import { ConversationSettingsDialog } from "@/components/conversation/conversation-settings-dialog"
 import { useServerConnection } from "@/components/server-connection-provider"
 import { Button } from "@/components/ui/button"
+import { ForwardDialog } from "@/components/world/forward-dialog"
 import { useIsMobile } from "@/hooks/use-mobile"
 import { usePageNavigation } from "@/hooks/use-page-navigation"
 import type { ConversationSync } from "@/lib/api/conversation-sync"
+import {
+  getInboundThreadBindings,
+  getWorldSenderLabel,
+  parseWorldAddress,
+} from "@/lib/api/world"
 import type {
   SessionRuntimeInfo,
   SessionID,
   ListConversationsResult,
 } from "@/lib/api/protocol.gen"
 import { notifySuccess } from "@/lib/notify"
-import { getConversationPath, getSessionPath } from "@/lib/paths"
+import {
+  getContactsPath,
+  getConversationPath,
+  getSessionPath,
+} from "@/lib/paths"
+import { useWorldStatus, worldThreadsOptions } from "@/lib/query/world"
 import { getSessionAncestors, getSessionName } from "@/lib/session-tree"
 import type { TabWorkspace } from "@/lib/workspace/tab-workspace"
 import type { TabWorkspaceTab } from "@/lib/workspace/types"
@@ -60,7 +76,9 @@ export function WorkspaceTopBar({
 }) {
   const { t } = useTranslation()
   const isMobile = useIsMobile()
+  const worldStatus = useWorldStatus()
   const sync = workspace.getConversationSync(selectedTabID)
+  const forwardSync = tab.kind === "sub-agent" ? workspace.getRootSync() : sync
   // 终端标题跟着 shell 变化
   useStore(workspace.$terminalTitles)
   const isSubSession = tab.kind === "sub-agent"
@@ -99,6 +117,9 @@ export function WorkspaceTopBar({
               conversationID={workspace.conversationID}
             />
           )}
+        {worldStatus?.enabled && forwardSync && (
+          <ForwardConversationButton key={selectedTabID} sync={forwardSync} />
+        )}
         <Tooltip>
           <TooltipTrigger
             render={
@@ -123,6 +144,34 @@ export function WorkspaceTopBar({
   )
 }
 
+function ForwardConversationButton({ sync }: { sync: ConversationSync }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              variant="ghost"
+              size="icon"
+              className="shrink-0"
+              aria-label={t("world.forward")}
+              onClick={() => setOpen(true)}
+            />
+          }
+        >
+          <ForwardIcon />
+        </TooltipTrigger>
+        <TooltipContent className="text-caption">
+          {t("world.forward")}
+        </TooltipContent>
+      </Tooltip>
+      {open && <ForwardDialog sync={sync} onClose={() => setOpen(false)} />}
+    </>
+  )
+}
+
 // 旁支和终端标签页的标题：只是文字，点了没有反应
 function PlainTabTitle({ title }: { title: string }) {
   usePageNavigation(title)
@@ -140,6 +189,19 @@ function ConversationTabTitle({
   const { t } = useTranslation()
   const connection = useServerConnection()
   const isSubSession = !!sessionID
+  const worldStatus = useWorldStatus()
+  const threads = useQuery({
+    ...worldThreadsOptions(connection),
+    enabled: !isSubSession && worldStatus?.enabled === true,
+    select: getInboundThreadBindings,
+  })
+  const threadBinding =
+    !isSubSession && worldStatus?.enabled && threads.isSuccess
+      ? threads.data.get(sync.conversationID)
+      : undefined
+  const localDomain = worldStatus?.enabled
+    ? parseWorldAddress(worldStatus.node_addr)?.domain
+    : undefined
   useStore(sync.$syncState)
   const isReady = sync.hasInitialData()
   const conversationTitle = useStore(sync.$title)
@@ -158,7 +220,10 @@ function ConversationTabTitle({
     cachedTitle ||
     t(isReady ? "conversationList.untitled" : "common.loading")
   const [isRenaming, setIsRenaming] = useState(false)
-  const openRenameDialog = useCallback(() => setIsRenaming(true), [])
+  const openRenameDialog = useCallback(
+    () => setIsRenaming(true),
+    [setIsRenaming]
+  )
   const rootName = t("conversation.session.root")
   const followedSessionID = isReady
     ? sync.getFollowedSessionID()
@@ -179,7 +244,18 @@ function ConversationTabTitle({
           getSessionAncestors(sessions, followedSessionID),
           rootName
         )
-      : undefined,
+      : threadBinding
+        ? [
+            {
+              icon: "mail",
+              label: getWorldSenderLabel(threadBinding.peer_addr, localDomain),
+              tooltip: threadBinding.peer_addr,
+              to: getContactsPath(connection.getServerID(), {
+                peer: threadBinding.peer_addr,
+              }),
+            },
+          ]
+        : undefined,
     isSubSession || !isReady ? undefined : openRenameDialog
   )
   return (

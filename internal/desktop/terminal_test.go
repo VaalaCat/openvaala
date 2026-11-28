@@ -15,6 +15,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
+	"github.com/VaalaCat/openvaala/pkg/world"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -33,13 +34,17 @@ type terminalClient struct {
 // 连上 serve 时 handleClientEvent 会加载列表并订阅；这些调用的结果不影响终端，返回空值。
 func (c *terminalClient) SubscribeRunningConversations(context.Context) error { return nil }
 
+func (c *terminalClient) GetWorldStatus(context.Context) (world.NodeStatus, error) {
+	return world.NodeStatus{}, nil
+}
+
 func (c *terminalClient) SubscribeTerminals(context.Context) error { return nil }
 
 func (c *terminalClient) ListConversations(context.Context, *runtimeclient.ListConversationsRequest) (runtimeclient.ListConversationsResult, error) {
 	return runtimeclient.ListConversationsResult{}, nil
 }
 
-func (c *terminalClient) ListModels(context.Context, string) (runtime.ModelList, error) {
+func (c *terminalClient) ListModels(context.Context, *runtime.ListModelsRequest) (runtime.ModelList, error) {
 	return runtime.ModelList{}, nil
 }
 

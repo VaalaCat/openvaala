@@ -71,6 +71,23 @@ func (b *SessionInbox) Load(ctx context.Context) error {
 	return nil
 }
 
+// Add 校验并按发送方和模式接收输入，活动轮可以直接收下补充。
+func (b *SessionInbox) Add(ctx context.Context, input *SessionInput, turnID defs.TurnID) (defs.ItemID, error) {
+	// 1. 校验输入，重复提交返回原 ItemID。
+	if err := validateSessionInput(input); err != nil {
+		return "", err
+	}
+	if itemID, found := b.acceptedInputs[input.InputID]; found {
+		return itemID, nil
+	}
+	// 2. 保存完整输入组。
+	group := defs.SessionInputGroup{InputID: input.InputID, Items: []*defs.Item{input.Item.Clone()}}
+	if err := b.addInput(ctx, group, input.Mode, turnID, telemetry.GetSpanRef(ctx)); err != nil {
+		return "", err
+	}
+	return input.Item.ID, nil
+}
+
 // Withdraw 从普通队列或未借出的补充中撤回完整用户输入组。
 func (b *SessionInbox) Withdraw(ctx context.Context, itemID defs.ItemID) ([]*defs.Item, error) {
 	// 1. 移除目标输入组，保存后更新批次追踪。
@@ -99,33 +116,19 @@ func (b *SessionInbox) Withdraw(ctx context.Context, itemID defs.ItemID) ([]*def
 
 // TakeTurnInput 分配下一轮输入，返回原生 Turn 的开场组及该批次的追踪信息。
 func (b *SessionInbox) TakeTurnInput(ctx context.Context, turnID defs.TurnID) (defs.SessionInputBatch, telemetry.SpanRef, error) {
-	// 1. 选出可以分给下一轮的输入批次。
-	if b.checkpoint.TurnInputs != nil {
-		return nil, telemetry.SpanRef{}, nil
+	// 1. 保存原生 Turn 的开场和补充归属，返回首组。
+	batch, parentSpan, err := b.takeTurnBatch(ctx, turnID, false)
+	if len(batch) > 0 {
+		batch = cloneInputBatch(batch[:1])
 	}
-	next := cloneSessionCheckpoint(&b.checkpoint)
-	var batches []defs.SessionInputBatch
-	switch {
-	case len(next.PendingUserInputs) > 0:
-		batches = next.PendingUserInputs[:1]
-		next.PendingUserInputs = next.PendingUserInputs[1:]
-	case len(next.PendingAgentMessages) > 0 && !next.IsAgentMessagesPaused:
-		batches = next.PendingAgentMessages
-		next.PendingAgentMessages = nil
-	default:
-		return nil, telemetry.SpanRef{}, nil
-	}
-	// 2. 一次保存整轮归属，写成后取出该批次的追踪信息。
-	groups := slices.Concat(batches...)
-	next.TurnInputs = &defs.SessionTurnInputs{TurnID: turnID, OpeningInput: &groups[0], SteerInputs: groups[1:]}
-	if err := b.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
-		return nil, telemetry.SpanRef{}, fmt.Errorf("allocate Turn %q inputs: %w", turnID, err)
-	}
-	parentSpan := b.queuedBatchSpans[groups[0].Items[0].ID]
-	for _, batch := range batches {
-		delete(b.queuedBatchSpans, batch[0].Items[0].ID)
-	}
-	return cloneInputBatch(groups[:1]), parentSpan, nil
+	return batch, parentSpan, err
+}
+
+// TakeWholeBatch 把所有可开轮的输入借给指定 Turn，返回输入副本。
+func (b *SessionInbox) TakeWholeBatch(ctx context.Context, turnID defs.TurnID) (defs.SessionInputBatch, error) {
+	// 1. 保存该轮的批次归属并登记借出，交给外部 Turn 一次发送。
+	batch, _, err := b.takeTurnBatch(ctx, turnID, true)
+	return cloneInputBatch(batch), err
 }
 
 // TakeSteer 借出该轮尚未借出的补充输入。
@@ -138,6 +141,16 @@ func (b *SessionInbox) TakeSteer(turnID defs.TurnID) [][]*defs.Item {
 	for _, group := range b.getUnreadSteerInputs() {
 		items = append(items, cloneInputItems(group.Items))
 		b.borrowedSteerIDs[group.Items[0].ID] = struct{}{}
+	}
+	return items
+}
+
+// GetUnreadSteer 返回已接收且未借出的补充和排队 Agent 消息副本。
+func (b *SessionInbox) GetUnreadSteer() []*defs.Item {
+	// 1. 先读活动轮的补充，再读等待下一轮的 Agent 消息。
+	items := cloneInputGroups(b.getUnreadSteerInputs())
+	for _, batch := range b.checkpoint.PendingAgentMessages {
+		items = append(items, cloneInputGroups(batch)...)
 	}
 	return items
 }
@@ -191,6 +204,22 @@ func (b *SessionInbox) PruneCheckpoints(ctx context.Context) error {
 	return b.opt.Mutation.DeleteSessionCheckpoints(ctx, b.opt.ConversationID, b.opt.SessionID)
 }
 
+// ClearFailedTurnInputs 在失败轮及其输入已写入日志后清除该轮的借出记录。
+func (b *SessionInbox) ClearFailedTurnInputs(ctx context.Context, turnID defs.TurnID) error {
+	// 1. 开场和已借出的补充已经写入失败轮。在等待驱动确认期间新到的补充仍须回队。
+	next := cloneSessionCheckpoint(&b.checkpoint)
+	inputs := next.TurnInputs
+	if inputs == nil || inputs.TurnID != turnID {
+		return nil
+	}
+	inputs.OpeningInput = nil
+	inputs.SteerInputs = slices.DeleteFunc(inputs.SteerInputs, func(g defs.SessionInputGroup) bool {
+		_, borrowed := b.borrowedSteerIDs[g.Items[0].ID]
+		return borrowed
+	})
+	return b.requeueTurnInputs(context.WithoutCancel(ctx), next, turnID)
+}
+
 // addInput 将已校验的输入组写入活动轮或待开轮队列。
 func (b *SessionInbox) addInput(ctx context.Context, group defs.SessionInputGroup, mode SessionInputMode, turnID defs.TurnID, parentSpan telemetry.SpanRef) error {
 	// 1. 按发送方和模式写入下一份待办。
@@ -226,6 +255,45 @@ func (b *SessionInbox) addInput(ctx context.Context, group defs.SessionInputGrou
 		b.queuedBatchSpans[item.ID] = parentSpan
 	}
 	return nil
+}
+
+// takeTurnBatch 为原生轮取首批用户输入或全部 Agent 消息，为外部轮取所有可开轮的输入。
+func (b *SessionInbox) takeTurnBatch(ctx context.Context, turnID defs.TurnID, whole bool) (defs.SessionInputBatch, telemetry.SpanRef, error) {
+	// 1. 选出可以分给下一轮的输入批次。
+	if b.checkpoint.TurnInputs != nil {
+		return nil, telemetry.SpanRef{}, nil
+	}
+	next := cloneSessionCheckpoint(&b.checkpoint)
+	batches := next.PendingUserInputs
+	if !whole && len(batches) > 0 {
+		batches = batches[:1]
+		next.PendingUserInputs = next.PendingUserInputs[1:]
+	} else {
+		next.PendingUserInputs = nil
+	}
+	if (whole || len(batches) == 0) && !next.IsAgentMessagesPaused {
+		batches = append(batches, next.PendingAgentMessages...)
+		next.PendingAgentMessages = nil
+	}
+	if len(batches) == 0 {
+		return nil, telemetry.SpanRef{}, nil
+	}
+	// 2. 一次保存整轮归属，写成后更新借出和批次追踪。
+	groups := slices.Concat(batches...)
+	next.TurnInputs = &defs.SessionTurnInputs{TurnID: turnID, OpeningInput: &groups[0], SteerInputs: groups[1:]}
+	if err := b.appendSessionCheckpoint(context.WithoutCancel(ctx), next); err != nil {
+		return nil, telemetry.SpanRef{}, fmt.Errorf("allocate Turn %q inputs: %w", turnID, err)
+	}
+	if whole {
+		for _, group := range groups[1:] {
+			b.borrowedSteerIDs[group.Items[0].ID] = struct{}{}
+		}
+	}
+	parentSpan := b.queuedBatchSpans[groups[0].Items[0].ID]
+	for _, batch := range batches {
+		delete(b.queuedBatchSpans, batch[0].Items[0].ID)
+	}
+	return groups, parentSpan, nil
 }
 
 // SaveStopRequest 保存活动轮的停止请求及根会话的 Agent 消息暂停状态。

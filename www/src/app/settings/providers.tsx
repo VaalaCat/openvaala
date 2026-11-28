@@ -4,7 +4,8 @@ import { OverflowTooltip } from "@/components/base/overflow-tooltip"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { PlusIcon } from "lucide-react"
 import { useTranslation } from "react-i18next"
-import { Link, useSearchParams } from "react-router"
+import { useSearchParams } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { DetailPageState } from "@/components/base/detail-page-state"
 import { ListEmpty } from "@/components/base/list-empty"
 import { PageLayout } from "@/components/base/page-layout"
@@ -50,8 +51,10 @@ export function ProviderListPage() {
       actions={
         <Button
           className="text-ui"
-          nativeButton={false}
-          render={<Link to={getProviderCreatePath(connection.getServerID())} />}
+          role="button"
+          render={
+            <NavigationButton to={getProviderCreatePath(connection.getServerID())} />
+          }
         >
           <PlusIcon data-icon="inline-start" />
           {t("settings.providers.add")}

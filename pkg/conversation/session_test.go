@@ -70,7 +70,7 @@ func TestConversationSpawnAgentFork(t *testing.T) {
 			}
 			h := startTestConversation(t, store, model, c)
 			call := spawnCall("T11", "spawn-1")
-			id, err := h.impl().spawnAgent(t.Context(), h.record(t, c.GetRootSessionID()), call, &SpawnAgentParam{
+			id, err := h.spawnForTest(t, h.record(t, c.GetRootSessionID()), call, &SpawnAgentParam{
 				TaskName:  "review",
 				Message:   "check",
 				ForkTurns: tt.fork,
@@ -112,7 +112,7 @@ func TestConversationMultilevelFork(t *testing.T) {
 			original := historyMessage("original", "ended", "shared background")
 			saveCompletedHistory(t, store, c.GetID(), c.GetRootSessionID(), original)
 			h := startTestConversation(t, store, model, c)
-			parent, err := h.impl().spawnAgent(t.Context(), h.record(t, c.GetRootSessionID()), spawnCall("active_root", "parent"), &SpawnAgentParam{
+			parent, err := h.spawnForTest(t, h.record(t, c.GetRootSessionID()), spawnCall("active_root", "parent"), &SpawnAgentParam{
 				TaskName:  "parent",
 				Message:   "parent work",
 				ForkTurns: "all",
@@ -122,7 +122,7 @@ func TestConversationMultilevelFork(t *testing.T) {
 			}
 			receiveSessionRequest(t, model, parent)
 			// 用父 Session 正在执行的 Turn 创建孙 Session，继承时不含这一轮。
-			child, err := h.impl().spawnAgent(t.Context(), h.record(t, parent), spawnCall(latestTurn(t, store, parent).ID, "child"), &SpawnAgentParam{
+			child, err := h.spawnForTest(t, h.record(t, parent), spawnCall(latestTurn(t, store, parent).ID, "child"), &SpawnAgentParam{
 				TaskName:  "child",
 				Message:   "child work",
 				ForkTurns: fork,
@@ -309,7 +309,7 @@ func TestConversationSpawnAgentModel(t *testing.T) {
 				}}
 				h.impl().sessionRecords.Store(removed.ID, removed)
 			}
-			id, err := h.impl().spawnAgent(t.Context(), source, spawnCall("spawn-turn", "spawn"), &SpawnAgentParam{
+			id, err := h.spawnForTest(t, source, spawnCall("spawn-turn", "spawn"), &SpawnAgentParam{
 				TaskName:        "survey",
 				Message:         "count CPU cores",
 				AgentName:       tt.agentName,
@@ -377,7 +377,7 @@ func TestConversationSpawnFailures(t *testing.T) {
 			}
 			h := startTestConversation(t, store, model, c)
 			// 2. 创建子 Session，核对返回的 ID、持久化的记录和内存记录。
-			id, err := h.impl().spawnAgent(t.Context(), h.record(t, c.GetRootSessionID()), spawnCall("active", "spawn"), &SpawnAgentParam{
+			id, err := h.spawnForTest(t, h.record(t, c.GetRootSessionID()), spawnCall("active", "spawn"), &SpawnAgentParam{
 				TaskName:  "failed task",
 				Message:   "work",
 				ForkTurns: "all",
@@ -740,4 +740,11 @@ func (q *spawnStartupQuery) GetLatestLoggedTurn(ctx context.Context, cid defs.Co
 		return nil, errors.New("injected startup")
 	}
 	return q.Query.GetLatestLoggedTurn(ctx, cid, sid)
+}
+
+// spawnForTest 以原生工具调用的 Turn 和 CallID 创建测试子会话。
+func (h *conversationHarness) spawnForTest(t *testing.T, source defs.Session, call *defs.Item, param *SpawnAgentParam) (defs.SessionID, error) {
+	t.Helper()
+	result, err := h.impl().spawnAgent(t.Context(), source, call.TurnID, call.ToolCall.CallID, param)
+	return result.SessionID, err
 }

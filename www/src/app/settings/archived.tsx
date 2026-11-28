@@ -8,7 +8,8 @@ import {
 import { OverflowTooltip } from "@/components/base/overflow-tooltip"
 import { keepPreviousData, useInfiniteQuery } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
-import { Link, useLocation, useSearchParams } from "react-router"
+import { useLocation, useSearchParams } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { InfiniteList } from "@/components/base/infinite-list"
 import { ListEmpty } from "@/components/base/list-empty"
 import { ListSearch } from "@/components/base/list-search"
@@ -87,7 +88,7 @@ export function ArchivedConversationsPage() {
                 <div className="flex min-w-0 flex-1 flex-col gap-1">
                   <OverflowTooltip
                     render={
-                      <Link
+                      <NavigationButton
                         to={{
                           pathname: getConversationPath(
                             connection.getServerID(),

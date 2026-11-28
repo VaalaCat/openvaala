@@ -4,6 +4,7 @@ import {
   $activeServerURL,
   $servers,
   getPageServerURL,
+  getServerDisplay,
   parseServerInput,
   removeServer,
   setActiveServerURL,
@@ -63,7 +64,6 @@ test("parseServerInput normalizes web links, ws links, and bare hosts", () => {
         ok: true as const,
         url: "ws://10.0.0.5:8790/api/v1/openvaala",
         token: "secret-1",
-        defaultName: "10.0.0.5:8790",
         extractedToken: true,
       },
     },
@@ -75,7 +75,6 @@ test("parseServerInput normalizes web links, ws links, and bare hosts", () => {
         ok: true as const,
         url: "wss://gpu.vaala.dev/api/v1/openvaala",
         token: "t 2",
-        defaultName: "gpu.vaala.dev",
         extractedToken: true,
       },
     },
@@ -87,7 +86,6 @@ test("parseServerInput normalizes web links, ws links, and bare hosts", () => {
         ok: true as const,
         url: "ws://10.0.0.5:8790/api/v1/openvaala",
         token: "qtok",
-        defaultName: "10.0.0.5:8790",
         extractedToken: true,
       },
     },
@@ -99,7 +97,6 @@ test("parseServerInput normalizes web links, ws links, and bare hosts", () => {
         ok: true as const,
         url: "ws://10.0.0.8:8790/api/v1/openvaala",
         token: "manual",
-        defaultName: "10.0.0.8:8790",
         extractedToken: false,
       },
     },
@@ -117,11 +114,7 @@ test("parseServerInput normalizes web links, ws links, and bare hosts", () => {
     },
   ]
   for (const tc of cases)
-    assert.deepEqual(
-      parseServerInput(tc.rawURL, tc.fallback),
-      tc.want,
-      tc.name
-    )
+    assert.deepEqual(parseServerInput(tc.rawURL, tc.fallback), tc.want, tc.name)
 })
 
 test("upsertServer, setActiveServerURL, and removeServer manage profiles cleanly", () => {
@@ -154,4 +147,64 @@ test("upsertServer, setActiveServerURL, and removeServer manage profiles cleanly
   removeServer("wss://gpu.vaala.dev/api/v1/openvaala")
   assert.equal($servers.get().length, 0)
   assert.equal($activeServerURL.get(), "")
+})
+
+test("World profiles preserve the node and never fall back to the page socket", () => {
+  const target = {
+    node: "b",
+    domain: "home.test",
+    public_key: Buffer.alloc(32).toString("base64"),
+    entries: { relays: ["wss://relay.test/prefix"] },
+  }
+  const link = (node: typeof target) =>
+    "https://relay.test/web/v1/#world=" +
+    Buffer.from(JSON.stringify(node)).toString("base64url")
+  for (const node of ["a", "b"]) {
+    const url = link({ ...target, node })
+    assert.deepEqual(parseServerInput(url, "key"), {
+      ok: true,
+      url,
+      token: "key",
+      worldTarget: { ...target, node },
+      extractedToken: false,
+    })
+  }
+  for (const bad of [
+    link(target) + "#world=extra",
+    link({ ...target, domain: "-bad.test" }),
+    link({ ...target, domain: "test:0" }),
+    link({ ...target, entries: { relays: ["wss://user@host"] } }),
+  ])
+    assert.deepEqual(parseServerInput(bad, "secret"), {
+      ok: false,
+      error: "invalid",
+    })
+})
+
+test("a new link updates a World profile by public key and preserves its custom name", () => {
+  $servers.set([])
+  for (const [i, token] of ["old", "a+&=% b"].entries()) {
+    const target = {
+      name: "studio" + i,
+      public_key: Buffer.alloc(32).toString("base64"),
+      entries: { relays: ["https://relay" + i + ".test"] },
+    }
+    const url =
+      "https://example.test/web/v1/#world=" +
+      Buffer.from(JSON.stringify(target)).toString("base64url") +
+      "&token=" +
+      encodeURIComponent(token)
+    const parsed = parseServerInput(url)
+    assert.ok(parsed.ok)
+    assert.equal(parsed.token, token)
+    assert.equal(getServerDisplay(parsed).name, target.name)
+    upsertServer({
+      url: parsed.url,
+      token: parsed.token,
+      name: i === 0 ? "My studio" : undefined,
+    })
+    assert.equal($servers.get().length, 1)
+    assert.equal($servers.get()[0].name, "My studio")
+    assert.equal($servers.get()[0].token, token)
+  }
 })

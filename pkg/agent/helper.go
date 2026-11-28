@@ -2,8 +2,12 @@ package agent
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"path"
 	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
@@ -83,14 +87,69 @@ func newHookRunItems(runs []*defs.HookRun, turnID defs.TurnID, modelCallID defs.
 	return items
 }
 
-// Clone 复制 Agent 定义和其中的列表。
+// Clone 复制 Agent 定义、列表和 ACP 启动命令。
 func (d *AgentDefinition) Clone() *AgentDefinition {
 	// 1. 复制角色字段及工具名、skill 名和 MCP server id 列表，保留 nil 和空列表的区别。
 	cloned := *d
 	cloned.ToolNames = slices.Clone(d.ToolNames)
 	cloned.SkillNames = slices.Clone(d.SkillNames)
 	cloned.MCPServerIDs = slices.Clone(d.MCPServerIDs)
+	cloned.ACP = d.ACP.Clone()
 	return &cloned
+}
+
+// ValidateExecutionType 校验 Go 定义中已设置的执行配置字段。
+func (d *AgentDefinition) ValidateExecutionType() error {
+	// 1. 收集已设置字段，按执行类型校验。
+	var fields []string
+	if d.Model != (defs.ModelRef{}) {
+		fields = append(fields, "model")
+	}
+	if d.CompactModel != (defs.ModelRef{}) {
+		fields = append(fields, "compact_model")
+	}
+	if d.Instructions != "" {
+		fields = append(fields, "instructions")
+	}
+	if d.MaxSteps != 0 {
+		fields = append(fields, "max_steps")
+	}
+	return ValidateAgentExecutionType(d.Type, d.ACP, fields...)
+}
+
+// ValidateAgentExecutionType 校验执行类型、ACP 命令和已设置的配置字段。
+func ValidateAgentExecutionType(agentType defs.AgentType, acp *defs.ACPCommand, fields ...string) error {
+	// 1. 校验执行类型对应的字段组合。
+	switch agentType {
+	case "", defs.AgentTypeNative:
+		if acp != nil || slices.Contains(fields, "acp") {
+			return errors.New("native agent must not configure acp")
+		}
+	case defs.AgentTypeACP:
+		if acp == nil || strings.TrimSpace(acp.Command) == "" {
+			return errors.New("acp.command must not be empty")
+		}
+		for field, params := range map[string]map[string]map[string]any{
+			"param_overwrite":           acp.ParamOverwrite,
+			"ephemeral_param_overwrite": acp.EphemeralParamOverwrite,
+		} {
+			for method := range params {
+				switch method {
+				case "initialize", "session/new", "session/load", "session/list", "session/prompt", "session/cancel", "session/set_mode", "session/set_config_option":
+				default:
+					return fmt.Errorf("unknown ACP method %s in %s", method, field)
+				}
+			}
+		}
+		for _, field := range []string{"model", "compact_model", "instructions", "max_steps"} {
+			if slices.Contains(fields, field) {
+				return fmt.Errorf("acp agent must not configure %s", field)
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported agent type %q", agentType)
+	}
+	return nil
 }
 
 // ApplyItemDelta 将消息、推理或工具参数的增量追加到 Item。
@@ -138,4 +197,44 @@ func truncateMemoryIndex(content []byte, isEndOfFile bool) (string, bool) {
 		cut--
 	}
 	return string(content[:cut]), true
+}
+
+// GetIconKey 按 Agent 名称匹配品牌图标，有外部启动命令时也匹配可执行文件名。
+func (d *AgentDefinition) GetIconKey() string {
+	names := []string{strings.ToLower(d.Name)}
+	if d.Type.IsExternal() && d.ACP != nil && d.ACP.Command != "" {
+		command := path.Base(strings.ReplaceAll(d.ACP.Command, `\`, "/"))
+		names = append(names, strings.ToLower(command))
+	}
+	aliases := []struct{ name, icon string }{
+		{"github-copilot", "githubcopilot"}, {"githubcopilot", "githubcopilot"},
+		{"claude-code", "claudecode"}, {"claudecode", "claudecode"},
+		{"gemini-cli", "geminicli"}, {"geminicli", "geminicli"},
+		{"antigravity", "antigravity"}, {"agy", "antigravity"},
+		{"opencode", "opencode"}, {"windsurf", "windsurf"},
+		{"cursor", "cursor"}, {"codex", "codex"}, {"claude", "claude"},
+		{"gemini", "gemini"}, {"openai", "openai"}, {"goose", "goose"},
+		{"cline", "cline"}, {"kiro", "kiro"}, {"trae", "trae"},
+		{"qwen", "qwen"}, {"kimi", "kimi"}, {"amp", "amp"},
+	}
+	for _, value := range names {
+		for _, alias := range aliases {
+			if value == alias.name {
+				return alias.icon
+			}
+		}
+	}
+	for _, value := range names {
+		words := " " + strings.Join(strings.FieldsFunc(value, isAgentIconSeparator), " ") + " "
+		for _, alias := range aliases {
+			if strings.Contains(words, " "+strings.ReplaceAll(alias.name, "-", " ")+" ") {
+				return alias.icon
+			}
+		}
+	}
+	return ""
+}
+
+func isAgentIconSeparator(r rune) bool {
+	return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 }

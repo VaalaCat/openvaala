@@ -50,11 +50,14 @@ func (d *WebViewDesktop) Run(ctx context.Context) error {
 	var runtimeURL, token string
 	isRemote := strings.TrimSpace(d.opt.StartTarget.URL) != ""
 	if isRemote {
-		parsedURL, parsedToken, _, _, err := parseRemoteServerInput(d.opt.StartTarget.URL, d.opt.StartTarget.Token)
+		input, err := parseRemoteServerInput(d.opt.StartTarget.URL, d.opt.StartTarget.Token)
 		if err != nil {
 			return err
 		}
-		runtimeURL, token = parsedURL, parsedToken
+		runtimeURL, token = input.URL, input.Token
+		if input.WorldTarget != nil && input.ExtractedToken {
+			runtimeURL = d.opt.StartTarget.URL
+		}
 	} else {
 		connection, err := cli.EnsureRuntimeServer(ctx, &d.opt.RuntimeServerStart)
 		if err != nil {

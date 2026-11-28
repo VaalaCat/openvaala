@@ -85,7 +85,7 @@ The web UI is laid out for small screens too, so you can check on a long task, a
 
 ![The web UI on a phone](../images/web-mobile.png)
 
-Your phone needs to reach the runtime server: on your home or office network, follow [Access from another machine](#access-from-another-machine); from anywhere else, use an [HTTPS reverse proxy](#over-the-internet-https-reverse-proxy). Then open the address with the token on the phone once — the page remembers the token.
+On the machine running serve, open **Settings → World → Local → Remote access**, turn it on, then save and restart. When the relay shows connected, scan the QR code on your phone to open your conversations. Keep the link private because it grants control of the machine. After a token reset, scan again or paste the new link.
 
 ## Access from another machine
 
@@ -147,4 +147,4 @@ Then open `https://openvaala.example.com/web/v1/#token=<token>`. The page connec
 
 Other clients can use the same proxy: set `client.url: wss://openvaala.example.com/api/v1/openvaala` and `client.token` on your laptop to run the terminal UI, an editor or Codex against that server. See [Configuration → client](../configuration/overview.md#client).
 
-A page always talks to the runtime server it was loaded from. To use several servers, open each one's address in its own tab.
+Return to the same relay homepage (for example, `https://open.vaa.la`) and select the machine under **My servers**. You can also paste another machine’s remote access link or enter its direct address and token under **Advanced**.

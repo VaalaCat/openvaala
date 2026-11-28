@@ -151,7 +151,7 @@ func (f *fakeHistoryClient) ListConversations(_ context.Context, request *runtim
 }
 
 // ListModels 返回预设的 Agent 默认模型。
-func (f *fakeHistoryClient) ListModels(context.Context, string) (runtime.ModelList, error) {
+func (f *fakeHistoryClient) ListModels(context.Context, *runtime.ListModelsRequest) (runtime.ModelList, error) {
 	// 1. 累计模型查询次数，返回默认模型引用。
 	f.modelReads++
 	return runtime.ModelList{AgentDefaultModel: f.defaultModel}, nil
@@ -1885,7 +1885,7 @@ func TestGetThreadStatus(t *testing.T) {
 				}()
 				t.Cleanup(func() { close(thread.requests) })
 			}
-			status := c.getThreadStatus(t.Context(), cmp.Or(tt.threadID, "thread-1"))
+			status := c.getThreadLiveInfo(t.Context(), cmp.Or(tt.threadID, "thread-1")).status
 			if status.Type != tt.want.Type || !slices.Equal(status.ActiveFlags, tt.want.ActiveFlags) || (status.ActiveFlags == nil) != (tt.want.ActiveFlags == nil) {
 				t.Fatalf("getThreadStatus = %+v, want %+v", status, tt.want)
 			}

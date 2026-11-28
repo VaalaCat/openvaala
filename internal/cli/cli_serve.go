@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -21,8 +22,13 @@ import (
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/httpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
+	"github.com/VaalaCat/openvaala/pkg/storage/sqlite"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
+	"github.com/VaalaCat/openvaala/pkg/world"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 	"github.com/VaalaCat/openvaala/www"
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
@@ -52,6 +58,7 @@ func newServeCommand() *cobra.Command {
 		RunE:  BuildCLIHandler(runServeCommand),
 	}
 	command.Flags().String("listen", "", "Runtime Server listen address (host:port)")
+	command.Flags().String("relay-mode", "", "override world.relay_mode for this run (off, domain, public). Defaults to domain with the control plane, off otherwise")
 	command.Flags().Duration("idle-timeout", 0, "exit after this long without connections or running turns (0 keeps running)")
 	_ = command.Flags().MarkHidden("idle-timeout")
 	// 2. 注册 stop 和 reload 子命令。
@@ -72,11 +79,45 @@ func newServeCommand() *cobra.Command {
 }
 
 // runServeCommand 运行 serve：绑定端口、锁定数据目录、写连接文件，运行 Runtime 和 Runtime Server，返回前按相反顺序关闭。
-func runServeCommand(ctx context.Context, args *AppArgs) (err error) {
+func runServeCommand(ctx context.Context, args *AppArgs) error {
+	listen := args.Config.Server.Listen
+	restart, err := runServeOnce(ctx, args)
+	if err != nil || restart == nil {
+		return err
+	}
+	argv := os.Args
+	if args.Config.Server.Listen != listen {
+		argv = append(argv, "--listen", args.Config.Server.Listen)
+	}
+	err = restartServe(args.Executable, argv, os.Environ())
+	if err != nil {
+		slog.Error("restart serve", "error", err)
+	}
+	return err
+}
+
+func restartServe(executable string, argv, env []string) error {
+	return syscall.Exec(executable, argv, env)
+}
+
+// archiveWorldServer 在关闭数据库后、释放数据目录锁前备份旧域。
+func archiveWorldServer(dataDirectory, domain string) error {
+	timestamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	return os.Rename(filepath.Join(dataDirectory, "worldserver"), filepath.Join(dataDirectory, "worldserver.bak-"+domain+"-"+timestamp))
+}
+
+// runServeOnce 运行并清理本次服务，返回已提交的重启请求。
+func runServeOnce(ctx context.Context, args *AppArgs) (restart *runtimeserver.ServeRestartRequest, err error) {
+	nodeCfg := args.Config.WorldNodeWithDefaults()
+	if nodeCfg.Enabled {
+		if err := args.Config.ValidateWorldRuntimeTargets(nodeCfg); err != nil {
+			return nil, err
+		}
+	}
 	// 1. 启动遥测，返回时最后关闭。
 	tel, shutdownTelemetry, err := newTelemetry(ctx, args.Config, args.Stderr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
 		err = errors.Join(err, shutdownTelemetry(context.WithoutCancel(ctx)))
@@ -84,120 +125,229 @@ func runServeCommand(ctx context.Context, args *AppArgs) (err error) {
 	// 2. 绑定监听地址并取得数据目录锁。
 	listener, err := net.Listen("tcp", args.Config.Server.Listen)
 	if err != nil {
-		return newServeListenError(ctx, args.Config.Server.Listen, getRuntimeServerFilePath(args.Config), err)
+		return nil, newServeListenError(ctx, args.Config.Server.Listen, getRuntimeServerFilePath(args.Config), err)
 	}
 	// 返回时关闭监听器，忽略重复关闭的错误。
 	defer func() { _ = listener.Close() }()
 	dataDirectory := args.Config.GetDataDirectory()
 	if err := ensureDataDirectory(dataDirectory); err != nil {
-		return err
+		return nil, err
 	}
 	unlock, err := lockDataDirectory(dataDirectory)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Runtime 和存储关闭后释放数据目录锁。
 	defer func() {
+		if err == nil && restart != nil && restart.ArchiveWorldServer {
+			err = archiveWorldServer(dataDirectory, args.Config.World.Server.Domain)
+		}
 		err = errors.Join(err, unlock())
 	}()
-	// 3. 写入连接文件，打开存储并创建 Runtime。
-	token, serverID, err := writeRuntimeServerFile(args.Config, listener)
+	// 3. 写入连接凭据，并在同一个路由器上装配已启用的控制面和节点。
+	connection, err := writeRuntimeServerFile(args.Config, listener)
+	token, serverID := connection.Token, connection.ServerID
 	if err != nil {
-		return err
+		return nil, err
 	}
-	rt, closeRuntimeResources, err := newRuntime(ctx, args.Config, tel)
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	files := config.NewConfigFiles(args.ConfigOpt)
+	files.DataDirectory = dataDirectory
+	var worldServer worldserver.WorldServer
+	var publicRelay *worldserver.Relay
+	if args.Config.World.Server.Enabled {
+		worldServer, err = newConfiguredWorldServer(args.Config.World, listener.Addr().(*net.TCPAddr), dataDirectory, files, tel)
+		if err != nil {
+			return nil, err
+		}
+		worldServer.RegisterRoutes(engine)
+	} else if args.Config.World.GetRelayMode() == "public" {
+		publicRelay = worldserver.NewRelay(args.Config.World.RelayInstances)
+		publicRelay.RegisterRoutes(engine)
+	}
+	remote := args.Config.World.RemoteAccess
+	publicRelays := args.Config.World.Relays
+	if nodeCfg.Enabled && worldServer != nil && args.Config.World.Server.Domain == nodeCfg.Domain && args.Config.World.GetRelayMode() != "public" {
+		home, _ := world.GetWorldSocketURL(nodeCfg.ServerURL, "")
+		publicRelays = slices.DeleteFunc(slices.Clone(publicRelays), func(raw string) bool {
+			base, _ := world.GetWorldSocketURL(raw, "")
+			return base == home
+		})
+	}
+	if remote.Name == "" && nodeCfg.Enabled {
+		remote.Name, _ = os.Hostname()
+	}
+	var node world.WorldNode
+	if nodeCfg.Enabled {
+		directory := filepath.Join(dataDirectory, "world")
+		identity, identityErr := world.LoadOrCreateIdentity(filepath.Join(directory, "identity.json"))
+		if identityErr != nil {
+			return nil, identityErr
+		}
+		database, openErr := sqlite.OpenDatabase(sqlite.NewDatabaseOpt(filepath.Join(directory, "world.db"), world.WorldNamespaces()...))
+		if openErr != nil {
+			return nil, openErr
+		}
+		defer func() { err = errors.Join(err, database.Close()) }()
+		nodeOpt := world.NewWorldNodeOpt(database.Record(), identity, nodeCfg.Name, nodeCfg.Domain, nodeCfg.ServerURL)
+		nodeOpt.DirectURLs, nodeOpt.DefaultTarget, nodeOpt.AdvertiseTargets = nodeCfg.DirectURLs, nodeCfg.DefaultTarget, nodeCfg.AdvertiseTargets
+		nodeOpt.RemoteAccessName = remote.Name
+		nodeOpt.WebURL = args.Config.World.WebURL
+		nodeOpt.Relays = publicRelays
+		nodeOpt.Telemetry = tel
+		node, err = world.NewWorldNode(nodeOpt)
+		if err != nil {
+			return nil, err
+		}
+		files.ExtraTools = node
+	}
+	// 4. 使用同一组附加工具创建 Runtime 和配置重载入口。
+	tokenSecret := sessiontoken.NewSecret(token)
+	rt, closeRuntimeResources, err := newRuntime(ctx, args.Config, tel, connection, tokenSecret, files.ExtraTools)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	world.RegisterDirectRoutes(engine, node, worldServer)
 	// Runtime 停止后关闭存储。
 	defer func() {
 		err = errors.Join(err, closeRuntimeResources())
 	}()
-	// 4. 打开 models.dev 模型目录缓存，创建 Runtime Server。
+	// 5. 打开 models.dev 模型目录缓存，创建 Runtime Server。
 	cacheDirectory, err := os.UserCacheDir()
 	if err != nil {
-		return fmt.Errorf("locate cache directory: %w", err)
+		return nil, fmt.Errorf("locate cache directory: %w", err)
 	}
 	catalogHTTPClient := httpclient.NewHTTPClient(httpclient.NewHTTPClientOpt().WithHeaders(args.Config.GetHTTPHeaders()))
 	modelCatalog, err := modelcatalog.NewCatalog(modelcatalog.NewCatalogOpt(filepath.Join(cacheDirectory, "openvaala", "models-dev.json")).WithHTTPClient(catalogHTTPClient))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	serverOpt := runtimeserver.NewRuntimeServerOpt(rt, token)
+	serverOpt := &runtimeserver.RuntimeServerOpt{Runtime: rt, TokenSecret: tokenSecret}
+	restartRequests := make(chan runtimeserver.ServeRestartRequest, 1)
+	serverOpt.ConnectionFile = getRuntimeServerFilePath(args.Config)
+	serverOpt.ConfiguredToken = args.Config.Server.Token
+	serverOpt.RemoteAccessName = remote.Name
+	if nodeCfg.ServerURL != "" {
+		serverOpt.RegisteredNode = world.Address{Node: nodeCfg.Name, Domain: nodeCfg.Domain}
+	}
+	serverOpt.RemoteAccessRelays = publicRelays
+	serverOpt.RemoteAccessWebURL = world.SelectRemoteAccessPage(args.Config.World.WebURL, publicRelays, nodeCfg.DirectURLs)
+	serverOpt.WorldRunning = runtimeprotocol.WorldRunning{RemoteAccessEnabled: remote.Enabled, NodeEnabled: node != nil, ServerEnabled: worldServer != nil}
+	serverOpt.WorldNode, serverOpt.WorldServer = node, worldServer
+	serverOpt.WorldIdentityPath = filepath.Join(dataDirectory, "world", "identity.json")
+	serverOpt.RestartRequests = restartRequests
 	serverOpt.ServerID = serverID
 	serverOpt.Telemetry = tel
-	files := config.NewConfigFiles(args.ConfigOpt)
-	files.DataDirectory = dataDirectory
 	serverOpt.Configuration = files
 	serverOpt.ModelCatalog = modelCatalog
 	serverOpt.WebUI = www.GetAssets()
-	serverOpt.IdleTimeout = args.IdleTimeout
+	if !remote.Enabled && node == nil && worldServer == nil && publicRelay == nil {
+		serverOpt.IdleTimeout = args.IdleTimeout
+	}
 	server, err := runtimeserver.NewRuntimeServer(serverOpt)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// 5. 启动 Runtime；返回时等 Server 关闭全部连接后再停止并等待 Runtime。
+	// 6. 启动 Runtime；返回时等 Server 关闭全部连接后再停止并等待 Runtime。
 	stopRuntime := startDetachedRun(ctx, rt.Run)
 	defer func() {
 		err = errors.Join(err, stopRuntime())
 	}()
 
-	// 6. 将 Runtime 路由挂到 HTTP 服务，连接遥测使用实际监听地址。
-	gin.SetMode(gin.ReleaseMode)
-	engine := gin.New()
+	// 7. 挂载 Runtime 路由并运行共享的 HTTP 服务。
 	server.RegisterRoutes(engine)
 	address := listener.Addr().(*net.TCPAddr)
+	if host, port, _ := net.SplitHostPort(args.Config.Server.Listen); port == "0" {
+		args.Config.Server.Listen = net.JoinHostPort(host, fmt.Sprint(address.Port))
+	}
 	serverCtx := telemetry.ContextWithTelemetry(ctx, tel)
 	serverCtx = telemetry.ContextWithAttrs(serverCtx, telemetry.ServerAddress(address.IP.String()), telemetry.ServerPort(address.Port))
-	runCtx, stopServer := context.WithCancel(context.WithoutCancel(serverCtx))
-	logger := telemetry.GetLogger(serverCtx)
+	telemetry.GetLogger(serverCtx).Info("runtime server listening")
+	fmt.Fprintf(args.Stdout, "serving OpenVaala on %s, WebSocket path /api/v1/openvaala\n", args.Config.Server.Listen)
+	return runServeHTTP(serverCtx, listener, engine, server, rt, node, worldServer, publicRelay, restartRequests, remote.Enabled && len(publicRelays) > 0)
+}
+
+// runServeHTTP 运行已装配的服务，取消长连接并等待各服务退出。
+func runServeHTTP(ctx context.Context, listener net.Listener, engine *gin.Engine, server runtimeserver.RuntimeServer, rt runtime.Runtime, node world.WorldNode, worldServer worldserver.WorldServer, publicRelay *worldserver.Relay, restarts <-chan runtimeserver.ServeRestartRequest, remoteAccess bool) (*runtimeserver.ServeRestartRequest, error) {
+	// 1. HTTP 请求、控制面、节点与 Runtime Server 共用取消信号。
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	httpServer := &http.Server{
 		Handler:           engine,
 		ReadHeaderTimeout: 10 * time.Second,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
+		ErrorLog:          slog.NewLogLogger(telemetry.GetLogger(ctx).Handler(), slog.LevelError),
 		BaseContext:       func(net.Listener) context.Context { return runCtx },
 	}
-
-	// 7. 启动 Runtime Server 和 HTTP 服务，等待取消或任一服务结束。
-	logger.Info("runtime server listening")
-	fmt.Fprintf(args.Stdout, "serving OpenVaala on %s, WebSocket path /api/v1/openvaala\n", args.Config.Server.Listen)
-	serverDone, httpDone := make(chan struct{}), make(chan struct{})
-	var serverErr, httpErr error
-	go func() {
-		defer close(serverDone)
-		serverErr = server.Run(runCtx)
-	}()
-	go func() {
-		defer close(httpDone)
-		httpErr = httpServer.Serve(listener)
-	}()
-	select {
-	case <-ctx.Done():
-	case <-serverDone:
-	case <-httpDone:
+	// 2. 仅启动已装配的服务，任一服务返回即唤醒其余服务。
+	var worldServerDone, worldNodeDone, serverDone, relayDone chan error
+	if publicRelay != nil {
+		relayDone = make(chan error, 1)
+		go func() { err := publicRelay.Run(runCtx); cancel(); relayDone <- err }()
 	}
-
-	// 8. 取消请求上下文唤醒长连接与 Runtime Server，再限期排空 HTTP 服务，最后由 defer 停止 Runtime。
-	stopServer()
+	if worldServer != nil {
+		worldServerDone = make(chan error, 1)
+		go func() {
+			runErr := worldServer.Run(runCtx)
+			cancel()
+			worldServerDone <- runErr
+		}()
+	}
+	if node != nil {
+		worldNodeDone = make(chan error, 1)
+		go func() {
+			var rpc world.WorldRPCServer
+			if remoteAccess {
+				rpc = server
+			}
+			runErr := node.Run(runCtx, world.NewRuntimeHost(rt), rpc)
+			cancel()
+			worldNodeDone <- runErr
+		}()
+	}
+	if server != nil {
+		serverDone = make(chan error, 1)
+		go func() {
+			runErr := server.Run(runCtx)
+			cancel()
+			serverDone <- runErr
+		}()
+	}
+	httpDone := make(chan error, 1)
+	go func() {
+		runErr := httpServer.Serve(listener)
+		cancel()
+		httpDone <- runErr
+	}()
+	var restart *runtimeserver.ServeRestartRequest
+	select {
+	case <-runCtx.Done():
+	case req := <-restarts:
+		restart = &req
+		cancel()
+	}
+	// 3. 限期排空 HTTP，再依次等后台服务退出，之后调用方才释放 Runtime 和存储。
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancelShutdown()
-	shutdownErr := httpServer.Shutdown(shutdownCtx)
-	if shutdownErr != nil {
-		shutdownErr = errors.Join(shutdownErr, httpServer.Close())
+	err := httpServer.Shutdown(shutdownCtx)
+	if err != nil {
+		err = errors.Join(err, httpServer.Close())
 	}
-	<-httpDone
-	<-serverDone
-	if errors.Is(httpErr, http.ErrServerClosed) {
-		httpErr = nil
+	if httpErr := <-httpDone; !errors.Is(httpErr, http.ErrServerClosed) {
+		err = errors.Join(err, httpErr)
 	}
-	if errors.Is(serverErr, context.Canceled) {
-		serverErr = nil
+	for _, done := range []chan error{serverDone, worldNodeDone, worldServerDone, relayDone} {
+		if done != nil {
+			if runErr := <-done; !errors.Is(runErr, context.Canceled) {
+				err = errors.Join(err, runErr)
+			}
+		}
 	}
-	if ctx.Err() == context.DeadlineExceeded {
-		serverErr = errors.Join(serverErr, ctx.Err())
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		err = errors.Join(err, ctx.Err())
 	}
-	return errors.Join(shutdownErr, httpErr, serverErr)
+	return restart, err
 }
 
 // newServeListenError 生成监听失败的错误；本机已有 serve 在运行时提示先 serve stop。
@@ -215,32 +365,39 @@ func newServeListenError(ctx context.Context, listen, runtimeServerFilePath stri
 }
 
 // writeRuntimeServerFile 确定令牌和 server_id，写入本机连接文件 runtime-server.yaml，返回这两项。
-func writeRuntimeServerFile(cfg *config.Config, listener net.Listener) (token, serverID string, err error) {
+func writeRuntimeServerFile(cfg *config.Config, listener net.Listener) (RuntimeServerConnection, error) {
 	// 1. 定位连接文件并读取已有内容；文件缺失或损坏时使用空记录。
 	path := getRuntimeServerFilePath(cfg)
 	existing, _, _ := getRuntimeServerFile(path)
 	// 2. 令牌依次用配置的 server.token 和文件里已有的，server_id 沿用文件里的；都没有时生成随机值。
-	token = cmp.Or(cfg.Server.Token, existing.Token)
+	var err error
+	token := cmp.Or(cfg.Server.Token, existing.Token)
+	resetFor := ""
+	if existing.ResetFor != "" && existing.ResetFor == config.ConfiguredTokenDigest(cfg.Server.Token) {
+		token = existing.Token
+		resetFor = existing.ResetFor
+	}
 	if token == "" {
 		if token, err = newRandomHex(32); err != nil {
-			return "", "", err
+			return RuntimeServerConnection{}, err
 		}
 	}
-	serverID = existing.ServerID
+	serverID := existing.ServerID
 	if serverID == "" {
 		if serverID, err = newRandomHex(16); err != nil {
-			return "", "", err
+			return RuntimeServerConnection{}, err
 		}
 	}
 	// 3. 按实际绑定的地址生成连接 URL，监听全部网卡时改用 127.0.0.1。
 	host, port, err := net.SplitHostPort(listener.Addr().String())
 	if err != nil {
-		return "", "", err
+		return RuntimeServerConnection{}, err
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
 		host = "127.0.0.1"
 	}
 	file := RuntimeServerConnection{
+		ResetFor: resetFor,
 		URL:      "ws://" + net.JoinHostPort(host, port) + "/api/v1/openvaala",
 		Token:    token,
 		ServerID: serverID,
@@ -253,27 +410,27 @@ func writeRuntimeServerFile(cfg *config.Config, listener net.Listener) (token, s
 	// 5. 编码连接信息，以 0700 创建目录，写进同目录的 0600 临时文件；写入失败时删除临时文件。
 	payload, err := yaml.Marshal(file)
 	if err != nil {
-		return "", "", fmt.Errorf("encode runtime server file: %w", err)
+		return RuntimeServerConnection{}, fmt.Errorf("encode runtime server file: %w", err)
 	}
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0700); err != nil {
-		return "", "", fmt.Errorf("create runtime server file directory: %w", err)
+		return RuntimeServerConnection{}, fmt.Errorf("create runtime server file directory: %w", err)
 	}
 	temporary, err := os.CreateTemp(directory, ".runtime-server-*.yaml")
 	if err != nil {
-		return "", "", fmt.Errorf("write runtime server file: %w", err)
+		return RuntimeServerConnection{}, fmt.Errorf("write runtime server file: %w", err)
 	}
 	_, writeErr := temporary.Write(payload)
 	if err := errors.Join(writeErr, temporary.Close()); err != nil {
 		_ = os.Remove(temporary.Name())
-		return "", "", fmt.Errorf("write runtime server file: %w", err)
+		return RuntimeServerConnection{}, fmt.Errorf("write runtime server file: %w", err)
 	}
 	// 6. 用临时文件替换连接文件，失败时删除临时文件。
 	if err := os.Rename(temporary.Name(), path); err != nil {
 		_ = os.Remove(temporary.Name())
-		return "", "", fmt.Errorf("write runtime server file: %w", err)
+		return RuntimeServerConnection{}, fmt.Errorf("write runtime server file: %w", err)
 	}
-	return token, serverID, nil
+	return file, nil
 }
 
 // newRandomHex 生成 size 字节随机值的十六进制文本。

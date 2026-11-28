@@ -371,12 +371,24 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
   {
     name: "open_and_stream",
     async run(h) {
-      // 1. 首次同步：open 之后才知道根 Session，再退订、订阅两种订阅，最后按 desc 读最近一页。
+      // 1. 对话订阅尚未返回时 Session 已经开始订阅，历史仍要等待两个快照。
+      let finishSubscription!: () => void
+      h.connection.reply("conversation/subscribe", async () => {
+        await new Promise<void>((resolve) => {
+          finishSubscription = resolve
+        })
+        return { title: "标题", sessions: [sessionInfo(rootSessionID)] }
+      })
       await h.start()
       assert.deepEqual(h.connection.getMethods(), [
         "conversation/open",
-        "conversation/unsubscribe",
-        "session/unsubscribe",
+        "conversation/subscribe",
+        "session/subscribe",
+      ])
+      finishSubscription()
+      await flush()
+      assert.deepEqual(h.connection.getMethods(), [
+        "conversation/open",
         "conversation/subscribe",
         "session/subscribe",
         "session/items/list",
@@ -508,13 +520,9 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
       })
       h.connection.connect()
       await flush()
-      // 3. 重新同步先退订上一次的订阅，再按 asc 从已交付位置补齐，不缺不重。
+      // 3. 新连接直接建立两种订阅，并按 asc 从已交付位置补齐。
       assert.deepEqual(h.connection.getMethods(), [
-        "conversation/unsubscribe",
-        "session/unsubscribe",
         "conversation/open",
-        "conversation/unsubscribe",
-        "session/unsubscribe",
         "conversation/subscribe",
         "session/subscribe",
         "session/items/list",
@@ -561,7 +569,9 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
           { item_index: 0, item: messageItem("reply", "t1", "今天sunny") },
         ],
       }))
-      h.connection.connect()
+      h.connection.push(
+        notification("subscription/closed", { reason: "subscriber too slow" })
+      )
       await flush()
       // 3. 生成中的 Item 只有一条，之后的增量接着拼。
       h.connection.push(textDelta("t1", 0, "!"))
@@ -686,6 +696,7 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
     name: "closed_during_sync_drops_staged_without_resync",
     async run(h) {
       // 1. 同步自己退订时：旧订阅的通知先到，随后是 Session 订阅的 subscription/closed。
+      await h.start()
       h.connection.reply("session/unsubscribe", () => {
         h.connection.push(
           notification("item/started", {
@@ -706,9 +717,12 @@ const tests: { name: string; run: (h: Harness) => Promise<void> }[] = [
         )
         return {}
       })
-      await h.start()
+      h.connection.push(
+        notification("subscription/closed", { reason: "subscriber too slow" })
+      )
+      await flush()
       // 2. 只删掉同一种订阅暂存的通知，不重新同步。
-      assert.equal(countCalls(h, "conversation/open"), 1)
+      assert.equal(countCalls(h, "conversation/open"), 2)
       assert.deepEqual(getKeys(h.sync), [])
       assert.deepEqual(Object.keys(h.sync.$sessions.get()).sort(), [
         "child",
@@ -1785,10 +1799,6 @@ test("session_only_sync_leaves_the_conversation_subscription_to_the_root_sync", 
       wantCalls: [
         ["conversation/open", { conversation_id: conversationID }],
         [
-          "session/unsubscribe",
-          { conversation_id: conversationID, session_id: "child" },
-        ],
-        [
           "session/subscribe",
           { conversation_id: conversationID, session_id: "child" },
         ],
@@ -2017,3 +2027,55 @@ test("session_only_sync_turns_follow_the_root_session_info_after_reconnect", asy
     }
   }
 })
+
+for (const restoring of [true, false]) {
+  test(
+    "external_history_replaced_at_equal_tail_restoring_" + restoring,
+    async () => {
+      const h = createHarness()
+      const info = sessionInfo(rootSessionID)
+      info.session.external = { agent_type: "acp" }
+      h.connection.reply("conversation/subscribe", () => ({
+        title: "ACP",
+        sessions: [info],
+      }))
+      let subscription = 0
+      h.connection.reply("session/subscribe", () => {
+        subscription++
+        const waiting = restoring && subscription === 2
+        if (waiting)
+          h.connection.push(
+            notification("subscription/closed", {
+              reason: "external history ready",
+            })
+          )
+        return {
+          restoring: waiting,
+          last_saved_ordinal: waiting ? 0 : 2,
+          streaming_items: [],
+          pending_inputs: { inputs: [] },
+        }
+      })
+      h.connection.reply("session/items/list", () => ({
+        items: [
+          logged(
+            2,
+            messageItem(subscription === 1 ? "old" : "new", "t", "latest")
+          ),
+          ...loggedMessages(1),
+        ],
+        next_cursor: 1,
+      }))
+      await h.start()
+      assert.deepEqual(getKeys(h.sync), ["item-1", "old"])
+      h.connection.connect()
+      await flush()
+      assert.equal(subscription, restoring ? 3 : 2)
+      assert.deepEqual(getKeys(h.sync), ["item-1", "new"])
+      assert.deepEqual(
+        h.connection.getParams("session/items/list").map((p) => p.order),
+        ["desc", "desc"]
+      )
+    }
+  )
+}

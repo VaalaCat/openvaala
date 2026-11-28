@@ -22,34 +22,26 @@ import (
 func (d *Desktop) getActiveServerTarget() (target *remoteServer, isLocal bool) {
 	// 1. 命令行 --url 一次性覆盖优先级最高。
 	if d.serverOverride != nil {
-		server := *d.serverOverride
-		return &server, false
+		return d.serverOverride, false
 	}
 	// 2. 偏好里显式选中的远端服务器。
 	if d.preferences.ActiveServer != "" && d.preferences.ActiveServer != localServerID {
 		if index := slices.IndexFunc(d.preferences.RemoteServers, func(s remoteServer) bool { return s.ID == d.preferences.ActiveServer }); index >= 0 {
-			server := d.preferences.RemoteServers[index]
-			return &server, false
+			return &d.preferences.RemoteServers[index], false
 		}
 	}
 	// 3. 偏好还没显式选过服务器时，回落到 config.yaml 的 client.url；否则连接本机。
 	if d.preferences.ActiveServer == "" && d.defaultRemote != nil {
-		server := *d.defaultRemote
-		return &server, false
+		return d.defaultRemote, false
 	}
-	return nil, true
+	return &d.localServer, true
 }
 
 // getActiveServerLabel 返回状态栏和横幅里显示的当前服务器名称。
 func (d *Desktop) getActiveServerLabel() string {
-	target, isLocal := d.getActiveServerTarget()
-	if isLocal {
-		return d.t("server.local")
-	}
-	if target.Name != "" {
-		return target.Name
-	}
-	return getRemoteServerHost(target.URL)
+	target, _ := d.getActiveServerTarget()
+	name, _ := getServerDisplay(*target)
+	return name
 }
 
 // connect 异步连接当前选定的本机或远端 serve，启动独立上下文的 Client 与事件读取任务。
@@ -98,6 +90,7 @@ func (d *Desktop) connect() {
 	d.connecting = true
 	d.connectionError = nil
 	target, isLocal := d.getActiveServerTarget()
+	targetURL, targetToken := target.URL, target.Token
 	d.tasks.Go(func() {
 		var (
 			runtimeURL string
@@ -112,7 +105,7 @@ func (d *Desktop) connect() {
 				runtimeURL, token, serverID = connection.URL, connection.Token, connection.ServerID
 			}
 		} else {
-			runtimeURL, token = target.URL, target.Token
+			runtimeURL, token = targetURL, targetToken
 		}
 		var client runtimeclient.Client
 		if err == nil {
@@ -131,6 +124,10 @@ func (d *Desktop) connect() {
 			d.connectionError = err
 			if err != nil {
 				return
+			}
+			d.connectedServer = cli.RuntimeServerConnection{URL: runtimeURL, Token: token}
+			if isLocal {
+				d.localServer.URL = runtimeURL
 			}
 			d.client = client
 			d.clientStopped = false
@@ -161,10 +158,35 @@ func (d *Desktop) connect() {
 	})
 }
 
+// loadServerIdentity 在握手后用节点状态更新服务器档案。
+func (d *Desktop) loadServerIdentity(runtimeName string) {
+	client, ctx := d.client, d.clientCtx
+	d.tasks.Go(func() {
+		status, err := client.GetWorldStatus(ctx)
+		d.window.Update(func() {
+			if d.closed || d.client != client {
+				return
+			}
+			server, local := d.getActiveServerTarget()
+			previous := *server
+			input, _ := parseRemoteServerInput(server.URL, "")
+			if local || (server.Name == "" && (input.WorldTarget == nil || input.WorldTarget.Name == "")) {
+				server.Name = runtimeName
+			}
+			if err == nil && (server.NodeAddr == nil || *server.NodeAddr != status.NodeAddr) {
+				server.NodeAddr = &status.NodeAddr
+			}
+			if !local && *server != previous {
+				d.savePreferencesWithToast()
+			}
+		})
+	})
+}
+
 // switchServer 切换到指定服务器（localServerID 表示本机）；若有未保存设置编辑先弹确认框。
 func (d *Desktop) switchServer(serverID string) {
 	// 1. 保护未保存的设置草稿。
-	if d.isProviderDirty() || d.isExecutorDirty() {
+	if d.isProviderDirty() || d.isExecutorDirty() || d.isAgentDirty() || d.isWorldDirty() {
 		d.confirm = confirmation{Kind: "switch-server", ServerID: serverID}
 		d.confirmOpen = true
 		return
@@ -184,11 +206,7 @@ func (d *Desktop) forceSwitchServer(serverID string) {
 	d.serverOverride = nil
 	d.startTargetError = nil
 	// 2. 更新并持久化当前选定的服务器。
-	if serverID == "" || serverID == localServerID {
-		d.preferences.ActiveServer = localServerID
-	} else {
-		d.preferences.ActiveServer = serverID
-	}
+	d.preferences.ActiveServer = serverID
 	d.resetServerState()
 	d.savePreferencesWithToast()
 	if d.window != nil {
@@ -205,6 +223,11 @@ func (d *Desktop) resetServerState() {
 	}
 	d.closeTerminalStates()
 	// 2. 重置连接状态、会话、配置与面板数据。
+	d.worldSaved = nil
+	d.worldChangeOpen = false
+	d.worldRestarting = false
+	d.worldSaving = false
+	d.connectedServer = cli.RuntimeServerConnection{}
 	d.client = nil
 	d.connecting = false
 	d.clientStopped = false
@@ -225,10 +248,17 @@ func (d *Desktop) resetServerState() {
 	d.conversation = defs.Conversation{}
 	d.previousConversation = defs.Conversation{}
 	d.sessionInfos = nil
+	d.externalModel = defs.ModelRef{}
+	d.externalOptions, d.externalCommands, d.externalCapabilities = nil, nil, nil
+	d.draftProbe, d.draftOptions, d.importDialog = nil, nil, nil
+	d.draftCatalogLocation = runtime.ExternalAgentLocation{}
+	d.externalMoreOpen, d.backgroundExpanded = false, false
+	d.modelRequest++
 	d.items = nil
 	d.toolProgress = nil
 	d.itemCursor = 0
 	d.readingReady = false
+	d.historyRestoring = false
 	d.historyLoading = false
 	d.historyError = nil
 	d.pendingInputs = session.SessionPendingInputs{}
@@ -279,6 +309,10 @@ func (d *Desktop) resetServerState() {
 	d.providers = nil
 	d.defaultModel = defs.ModelRef{}
 	d.modelDefaults = defs.ModelDefaults{}
+	d.agentRows, d.agentModels, d.agentDraft = nil, nil, nil
+	d.agentPresets, d.agentPresetQuery = nil, ""
+	d.agentBaseline = agentSettingsDraft{}
+	d.agentSaving, d.agentError = false, nil
 	d.providerDraft = nil
 	d.providerBaseline = nil
 	d.providerLoading = false
@@ -308,6 +342,7 @@ func (d *Desktop) handleClientEvent(event runtimeclient.ClientEvent) {
 		d.connectionError = event.Err
 		if event.State == runtimeclient.ConnectionConnected {
 			d.setServerIdentity(event.ServerID)
+			d.loadServerIdentity(event.ServerInfo.Name)
 			if d.clientNeedsReading {
 				d.clientNeedsReading = false
 				d.openConversation(d.readingTarget.ConversationID, d.readingTarget.SessionID)
@@ -317,6 +352,12 @@ func (d *Desktop) handleClientEvent(event runtimeclient.ClientEvent) {
 			d.loadModels(d.readingTarget)
 			d.loadExecutors()
 			d.loadAgents()
+			if d.page == "world" && (!d.isWorldDirty() || d.worldRestarting) {
+				d.loadWorldSettings()
+			}
+			if d.page == "agents" {
+				d.loadAgentSettings()
+			}
 			client := d.client
 			d.tasks.Go(func() { _ = client.SubscribeRunningConversations(d.ctx) })
 			d.tasks.Go(func() { _ = client.SubscribeTerminals(d.ctx) })
@@ -358,12 +399,38 @@ func (d *Desktop) handleClientEvent(event runtimeclient.ClientEvent) {
 		if !d.isReading(event.ConversationID, event.SessionID) {
 			return
 		}
-		d.readingReady = true
+		if event.External {
+			d.externalOptions, d.externalCommands, d.externalCapabilities = event.Options, event.Commands, event.Capabilities
+			d.externalModel = runtimeclient.GetExternalModelRef(d.getSessionInfo().Session.AgentName, event.Options)
+		}
 		d.pendingInputs = event.PendingInputs
+		readPage := !d.readingReady
+		d.historyRestoring = event.HistoryAction == runtimeclient.HistoryWait
+		switch event.HistoryAction {
+		case runtimeclient.HistoryWait:
+			d.readingReady = false
+			d.historyLoading = false
+			d.historyError = nil
+			return
+		case runtimeclient.HistoryReplace:
+			readPage = true
+			// 即使新旧库尾序相同，旧分页、轮次和滚动位置也属于上一次订阅。
+			d.readingTarget.Request++
+			d.resetHistoryPage()
+			clear(d.turns)
+			clear(d.toolProgress)
+		}
+		d.readingReady = true
 		d.mergeSavedItems(event.Items, false)
 		d.items = slices.DeleteFunc(d.items, func(view viewItem) bool { return view.Ordinal == 0 })
 		for _, stream := range event.StreamingItems {
 			d.mergeStreamingItem(stream.Item, stream.ItemIndex, false)
+		}
+		if readPage {
+			d.historyLoading = false
+			d.loadHistory()
+			d.loadModels(d.readingTarget)
+			d.loadPanel(d.getShownRightPanelID())
 		}
 	case *runtimeclient.ItemsSaved:
 		if d.isReading(event.ConversationID, event.SessionID) {
@@ -396,6 +463,12 @@ func (d *Desktop) handleClientEvent(event runtimeclient.ClientEvent) {
 		if d.isReading(event.ConversationID, event.SessionID) {
 			d.pendingInputs = event.PendingInputs
 		}
+	case *runtimeclient.SessionExternalStateChanged:
+		if d.isReading(event.ConversationID, event.SessionID) {
+			d.externalOptions, d.externalCommands, d.externalCapabilities = &event.Options, event.Commands, &event.Capabilities
+			d.externalModel = runtimeclient.GetExternalModelRef(d.getSessionInfo().Session.AgentName, &event.Options)
+			d.loadModels(d.readingTarget)
+		}
 	case *runtimeclient.SessionStatusChanged:
 		if event.ConversationID != d.readingTarget.ConversationID {
 			return
@@ -422,8 +495,7 @@ func (d *Desktop) handleClientEvent(event runtimeclient.ClientEvent) {
 		}
 	case *runtimeclient.ConversationSyncFailed:
 		if event.ConversationID == d.readingTarget.ConversationID {
-			d.readingReady = false
-			d.historyError = event.Err
+			d.handleReadingFailed(d.readingTarget, event.Err)
 		}
 	case *runtimeclient.ToolProgress:
 		if d.isReading(event.ConversationID, event.SessionID) {
@@ -513,16 +585,20 @@ func (d *Desktop) getSessionInfo() runtime.SessionRuntimeInfo {
 	return runtime.SessionRuntimeInfo{}
 }
 
+// isServerDisconnected 当前服务器是否已经断开或连接失败？
+func (d *Desktop) isServerDisconnected() bool {
+	return d.connectionError != nil || d.clientStopped || d.connectionState == runtimeclient.ConnectionReconnecting
+}
+
 // connectionBannerView 在对话区顶部显示连接问题：本地化原因、原文详情和「重试」；重试期间显示转圈。
 func (d *Desktop) connectionBannerView(c *ui.Context) {
 	// 1. 初次连接中不打扰；断线重连、出现错误或 Client 已停止后才显示。
-	isFailed := d.connectionError != nil || d.clientStopped
-	if !isFailed && d.connectionState != runtimeclient.ConnectionReconnecting {
+	if !d.isServerDisconnected() {
 		return
 	}
 	isRetrying := d.connecting || d.connectionState == runtimeclient.ConnectionReconnecting
 	kind := kit.CalloutWarning
-	if isFailed {
+	if d.connectionError != nil || d.clientStopped {
 		kind = kit.CalloutError
 	}
 	// 2. 原因用本地化文案，Go 错误原文放在详情里。

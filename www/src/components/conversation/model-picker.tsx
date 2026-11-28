@@ -6,7 +6,8 @@ import {
 } from "@/components/ui/tooltip"
 import { OverflowTooltip } from "@/components/base/overflow-tooltip"
 import { useMemo, useRef, useState } from "react"
-import { motion } from "motion/react"
+import { BrandIcon } from "@/components/base/brand-icon"
+import { AnimatePresence, motion } from "motion/react"
 import { useQuery } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
 import { CheckIcon, ChevronDownIcon, XIcon } from "lucide-react"
@@ -52,10 +53,15 @@ import {
 import { LatticeLoader } from "@/components/base/lattice-loader"
 import { InputGroupInput } from "@/components/ui/input-group"
 import type {
+  ExternalOptionGroup,
+  ExternalOptionSelection,
+  ExternalOptions,
+  ListModelsParams,
   ModelDefinition,
   ModelRef,
   ModelSelection,
 } from "@/lib/api/protocol.gen"
+import { agentCatalogOptions } from "@/lib/query/agent-settings"
 import { modelListOptions } from "@/lib/query/model"
 import { shouldShowLoadError } from "@/lib/rpc-error"
 import { cn, formatModelRef } from "@/lib/utils"
@@ -73,11 +79,19 @@ export function ModelPicker({
   agentName,
   value,
   onChange,
+  scope,
+  externalOptions,
+  onOption,
+  onRefreshOptions,
   variant = "ghost",
   showReasoningEffort = true,
   compact = false,
   disabled = false,
 }: {
+  scope?: ListModelsParams
+  externalOptions?: ExternalOptions
+  onOption?(option: ExternalOptionSelection): void
+  onRefreshOptions?(): void
   compact?: boolean
   disabled?: boolean
   agentName?: string
@@ -97,9 +111,14 @@ export function ModelPicker({
   const triggerRef = useRef<HTMLButtonElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
   const models = useQuery({
-    ...modelListOptions(connection, agentName ?? ""),
+    ...modelListOptions(connection, agentName ?? "", scope),
     enabled: agentName !== undefined,
   })
+  const agents = useQuery(agentCatalogOptions(connection))
+  const externalAgent = (name?: string) =>
+    agents.data?.agents?.find(
+      (agent) => agent.type !== "native" && agent.name === name
+    )
   const modelData = agentName === undefined ? undefined : models.data
   const isSelectionPending = agentName === undefined || models.isPending
   const selectionDisabled = disabled || isSelectionPending
@@ -119,25 +138,168 @@ export function ModelPicker({
     [definitions]
   )
   const agentDefaultRef = modelData?.agent_default_model
-  const selectedRef =
+  const requestedRef =
     agentName === undefined
       ? undefined
       : value?.ref.provider_id
         ? value.ref
         : agentDefaultRef
+  const selectedRef =
+    requestedRef?.model_id === "default" &&
+    externalOptions?.model?.current_value
+      ? { ...requestedRef, model_id: externalOptions.model.current_value }
+      : requestedRef
   const selected = definitions.find((model) =>
     isSameModel(model.ref, selectedRef)
   )
-  const effort = selected
-    ? getReasoningEffort(selected, value?.reasoning_effort)
-    : undefined
+  const thought = externalOptions?.thought
+  const effort =
+    thought?.current_value ??
+    (selected
+      ? getReasoningEffort(selected, value?.reasoning_effort)
+      : undefined)
   const label = selected
     ? getModelName(selected)
     : selectedRef?.provider_id
-      ? formatModelRef(selectedRef)
+      ? externalAgent(selectedRef.provider_id)
+        ? selectedRef.model_id
+        : formatModelRef(selectedRef)
       : isSelectionPending
         ? t("common.loading")
         : t("modelPicker.placeholder")
+  const selectedAgent = externalAgent(selectedRef?.provider_id)
+  const buttonLabel = (
+    <span className="relative inline-flex min-w-0">
+      <AnimatePresence initial={false} mode="popLayout">
+        <motion.span
+          key={selectedRef ? formatModelRef(selectedRef) : ""}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.15, ease: "easeOut" }}
+          className="inline-flex min-w-0 items-center"
+        >
+          {selectedAgent ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <span className="inline-flex min-w-0 items-center gap-1" />
+                }
+              >
+                <BrandIcon icon={selected?.icon ?? selectedAgent.icon ?? ""} />
+                <span className="truncate">{label}</span>
+              </TooltipTrigger>
+              <TooltipContent>{selectedAgent.name}</TooltipContent>
+            </Tooltip>
+          ) : (
+            <OverflowTooltip render={<span className="min-w-0 truncate" />}>
+              {label}
+            </OverflowTooltip>
+          )}
+        </motion.span>
+      </AnimatePresence>
+    </span>
+  )
+  const groupIcon = (group: ModelGroup) => {
+    const agent = externalAgent(group.value)
+    return (
+      agent && (
+        <BrandIcon
+          icon={group.items[0]?.icon ?? agent.icon ?? ""}
+          className="mr-1 inline-block align-middle"
+        />
+      )
+    )
+  }
+  const groupsMore = [
+    externalOptions?.mode,
+    ...(externalOptions?.others ?? []),
+  ].filter((g): g is ExternalOptionGroup => !!g)
+  const effortChoices =
+    thought?.options ??
+    (selected?.reasoning_efforts ?? []).map((value) => ({
+      value,
+      label: value,
+    }))
+  const hasEffort = effortChoices.length > 0
+  const effortLabel =
+    effortChoices.find((o) => o.value === effort)?.label ||
+    effort ||
+    t("modelPicker.defaultEffort")
+  function chooseEffort(next: string | null) {
+    if (!next || selectionDisabled) return
+    if (thought) onOption?.({ kind: thought.kind, id: thought.id, value: next })
+    else if (selected) onChange({ ref: selected.ref, reasoning_effort: next })
+  }
+  const moreOptionFields = groupsMore.map((group) => (
+    <div key={group.id} className="contents">
+      <span className="text-ui">{group.label}</span>
+      <Select
+        value={group.current_value}
+        onValueChange={(v) =>
+          v && onOption?.({ kind: group.kind, id: group.id, value: v })
+        }
+      >
+        <SelectTrigger
+          className="model-selection-value w-full text-ui"
+          aria-label={group.label}
+        >
+          <SelectValue className="text-table">
+            {group.options.find((o) => o.value === group.current_value)
+              ?.label ?? group.current_value}
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {group.options.map((o) => (
+            <SelectItem
+              key={o.value}
+              value={o.value}
+              className="model-selection-option text-table"
+            >
+              {o.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  ))
+  const more = (
+    <AnimatePresence initial={false} mode="wait">
+      {groupsMore.length > 0 && (
+        <motion.div
+          key={selectedAgent?.name}
+          initial={{ width: 0, opacity: 0 }}
+          animate={{ width: "auto", opacity: 1 }}
+          exit={{ width: 0, opacity: 0 }}
+          transition={{ duration: 0.15, ease: "easeOut" }}
+          className="shrink-0"
+        >
+          <Popover>
+            <PopoverTrigger
+              render={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={disabled}
+                  className="model-selection-value gap-1 px-1 text-ui"
+                />
+              }
+            >
+              {t("externalSession.more")}
+              <ChevronDownIcon />
+            </PopoverTrigger>
+            <PopoverContent
+              side="top"
+              align="start"
+              className="grid w-auto min-w-48 grid-cols-[auto_1fr] items-center gap-x-4 gap-y-2 p-3"
+            >
+              {moreOptionFields}
+            </PopoverContent>
+          </Popover>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  )
   // 2. 容器窄时合并入口；手机用抽屉，桌面用锚定浮层。
   if (compact || isMobile) {
     const filtered = groups
@@ -161,9 +323,7 @@ export function ModelPicker({
         aria-label={t("modelPicker.model")}
         disabled={selectionDisabled}
       >
-        <OverflowTooltip render={<span className="min-w-0 truncate" />}>
-          {label}
-        </OverflowTooltip>
+        {buttonLabel}
         {showReasoningEffort && effort && (
           <span className="shrink-0 color-muted">{effort}</span>
         )}
@@ -171,6 +331,7 @@ export function ModelPicker({
       </Button>
     )
     const onCompactOpenChange = (next: boolean) => {
+      if (next) onRefreshOptions?.()
       setCompactOpen(next)
       if (!next) setSearch("")
     }
@@ -215,32 +376,27 @@ export function ModelPicker({
             aria-label={t("modelPicker.search")}
             placeholder={t("modelPicker.search")}
           />
-          {showReasoningEffort &&
-            selected &&
-            selected.reasoning_efforts.length > 0 && (
-              <ToggleGroup
-                disabled={selectionDisabled}
-                className="max-w-full shrink-0 overflow-x-auto"
-                aria-label={t("modelPicker.reasoningEffort", {
-                  effort: effort || t("modelPicker.defaultEffort"),
-                })}
-                value={effort ? [effort] : []}
-                onValueChange={(next) => {
-                  if (next[0])
-                    onChange({ ref: selected.ref, reasoning_effort: next[0] })
-                }}
-              >
-                {selected.reasoning_efforts.map((each) => (
-                  <ToggleGroupItem
-                    key={each}
-                    value={each}
-                    className="model-selection-option text-ui"
-                  >
-                    {each}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            )}
+          {showReasoningEffort && hasEffort && (
+            <ToggleGroup
+              disabled={selectionDisabled}
+              className="max-w-full shrink-0 overflow-x-auto"
+              aria-label={t("modelPicker.reasoningEffort", {
+                effort: effort || t("modelPicker.defaultEffort"),
+              })}
+              value={effort ? [effort] : []}
+              onValueChange={(next) => chooseEffort(next[0] ?? null)}
+            >
+              {effortChoices.map(({ value: each, label }) => (
+                <ToggleGroupItem
+                  key={each}
+                  value={each}
+                  className="model-selection-option text-ui"
+                >
+                  {label}
+                </ToggleGroupItem>
+              ))}
+            </ToggleGroup>
+          )}
           {models.isError && shouldShowLoadError(models.error) && (
             <RequestError
               error={models.error}
@@ -263,6 +419,7 @@ export function ModelPicker({
                     <p className="truncate px-2 py-1 text-caption color-muted" />
                   }
                 >
+                  {groupIcon(group)}
                   {group.value}
                 </OverflowTooltip>
                 {group.items.map((model) => (
@@ -278,7 +435,7 @@ export function ModelPicker({
                         ref: model.ref,
                         reasoning_effort:
                           value?.reasoning_effort &&
-                          model.reasoning_efforts.includes(
+                          model.reasoning_efforts?.includes(
                             value.reasoning_effort
                           )
                             ? value.reasoning_effort
@@ -317,33 +474,48 @@ export function ModelPicker({
                   : t("common.selection.empty")}
               </p>
             )}
+            {isMobile && moreOptionFields.length > 0 && (
+              <fieldset className="mt-2 min-w-0 px-2 pb-1">
+                <legend className="text-caption color-muted">
+                  {t("externalSession.moreOptions")}
+                </legend>
+                <div className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2">
+                  {moreOptionFields}
+                </div>
+              </fieldset>
+            )}
           </div>
         </div>
       </>
     )
-    return isMobile ? (
-      <Drawer
-        open={compactOpen && !selectionDisabled}
-        onOpenChange={onCompactOpenChange}
-      >
-        <DrawerTrigger render={trigger} />
-        <DrawerContent className="text-body">{content}</DrawerContent>
-      </Drawer>
-    ) : (
-      <Popover
-        open={compactOpen && !selectionDisabled}
-        onOpenChange={onCompactOpenChange}
-      >
-        <PopoverTrigger render={trigger} />
-        <PopoverContent
-          initialFocus={searchRef}
-          align={variant === "ghost" ? "end" : "start"}
-          side="top"
-          className="max-h-(--available-height) w-80 max-w-(--available-width) gap-0 p-0 text-body"
-        >
-          {content}
-        </PopoverContent>
-      </Popover>
+    return (
+      <>
+        {isMobile ? (
+          <Drawer
+            open={compactOpen && !selectionDisabled}
+            onOpenChange={onCompactOpenChange}
+          >
+            <DrawerTrigger render={trigger} />
+            <DrawerContent className="text-body">{content}</DrawerContent>
+          </Drawer>
+        ) : (
+          <Popover
+            open={compactOpen && !selectionDisabled}
+            onOpenChange={onCompactOpenChange}
+          >
+            <PopoverTrigger render={trigger} />
+            <PopoverContent
+              initialFocus={searchRef}
+              align={variant === "ghost" ? "end" : "start"}
+              side="top"
+              className="max-h-(--available-height) w-80 max-w-(--available-width) gap-0 p-0 text-body"
+            >
+              {content}
+            </PopoverContent>
+          </Popover>
+        )}
+        {!isMobile && more}
+      </>
     )
   }
   return (
@@ -351,7 +523,10 @@ export function ModelPicker({
       <Combobox<ModelDefinition>
         disabled={selectionDisabled}
         open={modelOpen && !selectionDisabled}
-        onOpenChange={setModelOpen}
+        onOpenChange={(open) => {
+          setModelOpen(open)
+          if (open) onRefreshOptions?.()
+        }}
         items={groups}
         value={selected ?? null}
         onValueChange={(model) => {
@@ -360,7 +535,7 @@ export function ModelPicker({
             ref: model.ref,
             reasoning_effort:
               value?.reasoning_effort &&
-              model.reasoning_efforts.includes(value.reasoning_effort)
+              model.reasoning_efforts?.includes(value.reasoning_effort)
                 ? value.reasoning_effort
                 : undefined,
           })
@@ -387,11 +562,7 @@ export function ModelPicker({
             />
           }
         >
-          <OverflowTooltip
-            render={<span className="min-w-0 flex-1 truncate text-left" />}
-          >
-            {label}
-          </OverflowTooltip>
+          {buttonLabel}
         </ComboboxTrigger>
         <ComboboxContent
           anchor={triggerRef}
@@ -441,6 +612,7 @@ export function ModelPicker({
                     <ComboboxLabel className="min-w-0 truncate text-caption" />
                   }
                 >
+                  {groupIcon(group)}
                   {group.value}
                 </OverflowTooltip>
                 <ComboboxCollection>
@@ -475,80 +647,67 @@ export function ModelPicker({
           </ComboboxList>
         </ComboboxContent>
       </Combobox>
-      <motion.div
-        initial={false}
-        animate={{
-          width:
-            showReasoningEffort &&
-            (isSelectionPending || !!selected?.reasoning_efforts.length)
-              ? "auto"
-              : 0,
-          opacity:
-            showReasoningEffort &&
-            (isSelectionPending || !!selected?.reasoning_efforts.length)
-              ? 1
-              : 0,
-        }}
-        transition={{ duration: 0.2 }}
-        className="shrink-0"
-        inert={
-          selectionDisabled ||
-          !showReasoningEffort ||
-          !selected?.reasoning_efforts.length
-        }
-        aria-hidden={
-          !showReasoningEffort ||
-          (!isSelectionPending && !selected?.reasoning_efforts.length)
-        }
-      >
-        <div className={variant === "ghost" ? "pl-1" : "pl-2"}>
-          <Select
-            disabled={selectionDisabled || !selected?.reasoning_efforts.length}
-            open={
-              effortOpen &&
-              !selectionDisabled &&
-              !!selected?.reasoning_efforts.length
-            }
-            onOpenChange={setEffortOpen}
-            value={effort || null}
-            onValueChange={(next: string | null) => {
-              if (next && selected && !selectionDisabled)
-                onChange({ ref: selected.ref, reasoning_effort: next })
-            }}
-          >
-            <SelectTrigger
-              aria-label={t("modelPicker.reasoningEffort", {
-                effort: effort || t("modelPicker.defaultEffort"),
-              })}
-              className={cn(
-                "model-selection-value shrink-0 text-ui transition-colors",
-                variant === "ghost"
-                  ? "w-auto border-transparent px-1 hover:bg-muted aria-expanded:bg-muted dark:bg-transparent dark:hover:bg-muted/50"
-                  : "w-28"
-              )}
+      <AnimatePresence initial={false} mode="wait">
+        <motion.div
+          key={selectedAgent?.name ?? "native"}
+          initial={{ width: 0, opacity: 0 }}
+          exit={{ width: 0, opacity: 0 }}
+          animate={{
+            width:
+              showReasoningEffort && (isSelectionPending || hasEffort)
+                ? "auto"
+                : 0,
+            opacity:
+              showReasoningEffort && (isSelectionPending || hasEffort) ? 1 : 0,
+          }}
+          transition={{ duration: 0.15, ease: "easeOut" }}
+          className="shrink-0"
+          inert={selectionDisabled || !showReasoningEffort || !hasEffort}
+          aria-hidden={
+            !showReasoningEffort || (!isSelectionPending && !hasEffort)
+          }
+        >
+          <div className={variant === "ghost" ? "pl-1" : "pl-2"}>
+            <Select
+              disabled={selectionDisabled || !hasEffort}
+              open={effortOpen && !selectionDisabled && hasEffort}
+              onOpenChange={setEffortOpen}
+              value={effort || null}
+              onValueChange={chooseEffort}
             >
-              <SelectValue className="text-table">
-                {isSelectionPending
-                  ? t("common.loading")
-                  : effort || t("modelPicker.defaultEffort")}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent alignItemWithTrigger={false} align="end">
-              <SelectGroup>
-                {selected?.reasoning_efforts.map((each) => (
-                  <SelectItem
-                    key={each}
-                    value={each}
-                    className="model-selection-option text-table"
-                  >
-                    {each}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
-          </Select>
-        </div>
-      </motion.div>
+              <SelectTrigger
+                aria-label={t("modelPicker.reasoningEffort", {
+                  effort: effort || t("modelPicker.defaultEffort"),
+                })}
+                className={cn(
+                  "model-selection-value shrink-0 text-ui transition-colors",
+                  variant === "ghost"
+                    ? "w-auto border-transparent px-1 hover:bg-muted aria-expanded:bg-muted dark:bg-transparent dark:hover:bg-muted/50"
+                    : "w-28"
+                )}
+              >
+                <SelectValue className="text-table">
+                  {isSelectionPending ? t("common.loading") : effortLabel}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent alignItemWithTrigger={false} align="end">
+                <SelectGroup>
+                  {effortChoices.map(({ value: each, label }) => (
+                    <SelectItem
+                      key={each}
+                      value={each}
+                      className="model-selection-option text-table"
+                    >
+                      {label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
+        </motion.div>
+      </AnimatePresence>
+      {more}
     </div>
   )
 }
@@ -584,6 +743,7 @@ function getReasoningEffort(
   model: ModelDefinition,
   requested: string | undefined
 ): string {
-  if (requested && model.reasoning_efforts.includes(requested)) return requested
+  if (requested && model.reasoning_efforts?.includes(requested))
+    return requested
   return model.default_reasoning_effort ?? ""
 }

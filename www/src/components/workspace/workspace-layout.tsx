@@ -4,6 +4,7 @@ import {
   type ITabRenderValues,
   type TabNode,
 } from "flexlayout-react"
+import { SessionMenu } from "@/components/conversation/session-menu"
 import { useStore } from "@nanostores/react"
 import type { ParseKeys } from "i18next"
 import {
@@ -105,18 +106,13 @@ export function WorkspaceLayout({
           key
         }
         onRenderTab={(node, values) => {
-          // 图标和标题自己订阅，跟着对话标题变化，不用 flexlayout 记下的名字
           const tabID = node.getId()
-          values.leading = (
-            <WorkspaceTabIcon
+          values.content = (
+            <WorkspaceTabLabel
               workspace={workspace}
               tabID={tabID}
-              className="size-4"
-              data-tab-closable={node.isEnableClose()}
+              closable={node.isEnableClose()}
             />
-          )
-          values.content = (
-            <WorkspaceTabTitle workspace={workspace} tabID={tabID} />
           )
           // name 是标签按钮的无障碍名称和溢出菜单里的名字，运行时有、类型里没有
           const named = values as ITabRenderValues & { name: string }
@@ -138,6 +134,45 @@ export function WorkspaceLayout({
         }}
       />
     </div>
+  )
+}
+
+// 标签页的图标和标题共用右键入口，关闭和拖动仍由 flexlayout 处理。
+function WorkspaceTabLabel({
+  workspace,
+  tabID,
+  closable,
+}: {
+  workspace: TabWorkspace
+  tabID: string
+  closable: boolean
+}) {
+  const tab = useStore(workspace.$tabs)[tabID]
+  const sync = workspace.getConversationSync(tabID)
+  const labelSync = sync ?? workspace.getRootSync()
+  const rootSessionID = useStore(labelSync.$rootSessionID)
+  const sessionID =
+    (tab?.kind === "sub-agent" ? tab.sessionID : rootSessionID) ?? ""
+  const session = useStore(labelSync.$sessions, { keys: [sessionID] })[
+    sessionID
+  ]?.session
+  const label = (
+    <span className="flex h-full min-w-0 items-center gap-1">
+      <WorkspaceTabIcon
+        workspace={workspace}
+        tabID={tabID}
+        className="size-4 shrink-0"
+        data-tab-closable={closable}
+      />
+      <span className="max-w-48 min-w-0 truncate">
+        <WorkspaceTabTitle workspace={workspace} tabID={tabID} />
+      </span>
+    </span>
+  )
+  return sync && session ? (
+    <SessionMenu session={session} sync={sync} trigger={label} />
+  ) : (
+    label
   )
 }
 

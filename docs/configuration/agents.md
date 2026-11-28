@@ -42,6 +42,23 @@ max_steps: 50                        # optional; default: 0 (no limit)
 
 Every model reference must resolve to a configured model, or the configuration fails to load.
 
+## ACP request parameters
+
+For an ACP agent, `acp.param_overwrite` sets request fields by ACP method name. Objects merge recursively. Configured scalars and arrays replace the original values. Temporary sessions also apply `acp.ephemeral_param_overwrite` last. Configure it when the adapter can avoid saving sessions to enable Web `/btw`. The Claude Code preset uses the following configuration.
+
+```yaml
+name: claude-code
+type: acp
+acp:
+  command: claude-agent-acp
+  ephemeral_param_overwrite:
+    session/new:
+      _meta:
+        claudeCode:
+          options:
+            persistSession: false
+```
+
 ## Customize the default agent
 
 `agents/default.yaml` is special: it starts from the built-in `default` agent and replaces only the fields you write. `name` may be left out (if present it must be `default`), and `instructions` is optional. To pin the default agent to one model, this is all you need:
@@ -53,7 +70,7 @@ model:
   model: claude-sonnet
 ```
 
-Every other agent file must set `name` and `instructions`.
+Every other native agent file must set `name` and `instructions`.
 
 If no model is configured at all, agents have no model until you [add a provider](models.md#add-a-provider-without-editing-files).
 

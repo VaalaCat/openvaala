@@ -12,6 +12,7 @@ import (
 	"github.com/VaalaCat/openvaala/internal/runtimeclient"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/charmbracelet/x/ansi"
@@ -647,6 +648,55 @@ func TestMCPCommand(t *testing.T) {
 			h.waitFor("mcp servers listed", func() bool { return !opened.fetch.isLoading })
 			if calls := h.client.getCalls("ListMCPServers"); !slices.Equal(calls, tt.wantCalls) {
 				t.Fatalf("ListMCPServers calls = %v, want %v", calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
+// TestExternalCommand 验证快照及后端更新后的候选、同名命令的归属和运行中的发送方式。
+func TestExternalCommand(t *testing.T) {
+	for _, tt := range []struct {
+		name, input, match, key, mode string
+		running                       bool
+	}{
+		{"compact_unreported", "/compact", "", "", "", false},
+		{"compact_reported", "/compact details", "compact", "enter", "normal", false},
+		{"agents_local", "/agents", "agents", "enter", "", false},
+		{"help_conflict", "/help", "help", "enter", "normal", false},
+		{"backend_with_args", "/review   my draft", "review", "enter", "steer", true},
+		{"queue_with_tab", "/review   my draft", "review", "tab", "normal", true},
+		{"update_removed", "/old", "", "", "", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newTUIHarness(t, 80, 24)
+			h.model.setConversation(&defs.Conversation{ID: "c1", RootSessionID: "s1"})
+			root := newRootInfo("")
+			if tt.running {
+				root = newRootInfo("working")
+			}
+			root.Session.External = &defs.ExternalSession{}
+			h.emit(&runtimeclient.ConversationSynced{ConversationID: "c1", SessionInfos: []runtime.SessionRuntimeInfo{root}},
+				&runtimeclient.SessionSynced{ConversationID: "c1", SessionID: "s1", External: true, HistoryAction: runtimeclient.HistoryReplace, Commands: []defs.ExternalCommand{{Name: "help"}, {Name: "old"}}})
+			if tt.input != "/help" && tt.input != "/compact" {
+				h.emit(&runtimeclient.SessionExternalStateChanged{NotificationTarget: runtimeprotocol.NotificationTarget{ConversationID: "c1", SessionID: "s1"}, Commands: []defs.ExternalCommand{{Name: "agents"}, {Name: "compact"}, {Name: "review", InputHint: "<text>"}}})
+			}
+			h.typeText(tt.input)
+			if got := getCommandNames(h.model.getSlashMatches()); got != tt.match {
+				t.Fatalf("matches=%q want %q", got, tt.match)
+			}
+			if tt.key == "" {
+				return
+			}
+			h.press(tt.key)
+			if tt.mode == "" {
+				if _, ok := h.model.activePanel.(*agentsPanel); !ok {
+					t.Fatalf("panel=%T", h.model.activePanel)
+				}
+				return
+			}
+			h.waitFor("external command submission", func() bool { return len(h.client.getCalls("SubmitInput")) == 1 })
+			if got := h.client.getCalls("SubmitInput")[0]; got != "SubmitInput c1 "+tt.mode+" "+tt.input {
+				t.Fatalf("submit=%q", got)
 			}
 		})
 	}

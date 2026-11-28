@@ -1,4 +1,6 @@
 import {
+  captureExternalUI,
+  chooseExternalModel,
   expect,
   expectDocumentNotScrollable,
   getComposer,
@@ -547,3 +549,52 @@ test("long_history_mounts_only_rows_near_the_view", async ({
     Math.abs((await middleMessage.boundingBox())!.y - middleTop)
   ).toBeLessThanOrEqual(2)
 })
+
+for (const manual of [false, true]) {
+  test(
+    "external_import_search_preview_manual_" + manual,
+    async ({ page, fixture }) => {
+      await fixture.withExternalAgent(
+        manual ? ["-list=false"] : ["-sessions=16"],
+        async () => {
+          await fixture.openApp(page)
+          await chooseExternalModel(page)
+          await page.getByRole("button", { name: "导入已有会话" }).click()
+          const dialog = page.getByRole("dialog", {
+            name: "导入 codex-acp 会话",
+          })
+          if (manual) {
+            await expect(dialog).toContainText(
+              "external agent does not support session listing"
+            )
+            await dialog.getByRole("textbox").last().fill("manual-id")
+          } else {
+            await dialog.getByRole("button", { name: "加载更多" }).click()
+            await expect(
+              dialog.getByText("chat 8", { exact: true })
+            ).toBeVisible()
+            await dialog.getByRole("searchbox").fill("Needle")
+            await expect(
+              dialog.getByText("chat 8", { exact: true })
+            ).toHaveCount(0)
+            await dialog.getByText("Needle", { exact: true }).first().click()
+            const preview = dialog.getByRole("blockquote")
+            await expect(preview).toContainText("hello world")
+            await expect(preview).toContainText("latest")
+            await expect(preview).toHaveCSS("font-size", "12px")
+            await captureExternalUI(page, "import-preview")
+          }
+          await dialog
+            .getByRole("button", { name: "导入", exact: true })
+            .click()
+          await expect(
+            getMessages(page).getByText("hello world", { exact: true })
+          ).toBeVisible()
+          await expect(getMessages(page)).not.toContainText(
+            "<openvaala-session-info>"
+          )
+        }
+      )
+    }
+  )
+}

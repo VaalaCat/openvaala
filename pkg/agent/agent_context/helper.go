@@ -145,7 +145,11 @@ func itemsToLLMKitMessages(items []*defs.Item, isImageInputSupported bool) ([]*l
 			continue
 		}
 		if item.Kind == defs.ItemMessage {
-			item = omitUnsentMessageImages(item, sentImages, isImageInputSupported)
+			converted, err := getModelMessageItem(item, sentImages, isImageInputSupported)
+			if err != nil {
+				return nil, nil, fmt.Errorf("convert context item %d: %w", index, err)
+			}
+			item = converted
 		}
 
 		// 4. 按 ModelCallID 合并助手输出；CallID 重复或已结束的模型调用又出现时返回错误。
@@ -369,26 +373,33 @@ func getSentImages(items []*defs.Item, isImageInputSupported bool) map[*defs.Ima
 	return sentImages
 }
 
-// omitUnsentMessageImages 将未发送的消息图片替换为占位文字。
-func omitUnsentMessageImages(item *defs.Item, sentImages map[*defs.ImageContent]bool, isImageInputSupported bool) *defs.Item {
-	// 1. 检查消息是否有未选中的图片，没有时返回原 Item。
-	isUnsent := func(content *defs.Content) bool { return isImageContent(content) && !sentImages[content.Image] }
-	if !slices.ContainsFunc(item.Message.Content, isUnsent) {
-		return item
+// getModelMessageItem 将文件附件和未发送的图片转换为模型看到的文字。
+func getModelMessageItem(item *defs.Item, sentImages map[*defs.ImageContent]bool, isImageInputSupported bool) (*defs.Item, error) {
+	// 1. 找出需要转换的消息内容。
+	isUnsentImage := func(content *defs.Content) bool { return isImageContent(content) && !sentImages[content.Image] }
+	if !slices.ContainsFunc(item.Message.Content, func(content *defs.Content) bool {
+		return content != nil && (content.Kind == defs.ContentFile || isUnsentImage(content))
+	}) {
+		return item, nil
 	}
-	// 2. 克隆消息，再原位替换副本中未发送的图片。
-	omitted := item.Clone()
+	// 2. 在消息副本中替换对应的内容块。
+	converted := item.Clone()
 	for index, content := range item.Message.Content {
-		if isUnsent(content) {
-			omitted.Message.Content[index] = &defs.Content{
-				Kind: defs.ContentText,
-				Text: &defs.TextContent{
-					Text: getOmittedImageText(content.Image, isImageInputSupported),
-				},
+		var text string
+		switch {
+		case content != nil && content.Kind == defs.ContentFile:
+			if err := content.Validate(); err != nil {
+				return nil, err
 			}
+			text = prompt.FormatAttachment(*content.File)
+		case isUnsentImage(content):
+			text = getOmittedImageText(content.Image, isImageInputSupported)
+		default:
+			continue
 		}
+		converted.Message.Content[index] = &defs.Content{Kind: defs.ContentText, Text: &defs.TextContent{Text: text}}
 	}
-	return omitted
+	return converted, nil
 }
 
 // toolResultImagesToMessage 将工具结果图片转换为用户消息。
@@ -601,14 +612,10 @@ func agentMessageToMessage(item *defs.Item, message *llmkit.Message) (*llmkit.Me
 	if item.Message.From.Kind != defs.IdentityAgent || !validRelation {
 		return nil, errors.New("invalid agent message sender")
 	}
-	// 2. 收集消息文本并包装来源信息，替换为单个文本块。
-	textParts := make([]string, len(message.Content))
-	for index, block := range message.Content {
-		textParts[index] = block.Text
-	}
+	// 2. 先放派活携带的历史，再包装本次 Agent 消息。
 	message.Content = []llmkit.ContentBlock{{
 		Type: llmkit.ContentTypeText,
-		Text: prompt.FormatAgentMessage(defs.SessionID(item.Message.From.ID), *sender, textParts),
+		Text: prompt.FormatAgentMessage(item.Message),
 	}}
 	return message, nil
 }
@@ -735,16 +742,6 @@ func missingToolResultMessage(callID string) (*llmkit.Message, error) {
 			Message: "tool result is missing",
 		},
 	}).ToLLMKit()
-}
-
-// cloneItems 返回切片及每条 Item 的副本。
-func cloneItems(items []*defs.Item) []*defs.Item {
-	// 1. 复制切片并依次克隆 Item。
-	cloned := slices.Clone(items)
-	for index := range cloned {
-		cloned[index] = cloned[index].Clone()
-	}
-	return cloned
 }
 
 // NewTokenUsage 将 llmkit 用量转换为输入、输出、缓存和推理用量。

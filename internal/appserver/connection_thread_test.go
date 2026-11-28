@@ -165,12 +165,18 @@ func TestConnectionThreadReportsSelectedModel(t *testing.T) {
 	effort := func(value string) *string { return &value }
 	tests := []struct {
 		name         string
+		external     *defs.ExternalSession
 		session      defs.ModelSelection   // Session 记录里的选择
 		model        *defs.ModelDefinition // Session 详情里的 Model；nil 表示所选模型不在目录里
 		wantModel    string                // Thread 报告的 model
 		wantEffort   *string               // Thread 报告的 reasoningEffort
 		wantProvider string                // Thread 报告的 modelProvider
 	}{
+		{
+			name:      "external_session_without_reported_model",
+			external:  &defs.ExternalSession{AgentType: defs.AgentTypeACP, SessionID: "peer"},
+			wantModel: "",
+		},
 		{
 			name: "selected_model_in_catalog",
 			session: defs.ModelSelection{
@@ -229,6 +235,7 @@ func TestConnectionThreadReportsSelectedModel(t *testing.T) {
 						ID:             sessionID,
 						ConversationID: conversationID,
 						AgentName:      "assistant",
+						External:       tt.external,
 						Model:          tt.session,
 					},
 					Model: tt.model,

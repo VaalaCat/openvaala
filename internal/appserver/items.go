@@ -476,8 +476,9 @@ func isToolCallSplit(items []*defs.Item, order storage.Direction) bool {
 // ── Thread、Turn 翻译 ──
 
 // newCodexRootThread 从对话记录和模型选择创建根 Thread。
-func newCodexRootThread(record defs.Conversation, model defs.ModelSelection, pathMappings config.PathMappings, isWindowsClient bool, status codexThreadStatus, version string) codexThread {
+func newCodexRootThread(record defs.Conversation, root defs.Session, pathMappings config.PathMappings, isWindowsClient bool, status codexThreadStatus, version string) codexThread {
 	// 1. 截取标题前 256 个字符，空标题和空强度使用 null，填写分叉来源。
+	model := root.Model
 	var name, reasoningEffort *string
 	title := defs.TruncateConversationTitle(record.Title)
 	if title != "" {
@@ -493,6 +494,10 @@ func newCodexRootThread(record defs.Conversation, model defs.ModelSelection, pat
 		forkedFromID = &source
 	}
 	// 2. Thread 与 Session ID 使用对话 ID，cwd 使用归属目录的客户端映射，时间转为 Unix 秒，允许直接输入。
+	modelName := model.Ref.String()
+	if root.External != nil && model.Ref == (defs.ModelRef{}) {
+		modelName = ""
+	}
 	return codexThread{
 		ID:                   string(record.ID),
 		SessionID:            string(record.ID),
@@ -500,7 +505,7 @@ func newCodexRootThread(record defs.Conversation, model defs.ModelSelection, pat
 		Preview:              title,
 		Cwd:                  pathMappings.GetClientPath(record.ExecutorSettings.GetConversationDirectory(), isWindowsClient),
 		ModelProvider:        model.Ref.ProviderID,
-		Model:                model.Ref.String(),
+		Model:                modelName,
 		ReasoningEffort:      reasoningEffort,
 		CreatedAt:            getUUIDv7Seconds(string(record.ID)),
 		UpdatedAt:            record.UpdatedAt / 1000,
@@ -517,7 +522,7 @@ func newCodexRootThread(record defs.Conversation, model defs.ModelSelection, pat
 // newCodexChildThread 从子 Session 和层级记录创建子 Thread。
 func newCodexChildThread(record defs.Conversation, child subAgentSession, pathMappings config.PathMappings, isWindowsClient bool, status codexThreadStatus, version string) codexThread {
 	// 1. 沿用对话标题和目录，替换子 Session ID、创建及更新时间，填入父 Thread、层数和 Agent 信息，禁止直接输入并清空分叉来源。
-	thread := newCodexRootThread(record, child.record.Model, pathMappings, isWindowsClient, status, version)
+	thread := newCodexRootThread(record, child.record, pathMappings, isWindowsClient, status, version)
 	nickname, role, parentThreadID := child.record.TaskName, child.record.AgentName, child.parentThreadID
 	thread.ID, thread.SessionID = string(child.record.ID), string(child.record.ID)
 	thread.CreatedAt = getUUIDv7Seconds(string(child.record.ID))
@@ -534,17 +539,23 @@ func newCodexChildThread(record defs.Conversation, child subAgentSession, pathMa
 }
 
 // newCodexHistoryThread 按存储记录创建不带 Turn 的历史 Thread。
-func newCodexHistoryThread(thread historyThread, sessions []defs.Session, pathMappings config.PathMappings, isWindowsClient bool, status codexThreadStatus, version string) codexThread {
+func newCodexHistoryThread(thread historyThread, sessions []defs.Session, pathMappings config.PathMappings, isWindowsClient bool, live threadLiveInfo, version string) codexThread {
 	// 1. 找到子 Session 时创建子 Thread，否则读取根 Session 模型创建根 Thread，状态由调用方提供。
 	subAgents := getSubAgentSessions(thread.conversation, sessions)
 	if index := slices.IndexFunc(subAgents, func(subAgent subAgentSession) bool { return subAgent.record.ID == thread.sessionID }); index >= 0 {
-		return newCodexChildThread(thread.conversation, subAgents[index], pathMappings, isWindowsClient, status, version)
+		if subAgents[index].record.External != nil {
+			subAgents[index].record.Model = live.model
+		}
+		return newCodexChildThread(thread.conversation, subAgents[index], pathMappings, isWindowsClient, live.status, version)
 	}
-	var model defs.ModelSelection
+	var root defs.Session
 	if index := slices.IndexFunc(sessions, func(record defs.Session) bool { return record.ID == thread.sessionID }); index >= 0 {
-		model = sessions[index].Model
+		root = sessions[index]
+		if root.External != nil {
+			root.Model = live.model
+		}
 	}
-	return newCodexRootThread(thread.conversation, model, pathMappings, isWindowsClient, status, version)
+	return newCodexRootThread(thread.conversation, root, pathMappings, isWindowsClient, live.status, version)
 }
 
 // newCodexThreadOpenResult 创建 Thread 打开结果和历史起点游标；hasExecutors 为 false（对话没有装配 Executor）时沙箱报告只读。

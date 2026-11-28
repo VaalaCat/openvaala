@@ -21,7 +21,7 @@ func TestGenerateProtocolTypes(t *testing.T) {
 		{"header", "// 由 internal/protocolgen 生成，不要手改"},
 		{"protocol_version", `export const ProtocolVersion = "6"`},
 		{"agent_list_method", `"agent/list": ListAgentsResult`},
-		{"agent_info_fields", "export interface AgentInfo {\n    name: string;\n    description?: string;"},
+		{"agent_info_fields", "export interface AgentInfo {\n    name: string;\n    type: AgentType;\n    description?: string;"},
 		{"terminal_open_method", `"terminal/open": TerminalOpenParams`},
 		{"terminal_attach_method", `"terminal/attach": TerminalAttachParams`},
 		{"terminal_attach_result", `"terminal/attach": TerminalAttachResult`},

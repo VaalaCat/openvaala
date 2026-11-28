@@ -35,6 +35,11 @@ import {
 import { DefaultTool } from "../components/conversation/tools/default"
 import { ReadFileTool } from "../components/conversation/tools/read-file"
 import {
+  GetWorldMessageTool,
+  ListWorldPeersTool,
+  SendWorldMessageTool,
+} from "../components/conversation/tools/world"
+import {
   getContentText,
   getToolResultsByCallID,
   type TurnView,
@@ -173,6 +178,9 @@ const toolRenderers: Record<string, ToolRenderer> = {
   read_file: ReadFileTool,
   spawn_agent: SpawnAgentTool,
   send_message: SendMessageTool,
+  send_world_message: SendWorldMessageTool,
+  list_world_peers: ListWorldPeersTool,
+  get_world_message: GetWorldMessageTool,
   wait_agent: WaitAgentTool,
   interrupt_agent: InterruptAgentTool,
   list_agents: ListAgentsTool,
@@ -215,6 +223,9 @@ export function getToolActionLabel(name: string, t: TFunction): string {
     grep: "conversation.process.actions.grep",
     spawn_agent: "conversation.process.actions.spawn_agent",
     send_message: "conversation.process.actions.send_message",
+    send_world_message: "conversation.process.actions.send_world_message",
+    list_world_peers: "conversation.process.actions.list_world_peers",
+    get_world_message: "conversation.process.actions.get_world_message",
     wait_agent: "conversation.process.actions.wait_agent",
     interrupt_agent: "conversation.process.actions.interrupt_agent",
     list_agents: "conversation.process.actions.list_agents",

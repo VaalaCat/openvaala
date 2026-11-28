@@ -18,7 +18,7 @@ const (
 	InterruptAgentDescription = "请求取消指定后代当前正在执行的 Turn。" +
 		"返回 cancel_requested 和选定的 turn_id，或无活动 Turn 时返回 no_active_turn；不等待取消完成。" +
 		"排队输入和它的子任务继续运行；可通过 wait_agent 或 list_agents 查看后续结果与状态。"
-	ListAgentsDescription = "使用空参数对象读取全部后代；sessions 中每项的 session 保存身份与父子关系，status 保存活动 Turn、排队数量和最近 Turn 状态，" +
+	ListAgentsDescription = "默认查询当前工作目录最近 24 小时内更新的非后台后代，最多 20 条。agents 中每项的 session 保存身份与父子关系，status 保存活动 Turn、排队数量和最近 Turn 状态，" +
 		"usage 是已保存 Turn 的累计 token 用量，context_window 是该 Session 所选模型的上下文窗口。" +
 		"使用 session.id 选择通信、等待或中断的目标；这是查询时的工作快照，不等待任务完成、不领取结果正文，也不启动历史任务。"
 	ListExecutorsDescription = "无参数时只查询当前在线的全部 Executor（含服务端与已连接客户端），返回默认标记、说明、工作目录和可用工具名，不影响前缀缓存。" +
@@ -26,8 +26,8 @@ const (
 	ReadSessionHistoryDescription = "需要子任务的详细执行过程时，读取指定后代在 fork 之后自身已保存的消息、工具调用与结果。" +
 		"从最新内容向更早历史分页，每页 Items 按时间正序返回；使用非零 next_cursor 继续，为 0 时结束。" +
 		"返回资料省略加密推理、provider RawJSON 和图片 base64；查询不启动执行，也不影响结果通知。"
-	WaitAgentDescription = "暂停当前工作，直到收到 steer 消息（Agent 消息或用户补充输入）、子任务结果通知或超时。normal 消息排队等待新 Turn，不会唤醒本次等待。" +
-		"返回 reason：user_steer、subagent_result、agent_message 或 timeout（同时存在时按此顺序），from 为发送消息的 Agent SessionID；不返回正文。" +
+	WaitAgentDescription = "暂停当前工作，直到收到 steer 消息（Agent 消息或用户补充输入）、子任务结果通知或超时。排入下一轮的 Agent 回报也会唤醒等待。" +
+		"返回 reason：user_steer、subagent_result、agent_message 或 timeout（同时存在时按此顺序），from 为发送消息的 Agent SessionID，text 为子任务最终正文。" +
 		"可选 wait_for: \"subagent_result\" 优先返回已有未读补充；没有未读补充且没有运行中的后代时立即返回 no_running_subagents，可用 list_agents 查看状态。" +
 		"消息正文会在下一次模型请求中读入；省略参数默认等待 30 秒，超时不会取消子任务。"
 	BashDescription = "在工作区后台启动一条 Bash 命令（省略 cwd 时在工作区根目录运行），最多等 wait_seconds 秒后返回 command_id、status 和从头开始的第一页输出（stdout、stderr 合并）。" +
@@ -62,8 +62,8 @@ func FormatSpawnAgentDescription(agents []AgentEntry, models []*defs.ModelDefini
 	var description strings.Builder
 	description.WriteString("将可独立执行的工作委派给一个直接子 Agent，子任务可以并行运行。" +
 		"message 应提供目标、必要材料和预期交付物；默认不继承历史，需要时明确设置 fork_turns。" +
-		"返回 session_id、task_name 和 accepted 表示首个任务已接收，不表示已经完成；子任务每个 Turn 结束后，结果以通知消息自动进入你的收件箱，在下一次模型请求前读入。" +
-		"需要暂停等待时使用 wait_agent，它只在新消息到达时唤醒、不返回正文。")
+		"返回 session_id 和 input_item_id 表示首个任务已接收。默认在每轮结束时回报，notify_on_finish=false 关闭自动回报。" +
+		"需要等待子任务结果时使用 wait_agent，可读取最终正文。")
 	// 2. 按名字排序列出 Agent 和用途说明。
 	description.WriteString("可选 agent_name（省略时与当前 Agent 相同）：")
 	for _, definition := range slices.SortedFunc(slices.Values(agents), func(a, b AgentEntry) int {

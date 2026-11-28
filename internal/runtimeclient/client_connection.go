@@ -3,13 +3,17 @@ package runtimeclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
+	"github.com/VaalaCat/openvaala/pkg/world"
 	"github.com/coder/websocket"
 )
 
@@ -26,7 +30,8 @@ const (
 
 // clientConnection 是一条已建立的 WebSocket 连接：为请求分配 id 并配对响应，把通知交给 Client 事件循环。
 type clientConnection struct {
-	conn *websocket.Conn
+	conn    world.SecureChannel
+	writeMu sync.Mutex
 	// 调试采样出口由 Client 创建，连接只尽力投递，不拥有记录。
 	rpcConnectionID uint64
 	rpcSamples      chan<- RPCFrame
@@ -43,8 +48,39 @@ type clientConnection struct {
 	closed chan struct{}
 }
 
-// dialConnection 建立 WebSocket 连接。
-func dialConnection(ctx context.Context, url, token string) (*websocket.Conn, error) {
+// authenticateWorldRPC 在已校验身份的通道中发送 Token，等待节点确认。
+func authenticateWorldRPC(ctx context.Context, conn world.SecureChannel, token string) error {
+	data, _ := json.Marshal(struct {
+		Token string `json:"token"`
+	}{token})
+	if err := conn.WriteMessage(ctx, data); err != nil {
+		return err
+	}
+	data, err := conn.ReadMessage(ctx)
+	if err != nil {
+		return err
+	}
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return err
+	}
+	if result.Error == "unauthorized" {
+		return &serverRuntimeError{message: "unauthorized", sentinel: ErrUnauthorized}
+	}
+	if !result.OK {
+		return errors.New("invalid World authentication response")
+	}
+	return nil
+}
+
+// dialConnection 建立普通 WebSocket 或 World 加密通道。
+func (c *clientImpl) dialConnection(ctx context.Context, url, token string, target *world.RemoteAccessTarget) (world.SecureChannel, error) {
+	if target != nil {
+		return c.peerDialer.DialPeer(ctx, target.GetDisplayName(), target.PublicKey, target.Entries, nil, world.ChannelPurposeRPC)
+	}
 	// 1. 设置 Bearer token，按拨号超时建立连接。
 	header := http.Header{}
 	if token != "" {
@@ -62,11 +98,11 @@ func dialConnection(ctx context.Context, url, token string) (*websocket.Conn, er
 	}
 	// 3. 设置单帧读取上限并返回连接。
 	conn.SetReadLimit(maxFrameBytes)
-	return conn, nil
+	return runtimeprotocol.WebSocketMessages{Conn: conn}, nil
 }
 
 // newClientConnection 保存 WebSocket 和客户端事件入口。
-func newClientConnection(conn *websocket.Conn, loopInputs chan<- clientLoopInput) *clientConnection {
+func newClientConnection(conn world.SecureChannel, loopInputs chan<- clientLoopInput) *clientConnection {
 	// 1. 保存连接和事件入口，创建连接结束通知。
 	return &clientConnection{
 		conn:       conn,
@@ -79,10 +115,10 @@ func newClientConnection(conn *websocket.Conn, loopInputs chan<- clientLoopInput
 func (c *clientConnection) Run(ctx context.Context) error {
 	// 1. 连接断开或 ctx 结束时返回，先关闭连接，再关闭结束通知并唤醒等待中的请求。
 	defer close(c.closed)
-	defer c.conn.CloseNow()
+	defer c.conn.Close()
 	// 2. 持续读取并解码消息，读取或解码失败时返回错误。
 	for {
-		_, frame, err := c.conn.Read(ctx)
+		frame, err := c.conn.ReadMessage(ctx)
 		if err != nil {
 			return err
 		}
@@ -176,7 +212,12 @@ func (c *clientConnection) writeFrame(ctx context.Context, method string, payloa
 	}
 	// 3. 写出文本帧，将连接错误转为 ErrConnectionLost。
 	c.observeRPCFrame(RPCSent, payload)
-	if err := c.conn.Write(ctx, websocket.MessageText, payload); err != nil {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.conn.WriteMessage(ctx, payload); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

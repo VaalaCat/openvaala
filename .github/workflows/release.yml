@@ -254,3 +254,35 @@ jobs:
           fi
           gh release upload "$VERSION" dist/release/* --clobber
           gh release edit "$VERSION" --draft=false
+
+  docker:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      KO_DOCKER_REPO: docker.io/vaalacat/openvaala
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      # 正式 tag 已包含 prepare 构建的 WebUI。
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.version }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: ko-build/setup-ko@v0.9
+        with:
+          version: v0.18.1
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish image
+        run: ko build ./cmd/openvaala --bare --sbom=none -t "$VERSION,latest"
+      - uses: imjasonh/setup-crane@v0.4
+      - name: Copy release tags to GHCR
+        run: |
+          crane copy "$KO_DOCKER_REPO:$VERSION" "ghcr.io/vaalacat/openvaala:$VERSION"
+          crane copy "$KO_DOCKER_REPO:$VERSION" ghcr.io/vaalacat/openvaala:latest

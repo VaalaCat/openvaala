@@ -1,5 +1,5 @@
 import { CircleAlert, ListTree } from "lucide"
-import { LayoutGroup, motion } from "motion/react"
+import { AnimatePresence, LayoutGroup, motion } from "motion/react"
 import {
   memo,
   useCallback,
@@ -120,12 +120,14 @@ export function MessageScroller({
     () => rows.flatMap((row) => (row.kind === "turn" ? [row.turnID] : [])),
     [rows]
   )
+  const historyGeneration = useStore(sync.$historyGeneration)
   const turns = useQuery({
     ...turnsOptions(
       connection,
       sync.conversationID,
       isReady ? sync.getFollowedSessionID() : "",
-      turnIDs
+      turnIDs,
+      historyGeneration
     ),
     enabled: isReady && turnIDs.length > 0,
     select: getTurnsByID,
@@ -203,19 +205,31 @@ export function MessageScroller({
           />
         )
       }
+      fadeInRows={!!historyGeneration}
       header={
-        isReady ? (
-          <>
-            {header}
-            {rows.length === 0 && (
-              <p className="py-8 text-center text-body color-muted">
-                {t("conversation.empty")}
-              </p>
-            )}
-          </>
-        ) : (
-          loadingContent
-        )
+        <AnimatePresence initial={false} mode="popLayout">
+          {isReady ? (
+            <>
+              {header}
+              {rows.length === 0 && (
+                <p className="py-8 text-center text-body color-muted">
+                  {t("conversation.empty")}
+                </p>
+              )}
+            </>
+          ) : (
+            <motion.div
+              key="loading"
+              exit={{ opacity: 0 }}
+              transition={{
+                duration: historyGeneration ? 0.15 : 0,
+                ease: "easeOut",
+              }}
+            >
+              {loadingContent}
+            </motion.div>
+          )}
+        </AnimatePresence>
       }
       footer={footer}
       ariaLabel={t("conversation.messages")}

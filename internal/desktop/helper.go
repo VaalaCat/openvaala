@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
+	"github.com/VaalaCat/openvaala/pkg/world"
 )
 
 func conversationTitle(conv defs.Conversation) string {
@@ -617,21 +619,26 @@ func previousConversationHint() string {
 	return "Ctrl+Tab"
 }
 
-// toProviderHeaders 把请求头编辑行转成 Provider 的 headers：名称去掉首尾空白，名称为空的行忽略，值为空的行照常保留；没有可保存的行时返回 nil。
-func toProviderHeaders(rows []*providerHeaderDraft) map[string]string {
-	// 1. 逐行收集有名称的条目。
-	var headers map[string]string
-	for _, row := range rows {
-		name := strings.TrimSpace(row.Name)
-		if name == "" {
-			continue
-		}
-		if headers == nil {
-			headers = map[string]string{}
-		}
-		headers[name] = row.Value
+func newKeyValueRows(values map[string]string) []*keyValueDraft {
+	var rows []*keyValueDraft
+	for _, name := range slices.Sorted(maps.Keys(values)) {
+		rows = append(rows, &keyValueDraft{Name: name, Value: values[name]})
 	}
-	return headers
+	return rows
+}
+
+// keyValueMap 忽略空名称，保留值的原文。没有可保存的行时省略配置项。
+func keyValueMap(rows []*keyValueDraft) map[string]string {
+	var values map[string]string
+	for _, row := range rows {
+		if name := strings.TrimSpace(row.Name); name != "" {
+			if values == nil {
+				values = map[string]string{}
+			}
+			values[name] = row.Value
+		}
+	}
+	return values
 }
 
 const (
@@ -723,13 +730,26 @@ const (
 	runtimeServerWSPath = "/api/v1/openvaala"
 )
 
+type remoteServerInput struct {
+	URL, Token, DefaultName string
+	ExtractedToken          bool
+	WorldTarget             *world.RemoteAccessTarget
+}
+
 // parseRemoteServerInput 把用户粘贴的 openvaala web 链接、ws(s) 链接或 host:port 规范成干净的 WebSocket 地址和令牌。
 // 当输入串自带 token 时 extractedToken 为 true，调用方可据此自动覆盖表单里的令牌框。
-func parseRemoteServerInput(rawURL, fallbackToken string) (parsedURL, parsedToken, defaultName string, extractedToken bool, err error) {
+func parseRemoteServerInput(rawURL, fallbackToken string) (remoteServerInput, error) {
 	// 1. 去掉空白；无 scheme 时默认按 ws:// 解析。
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
-		return "", "", "", false, errors.New("server address is required")
+		return remoteServerInput{}, errors.New("server address is required")
+	}
+	if strings.Contains(trimmed, "#world=") {
+		target, err := world.ParseRemoteAccessURL(trimmed)
+		if err != nil {
+			return remoteServerInput{}, err
+		}
+		return remoteServerInput{URL: strings.SplitN(trimmed, "&token=", 2)[0], Token: cmp.Or(target.Token, strings.TrimSpace(fallbackToken)), ExtractedToken: target.Token != "", DefaultName: target.Name, WorldTarget: &target}, nil
 	}
 	candidate := trimmed
 	if !strings.Contains(candidate, "://") {
@@ -737,7 +757,7 @@ func parseRemoteServerInput(rawURL, fallbackToken string) (parsedURL, parsedToke
 	}
 	parsed, err := url.Parse(candidate)
 	if err != nil {
-		return "", "", "", false, fmt.Errorf("invalid server address: %w", err)
+		return remoteServerInput{}, fmt.Errorf("invalid server address: %w", err)
 	}
 	// 2. 按协议规范 scheme 和路径，并从 fragment 或 query 里拆出 token。
 	token := ""
@@ -762,26 +782,44 @@ func parseRemoteServerInput(rawURL, fallbackToken string) (parsedURL, parsedToke
 			parsed.Path, parsed.RawPath = runtimeServerWSPath, ""
 		}
 	default:
-		return "", "", "", false, fmt.Errorf("unsupported server url scheme %q", parsed.Scheme)
+		return remoteServerInput{}, fmt.Errorf("unsupported server url scheme %q", parsed.Scheme)
 	}
 	if parsed.Host == "" {
-		return "", "", "", false, errors.New("server host is required")
+		return remoteServerInput{}, errors.New("server host is required")
 	}
 	// 3. 清除查询参数和 fragment，只保存干净连接地址。
 	parsed.RawQuery, parsed.Fragment, parsed.RawFragment = "", "", ""
 	if token != "" {
-		return parsed.String(), token, parsed.Host, true, nil
+		return remoteServerInput{URL: parsed.String(), Token: token, DefaultName: parsed.Hostname(), ExtractedToken: true}, nil
 	}
-	return parsed.String(), strings.TrimSpace(fallbackToken), parsed.Host, false, nil
+	return remoteServerInput{URL: parsed.String(), Token: strings.TrimSpace(fallbackToken), DefaultName: parsed.Hostname()}, nil
 }
 
-// getRemoteServerHost 提取服务器地址里的 host[:port] 供副标题显示；解析失败时返回原文。
-func getRemoteServerHost(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Host == "" {
-		return rawURL
+// getServerDisplay 返回列表标题和次行地址；相同文字只显示一次。
+func getServerDisplay(server remoteServer) (name, address string) {
+	input, _ := parseRemoteServerInput(server.URL, "")
+	raw := server.URL
+	name = server.Name
+	if target := input.WorldTarget; target != nil {
+		name = cmp.Or(name, target.Name)
+		if target.Node != "" && target.Domain != "" {
+			address = (world.Address{Node: target.Node, Domain: target.Domain}).NodeAddress()
+		}
+		if len(target.Entries.DirectURLs) > 0 {
+			raw = target.Entries.DirectURLs[0]
+		} else {
+			raw = target.Entries.Relays[0]
+		}
 	}
-	return parsed.Host
+	if server.NodeAddr != nil {
+		address = *server.NodeAddr
+	}
+	endpoint, _ := url.Parse(raw)
+	name, address = cmp.Or(name, endpoint.Hostname()), cmp.Or(address, endpoint.Host)
+	if name == address {
+		address = ""
+	}
+	return name, address
 }
 
 // newRemoteServerID 生成不与现有档案冲突的远端服务器稳定 ID。

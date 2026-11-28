@@ -97,6 +97,7 @@ function ConversationWorkspace({ workspace }: { workspace: TabWorkspace }) {
     return () => observer.disconnect()
   }, [])
   const isDesktop = isDesktopViewport && hasPanelSpace
+  const [showBackground, setShowBackground] = useState(false)
   const isMobile = useIsMobile()
   const layout = useStore($conversationLayout)
   const isRightPanelCollapsed = useStore($isRightPanelCollapsed)
@@ -228,6 +229,8 @@ function ConversationWorkspace({ workspace }: { workspace: TabWorkspace }) {
               {(!isRightPanelCollapsed || hasPanelContent) && (
                 <WorkspaceDetails
                   sync={lastSync}
+                  showBackground={showBackground}
+                  setShowBackground={setShowBackground}
                   debugTarget={debugTarget}
                   onClose={() => {
                     panelGroupRef.current?.setAttribute(
@@ -250,6 +253,8 @@ function ConversationWorkspace({ workspace }: { workspace: TabWorkspace }) {
             </DrawerTitle>
             <WorkspaceDetails
               sync={lastSync}
+              showBackground={showBackground}
+              setShowBackground={setShowBackground}
               debugTarget={debugTarget}
               onClose={() => setIsDrawerOpen(false)}
             />
@@ -270,9 +275,13 @@ function ConversationWorkspace({ workspace }: { workspace: TabWorkspace }) {
 // 右栏内容：只在调试页签订阅消息内容。
 function WorkspaceDetails({
   sync,
+  showBackground,
+  setShowBackground,
   debugTarget,
   onClose,
 }: {
+  showBackground: boolean
+  setShowBackground(value: boolean): void
   sync: ConversationSync
   debugTarget?: ItemDebugTarget
   onClose(): void
@@ -283,6 +292,8 @@ function WorkspaceDetails({
   return (
     <RightPanel
       sync={sync}
+      showBackground={showBackground}
+      setShowBackground={setShowBackground}
       isReady={sync.hasInitialData() && syncState !== "failed"}
       debugTarget={debugTarget}
       messageRows={messageRows}

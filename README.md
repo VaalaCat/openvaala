@@ -25,6 +25,7 @@ OpenVaala keeps the agent loop, tool execution and the interfaces apart — a ce
 
 OpenVaala runs on Linux and macOS (amd64 and arm64).
 
+- **Docker** — `docker pull vaalacat/openvaala` · [Docker deployment guide](https://vaalacat.github.io/openvaala/guides/docker).
 - **GitHub Releases** — download the `openvaala` binary for your platform, which includes the web UI, or a desktop package for macOS or Linux, from [Releases](https://github.com/VaalaCat/openvaala/releases).
 - **go install** — the command-line tool, or the desktop program (not an app package), from the latest release:
 

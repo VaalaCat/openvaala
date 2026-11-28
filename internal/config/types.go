@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 )
 
 // ── Config 配置错误 ──
@@ -34,38 +35,88 @@ var defaultHTTPHeaders = map[string]string{
 	"Conversation-Id": "${OPENVAALA_CONVERSATION_ID}",
 }
 
+// ── World 节点和控制面配置 ──
+
+// WorldConfig 分别配置同进程运行的节点和控制面。
+type WorldConfig struct {
+	RemoteAccess WorldRemoteAccessConfig `mapstructure:"remote_access" yaml:"remote_access,omitempty"`
+	// RelayInstances 是本公开 relay 所属集群的全部实例地址，为空时使用单实例。
+	RelayInstances []string          `mapstructure:"relay_instances" yaml:"relay_instances,omitempty"`
+	Relays         []string          `mapstructure:"relays" yaml:"relays,omitempty"`
+	RelayMode      string            `mapstructure:"relay_mode" yaml:"relay_mode,omitempty" flag:"relay-mode"`
+	WebURL         string            `mapstructure:"web_url" yaml:"web_url,omitempty"`
+	Node           WorldNodeConfig   `mapstructure:"node" yaml:"node,omitempty"`
+	Server         WorldServerConfig `mapstructure:"server" yaml:"server,omitempty"`
+}
+
+// WorldRemoteAccessConfig 保存本机远程访问开关和链接显示名。
+type WorldRemoteAccessConfig struct {
+	// 是否经 relay 开放本机 Runtime？
+	Enabled bool   `mapstructure:"enabled" yaml:"enabled" json:"enabled" default:"false"`
+	Name    string `mapstructure:"name" yaml:"name,omitempty" json:"name,omitempty"`
+}
+
+// WorldNodeConfig 描述本机节点的注册信息与对外开放的 Agent。
+type WorldNodeConfig struct {
+	// 是否在 serve 中运行本机节点？
+	Enabled          bool                           `mapstructure:"enabled" yaml:"enabled" default:"false"`
+	Name             string                         `mapstructure:"name" yaml:"name"`
+	Domain           string                         `mapstructure:"domain" yaml:"domain"`
+	ServerURL        string                         `mapstructure:"server_url" yaml:"server_url"`
+	DirectURLs       []string                       `mapstructure:"direct_urls" yaml:"direct_urls,omitempty"`
+	DefaultTarget    string                         `mapstructure:"default_target" yaml:"default_target,omitempty"`
+	AdvertiseTargets []worldserver.AdvertisedTarget `mapstructure:"advertise_targets" yaml:"advertise_targets,omitempty"`
+}
+
+// WorldServerConfig 描述本域控制面的监听地址、管理凭据和初始规则。
+type WorldServerConfig struct {
+	// 是否启用域控制面？
+	Enabled    bool                  `mapstructure:"enabled" yaml:"enabled" default:"false"`
+	Listen     string                `mapstructure:"listen" yaml:"listen"`
+	Domain     string                `mapstructure:"domain" yaml:"domain"`
+	AdminToken string                `mapstructure:"admin_token" yaml:"admin_token"`
+	ACL        []worldserver.ACLRule `mapstructure:"acl" yaml:"acl,omitempty"`
+}
+
+// WorldSettings 是设置页可见的本机节点和控制面配置。
+type WorldSettings struct {
+	RemoteAccess WorldRemoteAccessConfig `json:"remote_access"`
+	Relays       []string                `json:"relays"`
+	RelayMode    string                  `json:"relay_mode"`
+	WebURL       string                  `json:"web_url"`
+	Node         WorldNodeSettings       `json:"node"`
+	Server       WorldServerSettings     `json:"server"`
+}
+
+// WorldSettingsUpdate 保存已校验的配置变更，注册完成后补入控制面确认的节点身份。
+type WorldSettingsUpdate struct {
+	// 保存后是否启用节点？
+	NodeEnabled bool
+	fields      map[string]any
+	node        map[string]any
+	server      WorldServerSettings
+}
+
+type WorldNodeSettings struct {
+	Enabled          bool                           `json:"enabled"`
+	Name             string                         `json:"name"`
+	Domain           string                         `json:"domain"`
+	ServerURL        string                         `json:"server_url"`
+	DirectURLs       []string                       `json:"direct_urls"`
+	DefaultTarget    string                         `json:"default_target"`
+	AdvertiseTargets []worldserver.AdvertisedTarget `json:"advertise_targets"`
+}
+
+type WorldServerSettings struct {
+	Enabled           bool   `json:"enabled"`
+	Domain            string `json:"domain"`
+	IsDatabaseCreated bool   `json:"is_database_created"`
+}
+
 // ── Agent 文件配置 ──
 
 // defaultAgentName 是内置 default Agent 的名字，也是 run.agent_name 的默认值。
 const defaultAgentName = "default"
-
-// AgentConfig 是 agents/ 下一个 Agent 文件的内容；agents/default.yaml 没写的字段沿用内置 default Agent。
-type AgentConfig struct {
-	// Name 必须和文件名一致。
-	Name string `yaml:"name"`
-	// Description 是 Agent 的用途说明。
-	Description string `yaml:"description,omitempty"`
-	// Instructions 是 Agent 的指令，不能为空。
-	Instructions string `yaml:"instructions"`
-	// Model 是 Agent 的主模型；省略时加载后取默认模型，模型目录为空时保持为 nil。
-	Model *AgentModelConfig `yaml:"model,omitempty"`
-	// CompactModel 是生成上下文摘要使用的模型；省略时使用 Model。
-	CompactModel *AgentModelConfig `yaml:"compact_model,omitempty"`
-	// Tools 是可用普通工具名，由使用方的工具目录解释；省略时可用全部普通工具。
-	Tools []string `yaml:"tools,omitempty"`
-	// Skills 是可用 skill 名，由使用方的 skill 目录解释；省略时可用全部 skill。
-	Skills []string `yaml:"skills,omitempty"`
-	// MCPServers 是可用的 MCP server id；省略时全部可用（包括客户端连接带来的 MCP server），[] 表示不用 MCP。
-	MCPServers defs.OptionalStringList `yaml:"mcp_servers,omitempty"`
-	// MaxSteps 是一轮最多调用模型的次数；省略或 0 表示不限，不能为负。
-	MaxSteps int `yaml:"max_steps,omitempty"`
-}
-
-// AgentModelConfig 引用 Provider 中的模型别名。
-type AgentModelConfig struct {
-	Provider string `yaml:"provider"`
-	Model    string `yaml:"model,omitempty"`
-}
 
 // ── Executor 文件配置 ──
 

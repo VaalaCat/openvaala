@@ -1,3 +1,4 @@
+import { KeyValueRows } from "@/components/base/key-value-rows"
 import {
   Tooltip,
   TooltipTrigger,
@@ -24,7 +25,7 @@ import { EntityCombobox } from "@/components/base/entity-combobox"
 import { NumberUnitInput } from "@/components/base/number-unit-input"
 import { TokenNumberValue } from "@/components/base/token-number-value"
 import { FormInput } from "@/components/base/form-input"
-import { PageActions } from "@/components/base/page-layout"
+import { SettingsDraftActions } from "@/components/settings/settings-layout"
 import { RequestError } from "@/components/base/request-error"
 import { RowList } from "@/components/base/row-list"
 import { SecretInput } from "@/components/base/secret-input"
@@ -56,7 +57,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { LatticeLoader } from "@/components/base/lattice-loader"
 import { useDraftBaseline } from "@/hooks/use-draft-baseline"
 import type { ModelDefaults, ProviderConfig } from "@/lib/api/protocol.gen"
 import type { DraftBaselineRules } from "@/lib/draft-baseline"
@@ -79,7 +79,6 @@ import {
   toProviderConfig,
   toProviderHeaders,
   type ProviderDraft,
-  type ProviderHeaderDraft,
   type ProviderModelDraft,
   type ProviderModelIssues,
 } from "@/lib/provider-form"
@@ -200,14 +199,6 @@ export function ProviderEditor({
       id: !providerID || draft.id === catalogProviderID ? choice.id : draft.id,
       protocol: choice.protocol || providerProtocols[0],
       baseURL: choice.base_url,
-    })
-  }
-
-  function changeHeader(index: number, patch: Partial<ProviderHeaderDraft>) {
-    change({
-      headers: draft.headers.map((each, i) =>
-        i === index ? { ...each, ...patch } : each
-      ),
     })
   }
 
@@ -344,63 +335,29 @@ export function ProviderEditor({
         ? t("settings.providerEditor.idDuplicate", { name: providerID })
         : undefined
 
+  function revert() {
+    edit.revert()
+    setDefaultModelID("")
+    setHasSubmitted(false)
+    setExpandedModelID(undefined)
+    save.reset()
+  }
+
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <UnsavedChangesGuard dirty={dirty} />
-      <PageActions>
-        {isCreating ? (
-          <Button
-            className="text-ui"
-            type="submit"
-            form="provider-editor"
-            disabled={save.isPending || isCreated || !isConnected}
-          >
-            {save.isPending ? (
-              <LatticeLoader
-                data-icon="inline-start"
-                aria-label={t("common.loading")}
-              />
-            ) : (
-              <PlusIcon data-icon="inline-start" />
-            )}
-            {t("settings.providerEditor.create")}
-          </Button>
-        ) : (
-          <>
-            <Button
-              className="text-ui"
-              type="button"
-              variant="outline"
-              disabled={save.isPending || !edit.dirty}
-              onClick={() => {
-                edit.revert()
-                setDefaultModelID("")
-                setHasSubmitted(false)
-                setExpandedModelID(undefined)
-                save.reset()
-              }}
-            >
-              {t("settings.providerEditor.revert")}
-            </Button>
-            <Button
-              className="text-ui"
-              type="submit"
-              form="provider-editor"
-              disabled={
-                save.isPending || !edit.dirty || edit.stale || !isConnected
-              }
-            >
-              {save.isPending && (
-                <LatticeLoader
-                  data-icon="inline-start"
-                  aria-label={t("common.loading")}
-                />
-              )}
-              {t("settings.providerEditor.apply")}
-            </Button>
-          </>
-        )}
-      </PageActions>
+      <SettingsDraftActions
+        dirty={edit.dirty}
+        saving={save.isPending}
+        saveDisabled={!isConnected || (isCreating ? isCreated : edit.stale)}
+        saveLabel={
+          isCreating
+            ? t("settings.providerEditor.create")
+            : t("settings.providerEditor.apply")
+        }
+        form="provider-editor"
+        onRevert={isCreating ? undefined : revert}
+      />
       {save.isError && <RequestError error={save.error} />}
       {edit.stale && (
         <p role="status" className="text-caption color-warning">
@@ -590,73 +547,14 @@ export function ProviderEditor({
                 )}
               >
                 <FieldGroup className="process-disclosure-content min-w-0 gap-3 pt-3">
-                  {draft.headers.map((header, index) => (
-                    <div
-                      key={index}
-                      className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_auto]"
-                    >
-                      <Input
-                        aria-label={t("settings.providerEditor.headerName")}
-                        className="text-ui"
-                        value={header.name}
-                        autoComplete="off"
-                        spellCheck={false}
-                        onChange={(event) =>
-                          changeHeader(index, { name: event.target.value })
-                        }
-                      />
-                      <Input
-                        aria-label={t("settings.providerEditor.headerValue")}
-                        className="text-ui"
-                        value={header.value}
-                        autoComplete="off"
-                        spellCheck={false}
-                        onChange={(event) =>
-                          changeHeader(index, { value: event.target.value })
-                        }
-                      />
-                      <Tooltip>
-                        <TooltipTrigger
-                          render={
-                            <Button
-                              className="col-start-2 row-span-2 row-start-1 text-ui sm:col-start-3 sm:row-span-1"
-                              type="button"
-                              variant="ghost"
-                              size="icon-sm"
-                              aria-label={t(
-                                "settings.providerEditor.removeHeader"
-                              )}
-                              onClick={() =>
-                                change({
-                                  headers: draft.headers.filter(
-                                    (_, i) => i !== index
-                                  ),
-                                })
-                              }
-                            />
-                          }
-                        >
-                          <XIcon />
-                        </TooltipTrigger>
-                        <TooltipContent className="text-caption">
-                          {t("settings.providerEditor.removeHeader")}
-                        </TooltipContent>
-                      </Tooltip>
-                    </div>
-                  ))}
-                  <Button
-                    className="self-start text-ui"
-                    type="button"
-                    variant="outline"
-                    onClick={() =>
-                      change({
-                        headers: [...draft.headers, { name: "", value: "" }],
-                      })
-                    }
-                  >
-                    <PlusIcon data-icon="inline-start" />
-                    {t("settings.providerEditor.addHeader")}
-                  </Button>
+                  <KeyValueRows
+                    rows={draft.headers}
+                    onChange={(headers) => change({ headers })}
+                    nameLabel={t("settings.providerEditor.headerName")}
+                    valueLabel={t("settings.providerEditor.headerValue")}
+                    addLabel={t("settings.providerEditor.addHeader")}
+                    removeLabel={t("settings.providerEditor.removeHeader")}
+                  />
                   <p className="text-caption wrap-anywhere color-muted">
                     {t("settings.providerEditor.headersHint")}
                   </p>

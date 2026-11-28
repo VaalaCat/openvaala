@@ -42,6 +42,8 @@ import { notifyFailure } from "@/lib/notify"
 export function PendingInputs({ sync }: { sync: ConversationSync }) {
   const { t } = useTranslation()
   const pending = useStore(sync.$pendingInputs)
+  const supportsSteer = useStore(sync.$externalState).capabilities
+    ?.supports_steer
   const followedSessionID = sync.getFollowedSessionID()
   const activeTurnID = useStore(sync.$sessions, { keys: [followedSessionID] })[
     followedSessionID
@@ -64,7 +66,7 @@ export function PendingInputs({ sync }: { sync: ConversationSync }) {
       if (kind === "retrieve") {
         const content = await sync.withdrawInput(input.item_id, true)
         setDraft(sync.serverID, sync.conversationID, { content: content! })
-      } else if (kind === "steer") {
+      } else if (kind === "steer" && supportsSteer !== false) {
         await sync.steerInput(input.item_id, pending.steer_turn_id!)
       } else {
         await sync.interruptTurnWithInput(activeTurnID!, input.item_id)
@@ -170,7 +172,11 @@ export function PendingInputs({ sync }: { sync: ConversationSync }) {
                         >
                           <PendingInputRow
                             input={input}
-                            steerTurnID={pending.steer_turn_id}
+                            steerTurnID={
+                              supportsSteer === false
+                                ? activeTurnID
+                                : pending.steer_turn_id
+                            }
                             activeTurnID={activeTurnID}
                             isReady={isReady}
                             actionPending={action.isPending}

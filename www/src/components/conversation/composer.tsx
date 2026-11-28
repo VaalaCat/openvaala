@@ -9,7 +9,13 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from "react"
-import { ListEndIcon, PlusIcon, XIcon } from "lucide-react"
+import {
+  BookOpen,
+  SquareTerminal,
+  ListEndIcon,
+  PlusIcon,
+  XIcon,
+} from "lucide-react"
 import { ArrowUp, Square } from "lucide"
 import { MorphIcon } from "morphicons/react"
 import { AnimatePresence, motion, useIsPresent } from "motion/react"
@@ -17,7 +23,8 @@ import { useStore } from "@nanostores/react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
 import { useServerConnection } from "@/components/server-connection-provider"
-import { ImagePreview } from "@/components/base/image-preview"
+import { BrandIcon } from "@/components/base/brand-icon"
+import { AttachmentStrip } from "./attachment-strip"
 import { Button } from "@/components/ui/button"
 import {
   InputGroup,
@@ -40,15 +47,20 @@ import { shouldShowLoadError } from "@/lib/rpc-error"
 import { LatticeLoader } from "@/components/base/lattice-loader"
 import type { ConversationSync } from "@/lib/api/conversation-sync"
 import type {
+  AgentInfo,
+  ExternalCommand,
   Content,
   ConversationID,
   SessionInputMode,
   SkillInfo,
 } from "@/lib/api/protocol.gen"
 import {
+  attachmentStatus,
+  attachmentBudgetBytes,
   checkAttachmentBudget,
   getImageBytes,
   readImageAsDataURL,
+  uploadDraftFiles,
 } from "@/lib/attachments"
 import {
   getSideConversationQuestion,
@@ -71,29 +83,36 @@ import { skillListOptions, type SkillTarget } from "@/lib/query/skill"
 import { getRpcErrorMessage } from "@/lib/rpc-error"
 import { cn } from "@/lib/utils"
 
-export type ComposerProps =
+export type ComposerProps = {
+  externalAgent?: AgentInfo
+  commands?: ExternalCommand[]
+  supportsSteer?: boolean
+} &
   // 对话页：提交到这个对话；isRunning 时可以补充、排队、插队和中断。
   // 给了 onSideConversation 才有内置的 /btw：输入以 /btw 开头时调用它开旁支，成功后清掉输入框里的文字，失败时抛错、文字保留
-  | {
-      serverID: string
-      conversationID: ConversationID
-      sync: ConversationSync
-      isReady: boolean
-      isRunning: boolean
-      sessionControls: ReactNode
-      contextUsage: ReactNode
-      onSideConversation?(question: string): Promise<void>
-      // 输入框挂上时是否直接获得焦点
-      autoFocus?: boolean
-    }
-  // 新对话页：建对话并提交第一条输入；返回 false 时页面已在字段旁写明没提交的原因，其他失败抛错。
-  // 斜杠补全按还没建的对话的 Agent 和 Executor 设置查 skill
-  | {
-      serverID: string
-      onCreateAndSubmit(content: Content[]): Promise<boolean>
-      sessionControls: ReactNode
-      skillTarget: SkillTarget
-    }
+  (
+    | {
+        serverID: string
+        conversationID: ConversationID
+        sync: ConversationSync
+        uploadFile(file: File): Promise<Content>
+        isReady: boolean
+        isRunning: boolean
+        sessionControls: ReactNode
+        contextUsage: ReactNode
+        onSideConversation?(question: string): Promise<void>
+        // 输入框挂上时是否直接获得焦点
+        autoFocus?: boolean
+      }
+    // 新对话页：建对话并提交第一条输入；返回 false 时页面已在字段旁写明没提交的原因，其他失败抛错。
+    // 斜杠补全按还没建的对话的 Agent 和 Executor 设置查 skill
+    | {
+        serverID: string
+        onCreateAndSubmit(content: Content[]): Promise<boolean>
+        sessionControls: ReactNode
+        skillTarget: SkillTarget
+      }
+  )
 
 // 输入完整草稿、补全 Skill，并发送或排队；成功后只移除已发送的内容。
 export function Composer(props: ComposerProps) {
@@ -112,9 +131,7 @@ export function Composer(props: ComposerProps) {
     useStore($drafts, { keys: [draftKey] })[draftKey] ??
     getDraft(serverID, draftID)
   const text = getDraftText(draft.content)
-  const attachments = draft.content.flatMap((content, index) =>
-    content.kind === "image" && content.image ? [{ content, index }] : []
-  )
+  const attachments = draft.content.filter((item) => item.image || item.file)
   const materials = draft.content.flatMap((content, index) =>
     content.kind === "text" && content.text?.is_context
       ? [{ content, index }]
@@ -122,27 +139,20 @@ export function Composer(props: ComposerProps) {
   )
   const isConnected = useStore(connection.$state) === "connected"
   // 最近一次加图片没加进去的原因，显示在输入框里；再加图片、移除图片或发送成功后清掉
-  const [attachmentError, setAttachmentError] = useState<string>()
+
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // 补全插入后光标要放的位置，文字更新后的 layout effect 里放好
   const pendingCaretRef = useRef<number | undefined>(undefined)
-  const targetRef = useRef<string | undefined>(draftKey)
   useLayoutEffect(() => {
-    // 1. 切目标后清掉光标任务与文件选择。
-    targetRef.current = draftKey
     pendingCaretRef.current = undefined
     if (fileInputRef.current) fileInputRef.current.value = ""
-    return () => {
-      targetRef.current = undefined
-    }
   }, [draftKey])
   // 返回这条输入是否已提交
   const submit = useMutation({
     mutationFn: async (variables: {
       draftKey: string
-      sync?: ConversationSync
-      create?: (content: Content[]) => Promise<boolean>
+      target: ComposerProps
       // 输入是 /btw 命令时开旁支，不当作普通输入发送
       openSideConversation?: () => Promise<void>
       content: Content[]
@@ -152,8 +162,16 @@ export function Composer(props: ComposerProps) {
         await variables.openSideConversation()
         return true
       }
-      if (!variables.sync) return variables.create!(variables.content)
-      await variables.sync.submitInput(variables.content, variables.mode)
+      const target = variables.target
+      if ("onCreateAndSubmit" in target)
+        return target.onCreateAndSubmit(variables.content)
+      // 新建页发送期间追加的文件会随草稿进入已创建的对话。
+      const content = await uploadDraftFiles(
+        variables.content,
+        target.sync.conversationID,
+        target.uploadFile
+      )
+      await target.sync.submitInput(content, variables.mode)
       return true
     },
   })
@@ -169,7 +187,6 @@ export function Composer(props: ComposerProps) {
     setCursor(0)
     setIsSlashDismissed(true)
     setHighlightedIndex(0)
-    setAttachmentError(undefined)
   }
   const slashToken = isSlashDismissed ? undefined : getSlashToken(text, cursor)
   const skills = useQuery({
@@ -179,22 +196,31 @@ export function Composer(props: ComposerProps) {
         ? { conversationID: props.sync.conversationID }
         : props.skillTarget
     ),
-    enabled: !!slashToken && isReady && isConnected,
+    enabled: !props.externalAgent && !!slashToken && isReady && isConnected,
   })
-  const builtinCommands: SkillInfo[] =
+  const builtinCommands: SlashCommand[] =
     onSideConversation && slashToken?.start === 0
       ? [
           {
             name: "btw",
             description: t("composer.btwDescription"),
-            path: "",
-            executor: "",
+            type: "builtin",
           },
         ]
       : []
   const matches = slashToken
     ? matchSkills(
-        [...builtinCommands, ...(skills.data ?? [])],
+        [
+          ...builtinCommands,
+          ...(props.externalAgent
+            ? (props.commands ?? [])
+                .filter((c) => !builtinCommands.some((b) => b.name === c.name))
+                .map((c) => ({ ...c, type: "external" as const }))
+            : (skills.data ?? []).map((c) => ({
+                ...c,
+                type: "skill" as const,
+              }))),
+        ],
         slashToken.prefix
       )
     : []
@@ -202,7 +228,8 @@ export function Composer(props: ComposerProps) {
     isReady &&
     isConnected &&
     !!slashToken &&
-    (skills.isPending || skills.isError || matches.length > 0)
+    ((!props.externalAgent && (skills.isPending || skills.isError)) ||
+      matches.length > 0)
   const highlighted = Math.min(
     highlightedIndex,
     Math.max(matches.length - 1, 0)
@@ -234,7 +261,15 @@ export function Composer(props: ComposerProps) {
   )
   const isSubmitting =
     submit.isPending && submit.variables?.draftKey === draftKey
-  const canSubmit = isReady && isConnected && !isSubmitting && hasContent
+  const canSubmit =
+    isReady &&
+    isConnected &&
+    !isSubmitting &&
+    hasContent &&
+    !attachments.some((item) => {
+      const status = attachmentStatus.get(item)
+      return status?.loading || (status?.error && !status.file)
+    })
 
   // 提交完整内容，成功后移除本次发送的部分。
   async function handleSubmit(mode: SessionInputMode = "steer") {
@@ -249,15 +284,16 @@ export function Composer(props: ComposerProps) {
     try {
       isSubmitted = await submit.mutateAsync({
         draftKey,
-        sync,
-        create:
-          "onCreateAndSubmit" in props ? props.onCreateAndSubmit : undefined,
+        target: props,
         openSideConversation:
           sideQuestion === undefined
             ? undefined
             : () => onSideConversation!(sideQuestion),
         content,
-        mode,
+        mode:
+          mode === "steer" && isRunning && props.supportsSteer === false
+            ? "interrupt"
+            : mode,
       })
     } catch (error) {
       notifyFailure(error, t)
@@ -278,59 +314,84 @@ export function Composer(props: ComposerProps) {
             ),
           }
     )
-    if (targetRef.current === draftKey) setAttachmentError(undefined)
   }
 
-  // 加入图片：合计超过上限时这一批都不加并在输入框里提示；逐张读成 data URL 按原顺序加入，读不出的提示失败，
-  // 其余照常加入
-  async function addImages(images: File[]) {
-    if (images.length === 0) return
-    const budget = checkAttachmentBudget(
-      attachments.map(({ content }) => getImageBytes(content.image!.data_url)),
-      images.map((image) => image.size)
-    )
-    if (!budget.ok) {
-      setAttachmentError(t("composer.attachmentsTooLarge"))
-      return
-    }
-    const results = await Promise.allSettled(images.map(readImageAsDataURL))
-    const added = results.flatMap((result, index): Content[] =>
-      result.status === "fulfilled"
-        ? [
-            {
-              kind: "image",
-              image: { data_url: result.value, alt: images[index].name },
-            },
-          ]
-        : []
-    )
+  async function addFiles(files: File[]) {
+    const entries = files.map((file): Content => ({
+      kind: "file",
+      file: { name: file.name, mime: file.type, size: file.size, path: "" },
+    }))
     const latest = getDraft(serverID, draftID)
-    if (
-      !checkAttachmentBudget(
-        latest.content.flatMap((each) =>
-          each.image ? [getImageBytes(each.image.data_url)] : []
-        ),
-        added.map((each) => getImageBytes(each.image!.data_url))
-      ).ok
-    ) {
-      if (targetRef.current === draftKey)
-        setAttachmentError(t("composer.attachmentsTooLarge"))
-      else notifyFailure(new Error(t("composer.attachmentsTooLarge")), t)
-      return
+    let inlineBytes = latest.content.reduce(
+      (bytes, item) =>
+        bytes +
+        (item.image
+          ? getImageBytes(item.image.data_url)
+          : item.file?.mime.startsWith("image/") &&
+              attachmentStatus.get(item)?.loading
+            ? item.file.size
+            : 0),
+      0
+    )
+    for (const [i, item] of entries.entries()) {
+      const file = files[i]
+      const tooLarge = file.size > attachmentBudgetBytes
+      const exceedsBudget =
+        !tooLarge &&
+        file.type.startsWith("image/") &&
+        !checkAttachmentBudget([inlineBytes], [file.size]).ok
+      const error = tooLarge
+        ? t("externalSession.tooLarge")
+        : exceedsBudget
+          ? t("composer.attachmentsTooLarge")
+          : undefined
+      if (!error && file.type.startsWith("image/")) inlineBytes += file.size
+      const stageFile =
+        !error && !file.type.startsWith("image/") && !("sync" in props)
+      attachmentStatus.set(item, {
+        id: crypto.randomUUID?.() ?? Math.random().toString(36),
+        loading: !error && !stageFile,
+        file: stageFile ? file : undefined,
+        error,
+      })
     }
-    if (targetRef.current === draftKey)
-      setAttachmentError(
-        added.length < images.length ? t("composer.imageReadFailed") : undefined
-      )
-    else {
-      const failedRead = results.find((result) => result.status === "rejected")
-      if (failedRead?.status === "rejected") notifyFailure(failedRead.reason, t)
-    }
-    setDraft(serverID, draftID, { content: [...latest.content, ...added] })
+    setDraft(serverID, draftID, { content: [...latest.content, ...entries] })
+    await Promise.all(
+      entries.map(async (item, i) => {
+        const status = attachmentStatus.get(item)!
+        if (!status.loading) return
+        const file = files[i]
+        let result = item
+        try {
+          if (file.type.startsWith("image/")) {
+            result = {
+              kind: "image",
+              image: {
+                alt: file.name,
+                data_url: await readImageAsDataURL(file),
+              },
+            }
+          } else if ("sync" in props) {
+            result = await props.uploadFile(file)
+          }
+          attachmentStatus.set(result, { id: status.id })
+        } catch (error) {
+          attachmentStatus.set(item, {
+            id: status.id,
+            error: getRpcErrorMessage(error, t),
+          })
+        }
+        const draft = getDraft(serverID, draftID)
+        if (draft.content.includes(item))
+          setDraft(serverID, draftID, {
+            content: draft.content.map((c) => (c === item ? result : c)),
+          })
+      })
+    )
   }
 
   // 用选中的 skill 换掉光标处的斜杠词，后面补一个空格
-  function insertSkill(skill: SkillInfo) {
+  function insertSkill(skill: SlashCommand) {
     if (!slashToken) return
     const replacement = "/" + skill.name + " "
     pendingCaretRef.current = slashToken.start + replacement.length
@@ -397,19 +458,19 @@ export function Composer(props: ComposerProps) {
     }
   }
 
-  // 剪贴板里有图片文件时才拦截，纯文字照常粘贴
+  // 剪贴板含文件时加入附件，纯文字照常粘贴。
   function handlePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
-    const images = getImageFiles(event.clipboardData.files)
-    if (images.length === 0) return
+    const files = Array.from(event.clipboardData.files)
+    if (files.length === 0) return
     event.preventDefault()
-    void addImages(images)
+    void addFiles(files)
   }
 
-  // 拖入文件时不让浏览器打开它，图片加进这条输入
+  // 拖入的文件加入这条输入。
   function handleDrop(event: DragEvent<HTMLDivElement>) {
     if (!event.dataTransfer.types.includes("Files")) return
     event.preventDefault()
-    void addImages(getImageFiles(event.dataTransfer.files))
+    void addFiles(Array.from(event.dataTransfer.files))
   }
 
   return (
@@ -424,7 +485,12 @@ export function Composer(props: ComposerProps) {
       {isSlashOpen && (
         <SlashSkillList
           id={listboxID}
-          skills={skills}
+          skills={{
+            ...skills,
+            isPending: !props.externalAgent && skills.isPending,
+            isError: !props.externalAgent && skills.isError,
+          }}
+          icon={props.externalAgent?.icon ?? ""}
           matches={matches}
           highlighted={highlighted}
           onHighlight={setHighlightedIndex}
@@ -442,30 +508,22 @@ export function Composer(props: ComposerProps) {
         {sync && sync.hasInitialData() && (
           <PendingInputs key={`pending:${draftKey}`} sync={sync} />
         )}
-        <AnimatePresence key={`attachments:${draftKey}`} initial={false}>
-          {attachments.length > 0 && (
-            <motion.div
-              key="attachments"
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: "auto", opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.2 }}
-              className="order-first w-full overflow-hidden"
-            >
-              <AttachmentStrip
-                attachments={attachments}
-                onRemove={(id) => {
-                  setDraft(serverID, draftID, {
-                    content: getDraft(serverID, draftID).content.filter(
-                      (_, index) => index !== id
-                    ),
-                  })
-                  setAttachmentError(undefined)
-                }}
-              />
-            </motion.div>
+        <div
+          className={cn(
+            "order-first w-full min-w-0",
+            attachments.length > 0 && "pt-2"
           )}
-        </AnimatePresence>
+        >
+          <AttachmentStrip
+            contents={attachments}
+            onRemove={(item) => {
+              const latest = getDraft(serverID, draftID)
+              setDraft(serverID, draftID, {
+                content: latest.content.filter((c) => c !== item),
+              })
+            }}
+          />
+        </div>
         {materials.length > 0 && (
           <InputGroupAddon
             align="block-start"
@@ -514,7 +572,11 @@ export function Composer(props: ComposerProps) {
           rows={1}
           value={text}
           aria-label={t("composer.label")}
-          placeholder={t("composer.placeholder")}
+          placeholder={t(
+            props.externalAgent
+              ? "externalSession.placeholder"
+              : "composer.placeholder"
+          )}
           autoFocus={"autoFocus" in props && props.autoFocus}
           aria-autocomplete="list"
           aria-controls={isSlashOpen ? listboxID : undefined}
@@ -552,7 +614,7 @@ export function Composer(props: ComposerProps) {
                     variant="ghost"
                     size="icon"
                     className="h-8 w-7"
-                    aria-label={t("composer.addImage")}
+                    aria-label={t("externalSession.add")}
                     onClick={() => fileInputRef.current?.click()}
                   />
                 }
@@ -560,18 +622,10 @@ export function Composer(props: ComposerProps) {
                 <PlusIcon />
               </TooltipTrigger>
               <TooltipContent className="text-caption">
-                {t("composer.addImage")}
+                {t("externalSession.add")}
               </TooltipContent>
             </Tooltip>
             {props.sessionControls}
-            {attachmentError && (
-              <span
-                role="alert"
-                className="min-w-0 truncate text-caption color-destructive"
-              >
-                {attachmentError}
-              </span>
-            )}
           </div>
           <div className="flex shrink-0 items-center gap-1">
             {"contextUsage" in props && props.contextUsage}
@@ -590,11 +644,10 @@ export function Composer(props: ComposerProps) {
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/*"
         multiple
         hidden
         onChange={(event) => {
-          void addImages(getImageFiles(event.target.files))
+          void addFiles(Array.from(event.target.files ?? []))
           event.target.value = ""
         }}
       />
@@ -605,13 +658,15 @@ export function Composer(props: ComposerProps) {
 // 已有对话内容后同步失败时，在输入框上方显示错误。
 function ConversationSyncError({ sync }: { sync: ConversationSync }) {
   const error = useStore(sync.$syncError)
-  if (!error || !shouldShowLoadError(error)) return null
+  if (!error || sync.$restoreError.get() || !shouldShowLoadError(error))
+    return null
   return <RequestError error={error} />
 }
 
 // 斜杠补全列表：先列出匹配的内置命令和 skill，查 skill 时在后面显示加载格点、失败时写原因；点选不让输入框失去焦点
 function SlashSkillList({
   id,
+  icon,
   skills,
   matches,
   highlighted,
@@ -620,10 +675,11 @@ function SlashSkillList({
 }: {
   id: string
   skills: { isPending: boolean; isError: boolean; error: unknown }
-  matches: SkillInfo[]
+  icon: string
+  matches: SlashCommand[]
   highlighted: number
   onHighlight(index: number): void
-  onPick(skill: SkillInfo): void
+  onPick(skill: SlashCommand): void
 }) {
   const { t } = useTranslation()
   return (
@@ -639,17 +695,28 @@ function SlashSkillList({
           id={id + "-" + index}
           role="option"
           aria-selected={index === highlighted}
-          className="flex cursor-default flex-col px-2 py-1 aria-selected:bg-accent aria-selected:text-accent-foreground"
+          className="flex cursor-default items-start gap-2 px-2 py-1 aria-selected:bg-accent aria-selected:text-accent-foreground"
           onMouseDown={(event) => event.preventDefault()}
           onMouseEnter={() => onHighlight(index)}
           onClick={() => onPick(skill)}
         >
-          <span className="text-table wrap-anywhere">/{skill.name}</span>
-          {skill.description && (
-            <span className="truncate text-caption color-muted">
-              {skill.description}
-            </span>
-          )}
+          <span className="mt-1 flex shrink-0">
+            {skill.type === "external" ? (
+              <BrandIcon icon={icon} />
+            ) : skill.type === "builtin" ? (
+              <SquareTerminal className="size-4" />
+            ) : (
+              <BookOpen className="size-4" />
+            )}
+          </span>
+          <div className="flex min-w-0 flex-col">
+            <span className="text-table wrap-anywhere">/{skill.name}</span>
+            {skill.description && (
+              <span className="truncate text-caption color-muted">
+                {skill.description}
+              </span>
+            )}
+          </div>
         </div>
       ))}
       {skills.isPending ? (
@@ -663,59 +730,6 @@ function SlashSkillList({
         </p>
       ) : null}
     </div>
-  )
-}
-
-// 输入框上方待发送图片的缩略图，每张右上角可以移除
-function AttachmentStrip({
-  attachments,
-  onRemove,
-}: {
-  attachments: { content: Content; index: number }[]
-  onRemove(id: number): void
-}) {
-  const { t } = useTranslation()
-  const isPresent = useIsPresent()
-  return (
-    <InputGroupAddon
-      align="block-start"
-      className="flex-wrap gap-2 px-3"
-      inert={!isPresent}
-      aria-hidden={!isPresent}
-    >
-      {attachments.map(({ content, index }) => (
-        <div key={index} className="relative">
-          <ImagePreview
-            src={content.image!.data_url}
-            alt={content.image!.alt ?? t("composer.image")}
-            className="size-16 border object-cover"
-          />
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="icon-xs"
-                  className="absolute top-1 right-1"
-                  aria-label={t("composer.removeImage", {
-                    name: content.image!.alt ?? t("composer.image"),
-                  })}
-                  onClick={() => onRemove(index)}
-                />
-              }
-            >
-              <XIcon />
-            </TooltipTrigger>
-            <TooltipContent className="text-caption">
-              {t("composer.removeImage", {
-                name: content.image!.alt ?? t("composer.image"),
-              })}
-            </TooltipContent>
-          </Tooltip>
-        </div>
-      ))}
-    </InputGroupAddon>
   )
 }
 
@@ -851,13 +865,13 @@ function QueueButton({
   )
 }
 
-// 文件列表里的图片
-function getImageFiles(files: FileList | null): File[] {
-  return [...(files ?? [])].filter((file) => file.type.startsWith("image/"))
+type SlashCommand = Pick<SkillInfo, "name"> & {
+  description?: string
+  type: "external" | "builtin" | "skill"
 }
 
 // 按前缀匹配 skill，不分大小写；插件 skill 名是「插件名:skill 名」，输入 skill 名开头也能匹配。同 TUI 的补全规则
-function matchSkills(skills: SkillInfo[], prefix: string): SkillInfo[] {
+function matchSkills(skills: SlashCommand[], prefix: string): SlashCommand[] {
   const lowered = prefix.toLowerCase()
   return skills.filter((skill) => {
     const name = skill.name.toLowerCase()

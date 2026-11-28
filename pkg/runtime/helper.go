@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"slices"
@@ -70,6 +71,14 @@ func isSameExecutorSettings(a, b defs.ExecutorSettings) bool {
 		maps.Equal(a.WorkspaceDirectories, b.WorkspaceDirectories)
 }
 
+// IsSameSessionRuntimeInfo 两份 Session 运行信息是否相同？
+func IsSameSessionRuntimeInfo(a, b SessionRuntimeInfo) bool {
+	// 1. 比较 Session 记录、运行状态、轮次、模型及用量。
+	return defs.IsSameSession(a.Session, b.Session) && a.State == b.State && a.ActiveTurnID == b.ActiveTurnID &&
+		a.LastTurnID == b.LastTurnID && a.LastTurnStatus == b.LastTurnStatus && a.ActiveTurnModel == b.ActiveTurnModel &&
+		a.Context == b.Context && a.Usage == b.Usage
+}
+
 // newSkillInfos 取出各 skill 的展示字段。
 func newSkillInfos(skills []*skill.Skill) []skill.SkillInfo {
 	// 1. 按原顺序提取名称、说明、路径和 Executor。
@@ -85,12 +94,16 @@ func newSkillInfos(skills []*skill.Skill) []skill.SkillInfo {
 	return infos
 }
 
-// newAgentInfos 按定义的顺序取出各 Agent 的名称、说明和默认模型。
+// newAgentInfos 按定义的顺序取出各 Agent 的名称、类型、说明和默认模型。
 func newAgentInfos(agents []*agent.AgentDefinition) []AgentInfo {
 	// 1. 默认模型未指定时保持零值，序列化时省略。
 	infos := make([]AgentInfo, len(agents))
 	for index, definition := range agents {
-		infos[index] = AgentInfo{Name: definition.Name, Description: definition.Description, DefaultModel: definition.Model}
+		infos[index] = AgentInfo{
+			Name: definition.Name, Type: cmp.Or(definition.Type, defs.AgentTypeNative),
+			Description: definition.Description, DefaultModel: definition.Model,
+			Icon: definition.GetIconKey(),
+		}
 	}
 	return infos
 }
@@ -158,4 +171,24 @@ func getArchivedConversation(record defs.Conversation, archived bool) (archivedR
 		record.ArchivedAt = time.Now().UnixMilli()
 	}
 	return record, true
+}
+
+// resolveCreateModel 把外部模型引用解析为根 Agent 和后端初始选项。
+func resolveCreateModel(request CreateConversationRequest, agents []*agent.AgentDefinition) CreateConversationRequest {
+	for _, definition := range agents {
+		if !definition.Type.IsExternal() || definition.Name != request.Model.Ref.ProviderID {
+			continue
+		}
+		request.AgentName = definition.Name
+		request.InitialOptions = slices.DeleteFunc(slices.Clone(request.InitialOptions), func(option defs.ExternalOptionSelection) bool {
+			return option.Kind == "model"
+		})
+		model := request.Model.Ref.ModelID
+		if model != "" && model != "default" {
+			request.InitialOptions = append(request.InitialOptions, defs.ExternalOptionSelection{Kind: "model", Value: model})
+		}
+		request.Model = defs.ModelSelection{}
+		break
+	}
+	return request
 }

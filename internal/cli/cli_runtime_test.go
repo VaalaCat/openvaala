@@ -829,9 +829,15 @@ func TestGetRuntimeConnection(t *testing.T) {
 	}
 	unreachableURL := "ws://" + getFreeServeAddress(t) + "/api/v1/openvaala"
 	tests := []struct {
-		name       string
-		runtimeURL string // --url
-		clientURL  string
+		name                    string
+		runtimeURL              string
+		runtimeToken            string
+		conversationID          defs.ConversationID
+		environmentURL          string
+		environmentToken        string
+		environmentConversation string
+		environmentSession      string
+		clientURL               string
 		// clientToken 是配置 client.token。
 		clientToken string
 		// file 是 runtime-server.yaml 的内容，为 nil 时不写文件；unreadableFile 为 true 时写入无法解析的内容。
@@ -848,6 +854,35 @@ func TestGetRuntimeConnection(t *testing.T) {
 				URL:           remoteURL,
 				Source:        runtimeConnectionSourceFlag,
 				LocalServerID: "file-server-id",
+			},
+		},
+		{
+			name:                    "flags_override_environment",
+			runtimeURL:              remoteURL,
+			runtimeToken:            "flag-token",
+			conversationID:          "flag-conversation",
+			environmentURL:          configURL,
+			environmentToken:        "env-token",
+			environmentConversation: "env-conversation",
+			environmentSession:      "env-session",
+			file:                    localFile,
+			want: runtimeConnection{
+				URL: remoteURL, Token: "flag-token", ConversationID: "flag-conversation", SessionID: "env-session",
+				Source: runtimeConnectionSourceFlag, LocalServerID: "file-server-id",
+			},
+		},
+		{
+			name:                    "environment_overrides_config_and_connection_file",
+			clientURL:               configURL,
+			clientToken:             "client-token",
+			environmentURL:          localURL,
+			environmentToken:        "env-token",
+			environmentConversation: "env-conversation",
+			environmentSession:      "env-session",
+			file:                    localFile,
+			want: runtimeConnection{
+				URL: localURL, Token: "env-token", ConversationID: "env-conversation", SessionID: "env-session",
+				Source: runtimeConnectionSourceEnvironment, LocalServerID: "file-server-id",
 			},
 		},
 		{
@@ -1039,6 +1074,10 @@ func TestGetRuntimeConnection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
+			t.Setenv("OPENVAALA_URL", tt.environmentURL)
+			t.Setenv("OPENVAALA_TOKEN", tt.environmentToken)
+			t.Setenv("OPENVAALA_CONVERSATION_ID", tt.environmentConversation)
+			t.Setenv("OPENVAALA_SESSION_ID", tt.environmentSession)
 			if tt.file != nil {
 				writeTestRuntimeServerFile(t, *tt.file)
 			}
@@ -1051,9 +1090,11 @@ func TestGetRuntimeConnection(t *testing.T) {
 			}
 			cfg.Client.URL, cfg.Client.Token = tt.clientURL, tt.clientToken
 			args := &AppArgs{
-				Config:     cfg,
-				RuntimeURL: tt.runtimeURL,
-				Executable: filepath.Join(t.TempDir(), "missing"),
+				Config:         cfg,
+				RuntimeURL:     tt.runtimeURL,
+				RuntimeToken:   tt.runtimeToken,
+				ConversationID: tt.conversationID,
+				Executable:     filepath.Join(t.TempDir(), "missing"),
 			}
 			got, err := getRuntimeConnection(t.Context(), args, runtimeServerIdleTimeout)
 			if err != nil {
@@ -1071,6 +1112,28 @@ func TestGetRuntimeConnection(t *testing.T) {
 	}
 }
 
+func TestRuntimeCommandSandboxConnectionHint(t *testing.T) {
+	for _, tc := range []struct {
+		name, sessionID string
+		wantHint        bool
+	}{
+		{"external session", "external-session", true},
+		{"operator", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("OPENVAALA_SESSION_ID", tc.sessionID)
+			t.Setenv("OPENVAALA_URL", "ws://"+getFreeServeAddress(t)+"/api/v1/openvaala")
+			cfg := writeTestConfig(t, "http://127.0.0.1:1", "assistant")
+			_, err := runCLI(t, cfg, "executor", "ls")
+			var opErr *net.OpError
+			if !errors.As(err, &opErr) || strings.Contains(err.Error(), "openvaala MCP") != tc.wantHint {
+				t.Fatalf("connection error = %v, want original network error with hint=%t", err, tc.wantHint)
+			}
+		})
+	}
+}
+
 // TestIsSameRuntimeServer 检查 serve 地址和端口匹配。
 func TestIsSameRuntimeServer(t *testing.T) {
 	// 1. 列出回环、远端、不同端口和无效地址场景。
@@ -1081,6 +1144,10 @@ func TestIsSameRuntimeServer(t *testing.T) {
 		fileURL string
 		want    bool
 	}{
+		{
+			name:       "World page on local server",
+			runtimeURL: "http://127.0.0.1:8790/web/v1/#world=remote",
+		},
 		{
 			name:       "same_loopback_ip",
 			runtimeURL: "ws://127.0.0.1:8790/api/v1/openvaala",

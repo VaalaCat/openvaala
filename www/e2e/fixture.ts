@@ -3,11 +3,14 @@ import type {
   ExecutorSettings,
   Message,
 } from "../src/lib/api/protocol.gen"
-import { spawn } from "node:child_process"
+import { createServer } from "node:net"
+import { promisify } from "node:util"
+import { randomUUID } from "node:crypto"
+import { spawn, execFile } from "node:child_process"
 import { once } from "node:events"
 import { existsSync } from "node:fs"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir, hostname } from "node:os"
 import path from "node:path"
 import {
   test as base,
@@ -59,6 +62,315 @@ export class WebUIFixture {
 
   constructor(state: FixtureState) {
     this.state = state
+  }
+
+  // 在这个 worker 的临时配置里装入真实的 ACP 测试进程，结束后还原。
+  async withExternalAgent(
+    args: string[],
+    run: () => Promise<void>,
+    zeroModels = false,
+    agentName = "codex-acp",
+    acp: Partial<import("../src/lib/api/protocol.gen").ACPCommand> = {}
+  ) {
+    const config = path.resolve(
+      this.state.workspaceDirectory,
+      "../home/.config/openvaala"
+    )
+    const agent = path.join(config, "agents", agentName + ".yaml")
+    const previousAgent = existsSync(agent) ? await readFile(agent) : undefined
+    const provider = path.join(config, "models/local.yaml")
+    const original = await readFile(provider)
+    const configFile = path.join(config, "config.yaml")
+    const settings = await readFile(configFile, "utf8")
+    await mkdir(path.dirname(agent), { recursive: true })
+    try {
+      await writeFile(
+        agent,
+        JSON.stringify({
+          name: agentName,
+          type: "acp",
+          acp: { command: process.env.FAKE_ACP_BINARY, args, ...acp },
+        })
+      )
+      if (zeroModels) {
+        await rm(provider)
+        await writeFile(
+          configFile,
+          settings.replace(
+            "  default_model: local/default",
+            "  default_model: ''"
+          )
+        )
+      }
+      await this.restart()
+      await run()
+    } finally {
+      if (previousAgent) await writeFile(agent, previousAgent)
+      else await rm(agent, { force: true })
+      if (zeroModels) {
+        await writeFile(provider, original)
+        await writeFile(configFile, settings)
+      }
+      await this.restart()
+    }
+  }
+
+  // 独立的网页 relay 和节点 B 各自使用临时配置，只有额外 relay 提供配对。
+  async withWorldRuntime(
+    run: (world: {
+      link: string
+      token: string
+      url: string
+      relay: string
+      card: string
+      adminToken: string
+      joinNode: (
+        url: string,
+        owner: string,
+        name: string,
+        tags: string[],
+        reusable?: boolean
+      ) => Promise<void>
+      stopWebPage: () => Promise<void>
+    }) => Promise<void>,
+    {
+      multiInstance = false,
+      joinDomain = true,
+      domainName = "home.test",
+      nodeName = "b",
+      publicDefault = false,
+      withoutModels = false,
+    } = {}
+  ) {
+    const binary = process.env.OPENVAALA_BINARY!
+    const root = await mkdtemp(path.join(tmpdir(), "openvaala-world-web-"))
+    const processes = new Set<ReturnType<typeof spawn>>()
+    const env = (home: string) => ({
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([k]) => !k.startsWith("OPENVAALA_") && !k.startsWith("XDG_")
+        )
+      ),
+      HOME: home,
+      SHELL: "/bin/sh",
+    })
+    async function address() {
+      const server = createServer().listen(0, "127.0.0.1")
+      await once(server, "listening")
+      const addr = server.address() as { port: number }
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      return "127.0.0.1:" + addr.port
+    }
+    async function start(home: string, args: string[], ready: string) {
+      const proc = spawn(
+        binary,
+        ["--config-file", path.join(home, "config.yaml"), ...args],
+        { env: env(home), stdio: "ignore" }
+      )
+      processes.add(proc)
+      await expect
+        .poll(
+          async () =>
+            proc.exitCode === null &&
+            (await fetch(ready).then(
+              (r) => r.ok,
+              () => false
+            ))
+        )
+        .toBe(true)
+      return proc
+    }
+    async function stop(proc: ReturnType<typeof spawn>) {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        const exited = once(proc, "exit")
+        proc.kill("SIGTERM")
+        await exited
+      }
+      processes.delete(proc)
+    }
+    try {
+      const relayHome = path.join(root, "relay"),
+        home = path.join(root, "node")
+      await mkdir(relayHome)
+      await mkdir(path.join(home, "models"), { recursive: true })
+      const relayAddress = await address(),
+        nodeAddress = await address()
+      const relay = "http://" + relayAddress,
+        url = "http://" + nodeAddress,
+        token = randomUUID(),
+        admin = randomUUID()
+      const instances: string[] = []
+      if (multiInstance) {
+        for (let i = 0; i < 3; i++) instances.push("ws://" + (await address()))
+        for (const [index, instance] of instances.entries()) {
+          const instanceHome = path.join(root, "instance-" + index)
+          await mkdir(instanceHome)
+          await writeFile(
+            path.join(instanceHome, "config.yaml"),
+            JSON.stringify({
+              world: { relay_mode: "public", relay_instances: instances },
+            })
+          )
+          await start(
+            instanceHome,
+            ["world", "serve", "--listen", new URL(instance).host],
+            instance.replace("ws:", "http:") + "/world/v1/relay/instances"
+          )
+        }
+      }
+      await writeFile(
+        path.join(relayHome, "config.yaml"),
+        JSON.stringify({
+          world: {
+            relay_mode: "public",
+            relay_instances: instances,
+            server: multiInstance
+              ? undefined
+              : { enabled: true, domain: "relay.test", admin_token: admin },
+          },
+        })
+      )
+      await start(
+        relayHome,
+        ["world", "serve", "--listen", relayAddress],
+        relay + "/world/v1/healthz"
+      )
+      // 网页和配对端点分开监听，以便仅停止网页进程。
+      const webHome = path.join(root, "web")
+      await mkdir(webHome)
+      await writeFile(
+        path.join(webHome, "config.yaml"),
+        "world: {relay_mode: public}"
+      )
+      const webAddress = await address()
+      const webURL = "http://" + webAddress
+      const webProcess = await start(
+        webHome,
+        ["world", "serve", "--listen", webAddress],
+        webURL + "/web/v1/"
+      )
+      const config = path.join(home, "config.yaml")
+      await writeFile(
+        config,
+        `server: {listen: ${nodeAddress}, token: ${token}, workspace_directory: ${JSON.stringify(home)}}
+${withoutModels ? "" : "models: {default_model: local/default}"}
+world:
+  remote_access: {enabled: true, name: studio}
+  server: {enabled: true, domain: ${domainName}, admin_token: ${admin}}
+  web_url: ${webURL}
+  relay_mode: off
+  relays: [${relay}]
+  node: ${publicDefault ? "{advertise_targets: [{name: default, visibility: public}]}" : "{}"}
+`
+      )
+      if (!withoutModels)
+        await writeFile(
+          path.join(home, "models", "local.yaml"),
+          `id: local
+protocol: openai_chat
+base_url: ${this.modelBaseURL}
+models: {default: {context_window: 32000}}
+`
+        )
+      const proc = await start(home, ["serve"], url + "/world/v1/healthz")
+      const cli = (...args: string[]) =>
+        promisify(execFile)(binary, ["--config-file", config, ...args], {
+          env: { ...env(home), OPENVAALA_TOKEN: token },
+        })
+      if (joinDomain) {
+        const invite = await fetch(url + "/world/v1/admin/tokens", {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer " + admin,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            owner: "studio",
+            expires_at: Date.now() + 3600000,
+          }),
+        }).then((r) => r.json())
+        await cli("world", "join", invite.token, "--name", nodeName)
+        await stop(proc)
+        await start(home, ["serve"], url + "/api/v1/healthz")
+      }
+      let link = ""
+      await expect
+        .poll(async () => {
+          const { stdout } = await cli(
+            "world",
+            "status",
+            "--url",
+            url.replace("http", "ws") + "/api/v1/openvaala",
+            "--json"
+          )
+          const status = JSON.parse(stdout)
+          link = status.remote_access_url
+          return joinDomain ? status.relay_attachments?.[1]?.connected : status.remote_access_relays?.[0]?.connected
+        })
+        .toBe(true)
+      const domain = {
+        domain: "friend.test",
+        public_key: Buffer.alloc(32, 17).toString("base64"),
+        entries: { relays: [relay] },
+      }
+      await run({
+        link,
+        token,
+        url,
+        relay,
+        adminToken: admin,
+        joinNode: async (controlURL, owner, name, tags, reusable = true) => {
+          const nodeHome = await mkdtemp(path.join(root, "member-"))
+          const configFile = path.join(nodeHome, "config.yaml")
+          await writeFile(configFile, "{}")
+          const invite = await fetch(controlURL + "/world/v1/admin/tokens", {
+            method: "POST",
+            headers: {
+              Authorization: "Bearer " + admin,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              owner,
+              tags,
+              reusable,
+              expires_at: Date.now() + 3_600_000,
+            }),
+          })
+          expect(invite.status).toBe(201)
+          await promisify(execFile)(
+            binary,
+            [
+              "--config-file",
+              configFile,
+              "world",
+              "join",
+              (await invite.json()).token,
+              "--name",
+              name,
+            ],
+            { env: env(nodeHome) }
+          )
+        },
+        stopWebPage: async () => {
+          await stop(webProcess)
+          const { stdout } = await cli(
+            "world",
+            "status",
+            "--url",
+            link,
+            "--json"
+          )
+          expect(JSON.parse(stdout).remote_access_url).toBe(link)
+        },
+        card:
+          domain.domain +
+          "#" +
+          Buffer.from(JSON.stringify(domain)).toString("base64url"),
+      })
+    } finally {
+      for (const proc of processes) await stop(proc)
+      await rm(root, { recursive: true, force: true })
+    }
   }
 
   // 假模型的 base_url，新增模型服务时填它
@@ -347,6 +659,13 @@ export async function loadEarlierTurnsUntilFirst(page: Page): Promise<void> {
   }
 }
 
+// 侧栏里的对话也可能名为「新对话」，只选择不带会话 ID 的新建入口。
+export function getNewConversationLink(page: Page): Locator {
+  return page
+    .locator('[data-sidebar="menu-item"]:not([data-conversation-id])')
+    .getByRole("link", { name: "新对话", exact: true })
+}
+
 // 输入框
 export function getComposer(page: Page): Locator {
   return page.getByRole("textbox", { name: "消息" })
@@ -487,11 +806,41 @@ export async function openTurnRaw(turn: Locator): Promise<Locator> {
   return raw
 }
 
+// World 请求使用替身，其余请求继续走真实 serve。
+export async function routeWorldRPC(
+  page: Page,
+  handle: (method: string, params: unknown) => unknown
+) {
+  const subscribers = new Set<WebSocketRoute>()
+  await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
+    const upstream = socket.connectToServer()
+    socket.onMessage(async (frame) => {
+      const request = JSON.parse(frame.toString())
+      if (!request.method.startsWith("world/")) {
+        upstream.send(frame)
+        return
+      }
+      if (request.method === "world/subscribe") subscribers.add(socket)
+      if (request.method === "world/unsubscribe") subscribers.delete(socket)
+      const result = await handle(request.method, request.params)
+      socket.send(JSON.stringify({ id: request.id, result }))
+    })
+    socket.onClose(() => {
+      subscribers.delete(socket)
+      void upstream.close()
+    })
+  })
+  return (params: { event: string; data: unknown }) => {
+    for (const socket of subscribers)
+      socket.send(JSON.stringify({ method: "world/messageUpdated", params }))
+  }
+}
+
 // 代理页面到 serve 的 WebSocket，让用例决定何时断开、何时允许重连；要在 openApp 之前调用
 export async function controlConnection(page: Page) {
   let isHeld = false
   let live: WebSocketRoute | undefined
-  const control = page.getByRole("button", { name: /^本页 · / })
+  const control = page.getByRole("button", { name: / · (?:已连接|正在连接|已断开)/ })
   await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
     // 断开期间的重连尝试立即失败，页面按退避继续重试。
     if (isHeld) {
@@ -506,23 +855,23 @@ export async function controlConnection(page: Page) {
     async disconnect(): Promise<void> {
       isHeld = true
       await live!.close()
-      await expect(control).toHaveAccessibleName("本页 · 已断开，正在重连")
+      await expect(control).toHaveAccessibleName(`${hostname()} · 已断开，正在重连`)
     },
     // 允许重连：页面按退避自己连上，不碰页面，键盘焦点留在原处
     async allowReconnect(): Promise<void> {
       isHeld = false
-      await expect(control).toHaveAccessibleName("本页 · 已连接", {
+      await expect(control).toHaveAccessibleName(`${hostname()} · 已连接`, {
         timeout: 20_000,
       })
     },
-    // 允许重连并点「重连」跳过退避立即重试，等页面回到已连接；点击会把键盘焦点交给按钮
+    // 点已断开的服务器跳过退避，等页面回到已连接
     async reconnect(): Promise<void> {
       await control.click()
-      const reconnect = page.getByRole("button", { name: "重连", exact: true })
+      const reconnect = page.getByRole("menuitemradio", { name: /已断开/, checked: true })
       await expect(reconnect).toBeVisible()
       isHeld = false
       await reconnect.click()
-      await expect(control).toHaveAccessibleName("本页 · 已连接")
+      await expect(control).toHaveAccessibleName(`${hostname()} · 已连接`)
       await page.keyboard.press("Escape")
     },
   }
@@ -557,4 +906,54 @@ export async function closeTerminalTabs(page: Page): Promise<void> {
     if ((await closeButtons.count()) === 0) return
     await closeButtons.last().click()
   }
+}
+
+// 通过新建页现有模型选择器进入外部组，未命中探测缓存时先选 default。
+export async function chooseExternalModel(page: Page) {
+  const picker = page.getByLabel("模型", { exact: true }).first()
+  await picker.click()
+  const group = page
+    .getByRole("group")
+    .filter({ has: page.getByText("codex-acp", { exact: true }) })
+    .last()
+  await group.getByRole("option").first().click()
+  await expect(page.getByRole("button", { name: "导入已有会话" })).toBeVisible()
+}
+export async function captureExternalUI(page: Page, name: string) {
+  if (process.env.EXTERNAL_UI_SHOTS) {
+    await page.waitForTimeout(220)
+    await page.screenshot({
+      path: path.join(process.env.EXTERNAL_UI_SHOTS, "t10-" + name + ".png"),
+      animations: "disabled",
+    })
+  }
+}
+
+// 走查截图同时覆盖桌面和手机；录制后恢复原视口供用例继续。
+export async function captureWorldReview(
+  page: Page,
+  name: string,
+  focus?: Locator,
+  directoryEnv = "WORLD_REVIEW_SHOTS"
+) {
+  const directory = process.env[directoryEnv]
+  if (!directory) return
+  const original = page.viewportSize()!
+  await mkdir(directory, { recursive: true })
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 900 })
+    await page.evaluate(() => document.fonts.ready)
+    if (focus) {
+      await focus.scrollIntoViewIfNeeded()
+      await expect(focus).toBeInViewport()
+    }
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth)
+    ).toBe(width)
+    await page.screenshot({
+      path: path.join(directory, name + "-" + width + ".png"),
+      animations: "disabled",
+    })
+  }
+  await page.setViewportSize(original)
 }

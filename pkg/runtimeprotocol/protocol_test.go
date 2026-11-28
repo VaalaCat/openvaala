@@ -23,12 +23,13 @@ func TestProtocolNotificationNames(t *testing.T) {
 			notifications: ServerNotifications,
 			want: []string{
 				"conversation/runningChanged", "conversation/runningClosed",
-				"subscription/closed", "session/statusUpdated", "session/pendingInputsUpdated", "conversation/titleUpdated",
+				"subscription/closed", "session/statusUpdated", "session/pendingInputsUpdated", "session/externalStateUpdated", "conversation/titleUpdated",
 				"session/started", "session/stopped", "turn/started", "turn/finished", "items/saved",
 				"item/started", "item/delta", "item/completed", "item/interrupted", "item/toolProgress",
 				"hook/started", "hook/completed",
 				"clientMCP/connect", "clientMCP/message", "clientMCP/disconnect",
 				"terminal/output", "terminal/exited", "terminal/listChanged", "terminal/listClosed",
+				"world/messageUpdated", "world/messageUpdatedClosed",
 			},
 		},
 		{

@@ -341,3 +341,55 @@ func TestSkillGetContent(t *testing.T) {
 		})
 	}
 }
+
+func TestSkillGetFileContent(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "review")
+	write := func(path, text string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := skillFile("review", "Review")
+	write(filepath.Join(dir, "SKILL.md"), body)
+	write(filepath.Join(dir, "ref", "guide.md"), "review guide")
+	outside := filepath.Join(root, "outside")
+	write(filepath.Join(outside, "private.md"), "outside skill")
+	if err := os.Symlink(outside, filepath.Join(dir, "linked-dir")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "private.md"), filepath.Join(dir, "linked.md")); err != nil {
+		t.Fatal(err)
+	}
+	work, err := workspace.NewLocalWorkspace(workspace.NewLocalWorkspaceOpt(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	skills, err := skill.LoadSkills(t.Context(), []skill.SkillDirectory{{Workspace: work, Path: dir, Strict: true}})
+	if err != nil || len(skills) != 1 {
+		t.Fatalf("skills=%v, err=%v", skills, err)
+	}
+	for _, tc := range []struct {
+		file, want string
+		wantErr    bool
+	}{
+		{"", body, false},
+		{"ref/guide.md", "review guide", false},
+		{"../outside/private.md", "", true},
+		{"ref/../../outside/private.md", "", true},
+		{filepath.Join(outside, "private.md"), "", true},
+		{"linked-dir/private.md", "", true},
+		{"linked.md", "", true},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			got, err := skills[0].GetFileContent(t.Context(), tc.file)
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Fatalf("content=%q, err=%v", got, err)
+			}
+		})
+	}
+}

@@ -5,37 +5,51 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/utils/syncmap"
-	"github.com/coder/websocket"
+	"github.com/VaalaCat/openvaala/pkg/world"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 	"github.com/google/uuid"
 )
 
-// serverConnection 是一个已认证的 WebSocket 连接在服务端的运行记录，生命周期与连接相同：
+// serverConnection 是已认证的 RPC 连接在服务端的运行记录，生命周期与连接相同：
 // 读任务是唯一读连接的任务，把帧交给请求主循环串行处理；writer 是唯一写连接的任务；订阅转发任务把 Runtime 事件翻译为通知交给 writer。
 type serverConnection struct {
-	conn          *websocket.Conn
-	runtime       runtime.Runtime
-	configuration Configuration
-	modelCatalog  ModelCatalog
+	server                  *runtimeServerImpl
+	token                   string
+	disconnectAfterResponse context.CancelFunc
+	conn                    RuntimeMessageConn
+	runtime                 runtime.Runtime
+	configuration           Configuration
+	worldRunning            runtimeprotocol.WorldRunning
+	worldNode               world.WorldNode
+	worldServer             worldserver.WorldServer
+	worldIdentityPath       string
+	restartRequests         chan<- ServeRestartRequest
+	restartAfterResponse    *ServeRestartRequest
+	worldConfigWrite        chan struct{}
+	modelCatalog            ModelCatalog
 	// serverID 是 initialize 返回给客户端的 serve 标识。
 	serverID string
-	methods  map[string]methodHandler
+	// sessionCaller 是会话 Token 绑定的身份；操作者连接为空。
+	sessionCaller *sessionCaller
 
 	// outgoing 是待写出的响应与通知，按入队顺序写出。
-	outgoing chan *runtimeprotocol.JSONRPCMessage
+	outgoing chan outgoingFrame
 	// isInitialized 这个连接是否已经 initialize 成功？只由请求主循环读写。
 	isInitialized bool
-	// tasksAfterResponse 是当前请求登记的后台任务，在它的响应入队之后才启动，订阅结果先于该订阅的通知；只由请求主循环读写。
+	// tasksAfterResponse 保存当前请求登记的订阅转发和延后回复任务；普通响应先入队。
 	tasksAfterResponse []func()
-	// subscriptions 是本连接的订阅：键包含种类；目标订阅包含对话与 Session，全局运行订阅和终端列表订阅不带目标。
+	// subscriptions 是本连接的订阅：键包含种类；目标订阅包含对话与 Session，全局订阅不带目标。
 	subscriptions syncmap.SyncMap[subscriptionKey, *connectionSubscription]
 	// connectionCtx 是 Run 的 ctx，即连接的生命周期；转发给客户端的 MCP 消息没有调用方 ctx，用它发送，连接结束时发送立即返回。
 	// 由 Run 在启动任何任务之前设置，之后只读。
@@ -67,16 +81,24 @@ const (
 )
 
 // newServerConnection 创建协议连接的处理实例。
-func newServerConnection(conn *websocket.Conn, opt *RuntimeServerOpt, methods map[string]methodHandler) *serverConnection {
+func newServerConnection(conn RuntimeMessageConn, server *runtimeServerImpl, caller *sessionCaller) *serverConnection {
 	// 1. 填入连接配置，创建发送队列、连接 ID 和客户端执行环境登记表。
+	opt := &server.opt
 	return &serverConnection{
-		conn:          conn,
-		runtime:       opt.Runtime,
-		configuration: opt.Configuration,
-		modelCatalog:  opt.ModelCatalog,
-		serverID:      opt.ServerID,
-		methods:       methods,
-		outgoing:      make(chan *runtimeprotocol.JSONRPCMessage, outgoingBufferSize),
+		server:            server,
+		conn:              conn,
+		runtime:           opt.Runtime,
+		configuration:     opt.Configuration,
+		worldRunning:      opt.WorldRunning,
+		worldNode:         opt.WorldNode,
+		worldServer:       opt.WorldServer,
+		worldIdentityPath: opt.WorldIdentityPath,
+		restartRequests:   opt.RestartRequests,
+		worldConfigWrite:  server.worldConfigWrite,
+		modelCatalog:      opt.ModelCatalog,
+		serverID:          opt.ServerID,
+		sessionCaller:     caller,
+		outgoing:          make(chan outgoingFrame, outgoingBufferSize),
 
 		connectionID:    uuid.NewString(),
 		clientExecutors: make(map[defs.ConversationID]string),
@@ -85,23 +107,21 @@ func newServerConnection(conn *websocket.Conn, opt *RuntimeServerOpt, methods ma
 
 // Run 运行连接的读写、心跳和请求处理，返回连接结束的原因。
 func (c *serverConnection) Run(ctx context.Context) (closeReason error) {
-	// 1. 创建带结束原因的连接上下文；退出时（含 panic）依次以结束原因取消连接、移除客户端 MCP、等待后台任务、关闭连接。
+	// 1. 创建带结束原因的连接上下文；退出时（含 panic）依次以结束原因取消连接、移除客户端 MCP 并等待后台任务。
 	ctx, cancel := context.WithCancelCause(ctx)
 	c.connectionCtx = ctx
 	defer func() {
 		cancel(closeReason)
 		c.releaseClientExecutors(ctx)
 		c.tasks.Wait()
-		_ = c.conn.CloseNow()
 	}()
-	// 2. 设置帧上限，启动写出、心跳和读帧任务；写出或心跳结束时以各自的原因取消连接，先发生的原因就是连接结束原因。
-	c.conn.SetReadLimit(maxFrameBytes)
+	// 2. 启动写出、心跳和读帧任务；写出或心跳结束时以各自的原因取消连接，先发生的原因就是连接结束原因。
 	c.tasks.Go(func() {
 		cancel(c.writeOutgoing(ctx))
 	})
-	c.tasks.Go(func() {
-		cancel(c.keepAlive(ctx))
-	})
+	if socket, ok := c.conn.(runtimeprotocol.WebSocketMessages); ok {
+		c.tasks.Go(func() { cancel(c.keepAlive(ctx, socket)) })
+	}
 	frames := make(chan receivedFrame, incomingBufferSize)
 	c.tasks.Go(func() {
 		c.readFrames(ctx, frames)
@@ -121,10 +141,28 @@ func (c *serverConnection) handleRequest(ctx context.Context, frames <-chan rece
 		if frame.err != nil {
 			return frame.err
 		}
-		if response := c.handleFrame(ctx, frame.payload); response != nil && !c.send(ctx, response) {
+		response := c.handleFrame(ctx, frame.payload)
+		if c.restartAfterResponse != nil || c.disconnectAfterResponse != nil {
+			written := make(chan struct{})
+			select {
+			case c.outgoing <- outgoingFrame{message: response, written: written}:
+				select {
+				case <-written:
+				case <-ctx.Done():
+				}
+			case <-ctx.Done():
+			}
+			if c.disconnectAfterResponse != nil {
+				c.disconnectAfterResponse()
+			} else {
+				c.restartRequests <- *c.restartAfterResponse
+			}
+			return nil
+		}
+		if response != nil && !c.send(ctx, response) {
 			return context.Cause(ctx)
 		}
-		// 2. 响应入队后启动本次登记的任务，清空登记后处理下一帧。
+		// 2. 启动本次登记的任务，清空登记后处理下一帧。
 		for _, task := range c.tasksAfterResponse {
 			c.tasks.Go(task)
 		}
@@ -139,7 +177,7 @@ func (c *serverConnection) readFrames(ctx context.Context, frames chan<- receive
 	// 1. 登记返回前关闭帧通道，逐帧读取；读操作同时处理 ping、pong 和 close 控制帧。
 	defer close(frames)
 	for {
-		_, payload, err := c.conn.Read(ctx)
+		payload, err := c.conn.ReadMessage(ctx)
 		if err != nil {
 			err = fmt.Errorf("read frame: %w", err)
 		}
@@ -179,24 +217,30 @@ func (c *serverConnection) handleFrame(ctx context.Context, frame []byte) *runti
 	}
 	// 3. 创建 RPC 遥测，分发方法并返回带原请求 ID 的结果或协议错误。
 	ctx, recorder := telemetry.StartRPCServer(ctx, c.getTelemetryMethod(request.Method), request.Method, getRPCRequestID(request.ID))
-	result, err := c.dispatchRequest(ctx, request.Method, request.Params)
-	if err != nil {
-		protocolErr := getJSONRPCError(err)
-		recorder.End(protocolErr.Code, err)
-		return &runtimeprotocol.JSONRPCMessage{
-			ID:    request.ID,
-			Error: protocolErr,
+	response := func(result any, err error) *runtimeprotocol.JSONRPCMessage {
+		if err != nil {
+			protocolErr := getJSONRPCError(err)
+			recorder.End(protocolErr.Code, err)
+			return &runtimeprotocol.JSONRPCMessage{ID: request.ID, Error: protocolErr}
 		}
+		recorder.End(0, nil)
+		return &runtimeprotocol.JSONRPCMessage{ID: request.ID, Result: result}
 	}
-	recorder.End(0, nil)
-	return &runtimeprotocol.JSONRPCMessage{
-		ID:     request.ID,
-		Result: result,
+	result, err := c.dispatchRequest(ctx, request.Method, request.Params)
+	if wait, ok := result.(deferredResponse); ok {
+		c.startAfterResponse(func() {
+			c.send(ctx, response(wait()))
+		})
+		return nil
 	}
+	return response(result, err)
 }
 
 // handleNotification 将客户端 MCP 消息与关闭通知交给对应转发流，把终端输入和尺寸变化交给本连接对该终端的接入；都不阻塞请求循环。
 func (c *serverConnection) handleNotification(ctx context.Context, request *runtimeprotocol.JSONRPCRequest) {
+	if c.sessionCaller != nil && (request.Method != "terminal/input" || c.authorizeSessionMethod(ctx, request.Method, request.Params) != nil) {
+		return
+	}
 	// 1. 按方法解析并交付；流已结束或本连接没有接入该终端时丢弃通知，未知方法和无效参数记 Warn。
 	switch request.Method {
 	case "clientMCP/message":
@@ -249,7 +293,7 @@ func (c *serverConnection) handleNotification(ctx context.Context, request *runt
 // getTelemetryMethod 返回遥测使用的方法名。
 func (c *serverConnection) getTelemetryMethod(method string) string {
 	// 1. 已注册方法返回原名，其他方法归入 RPCMethodOther。
-	if _, found := c.methods[method]; !found {
+	if _, found := openvaalaMethods[method]; !found {
 		return telemetry.RPCMethodOther
 	}
 	return method
@@ -264,8 +308,13 @@ func (c *serverConnection) dispatchRequest(ctx context.Context, method string, p
 	if method != runtimeprotocol.InitializeMethod && !c.isInitialized {
 		return nil, newJSONRPCError(runtimeprotocol.ErrorCodeInvalidRequest, "not initialized")
 	}
-	// 2. 查找处理函数，未注册时返回方法不存在错误。
-	handler, found := c.methods[method]
+	// 2. 会话连接先检查授权，再查找处理函数。
+	if c.sessionCaller != nil {
+		if err := c.authorizeSessionMethod(ctx, method, params); err != nil {
+			return nil, err
+		}
+	}
+	handler, found := openvaalaMethods[method]
 	if !found {
 		return nil, newJSONRPCError(runtimeprotocol.ErrorCodeMethodNotFound, "method not found: "+method)
 	}
@@ -274,14 +323,75 @@ func (c *serverConnection) dispatchRequest(ctx context.Context, method string, p
 	if err == nil && method == runtimeprotocol.InitializeMethod {
 		c.isInitialized = true
 	}
+	if protocolErr, ok := err.(*runtimeprotocol.JSONRPCError); ok &&
+		protocolErr.Code == runtimeprotocol.ErrorCodeInvalidParams && protocolErr.Data == nil &&
+		strings.HasPrefix(method, "world/") {
+		protocolErr.Data = &runtimeprotocol.JSONRPCErrorData{Code: "invalid_arguments"}
+	}
 	return result, err
+}
+
+// authorizeSessionMethod 检查方法、绑定对话和目标会话。
+func (c *serverConnection) authorizeSessionMethod(ctx context.Context, method string, params json.RawMessage) error {
+	if method == "config/getWorld" || method == "config/setWorld" {
+		return errors.New("world settings require operator token")
+	}
+
+	// 1. 每次调用都按来源记录确认身份，转出后已连接的客户端也收到跳转错误。
+	source, err := c.runtime.GetSession(ctx, c.sessionCaller.conversationID, c.sessionCaller.sessionID)
+	if err != nil {
+		return errSessionPermissionDenied
+	}
+	if source.DetachedConversationID != "" {
+		target, err := c.runtime.GetConversation(ctx, &runtime.GetConversationRequest{ConversationID: source.DetachedConversationID})
+		if err != nil {
+			return err
+		}
+		return conversation.NewSessionDetachedError(target)
+	}
+	// 2. 查方法授权范围，拒绝未放行的方法。
+	scope, found := scopedOpenVaalaMethods[method]
+	if !found {
+		return errSessionPermissionDenied
+	}
+	if scope == sessionMethodGlobal {
+		return nil
+	}
+	// 3. 核对对话；可省略对话的方法使用令牌绑定的对话。
+	var target runtimeprotocol.SessionParams
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &target); err != nil {
+			return newJSONRPCError(runtimeprotocol.ErrorCodeInvalidParams, err.Error())
+		}
+	}
+	if scope == sessionMethodBoundConversation && target.ConversationID == "" {
+		return nil
+	}
+	if target.ConversationID != c.sessionCaller.conversationID {
+		if method == "session/send" {
+			return source.WithDetachOriginHint(errSessionPermissionDenied)
+		}
+		return errSessionPermissionDenied
+	}
+	if scope == sessionMethodConversation || scope == sessionMethodBoundConversation {
+		return nil
+	}
+	// 4. 检查目标是否是调用会话的后代。
+	allowed, err := c.runtime.IsSessionDescendant(ctx, target.ConversationID, c.sessionCaller.sessionID, target.SessionID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return errSessionPermissionDenied
+	}
+	return nil
 }
 
 // send 把消息加入发送队列，返回是否入队。
 func (c *serverConnection) send(ctx context.Context, message *runtimeprotocol.JSONRPCMessage) bool {
 	// 1. 入队成功返回 true，ctx 先结束时返回 false。
 	select {
-	case c.outgoing <- message:
+	case c.outgoing <- outgoingFrame{message: message}:
 		return true
 	case <-ctx.Done():
 		return false
@@ -310,13 +420,14 @@ func (c *serverConnection) startAfterResponse(task func()) {
 func (c *serverConnection) writeOutgoing(ctx context.Context) error {
 	// 1. 等待待写消息，上下文结束时返回 nil。
 	for {
-		var message *runtimeprotocol.JSONRPCMessage
+		var frame outgoingFrame
 		select {
 		case <-ctx.Done():
 			return nil
-		case message = <-c.outgoing:
+		case frame = <-c.outgoing:
 		}
 		// 2. 编码消息；通知无法编码时记 Warn 并丢弃，响应无法编码时改为 -32000 错误响应。
+		message := frame.message
 		payload, err := json.Marshal(message)
 		if err != nil {
 			if message.ID == nil {
@@ -326,14 +437,18 @@ func (c *serverConnection) writeOutgoing(ctx context.Context) error {
 			payload, _ = json.Marshal(newErrorResponse(message.ID, err))
 		}
 		// 3. 写出文本帧，失败时返回写错误。
-		if err := c.conn.Write(ctx, websocket.MessageText, payload); err != nil {
+		err = c.conn.WriteMessage(ctx, payload)
+		if frame.written != nil {
+			close(frame.written)
+		}
+		if err != nil {
 			return fmt.Errorf("write message: %w", err)
 		}
 	}
 }
 
 // keepAlive 定期发送 Ping 心跳。
-func (c *serverConnection) keepAlive(ctx context.Context) error {
+func (c *serverConnection) keepAlive(ctx context.Context, socket runtimeprotocol.WebSocketMessages) error {
 	// 1. 启动心跳定时器，返回时停止。
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
@@ -345,7 +460,7 @@ func (c *serverConnection) keepAlive(ctx context.Context) error {
 		case <-ticker.C:
 		}
 		pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
-		err := c.conn.Ping(pingCtx)
+		err := socket.Ping(pingCtx)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("ping: %w", err)

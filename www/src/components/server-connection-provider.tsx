@@ -8,12 +8,17 @@ import {
 } from "react"
 import { useStore } from "@nanostores/react"
 import { useQueryClient } from "@tanstack/react-query"
+import { ServerIcon } from "lucide-react"
 import { useTranslation } from "react-i18next"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { TokenEntryPage } from "@/app/token-entry"
 import { StandalonePage } from "@/components/base/standalone-page"
 import { LatticeLoader } from "@/components/base/lattice-loader"
+import { ServerListLabel } from "@/components/server-list-label"
 import { ServerManagerDialog } from "@/components/server-manager-dialog"
+import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
+import { getWorldTargetName } from "@/lib/api/world-transport"
 import { ServerConnection } from "@/lib/api/server-connection"
 import { RunningConversationsSync } from "@/lib/api/running-conversations-sync"
 import { RunningTerminalsSync } from "@/lib/api/running-terminals-sync"
@@ -21,11 +26,14 @@ import {
   $activeServerURL,
   $servers,
   getPageServerURL,
-  getServerHost,
-  saveServerID,
+  getServerDisplay,
+  saveServerIdentity,
   saveServerToken,
   setActiveServerURL,
   takeTokenFromHash,
+  upsertServer,
+  parseServerInput,
+  type ServerEntry,
 } from "@/lib/api/servers"
 import { invalidateAfterReconnect } from "@/lib/query/invalidation"
 
@@ -95,46 +103,111 @@ export function ServerConnectionProvider({
   children: ReactNode
 }) {
   const pageURL = getPageServerURL(window.location)
-  useState(takePageToken)
-  // 在 token 输入页把 openvaala web 打印的地址贴进同一个标签页，浏览器只换 #，不重新加载
+  const role = document.documentElement.dataset.pageRole
+  const hasPageRuntime = role === "runtime"
+  const [showHome, setShowHome] = useState(
+    () =>
+      !window.location.hash &&
+      ["/", "/web/v1/"].includes(window.location.pathname)
+  )
+  const [worldLink, setWorldLink] = useState<string>()
+  const [managerOpen, setManagerOpen] = useState(false)
   useEffect(() => {
-    window.addEventListener("hashchange", takePageToken)
-    return () => window.removeEventListener("hashchange", takePageToken)
-  }, [])
+    function importPageLink() {
+      const hash = window.location.hash
+      if (!hash.startsWith("#world=")) {
+        if (hasPageRuntime) takePageToken()
+        return
+      }
+      const link = window.location.origin + "/web/v1/" + hash
+      const parsed = parseServerInput(link)
+      setShowHome(false)
+      setManagerOpen(false)
+      if (parsed.ok && parsed.token && globalThis.crypto?.subtle) {
+        upsertServer({ url: parsed.url, token: parsed.token })
+        setActiveServerURL(parsed.url, pageURL)
+        setWorldLink(undefined)
+      } else {
+        setWorldLink(link)
+      }
+      window.history.replaceState(
+        window.history.state,
+        "",
+        window.location.pathname + window.location.search
+      )
+    }
+    importPageLink()
+    window.addEventListener("hashchange", importPageLink)
+    return () => window.removeEventListener("hashchange", importPageLink)
+  }, [pageURL, hasPageRuntime])
   const servers = useStore($servers)
   const activeServerURL = useStore($activeServerURL)
-  const [managerOpen, setManagerOpen] = useState(false)
+  const entries = servers.filter((s) => s.url !== pageURL)
+  if (hasPageRuntime)
+    entries.unshift(
+      servers.find((s) => s.url === pageURL) ?? { url: pageURL, token: "" }
+    )
 
-  const activeURL = activeServerURL || pageURL
+  const activeURL = worldLink || activeServerURL || pageURL
   const isRemote = activeURL !== pageURL
   const activeEntry = servers.find((server) => server.url === activeURL)
-  const token = activeEntry?.token
-  const serverLabel = isRemote
-    ? activeEntry?.name || getServerHost(activeURL)
-    : undefined
+  const parsed = useMemo(
+    () =>
+      activeURL.includes("#world=") ? parseServerInput(activeURL) : undefined,
+    [activeURL]
+  )
+  const target = parsed?.ok ? parsed.worldTarget : undefined
+  const needsSecurePage = !!target && !globalThis.crypto?.subtle
+  const token = worldLink ? undefined : activeEntry?.token
+  const serverLabel =
+    isRemote && parsed?.ok !== false
+      ? activeEntry?.name ||
+        (target ? getWorldTargetName(target) : new URL(activeURL).host)
+      : undefined
 
   const connection = useMemo(
     () =>
-      token === undefined
+      token === undefined || parsed?.ok === false || needsSecurePage
         ? undefined
-        : new ServerConnection({ url: activeURL, token }),
-    [activeURL, token]
+        : new ServerConnection({ url: activeURL, token, worldTarget: target }),
+    [activeURL, token, parsed, target, needsSecurePage]
   )
 
-  const fallbackActions = isRemote ? (
-    <RemoteFallbackActions
-      onSwitchDefault={() => setActiveServerURL("", pageURL)}
+  const { t } = useTranslation()
+  if (
+    window.location.hash.startsWith("#world=") ||
+    (hasPageRuntime && takeTokenFromHash(window.location.hash))
+  )
+    return <StandalonePage title={t("connection.connecting.title")} />
+  if (parsed?.ok === false)
+    return <StandalonePage title={t("worldSettings.invalidLink")} />
+  if (needsSecurePage)
+    return <StandalonePage title={t("worldSettings.securePage")} />
+  function submitToken(value: string) {
+    if (worldLink && parsed?.ok) {
+      upsertServer({ url: parsed.url, token: value })
+      setActiveServerURL(parsed.url, pageURL)
+      setWorldLink(undefined)
+    } else saveServerToken(activeURL, value)
+  }
+  const fallbackActions = !worldLink ? (
+    <ServerFallbackActions
+      onSwitchDefault={
+        isRemote && hasPageRuntime
+          ? () => setActiveServerURL("", pageURL)
+          : undefined
+      }
       onManageServers={() => setManagerOpen(true)}
     />
   ) : undefined
 
-  return (
+  const runtimePage = (
     <>
       {!connection ? (
         <TokenEntryPage
           isTokenInvalid={false}
           serverLabel={serverLabel}
-          onSubmit={(nextToken) => saveServerToken(activeURL, nextToken)}
+          onSubmit={submitToken}
           footer={fallbackActions}
         />
       ) : (
@@ -142,33 +215,153 @@ export function ServerConnectionProvider({
           connection={connection}
           serverLabel={serverLabel}
           fallbackActions={fallbackActions}
+          onSubmitToken={submitToken}
         >
           {children}
         </ConnectionGate>
       )}
       <ServerManagerDialog
+        connection={connection}
         open={managerOpen}
         onOpenChange={setManagerOpen}
         pageURL={pageURL}
+        entries={entries}
       />
     </>
   )
+  if (!hasPageRuntime && !worldLink && (showHome || !isRemote))
+    return (
+      <StandalonePage title={t("connection.servers.myServers")}>
+        <div className="flex flex-col gap-4">
+          {entries.map((server) => (
+            <Button
+              key={server.url}
+              variant="outline"
+              className="h-auto min-w-0 justify-start py-2 text-ui"
+              onClick={() => {
+                setActiveServerURL(server.url, pageURL)
+                setShowHome(false)
+              }}
+            >
+              <ServerIcon />
+              <ServerListLabel server={server} />
+            </Button>
+          ))}
+          <RemoteLinkInput onConnect={() => setShowHome(false)} />
+          <Button
+            variant="ghost"
+            className="self-start text-ui"
+            onClick={() => setManagerOpen(true)}
+          >
+            {t("connection.servers.connectByAddress")}
+          </Button>
+          {role === "control" && (
+            <NavigationButton className="text-link" to="/world/admin">
+              {t("worldSettings.admin")}
+            </NavigationButton>
+          )}
+        </div>
+        <ServerManagerDialog
+          open={managerOpen}
+          onOpenChange={setManagerOpen}
+          onSwitch={() => setShowHome(false)}
+          initialMode="form"
+          entries={entries}
+          pageURL={pageURL}
+        />
+      </StandalonePage>
+    )
+  return (
+    <PageServersContext.Provider value={entries}>
+      {runtimePage}
+    </PageServersContext.Provider>
+  )
 }
 
-// 远端离线、鉴权失败或版本不兼容时展示在卡片底部的逃生按钮，永不锁死页面
-function RemoteFallbackActions({
+const PageServersContext = createContext<ServerEntry[]>([])
+// eslint-disable-next-line react-refresh/only-export-components
+export function usePageServers() {
+  return useContext(PageServersContext)
+}
+
+function RemoteLinkInput({
+  onConnect,
+  publicKey,
+}: {
+  onConnect?: () => void
+  publicKey?: string
+}) {
+  const { t } = useTranslation()
+  const [value, setValue] = useState("")
+  const [invalid, setInvalid] = useState(false)
+  function connect() {
+    const p = parseServerInput(value)
+    if (
+      !p.ok ||
+      !p.worldTarget ||
+      (publicKey && publicKey !== p.worldTarget.public_key)
+    ) {
+      setInvalid(true)
+      return
+    }
+    if (!p.token) {
+      window.location.hash = value.slice(value.indexOf("#") + 1)
+      return
+    }
+    upsertServer({ url: p.url, token: p.token })
+    setActiveServerURL(p.url, getPageServerURL(window.location))
+    onConnect?.()
+  }
+  return (
+    <form
+      className="flex min-w-0 flex-col gap-2"
+      onSubmit={(e) => {
+        e.preventDefault()
+        connect()
+      }}
+    >
+      <label className="text-ui" htmlFor="paste-world-link">
+        {t("connection.servers.pasteLink")}
+      </label>
+      <Input
+        id="paste-world-link"
+        className="text-ui"
+        value={value}
+        onChange={(e) => {
+          setValue(e.target.value)
+          setInvalid(false)
+        }}
+        autoComplete="off"
+        type="password"
+      />
+      {invalid && (
+        <p role="alert" className="text-caption color-destructive">
+          {t("worldSettings.invalidLink")}
+        </p>
+      )}
+      <Button type="submit" className="text-ui" disabled={!value.trim()}>
+        {t("connection.servers.connect")}
+      </Button>
+    </form>
+  )
+}
+
+// 连接前可以选择其他服务器，连接远端时也可以切回本页服务器。
+function ServerFallbackActions({
   onSwitchDefault,
   onManageServers,
 }: {
-  onSwitchDefault: () => void
+  onSwitchDefault?: () => void
   onManageServers: () => void
 }) {
   const { t } = useTranslation()
   return (
     <div className="flex flex-wrap items-center justify-center gap-2 border-t border-border pt-3">
-      <Button size="sm" variant="outline" onClick={onSwitchDefault}>
-        {t("connection.servers.switchDefault")}
-      </Button>
+      {onSwitchDefault && (
+        <Button size="sm" variant="outline" onClick={onSwitchDefault}>
+          {t("connection.servers.switchDefault")}
+        </Button>
+      )}
       <Button size="sm" variant="ghost" onClick={onManageServers}>
         {t("connection.servers.switchOther")}
       </Button>
@@ -181,16 +374,18 @@ function ConnectionGate({
   connection,
   serverLabel,
   fallbackActions,
+  onSubmitToken,
   children,
 }: {
   connection: ServerConnection
   serverLabel?: string
+  onSubmitToken: (value: string) => void
   fallbackActions?: ReactNode
   children: ReactNode
 }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
-  const state = useStore(connection.$state)
+  const { state, reason } = useStore(connection.$status)
   const serverID = useStore(connection.$serverID)
   const runningConversationsSync = useMemo(
     () => new RunningConversationsSync(connection),
@@ -205,6 +400,8 @@ function ConnectionGate({
     // 1. 登记连上后的处理：首次连上时还没有查询，跳过；之后每次重连让全部查询过期。
     let hasConnected = false
     const stopRefreshingAfterReconnect = connection.onConnected(() => {
+      const result = connection.$identity.get()!
+      saveServerIdentity(connection.entry, result)
       if (hasConnected)
         invalidateAfterReconnect(queryClient, connection.getServerID())
       hasConnected = true
@@ -213,11 +410,7 @@ function ConnectionGate({
     const stopRunningConversationsSync = runningConversationsSync.run()
     const stopRunningTerminalsSync = runningTerminalsSync.run()
     const stop = connection.run()
-    const stopSavingServerID = connection.$serverID.listen((serverID) => {
-      if (serverID) saveServerID(url, serverID)
-    })
     return () => {
-      stopSavingServerID()
       stopRefreshingAfterReconnect()
       stopRunningTerminalsSync()
       stopRunningConversationsSync()
@@ -230,12 +423,27 @@ function ConnectionGate({
     runningTerminalsSync,
     url,
   ])
+  if (state === "unauthorized" && connection.entry.worldTarget)
+    return (
+      <StandalonePage
+        title={t("connection.servers.tokenExpired")}
+        titleClassName="font-(family-name:--appearance-body)"
+        description={t("connection.servers.tokenChanged")}
+      >
+        <div className="flex flex-col gap-4">
+          <RemoteLinkInput
+            publicKey={connection.entry.worldTarget.public_key}
+          />
+          {fallbackActions}
+        </div>
+      </StandalonePage>
+    )
   if (state === "unauthorized")
     return (
       <TokenEntryPage
         isTokenInvalid
         serverLabel={serverLabel}
-        onSubmit={(token) => saveServerToken(url, token)}
+        onSubmit={onSubmitToken}
         footer={fallbackActions}
       />
     )
@@ -249,7 +457,15 @@ function ConnectionGate({
       </StandalonePage>
     )
   if (serverID === undefined) {
-    const host = getServerHost(url)
+    const host = getServerDisplay(connection.entry).address
+    if (connection.entry.worldTarget && reason)
+      return (
+        <StandalonePage
+          title={t("connection.servers.offline", { name: serverLabel || host })}
+        >
+          {fallbackActions}
+        </StandalonePage>
+      )
     return (
       <StandalonePage
         title={
@@ -258,8 +474,8 @@ function ConnectionGate({
             : t("connection.connecting.title")
         }
         description={
-          state === "reconnecting"
-            ? t("connection.connecting.retrying", { host })
+          state === "reconnecting" && !connection.entry.worldTarget
+            ? reason || t("connection.connecting.retrying", { host })
             : undefined
         }
       >

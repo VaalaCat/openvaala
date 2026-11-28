@@ -16,7 +16,13 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     const fixtureBinary = path.join(directory, "webuifixture")
     const openvaalaBinary = path.join(directory, "openvaala")
     const repository = path.join(import.meta.dirname, "..", "..")
+    const fakeACP = path.join(directory, "fakeacp")
     await Promise.all([
+      promisify(execFile)(
+        "go",
+        ["build", "-o", fakeACP, "./internal/e2e/fakeacp"],
+        { cwd: repository }
+      ),
       promisify(execFile)(
         "go",
         ["build", "-o", fixtureBinary, "./internal/e2e/webuifixture"],
@@ -28,6 +34,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
         { cwd: repository }
       ),
     ])
+    process.env.FAKE_ACP_BINARY = fakeACP
     process.env.WEBUI_FIXTURE_BINARY = fixtureBinary
     process.env.OPENVAALA_BINARY = openvaalaBinary
   } catch (error) {

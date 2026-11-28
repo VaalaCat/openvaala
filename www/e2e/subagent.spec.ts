@@ -1,9 +1,11 @@
 import type { Locator, Page } from "@playwright/test"
 import {
+  captureExternalUI,
   expect,
   getMessages,
   openRightPanel,
   openTurnRaw,
+  recordRequests,
   startConversation,
   test,
 } from "./fixture"
@@ -168,4 +170,108 @@ test("long_agent_letters_preview_four_lines_with_fade_and_keep_expanded_content"
     )
   }
   await expect(messages.getByText("ok", { exact: true })).toBeVisible()
+})
+
+test("external_background_labels_session_menu_and_detach", async ({
+  page,
+  fixture,
+}) => {
+  await fixture.withExternalAgent([], async () => {
+    const requests = recordRequests(page)
+    await fixture.replies({
+      tool: "spawn_agent",
+      arguments: JSON.stringify({
+        agent_name: "codex-acp",
+        task_name: "workspace-review",
+        message: "检查目录",
+        labels: { role: "review", area: "workspace" },
+        background: true,
+      }),
+    })
+    await fixture.openApp(page)
+    await startConversation(page, "派一个后台会话")
+    await openRightPanel(page)
+    await page.getByRole("tab", { name: "Agent", exact: true }).click()
+    const tree = page.getByRole("tabpanel", { name: "Agent", exact: true })
+    const background = tree.getByRole("button", { name: "1 个后台 Agent" })
+    await background.click()
+    await expect(background).toHaveCSS("background-color", "rgba(0, 0, 0, 0)")
+    const row = tree.getByRole("link", { name: /workspace-review/ })
+    await expect(row).toContainText("area=workspace role=review")
+    await row.focus()
+    await expect(
+      tree.getByRole("button", { name: "更多", exact: true })
+    ).toHaveCount(0)
+    const sourceURL = page.url()
+    await row.click()
+    const tab = page
+      .locator(".flexlayout__tab_button")
+      .filter({ hasText: "workspace-review" })
+    await tab.click({ button: "right" })
+    await page.getByRole("menuitem", { name: "重载 Agent" }).click()
+    await expect
+      .poll(() => requests.filter(({ method }) => method === "session/reload"))
+      .toHaveLength(1)
+    await expect(page.getByRole("menu")).toBeHidden()
+    await row.click({ button: "right" })
+    await expect(
+      page.getByRole("menuitem", { name: "重载 Agent" })
+    ).toBeVisible()
+    await captureExternalUI(page, "session-menu")
+    await page.getByRole("menuitem", { name: "转为独立对话" }).click()
+    await expect(row.locator(".lucide-arrow-up-right")).toBeAttached()
+    await expect(row).not.toContainText("codex-acp")
+    await expect
+      .poll(() =>
+        row
+          .getByText("workspace-review", { exact: true })
+          .evaluate((name) => name.scrollWidth <= name.clientWidth)
+      )
+      .toBe(true)
+    await captureExternalUI(page, "agents-tree")
+    await expect(page.getByRole("link", { name: "打开独立对话" })).toBeVisible()
+    await row.click({ button: "right" })
+    await expect(page.getByRole("menu")).toBeHidden()
+    await row.click()
+    await expect(page).toHaveURL(/\/c\/[^/]+$/)
+    await expect(page).not.toHaveURL(sourceURL)
+  })
+})
+
+test("stopped_native_task_keeps_agent_name", async ({ page, fixture }) => {
+  await fixture.replies({
+    tool: "spawn_agent",
+    arguments: JSON.stringify({ task_name: "检查目录", message: "查看目录" }),
+  })
+  await fixture.openApp(page)
+  await startConversation(page, "派一个原生会话")
+  await openRightPanel(page)
+  await page.getByRole("tab", { name: "Agent", exact: true }).click()
+  const row = page
+    .getByRole("tabpanel", { name: "Agent", exact: true })
+    .getByRole("link", { name: /检查目录/ })
+  await expect(row).toContainText("空闲")
+  // 重开页面时，订阅快照中有一条已停止的原生子会话。
+  await page.routeWebSocket(/\/api\/v1\/openvaala/, (socket) => {
+    const server = socket.connectToServer()
+    const subscriptions = new Set<number>()
+    socket.onMessage((frame) => {
+      const rpc = JSON.parse(String(frame))
+      if (rpc.method === "conversation/subscribe") subscriptions.add(rpc.id)
+      server.send(frame)
+    })
+    server.onMessage((frame) => {
+      const rpc = JSON.parse(String(frame))
+      if (subscriptions.delete(rpc.id) && rpc.result) {
+        for (const info of rpc.result.sessions) {
+          if (info.session.task_name === "检查目录") info.state = "stopped"
+        }
+        socket.send(JSON.stringify(rpc))
+      } else socket.send(frame)
+    })
+  })
+  await page.reload()
+  await expect(row).toContainText("已停止")
+  await expect(row).toContainText("default")
+  await captureExternalUI(page, "stopped-native")
 })

@@ -307,7 +307,7 @@ func startACPTestServer(t *testing.T, cfg *config.Config, configureServer func(o
 	t.Helper()
 	// 1. 创建内存遥测和 Runtime。
 	pipeline := telemetrytest.NewPipeline(t)
-	rt, closeDAO, err := newRuntime(t.Context(), cfg, pipeline.Telemetry)
+	rt, closeDAO, err := newRuntime(t.Context(), cfg, pipeline.Telemetry, RuntimeServerConnection{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

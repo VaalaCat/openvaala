@@ -6,6 +6,7 @@ import {
   chooseDefaultWorkLocation,
   expect,
   getMessages,
+  getNewConversationLink,
   recordRequests,
   startConversationAtCurrentLocation,
   test,
@@ -29,11 +30,7 @@ function getRecentGroup(page: Page): Locator {
 
 // 点侧栏的「新对话」，等新对话页出现
 async function openNewConversation(page: Page): Promise<void> {
-  const newConversationPath = new URL(page.url()).pathname.split("/c/")[0]
-  await page
-    .getByRole("link", { name: "新对话", exact: true })
-    .and(page.locator(`a[href="${newConversationPath}"]`))
-    .click()
+  await getNewConversationLink(page).click()
   await expect(
     page.getByRole("heading", { name: "新对话", level: 1 })
   ).toBeVisible()

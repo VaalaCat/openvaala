@@ -42,6 +42,23 @@ max_steps: 50                        # 可选；默认 0，不限
 
 每个模型引用都必须对应一个已配置的模型，否则配置加载失败。
 
+## ACP 请求参数
+
+ACP Agent 的 `acp.param_overwrite` 按 ACP 方法名填写请求字段。对象逐层合并，标量和数组用配置值整体替换。临时会话最后再叠加 `acp.ephemeral_param_overwrite`。适配器能关闭会话持久化时，配置这个字段即可启用 Web 的 `/btw`。Claude Code 预设使用以下配置。
+
+```yaml
+name: claude-code
+type: acp
+acp:
+  command: claude-agent-acp
+  ephemeral_param_overwrite:
+    session/new:
+      _meta:
+        claudeCode:
+          options:
+            persistSession: false
+```
+
 ## 自定义默认 Agent
 
 `agents/default.yaml` 比较特殊：它从内置的 `default` Agent 出发，只替换你写了的字段。`name` 可以不写（写了就必须是 `default`），`instructions` 也是可选的。只想把默认 Agent 固定到一个模型，这样写就够了：
@@ -53,7 +70,7 @@ model:
   model: claude-sonnet
 ```
 
-其他 Agent 文件都必须写 `name` 和 `instructions`。
+其他原生 Agent 文件都必须写 `name` 和 `instructions`。
 
 如果一个模型都没配置，Agent 就没有模型，直到你[添加 Provider](models.md#不改文件添加-provider)。
 

@@ -1,3 +1,10 @@
+import { NavigationButton } from "@/components/base/navigation-button"
+import { motion } from "motion/react"
+import { BrandIcon } from "@/components/base/brand-icon"
+import { RequestError } from "@/components/base/request-error"
+import { agentCatalogOptions } from "@/lib/query/agent-settings"
+import { executorListOptions } from "@/lib/query/executor"
+import { uploadAttachment } from "@/lib/attachments"
 import { useCallback, useMemo, type ComponentProps } from "react"
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { useStore } from "@nanostores/react"
@@ -66,9 +73,10 @@ export function ConversationTab({
   const hasInitialData = sync.hasInitialData()
   const isReady = syncState === "synced"
   const isConnected = useStore(connection.$state) === "connected"
+  const rootSessionID = useStore(sync.$rootSessionID)
   const followedSessionID = hasInitialData
     ? sync.getFollowedSessionID()
-    : (sessionID ?? "")
+    : (sessionID ?? rootSessionID ?? "")
   const { $messageRows, $hasItems } = getConversationMessageStores(sync)
   const hasItems = useStore($hasItems)
   const inspectTabItem = useCallback(
@@ -78,7 +86,7 @@ export function ConversationTab({
   // 主对话标签页读对话记录里的分叉来源；旁支指回主对话标签页；子 Agent 没有来源提示
   const conversation = useQuery({
     ...conversationOptions(connection, sync.conversationID),
-    enabled: tab.kind === "main",
+    enabled: tab.kind !== "sub-agent",
   })
   const forkedFromID = conversation.data?.conversation.forked_from_id
   const forkOrigin: ForkOriginNoticeProps | undefined =
@@ -94,34 +102,67 @@ export function ConversationTab({
   const sessionInfo = useStore(sync.$sessions, { keys: [followedSessionID] })[
     followedSessionID
   ]
+  const agents = useQuery(agentCatalogOptions(connection))
+  const executors = useQuery(executorListOptions(connection))
+  const external = sessionInfo?.session.external
+  const agent = external
+    ? (agents.data?.agents?.find(
+        (a) => a.name === sessionInfo.session.agent_name
+      ) ?? {
+        name: sessionInfo.session.agent_name,
+        type: external.agent_type,
+        icon: "",
+      })
+    : undefined
+  const externalState = useStore(sync.$externalState)
+  const restoring = useStore(sync.$restoring)
+  const restoreError = useStore(sync.$restoreError)
+  const detached = sessionInfo?.session.detached_conversation_id
+  const scope = {
+    conversation_id: sync.conversationID,
+    session_id: followedSessionID,
+  }
+  const onError = (error: unknown) => notifyFailure(error, t)
   const setModel = useMutation({
-    mutationFn: (params: {
-      conversation_id: string
-      session_id: SessionID
-      model: ModelSelection
-    }) => connection.call("session/setModel", params),
-    onError: (error) => notifyFailure(error, t),
+    mutationFn: (model: ModelSelection) =>
+      connection.call("session/setModel", { ...scope, model }),
+    onError,
   })
+  const setOption = useMutation({
+    mutationFn: (
+      option: import("@/lib/api/protocol.gen").ExternalOptionSelection
+    ) => connection.call("session/setOption", { ...scope, ...option }),
+    onError,
+  })
+  const reload = useMutation({
+    mutationFn: () => sync.reloadSession(followedSessionID),
+    onError,
+  })
+  const externalModel = externalState.options?.model?.current_value || "default"
   const sessionControls = (
     <SessionControls
       agentName={sessionInfo?.session.agent_name}
-      value={sessionInfo?.session.model}
-      onChange={(model) =>
-        sessionInfo &&
-        setModel.mutate({
-          conversation_id: sync.conversationID,
-          session_id: followedSessionID,
-          model,
-        })
+      scope={scope}
+      value={
+        agent
+          ? { ref: { provider_id: agent.name, model_id: externalModel } }
+          : sessionInfo?.session.model
       }
-      disabled={!sessionInfo || !isReady || !isConnected}
+      onChange={(model) => {
+        if (agent)
+          setOption.mutate({ kind: "model", value: model.ref.model_id })
+        else setModel.mutate(model)
+      }}
+      externalOptions={externalState.options}
+      onOption={setOption.mutate}
+      disabled={!sessionInfo || !isReady || !isConnected || !!detached}
     />
   )
   const contextUsage = (
     <ContextUsageButton
       sync={sync}
       sessionInfo={sessionInfo}
-      canCompact={!sessionID}
+      canCompact={!sessionID && !external}
       disabled={!sessionInfo || !isReady || !isConnected}
     />
   )
@@ -130,13 +171,48 @@ export function ConversationTab({
     <div className="flex h-full min-h-0 flex-1 flex-col">
       <ConversationMessages
         sync={sync}
-        isReady={hasInitialData && syncState !== "failed"}
+        isReady={
+          hasInitialData && syncState !== "failed" && !restoring && !detached
+        }
         loadingContent={
-          <ConversationContentState
-            sync={sync}
-            sessionID={sessionID}
-            onRetry={() => workspace.restartConversationSync(tabID)}
-          />
+          detached ? (
+            <div className="flex items-center gap-2 py-4 text-body color-muted">
+              {t("externalSession.detached")}
+              <NavigationButton
+                className="text-link"
+                to={getConversationPath(sync.serverID, detached)}
+              >
+                {t("externalSession.openDetached")}
+              </NavigationButton>
+            </div>
+          ) : restoreError ? (
+            <div className="py-4">
+              <RequestError
+                title={t("externalSession.failed")}
+                error={new Error(restoreError)}
+                retryLabel={t("externalSession.reload")}
+                retryDisabled={reload.isPending}
+                onRetry={() => reload.mutate()}
+              />
+            </div>
+          ) : restoring ? (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15, ease: "easeOut" }}
+              className="flex items-center gap-2 py-4 text-body color-muted"
+            >
+              <BrandIcon icon={agent?.icon ?? ""} className="animate-pulse" />
+              {t("externalSession.restoring")}
+            </motion.div>
+          ) : (
+            <ConversationContentState
+              sync={sync}
+              sessionID={sessionID}
+              onRetry={() => workspace.restartConversationSync(tabID)}
+            />
+          )
         }
         isSubSession={!!sessionID}
         $messageRows={$messageRows}
@@ -157,10 +233,36 @@ export function ConversationTab({
               sync={sync}
               isReady={isReady}
               isRunning={!!sessionInfo?.active_turn_id}
+              externalAgent={agent}
+              commands={externalState.commands?.filter((command) => command.name !== "btw")}
+              supportsSteer={externalState.capabilities?.supports_steer}
+              uploadFile={(file) => {
+                const settings =
+                  conversation.data?.conversation.executor_settings
+                const executor =
+                  sessionInfo?.session.external?.executor_id ||
+                  settings?.default_executor_id ||
+                  executors.data?.executors.find(
+                    (e) =>
+                      e.kind !== "memory" &&
+                      (!settings?.executor_ids?.length ||
+                        settings.executor_ids.includes(e.id))
+                  )?.id
+                if (!executor)
+                  return Promise.reject(new Error(t("workLocation.executor")))
+                return uploadAttachment(
+                  connection,
+                  sync.conversationID,
+                  executor,
+                  file
+                )
+              }}
               sessionControls={sessionControls}
               contextUsage={contextUsage}
               onSideConversation={
-                tab.kind === "main" && hasItems
+                tab.kind === "main" &&
+                hasItems &&
+                (!external || externalState.capabilities?.supports_ephemeral_session)
                   ? async (question) => {
                       await workspace.openSideConversation(question, isMobile)
                     }

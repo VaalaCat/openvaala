@@ -1,7 +1,7 @@
 import { GitFork } from "lucide"
 import { useQuery } from "@tanstack/react-query"
 import { useTranslation } from "react-i18next"
-import { Link } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { ItemNotice } from "@/components/conversation/item-notice"
 import { useServerConnection } from "@/components/server-connection-provider"
 import type { ConversationID } from "@/lib/api/protocol.gen"
@@ -43,7 +43,7 @@ export function ForkOriginNotice(props: ForkOriginNoticeProps) {
         ) : source.isError ? (
           text
         ) : (
-          <Link
+          <NavigationButton
             className="text-link"
             to={getConversationPath(
               connection.getServerID(),
@@ -51,7 +51,7 @@ export function ForkOriginNotice(props: ForkOriginNoticeProps) {
             )}
           >
             {text}
-          </Link>
+          </NavigationButton>
         )}
       </ItemNotice>
     </div>

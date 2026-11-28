@@ -27,7 +27,7 @@ func (c *agentContextImpl) GetCompactionSource(measurement *ContextMeasurement, 
 		return nil
 	}
 	// 2. 选择历史前缀并克隆。
-	return cloneItems(c.selectCompactPrefix(measurement, isManual))
+	return defs.CloneItems(c.selectCompactPrefix(measurement, isManual))
 }
 
 // BuildCompactionRequest 组装摘要请求，并返回对应的模型和客户端。

@@ -58,12 +58,16 @@ func NewCLI(opt *CLIOpt) *cobra.Command {
 		newConfigCommand(),
 		newTUICommand(),
 		newServeCommand(),
+		newWorldCommand(),
+		newBridgeCommand(),
+		newMCPBridgeCommand(),
 		newWebCommand(),
 		newACPCommand(),
 		newAppServerCommand(),
 		newCodexCommand(),
 		newReindexCommand(),
 		newPluginCommand(),
+		newSessionCommand(), newAgentCommand(), newExecutorCommand(), newExecCommand(), newTerminalCommand(), newSkillCommand(),
 	)
 	return root
 }
@@ -84,6 +88,14 @@ func LoadConfig(command *cobra.Command) (*config.Config, *config.LoadConfigOpt, 
 
 // BuildCLIHandler 包装 handler 成 RunE：先加载配置、收集命令参数，再调用 handler。
 func BuildCLIHandler(handler func(context.Context, *AppArgs) error) func(*cobra.Command, []string) error {
+	// 1. 将加载好的应用参数交给业务入口。
+	return buildCLIHandlerWithArguments(func(command *cobra.Command, args *AppArgs, _ []string) error {
+		return handler(command.Context(), args)
+	})
+}
+
+// buildCLIHandlerWithArguments 将命令及其位置参数一并交给业务入口。
+func buildCLIHandlerWithArguments(handler func(*cobra.Command, *AppArgs, []string) error) func(*cobra.Command, []string) error {
 	// 1. 返回加载配置、收集参数后调用 handler 的 RunE。
 	return func(command *cobra.Command, arguments []string) error {
 		// 1. 加载配置。
@@ -103,7 +115,7 @@ func BuildCLIHandler(handler func(context.Context, *AppArgs) error) func(*cobra.
 		if args.ConfigFlags, err = GetConfigFlags(command.Flags()); err != nil {
 			return err
 		}
-		if args.ConfigPath, _, err = config.GetConfigPath("", opt.Path); err != nil {
+		if args.ConfigPath, err = config.GetConfigPath("", opt.Path); err != nil {
 			return err
 		}
 		// 取不到可执行文件路径时记录警告并留空，命令照常执行。
@@ -114,6 +126,12 @@ func BuildCLIHandler(handler func(context.Context, *AppArgs) error) func(*cobra.
 		if flag := command.Flags().Lookup("url"); flag != nil {
 			args.RuntimeURL = flag.Value.String()
 		}
+		if flag := command.Flags().Lookup("token"); flag != nil {
+			args.RuntimeToken = flag.Value.String()
+		}
+		if flag := command.Flags().Lookup("conversation"); flag != nil {
+			args.ConversationID = defs.ConversationID(flag.Value.String())
+		}
 		if err = readCodexFlags(command.Flags(), args); err != nil {
 			return err
 		}
@@ -123,7 +141,7 @@ func BuildCLIHandler(handler func(context.Context, *AppArgs) error) func(*cobra.
 			}
 		}
 		// 4. 执行业务处理。
-		return handler(command.Context(), args)
+		return handler(command, args, arguments)
 	}
 }
 
@@ -154,9 +172,14 @@ func getConfigOpt(command *cobra.Command) (*config.LoadConfigOpt, error) {
 		Flags: command.Flags(),
 	}
 	if command.Name() == "serve" {
+		opt.WorldServe = command.Parent().Name() == "world"
 		if flag := command.Flags().Lookup("listen"); flag != nil && flag.Changed {
 			listen := flag.Value.String()
-			opt.ServerListen = &listen
+			if command.Parent() == command.Root() {
+				opt.ServerListen = &listen
+			} else if command.Parent().Name() == "world" {
+				opt.WorldServerListen = &listen
+			}
 		}
 	}
 	return opt, nil

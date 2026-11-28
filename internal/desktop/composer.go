@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -37,10 +36,10 @@ func (d *Desktop) composerView(c *ui.Context) {
 		d.pendingInputsView(c)
 		// 2. 输入区背景和上边线铺满中间区，内容列最宽 800 并水平居中；外侧横边距 12 加输入框内边距 4，使输入文字与上方消息列 16 基线对齐。
 		zone := ui.Column(c).Padding(t.Space(2), t.Space(3))
-		// 手测：从文件管理器把图片和非图片文件一起拖到输入区。步骤：拖入一张图片和一个 .txt，
-		// 图片出现缩略图，同时弹出「只能添加图片」提示；再从系统剪贴板粘贴一张截图，也应出现缩略图。
+		// 系统拖放与文件选择使用相同的草稿目标。
 		if files := zone.DroppedFiles(); files != nil {
-			d.addImageFiles(draft, files)
+			executorID, _ := d.getWorkLocationExecutor()
+			d.addDraftFiles(key, draft, executorID, files)
 		}
 		zone.Children(func() {
 			ui.Row(c).Justify(ui.Center).Children(func() {
@@ -66,39 +65,10 @@ func (d *Desktop) composerView(c *ui.Context) {
 	})
 }
 
-// attachmentsView 显示已添加的图片和上下文材料；有图片时高度动画展开。
+// attachmentsView 在输入框上方显示附件和可折叠的上下文材料。
 func (d *Desktop) attachmentsView(c *ui.Context, draft *conversationDraft) {
-	// 1. 有图片时保留一行 40 高的缩略图条。
-	attachments := ui.Column(c.Key("attachments")).ClipY()
-	height := float32(0)
-	for _, part := range draft.Content {
-		if part != nil && part.Image != nil {
-			height = 40
-			break
-		}
-	}
-	height = attachments.Animate("attachment-height", height, 150*time.Millisecond)
-	attachments.Height(height).Children(func() {
-		t := kit.GetTheme(c)
-		ui.ScrollHorizontal(c).Height(40).Children(func() {
-			ui.Row(c).Gap(t.Space(2)).Children(func() {
-				for index, part := range draft.Content {
-					if part == nil || part.Image == nil {
-						continue
-					}
-					name := part.Image.Alt
-					if name == "" {
-						name = fmt.Sprintf(d.t("image.numbered"), index+1)
-					}
-					thumb := d.getImageResource(part.Image.DataURL, name).Source
-					if kit.AttachmentChip(c.Key(part), name, thumb, func() { draft.Content = slices.Delete(draft.Content, index, index+1) }).Clicked() {
-						d.imagePreview = part.Image.DataURL
-						d.imagePreviewOpen = true
-					}
-				}
-			})
-		})
-	})
+	// 1. 图片和普通文件共用一行。
+	d.attachmentStrip(c, draft.Content, draft)
 	// 2. 上下文材料折叠显示，展开状态按材料指针记在桌面上。
 	for index, part := range draft.Content {
 		if part != nil && part.Text != nil && part.Text.IsContext {
@@ -111,12 +81,15 @@ func (d *Desktop) attachmentsView(c *ui.Context, draft *conversationDraft) {
 	}
 }
 
-// composerInput 绘制消息输入框并处理发送、排队、停止、取回上一条和粘贴图片；text 在输入变化时被改写。
+// composerInput 绘制消息输入框并处理发送、排队、停止、取回上一条和粘贴附件；text 在输入变化时被改写。
 func (d *Desktop) composerInput(c *ui.Context, key draftKey, draft *conversationDraft, text *string) ui.Element {
 	// 1. 占位符和输入内容统一使用界面正文字体，避免键入首字时字号和字体跳变。
 	t := kit.GetTheme(c)
 	area := kit.TextArea(c.Key("composer-text"), text).Label(d.t("message")).Placeholder(d.t("message.skill")).Border(0, ui.Transparent).Background(ui.Transparent).Padding(t.Space(1)).FocusRing(false)
 	t.TextRole(area, kit.TextUI)
+	if d.getExternalAgent() != nil {
+		area.Placeholder(d.t("message.command"))
+	}
 	input := area.Lines(2, 8).Bind(&d.composerHandle)
 	_, d.composerCaret = input.TextAnchorCaret()
 	if d.composerCaretRequested {
@@ -125,6 +98,11 @@ func (d *Desktop) composerInput(c *ui.Context, key draftKey, draft *conversation
 		d.composerCaretRequested = false
 	}
 	input.OnPaste(func(_ string) bool {
+		if files, _ := mygo.Clipboard.ReadFiles(); len(files) > 0 {
+			executorID, _ := d.getWorkLocationExecutor()
+			d.addDraftFiles(key, draft, executorID, files)
+			return true
+		}
 		png := mygo.Clipboard.ReadImage()
 		if len(png) == 0 {
 			return false
@@ -135,7 +113,10 @@ func (d *Desktop) composerInput(c *ui.Context, key draftKey, draft *conversation
 	input.OnTextKey(func(k ui.TextKey) bool {
 		// 1. MyGo 在组字期间不分发此回调；技能补全浮层在它之前接管 Enter、Tab、方向键和 Esc。
 		// 手测：用拼音输入法组字时按 Enter 选词，消息不应被发送（TestComposerInput 只覆盖框架的组字事件，真实输入法要人工确认）。
-		draft.Content = replaceDraftText(draft.Content, k.Text())
+		// 只同步本帧之后的新输入。补全菜单可能已改写草稿，而编辑器仍显示本帧的旧词。
+		if typed := k.Text(); typed != *text {
+			draft.Content = replaceDraftText(draft.Content, typed)
+		}
 		switch {
 		case k.Key == ui.KeyEnter && k.Mods == 0:
 			d.submitDraft(key, session.SessionInputModeSteer)
@@ -183,23 +164,40 @@ func (d *Desktop) slashCompletionView(c *ui.Context, anchor, input ui.Element, d
 	// 1. 只在输入框有焦点且光标所在的词以 / 开头时打开，同一来源的技能只请求一次。
 	query, isSlash := getSlashQuery(text, d.composerCaret)
 	key := getSkillCatalogKey(d.readingTarget.ConversationID, d.newAgent, d.newExecutor, d.newDirectory)
+	agent := d.getExternalAgent()
 	opt := kit.CompletionOpt{Open: isSlash && input.Focused(), Empty: d.t("no.matching.skills")}
 	var matches []skill.SkillInfo
 	if opt.Open {
 		// 两个浮层都在输入区上方，输入技能时先收起工作位置表单。
 		d.workLocationPopoverOpen = false
-		catalog := d.loadSkillCatalog(key)
-		matches = getSkillMatches(catalog.Skills, query)
-		opt.Loading = catalog.Loading
-		if catalog.Err != nil {
-			opt.Error = d.getErrorMessage(catalog.Err)
+		if agent != nil {
+			opt.Empty = d.t("no.matching.commands")
+			var commands []skill.SkillInfo
+			for _, cmd := range d.externalCommands {
+				commands = append(commands, skill.SkillInfo{Name: cmd.Name, Description: cmd.Description})
+			}
+			matches = append(matches, getSkillMatches(commands, query)...)
+			if len(matches) == 0 {
+				opt.Open = false
+			}
+		} else {
+			catalog := d.loadSkillCatalog(key)
+			matches = getSkillMatches(catalog.Skills, query)
+			opt.Loading = catalog.Loading
+			if catalog.Err != nil {
+				opt.Error = d.getErrorMessage(catalog.Err)
+			}
 		}
 	} else if catalog := d.skillCatalogs[key]; catalog != nil && catalog.Err != nil {
 		// 2. 失败的结果不缓存，下次再输入 / 时重试。
 		delete(d.skillCatalogs, key)
 	}
 	for _, match := range matches {
-		opt.Items = append(opt.Items, kit.CompletionItem{Title: "/" + match.Name, Description: getSingleLine(match.Description)})
+		icon := kit.IconBookOpen
+		if agent != nil {
+			icon = agentBrandIcon(agent.Icon)
+		}
+		opt.Items = append(opt.Items, kit.CompletionItem{Icon: icon, Title: "/" + match.Name, Description: getSingleLine(match.Description)})
 	}
 	// 3. 选中的技能替换光标所在的词，下一帧把光标放到补全后的空格后。
 	selected := kit.CompletionMenu(c, anchor, input, opt)
@@ -213,17 +211,17 @@ func (d *Desktop) slashCompletionView(c *ui.Context, anchor, input ui.Element, d
 	c.AnimationFrame()
 }
 
-// composerToolbar 绘制输入区底部：添加图片在左，会话控件、排队和发送（或停止）在右。
+// composerToolbar 绘制输入区底部：添加附件在左，会话控件、排队和发送（或停止）在右。
 func (d *Desktop) composerToolbar(c *ui.Context, composer ui.Element, key draftKey, draft *conversationDraft) {
 	t := kit.GetTheme(c)
 	ui.Row(c).Gap(t.Space(1)).AlignItems(ui.Center).Children(func() {
-		if kit.IconButtonTip(c, kit.IconImagePlus, d.t("add.images")).Clicked() {
-			d.chooseImages(draft)
+		if kit.IconButtonTip(c, kit.IconPlus, d.t("add.files")).Clicked() {
+			d.chooseFiles(key, draft)
 		}
 		ui.Spacer(c)
 		d.sessionControls(c, composer)
 		running := d.getSessionInfo().ActiveTurnID != ""
-		canSend := d.connectionState == runtimeclient.ConnectionConnected && !draft.Pending && isContentPresent(draft.Content) && (key.ConversationID == "" || d.readingReady)
+		canSend := d.connectionState == runtimeclient.ConnectionConnected && !draft.Pending && draft.filesReady() && isContentPresent(draft.Content) && d.isDraftTargetReady(key)
 		queueVisible := running && isContentPresent(draft.Content)
 		// 排队按钮只在运行中且有内容时出现，宽度动画展开。
 		queueSlot := ui.Box(c.Key("queue-entry")).ClipX().Disabled(!queueVisible)
@@ -265,7 +263,7 @@ func (d *Desktop) composerToolbar(c *ui.Context, composer ui.Element, key draftK
 		if draft.Pending {
 			hint = d.t("sending")
 		}
-		if key.ConversationID != "" && !d.readingReady {
+		if !d.isDraftTargetReady(key) {
 			hint = d.t("loading.history")
 		}
 		if d.connectionState != runtimeclient.ConnectionConnected {
@@ -281,11 +279,16 @@ func (d *Desktop) composerToolbar(c *ui.Context, composer ui.Element, key draftK
 	})
 }
 
+// isDraftTargetReady 草稿能否发往新对话或已订阅的会话？外部历史恢复期间输入照常入队。
+func (d *Desktop) isDraftTargetReady(key draftKey) bool {
+	return key.ConversationID == "" || d.readingReady || d.historyRestoring
+}
+
 // submitDraft 提交原草稿快照，成功只移除实际发送部分。
 func (d *Desktop) submitDraft(key draftKey, mode session.SessionInputMode) {
 	// 1. 捕获完整内容和创建参数，禁止重复 pending 提交。
 	draft := d.drafts[key]
-	if draft == nil || draft.Pending || !isContentPresent(draft.Content) || d.client == nil || d.connectionState != runtimeclient.ConnectionConnected || key.ConversationID != "" && !d.readingReady {
+	if draft == nil || draft.Pending || !draft.filesReady() || !isContentPresent(draft.Content) || d.client == nil || d.connectionState != runtimeclient.ConnectionConnected || !d.isDraftTargetReady(key) {
 		return
 	}
 	draft.Pending = true
@@ -293,12 +296,28 @@ func (d *Desktop) submitDraft(key draftKey, mode session.SessionInputMode) {
 	d.composerFocusRequested = true
 	sent := slices.Clone(draft.Content)
 	client := d.client
+	executorID, _ := d.getWorkLocationExecutor()
+	staged := map[*defs.Content][]byte{}
+	for part, file := range draft.Files {
+		if file.data != nil {
+			staged[part] = file.data
+		}
+	}
 	requestID := d.readingTarget.Request
 	var ref defs.ModelRef
 	if d.newModel != "" {
 		ref, _ = defs.ParseModelRef(d.newModel)
 	}
 	create := runtimeclient.CreateConversationRequest{AgentName: d.newAgent, Model: defs.ModelSelection{Ref: ref, ReasoningEffort: d.newEffort}, ExecutorSettings: defs.ExecutorSettings{DefaultExecutorID: d.newExecutor, WorkspaceDirectories: map[string]string{d.newExecutor: d.newDirectory}}}
+	if d.getExternalAgent() != nil {
+		create.Model.ReasoningEffort = ""
+		if d.externalOptions != nil {
+			create.InitialOptions = slices.Clone(d.draftOptions)
+		}
+	}
+	if d.externalCapabilities != nil && !d.externalCapabilities.SupportsSteer && mode == session.SessionInputModeSteer && d.getSessionInfo().ActiveTurnID != "" {
+		mode = session.SessionInputModeInterrupt
+	}
 	// 2. 创建成功即迁移草稿身份；首次提交失败仍留在真实对话。
 	d.tasks.Go(func() {
 		conversationID := key.ConversationID
@@ -332,8 +351,32 @@ func (d *Desktop) submitDraft(key draftKey, mode session.SessionInputMode) {
 				})
 			}
 		}
+		outgoing := slices.Clone(sent)
+		for i, part := range sent {
+			data, ok := staged[part]
+			if !ok || err != nil {
+				continue
+			}
+			file, uploadErr := uploadDraftFile(d.ctx, client, conversationID, executorID, *part.File, data)
+			err = uploadErr
+			d.window.Update(func() {
+				if d.closed {
+					return
+				}
+				if state := draft.Files[part]; state != nil {
+					state.err = uploadErr
+					if uploadErr == nil {
+						part.File = &file
+						delete(draft.Files, part)
+					}
+				}
+			})
+			if err == nil {
+				outgoing[i] = &defs.Content{Kind: defs.ContentFile, File: &file}
+			}
+		}
 		if err == nil {
-			_, err = client.SubmitInput(d.ctx, &runtimeclient.SubmitInputRequest{ConversationID: conversationID, Mode: mode, Content: sent})
+			_, err = client.SubmitInput(d.ctx, &runtimeclient.SubmitInputRequest{ConversationID: conversationID, Mode: mode, Content: outgoing})
 		}
 		d.window.Update(func() {
 			if d.closed {
@@ -513,11 +556,12 @@ func (d *Desktop) queueAction(kind string, itemID defs.ItemID, turnID defs.TurnI
 	})
 }
 
-// chooseImages 使用系统多图选择，取消不产生错误。
-func (d *Desktop) chooseImages(draft *conversationDraft) {
+// chooseFiles 将系统选择器的结果放入打开它的草稿。
+func (d *Desktop) chooseFiles(key draftKey, draft *conversationDraft) {
 	win := d.window
+	executorID, _ := d.getWorkLocationExecutor()
 	d.tasks.Go(func() {
-		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: win, Multiple: true, Filters: []mygo.FileFilter{{Name: d.t("image.files"), Extensions: []string{"png", "jpg", "jpeg", "gif", "webp", "bmp"}}}})
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: win, Multiple: true})
 		win.Update(func() {
 			if d.closed {
 				return
@@ -526,48 +570,9 @@ func (d *Desktop) chooseImages(draft *conversationDraft) {
 				d.showFailure(err)
 				return
 			}
-			d.addImageFiles(draft, paths)
-		})
-	})
-}
-
-// addImageFiles 在任务中读取附件，结果仍返回原草稿。
-func (d *Desktop) addImageFiles(draft *conversationDraft, paths []string) {
-	if len(paths) == 0 {
-		return
-	}
-	d.tasks.Go(func() {
-		data := [][]byte{}
-		names := []string{}
-		var readErr error
-		for _, path := range paths {
-			info, err := os.Stat(path)
-			if err == nil && info.Size() > 10<<20 {
-				err = fmt.Errorf("%w: %s", errImageTooLarge, path)
+			if key.ServerID == d.serverID {
+				d.addDraftFiles(key, draft, executorID, paths)
 			}
-			if err != nil {
-				readErr = errors.Join(readErr, err)
-				continue
-			}
-			bytes, err := os.ReadFile(path)
-			if err != nil {
-				readErr = errors.Join(readErr, err)
-				continue
-			}
-			if !strings.HasPrefix(http.DetectContentType(bytes), "image/") {
-				readErr = errors.Join(readErr, fmt.Errorf("%w: %s", errNotImage, path))
-				continue
-			}
-			data = append(data, bytes)
-			names = append(names, filepath.Base(path))
-		}
-		attachments, prepareErr := prepareImageAttachments(d.ctx, data, names)
-		readErr = errors.Join(readErr, prepareErr)
-		d.window.Update(func() {
-			if d.closed {
-				return
-			}
-			d.acceptImageAttachments(draft, attachments, readErr)
 		})
 	})
 }
@@ -608,24 +613,11 @@ func prepareImageAttachments(ctx context.Context, data [][]byte, names []string)
 // acceptImageAttachments 在主线程校验最新草稿容量并加入已准备图片。
 func (d *Desktop) acceptImageAttachments(draft *conversationDraft, attachments []imageAttachment, preparationError error) {
 	// 1. 读取原草稿本次最新附件，容量只在写入处验证。
-	total := 0
-	for _, part := range draft.Content {
-		if part != nil && part.Image != nil {
-			_, encoded, found := strings.Cut(part.Image.DataURL, ",")
-			if found {
-				total += base64.StdEncoding.DecodedLen(len(encoded))
-				if strings.HasSuffix(encoded, "==") {
-					total -= 2
-				} else if strings.HasSuffix(encoded, "=") {
-					total--
-				}
-			}
-		}
-	}
+	total := draftImageBytes(draft.Content)
 	for _, attachment := range attachments {
 		total += attachment.Bytes
 	}
-	if total > 10<<20 {
+	if total > attachmentLimit {
 		d.showToast(kit.ToastOpt{Title: d.t("images.exceed.10.mib"), Kind: kit.ToastError})
 		return
 	}
@@ -635,21 +627,8 @@ func (d *Desktop) acceptImageAttachments(draft *conversationDraft, attachments [
 		d.images[attachment.Content.Image.DataURL] = &imageResource{Source: attachment.Bitmap}
 	}
 	if preparationError != nil {
-		d.showImageFailure(preparationError)
+		d.showToast(kit.ToastOpt{Title: d.t("image.read.failed"), Description: preparationError.Error(), Kind: kit.ToastError})
 	}
-}
-
-// showImageFailure 用本地化标题提示添加图片失败，文件名和原因放进详情。
-func (d *Desktop) showImageFailure(err error) {
-	// 1. 按最具体的原因选标题：不是图片、超过大小、其余读取或解码失败。
-	title := d.t("image.read.failed")
-	switch {
-	case errors.Is(err, errNotImage):
-		title = d.t("images.only")
-	case errors.Is(err, errImageTooLarge):
-		title = d.t("image.too.large")
-	}
-	d.showToast(kit.ToastOpt{Title: title, Description: err.Error(), Kind: kit.ToastError})
 }
 
 // loadSkillCatalog 返回来源 key 下的技能目录；首次请求时发出 skill/list，同一来源之后直接复用结果。

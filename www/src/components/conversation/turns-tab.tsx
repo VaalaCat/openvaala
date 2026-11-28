@@ -31,11 +31,13 @@ export function TurnsTab({ sync }: { sync: ConversationSync }) {
   const { t } = useTranslation()
   const connection = useServerConnection()
   const isConnected = useStore(connection.$state) === "connected"
+  const historyGeneration = useStore(sync.$historyGeneration)
   const turns = useInfiniteQuery(
     turnListOptions(
       connection,
       sync.conversationID,
-      sync.getFollowedSessionID()
+      sync.getFollowedSessionID(),
+      historyGeneration
     )
   )
   const maxInput = Math.max(

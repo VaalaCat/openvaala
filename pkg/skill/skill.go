@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/VaalaCat/openvaala/docs"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"gopkg.in/yaml.v3"
@@ -26,8 +27,9 @@ type Skill struct {
 	// 例如本机 skill 为 /home/me/.claude/skills/pdf/SKILL.md，openvaala 内置 skill 为 /skills/openvaala/SKILL.md。
 	Path string
 	// Executor 是 SKILL.md 所在的 Executor，例如内置 skill 为 "openvaala"。
-	Executor  string
-	workspace workspace.Workspace
+	Executor        string
+	workspace       workspace.Workspace
+	embeddedContent string
 }
 
 // SkillDirectory 指向递归包含多个技能的目录，或直接包含 SKILL.md 的单个技能目录，经 Workspace 读取。
@@ -43,6 +45,9 @@ type SkillDirectory struct {
 
 // maxSkillFileBytes 是读取单个 SKILL.md 的上限。
 const maxSkillFileBytes = 1 << 20
+
+// BuiltinSkillName 是内嵌 OpenVaala 文档的 Skill 名称。
+const BuiltinSkillName = "openvaala"
 
 // skillFrontmatter 是 SKILL.md 开头 YAML 中本包使用的字段；其他字段忽略。
 type skillFrontmatter struct {
@@ -173,12 +178,58 @@ func parseFrontmatter(content string) (*skillFrontmatter, error) {
 
 // GetContent 从来源工作区读取 Skill 文件当前的完整内容。
 func (s *Skill) GetContent(ctx context.Context) (string, error) {
+	if s.embeddedContent != "" {
+		return s.embeddedContent, nil
+	}
 	// 1. 从来源工作区读取包含 YAML 文件头的完整正文，失败时附上名称和路径。
 	text, err := workspace.GetFileText(ctx, s.workspace, s.Path)
 	if err != nil {
 		return "", fmt.Errorf("read skill %q (%s): %w", s.Name, s.Path, err)
 	}
 	return text, nil
+}
+
+// GetFileContent 读取 Skill 目录内的文件，省略文件时读取 SKILL.md。
+func (s *Skill) GetFileContent(ctx context.Context, file string) (string, error) {
+	if file == "" {
+		return s.GetContent(ctx)
+	}
+	relative, err := filepath.Localize(file)
+	if err != nil || relative == "." || strings.Contains(file, "\\") {
+		return "", fmt.Errorf("invalid skill file path %q", file)
+	}
+	if s.embeddedContent != "" {
+		data, err := docs.Files.ReadFile(file)
+		return string(data), err
+	}
+	path := filepath.Dir(s.Path)
+	for _, part := range strings.Split(file, "/") {
+		path = filepath.Join(path, part)
+		info, err := s.workspace.GetMetadata(ctx, path, false)
+		if err != nil {
+			return "", err
+		}
+		if info.IsSymlink {
+			return "", fmt.Errorf("invalid skill file path %q: symbolic link", file)
+		}
+	}
+	return workspace.GetFileText(ctx, s.workspace, path)
+}
+
+// GetBuiltinSkill 读取程序内嵌的 OpenVaala Skill。
+func GetBuiltinSkill() (*Skill, error) {
+	content, err := docs.Files.ReadFile("SKILL.md")
+	if err != nil {
+		return nil, err
+	}
+	frontmatter, err := parseFrontmatter(string(content))
+	if err != nil {
+		return nil, err
+	}
+	return &Skill{
+		Name: frontmatter.Name, Description: strings.Join(strings.Fields(frontmatter.Description), " "),
+		Path: "/skills/openvaala/SKILL.md", Executor: "openvaala", embeddedContent: string(content),
+	}, nil
 }
 
 // isPlainNameValid 不带插件前缀的 Skill 名称是否合法？
@@ -214,4 +265,19 @@ func GetSkillsByNames(names []string, catalog []*Skill) []*Skill {
 		}
 	}
 	return selected
+}
+
+// WithBuiltinSkill 保留已有同名 Skill，否则按名称顺序插入内置 Skill。
+func WithBuiltinSkill(catalog []*Skill) ([]*Skill, error) {
+	index, found := slices.BinarySearchFunc(catalog, BuiltinSkillName, func(listed *Skill, name string) int {
+		return strings.Compare(listed.Name, name)
+	})
+	if found {
+		return catalog, nil
+	}
+	builtin, err := GetBuiltinSkill()
+	if err != nil {
+		return nil, err
+	}
+	return slices.Insert(slices.Clip(catalog), index, builtin), nil
 }

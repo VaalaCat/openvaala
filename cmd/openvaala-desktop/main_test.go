@@ -207,7 +207,7 @@ func TestGetDesktopHTTPHeaders(t *testing.T) {
 	tests := []struct {
 		name       string
 		config     string // 为空表示配置文件不存在
-		wantTeam   string // 期望 http.headers 里的 X-Team；为空时期望返回 nil
+		wantTeam   string // 期望 http.headers 里的 X-Team
 		wantWarned bool
 	}{
 		{
@@ -226,8 +226,7 @@ func TestGetDesktopHTTPHeaders(t *testing.T) {
 			wantWarned: true,
 		},
 		{
-			name:       "missing_config_file_returns_nil_and_warns",
-			wantWarned: true,
+			name: "missing_config_file_uses_default_headers",
 		},
 	}
 	// 2. 用 --config-file 指向配置，记录警告日志，比较返回值。
@@ -254,7 +253,7 @@ func TestGetDesktopHTTPHeaders(t *testing.T) {
 				got = cfg.GetHTTPHeaders()
 			}
 
-			if tt.wantTeam == "" {
+			if tt.wantWarned {
 				if got != nil {
 					t.Fatalf("desktop headers = %v, want nil", got)
 				}

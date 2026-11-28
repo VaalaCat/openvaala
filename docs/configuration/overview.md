@@ -33,7 +33,7 @@ To use a different configuration file, pass `--config-file` to any command or se
 openvaala --config-file ~/work/openvaala/config.yaml
 ```
 
-Relative directory paths in `config.yaml` are resolved against the directory that contains `config.yaml`, and a leading `~` expands to your home directory. A missing default `config.yaml` is fine (built-in defaults apply); a file you named explicitly must exist.
+Relative directory paths in `config.yaml` are resolved against the directory that contains `config.yaml`, and a leading `~` expands to your home directory. If the file is missing at the default or a custom path, OpenVaala loads the built-in defaults and creates the file at that path when it first saves settings.
 
 OpenVaala also writes to a few locations outside the configuration directory:
 
@@ -137,7 +137,7 @@ These settings belong to `openvaala serve`, the runtime server.
 
 ### client
 
-These settings tell client commands — the terminal UI, `web`, `acp`, `app-server` and `codex` — which runtime server to use. The desktop app always uses the local runtime server.
+These settings tell client commands — the terminal UI, `web`, `acp`, `app-server` and `codex` — which runtime server to use. The desktop app defaults to the local runtime and accepts remote World links.
 
 - `url` — the server's WebSocket address, for example `ws://10.0.0.5:8790/api/v1/openvaala`. When empty, clients connect to the local runtime server and start it if it is not running. `--url` overrides it for one command.
 - `token` — the token for `url`. If `url` contains a `?token=` query parameter, that value wins. When both are empty and `url` points at the local runtime server, clients use the local token automatically. `client.token` is never read from `server.token`; the two are separate on purpose.
@@ -206,7 +206,7 @@ OPENVAALA_CLIENT_URL=ws://10.0.0.5:8790/api/v1/openvaala openvaala
 OPENVAALA_MODELS_DEFAULT_MODEL=openai/gpt-5 openvaala
 ```
 
-Settings are applied in this order, later ones winning: built-in defaults, `config.yaml`, environment variables, then command-line flags (`--data-dir`, `--agents-dir`, `--models-dir`, `--agent`, `serve --listen`). Maps and lists of objects — `telemetry.otlp_headers`, `http.headers` and `client.path_mappings` — can only be set in the file.
+Settings are applied in this order, later ones winning: built-in defaults, `config.yaml`, environment variables, then command-line flags (`--data-dir`, `--agents-dir`, `--models-dir`, `--agent`, plus `--listen` and `--relay-mode` on both serve commands). Maps and lists of objects — `telemetry.otlp_headers`, `http.headers` and `client.path_mappings` — can only be set in the file.
 
 `OPENVAALA_CONFIG` selects the configuration file itself; when it is set it must not be empty.
 
@@ -251,3 +251,31 @@ openvaala serve stop
 ```
 
 Client settings (`client.*` and `run.agent_name`) are read each time you start a client command.
+
+## World
+
+In **Settings → World**, you can join a World, choose which Agents to advertise, and enable the local node or control plane. Confirming a save restarts serve. Clients briefly disconnect and running turns are interrupted.
+
+- `world.relays` defaults to `[]`. Nodes try direct URLs first, then their home relay followed by the configured relays in order, skipping duplicates.
+The `world.server.domain` setting is the name shared by members. It does not require a DNS domain.
+
+- `world.relay_mode` accepts `off`, `domain` (members only, requires the local control plane), or `public`. It defaults to `domain` with the control plane enabled and `off` otherwise. A standalone relay requires `public`. On both `openvaala serve` and `openvaala world serve`, `--relay-mode` overrides the file for that run.
+- `world.relay_instances` lists the HTTPS addresses (also accepts HTTP, WS and WSS) of the instances of a public relay. Configure the same list on each instance. An empty list enables single-instance operation. Nodes and domain cards continue to use the entry address in `world.relays`.
+- `world.remote_access.enabled` defaults to false. When you enable it with an empty relay list, Settings adds `https://open.vaa.la` to the draft. Save and restart, then scan the code to connect. World membership is optional. `world.remote_access.name` defaults to the hostname.
+- `world.web_url` can specify the page origin (HTTP or HTTPS, host and optional port). Otherwise the server prefers a public HTTPS relay, then a direct HTTPS address, skipping the implicit home control plane. Settings labels a local-only address.
+
+`openvaala world serve` runs the enabled control plane, relay, or both on `world.server.listen` (default `0.0.0.0:8791`), without starting a Runtime or World node. Enable at least one role. Binaries with the embedded Web App serve it at `/web/v1/` on the same port, including on a relay-only deployment.
+
+For a control plane only, put the following in `config.yaml` and run `openvaala world serve`.
+
+```yaml
+world:
+  server: {enabled: true, domain: example.org}
+  relay_mode: off
+```
+
+For a relay only, leave the control plane disabled (the default) and run this command.
+
+```bash
+openvaala world serve --relay-mode public
+```

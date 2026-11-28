@@ -1,0 +1,22 @@
+{
+  "name": "openvaala-world-paseo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test server/*.test.ts"
+  },
+  "dependencies": {
+    "@getpaseo/client": "0.17.3"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.17.3",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.0",
+    "ws": "^8.23.0",
+    "zod": "^4.0.0"
+  }
+}

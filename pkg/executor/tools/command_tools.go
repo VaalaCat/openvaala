@@ -215,6 +215,24 @@ func NewCommandTools(opt *CommandToolsOpt) ([]executor.Tool, error) {
 	}, nil
 }
 
+// NewSessionCommandTools 为本 Session 的每个可运行命令的环境创建命令工具。
+func NewSessionCommandTools(environments []executor.ExecutionEnvironment, terminals terminal.TerminalManager) (map[string][]executor.Tool, error) {
+	// 1. 将命令工具绑定到各环境的工作区和同一个命令集合。
+	sessionTools := make(map[string][]executor.Tool, len(environments))
+	for _, environment := range environments {
+		work := environment.GetWorkspace()
+		if work == nil || !environment.IsCommandSupported() {
+			continue
+		}
+		commandTools, err := NewCommandTools(NewCommandToolsOpt(environment.GetID(), work, terminals))
+		if err != nil {
+			return nil, err
+		}
+		sessionTools[environment.GetID()] = commandTools
+	}
+	return sessionTools, nil
+}
+
 // GetCommandToolNames 返回五个命令工具的名称。
 func GetCommandToolNames() []string {
 	// 1. 按创建顺序返回工具名称列表。

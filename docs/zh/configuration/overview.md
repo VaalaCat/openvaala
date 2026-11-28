@@ -33,7 +33,7 @@
 openvaala --config-file ~/work/openvaala/config.yaml
 ```
 
-`config.yaml` 里的相对目录以 `config.yaml` 所在目录为基准，开头的 `~` 表示你的主目录。默认位置没有 `config.yaml` 没关系（用内置默认值）；你明确指定的文件必须存在。
+`config.yaml` 里的相对目录以 `config.yaml` 所在目录为基准，开头的 `~` 表示你的主目录。默认路径或自定义路径下缺少配置文件时，OpenVaala 使用内置默认值，首次保存设置时才在该路径创建文件。
 
 OpenVaala 还会在配置目录以外的几个地方写文件：
 
@@ -137,7 +137,7 @@ telemetry:
 
 ### client
 
-这些设置告诉客户端命令（终端界面、`web`、`acp`、`app-server` 和 `codex`）连哪个 Runtime 服务。桌面端总是用本机的 Runtime 服务。
+这些设置告诉客户端命令（终端界面、`web`、`acp`、`app-server` 和 `codex`）连哪个 Runtime 服务。桌面端默认使用本机的 Runtime 服务，也可以通过 World 链接连接远程机器。
 
 - `url`：服务的 WebSocket 地址，例如 `ws://10.0.0.5:8790/api/v1/openvaala`。为空时，客户端连接本机的 Runtime 服务，没在运行就启动它。`--url` 可以为单个命令覆盖它。
 - `token`：`url` 对应的 token。如果 `url` 里带了 `?token=` 查询参数，以它为准。两者都为空、`url` 又指向本机 Runtime 服务时，客户端自动用本机的 token。`client.token` 从不读取 `server.token`，两者是故意分开的。
@@ -206,7 +206,7 @@ OPENVAALA_CLIENT_URL=ws://10.0.0.5:8790/api/v1/openvaala openvaala
 OPENVAALA_MODELS_DEFAULT_MODEL=openai/gpt-5 openvaala
 ```
 
-设置按这个顺序生效，后面的覆盖前面的：内置默认值、`config.yaml`、环境变量、命令行参数（`--data-dir`、`--agents-dir`、`--models-dir`、`--agent`、`serve --listen`）。映射和对象列表（`telemetry.otlp_headers`、`http.headers` 和 `client.path_mappings`）只能在配置文件里设置。
+设置按这个顺序生效，后面的覆盖前面的：内置默认值、`config.yaml`、环境变量、命令行参数（`--data-dir`、`--agents-dir`、`--models-dir`、`--agent`，以及两个 serve 命令的 `--listen` 和 `--relay-mode`）。映射和对象列表（`telemetry.otlp_headers`、`http.headers` 和 `client.path_mappings`）只能在配置文件里设置。
 
 `OPENVAALA_CONFIG` 用来指定配置文件本身；设置了就不能为空。
 
@@ -251,3 +251,31 @@ openvaala serve stop
 ```
 
 客户端设置（`client.*` 和 `run.agent_name`）在每次启动客户端命令时读取。
+
+## World
+
+在**设置 → World** 中可以加入 World、选择通告的 Agent，以及启停本机节点或控制面。确认保存后会重启 serve，客户端会短暂断线，正在执行的轮次会中断。
+
+- `world.relays` 默认为 `[]`。节点先试直连，再试本域 relay，之后按配置顺序尝试其余 relay，跳过重复项。
+`world.server.domain` 是成员共用的域的名字，不需要拥有真实域名。
+
+- `world.relay_mode` 可选 `off`、`domain`（仅限域成员，需要同服控制面）或 `public`。启用控制面时默认为 `domain`，否则为 `off`。单独运行 relay 时只能选 `public`。`openvaala serve` 和 `openvaala world serve` 均可用 `--relay-mode` 覆盖配置文件，仅对本次启动生效。
+- `world.relay_instances` 列出公开 relay 的全部实例，使用 HTTPS 地址，也接受 HTTP、WS 和 WSS。仅 `public` 模式允许配置，所有实例填写同一份列表。留空时使用单实例；节点和域名片的 `world.relays` 仍填写入口地址。
+- `world.remote_access.enabled` 默认关闭。打开时，若 relay 列表为空，设置页在草稿中填入 `https://open.vaa.la`。保存并重启后即可扫码连接；无需加入 World。`world.remote_access.name` 留空时使用主机名。
+- `world.web_url` 可指定链接的页面 origin（HTTP 或 HTTPS 的协议、主机和可选端口）。留空时先选公开 HTTPS relay，再选 HTTPS 直连地址；隐式的本域控制面跳过。只能选到内网地址时，设置页标记「仅内网」。
+
+`openvaala world serve` 按配置在 `world.server.listen`（默认 `0.0.0.0:8791`）上运行控制面、relay 或两者。至少启用一种角色，进程不启动 Runtime 或 World 节点。内嵌前端的二进制会在同一端口的 `/web/v1/` 提供完整 Web App，纯 relay 部署也可访问。
+
+只运行控制面时，将以下配置写入 `config.yaml`，然后运行 `openvaala world serve`。
+
+```yaml
+world:
+  server: {enabled: true, domain: example.org}
+  relay_mode: off
+```
+
+只运行 relay 时，保持控制面关闭（默认），执行以下命令。
+
+```bash
+openvaala world serve --relay-mode public
+```

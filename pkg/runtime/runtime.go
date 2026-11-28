@@ -2,12 +2,16 @@
 package runtime
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,8 +22,10 @@ import (
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
+	"github.com/VaalaCat/openvaala/pkg/externalagent"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/session"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	storagesqlite "github.com/VaalaCat/openvaala/pkg/storage/sqlite"
@@ -33,12 +39,28 @@ import (
 // Runtime 保存共享定义和运行中的对话，按 ConversationID 处理对话操作与订阅。
 // 对话的装配、设置更新和客户端 MCP 登记在调用方 goroutine 里执行，运行表与定义只由 Runtime 事件循环修改。
 type Runtime interface {
+	// GetAgentOptions 按定义和工作位置读取或刷新选项。
+	GetAgentOptions(context.Context, AgentOptionsRequest) (defs.ExternalOptions, error)
+	// ListExternalSessions 分页列举可导入会话。
+	ListExternalSessions(context.Context, ExternalSessionsRequest) (ExternalSessionsResult, error)
+	// PreviewExternalSession 获取所选会话首末用户消息。
+	PreviewExternalSession(context.Context, ExternalSessionRequest) (externalagent.ExternalSessionPreview, error)
+	// ImportSession 从外部绑定新建持久对话。
+	ImportSession(context.Context, ImportSessionRequest) (defs.Conversation, error)
+	// DetachSession 将外部子会话转到一个新的根会话。
+	DetachSession(context.Context, defs.ConversationID, defs.SessionID) (defs.Conversation, error)
+	// GetCollaborationConversation 打开对话并返回拥有会话协作规则的实例。
+	GetCollaborationConversation(context.Context, defs.ConversationID) (conversation.Conversation, error)
+	// UpdateSession 保存会话标签、后台状态和任务名称，并通知订阅者。
+	UpdateSession(context.Context, defs.ConversationID, defs.SessionID, conversation.SessionUpdate) (defs.Session, error)
+	// Exec 在指定 Executor 的工作区运行命令并等待其退出。
+	Exec(context.Context, *ExecutorExecRequest) (ExecutorExecResult, error)
 	// Run 运行到上下文结束，停止并等待全部对话和交互终端后返回；只能调用一次。需要运行实例的方法在 Run 启动前等待，Run 返回后返回 ErrRuntimeStopped。
 	Run(ctx context.Context) error
 	// IsIdle 全部已打开对话是否都没有运行中的 Turn 或后台命令，也没有没结束的交互终端？包括子 Agent；Runtime 已停止时返回 ErrRuntimeStopped。
 	IsIdle(ctx context.Context) (bool, error)
 
-	// CreateConversation 按 Agent、模型、Executor 设置和环境创建并启动对话；模型目录为空返回 ErrNoModelConfigured，设置无效返回 conversation.ErrInvalidExecutorSettings。
+	// CreateConversation 按 Agent、模型、Executor 设置和环境创建并启动对话。
 	CreateConversation(ctx context.Context, request *CreateConversationRequest) (defs.Conversation, error)
 	// OpenConversation 对话已打开时返回最新记录，否则按记录里的设置装配并启动；同一对话同时打开只装配一次，记录不存在返回 ErrConversationNotFound。
 	OpenConversation(ctx context.Context, request *OpenConversationRequest) (defs.Conversation, error)
@@ -61,6 +83,8 @@ type Runtime interface {
 	SetConversationArchived(ctx context.Context, request *SetConversationArchivedRequest) (defs.Conversation, error)
 	// DeleteConversation 停止对话并删除全部记录和历史，删除成功后结束这个对话打开的终端；有 Session 在执行 Turn 时返回 session.ErrSessionBusy，临时和未保存对话返回 ErrConversationNotFound。
 	DeleteConversation(ctx context.Context, request *DeleteConversationRequest) error
+	// UploadAttachment 将文件写到指定 Executor 上该对话的附件目录。
+	UploadAttachment(ctx context.Context, request *UploadAttachmentRequest) (*defs.FileRef, error)
 
 	// SubmitInput 将输入交给已打开对话的根 Session，返回 ItemID；普通新对话先保存，用户输入接收后用正文给空标题命名。
 	SubmitInput(ctx context.Context, request *SubmitInputRequest) (defs.ItemID, error)
@@ -102,11 +126,13 @@ type Runtime interface {
 	ListExecutors(ctx context.Context) ([]conversation.ExecutorDetails, error)
 	// ResolveWorkspaceDirectory 按当前 ExecutorProvider 解析工作目录；SSH Executor 每次调用建立连接，结束后断开。
 	ResolveWorkspaceDirectory(ctx context.Context, request *ResolveWorkspaceDirectoryRequest) (string, error)
-	// OpenTerminal 用所属对话能用的 Executor 新建独立工作区并启动 shell；工作区建好后 ctx 结束只取消等待，终端照常启动和登记。未知 Executor 返回 conversation.ErrInvalidExecutorSettings，
+	// OpenTerminal 为选定的 Executor 新建独立工作区并启动 shell；工作区建好后 ctx 结束只取消等待，终端照常启动和登记。独立查询遇到未知 Executor 时返回 conversation.ErrInvalidExecutorSettings，
 	// virtual Executor 返回 workspace.ErrTTYUnsupported，没结束的终端达到上限时返回 terminal.ErrTerminalLimitReached。
 	OpenTerminal(ctx context.Context, request *OpenTerminalRequest) (opened *OpenedTerminal, err error)
 	// GetTerminal 查找已打开的终端，已结束但记录还在的也返回；找不到时返回 terminal.ErrTerminalNotFound，不新建。
 	GetTerminal(ctx context.Context, terminalID string) (result terminal.Terminal, err error)
+	// GetConversationTerminal 读取实际登记在指定对话下的终端。
+	GetConversationTerminal(ctx context.Context, conversationID defs.ConversationID, terminalID string) (terminal.Terminal, error)
 	// SubscribeTerminals 返回运行中的终端并订阅变化，ctx 结束后退订。
 	SubscribeTerminals(ctx context.Context) (subscription *TerminalsSubscription, err error)
 	// GetWorkspaceDirectories 列出指定 Executor 上一个目录的普通直接子目录，请求结束后关闭临时工作区。
@@ -115,11 +141,19 @@ type Runtime interface {
 	SetDefinitions(ctx context.Context, request *Definitions) (SetDefinitionsResult, error)
 	// GetSkills 返回对话根 Agent 或草稿 Agent 的可用 Skill 目录；草稿按 Executor 设置扫描项目目录和主目录。
 	GetSkills(ctx context.Context, request *GetSkillsRequest) ([]skill.SkillInfo, error)
+	// GetSkill 从同一目录读取指定 Skill 的正文。
+	GetSkill(ctx context.Context, request *GetSkillsRequest, name, file string) (string, error)
 	// SetSessionModel 保存已打开对话中 Session 的模型和推理强度，下个 Turn 起生效，返回记录并推送运行信息；已保存但通知 Session 失败时，仍推送运行信息并返回记录和错误。
 	SetSessionModel(ctx context.Context, request *SetSessionModelRequest) (defs.Session, error)
 
 	// ListSessions 分页读取对话内的 Session 记录。
 	ListSessions(ctx context.Context, request *dao.ListSessionsRequest) (storage.Page[defs.Session, dao.RecordCursor[defs.SessionID]], error)
+	// GetSession 从对话自己的 DAO 读取会话记录。
+	GetSession(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) (defs.Session, error)
+	// IsSessionDescendant 目标是否是同一对话里来源 Session 的后代？
+	IsSessionDescendant(ctx context.Context, conversationID defs.ConversationID, source, target defs.SessionID) (bool, error)
+	// IsSessionRecordDescendant 已读的目标记录是否是同一对话里来源 Session 的后代？
+	IsSessionRecordDescendant(ctx context.Context, source defs.SessionID, target defs.Session) (bool, error)
 	// GetSessionByID 从共享库按 SessionID 读取记录（含所属 ConversationID）；未找到时返回 ErrSessionNotFound。
 	GetSessionByID(ctx context.Context, request *GetSessionByIDRequest) (defs.Session, error)
 	// ListTurns 按请求排序分页读取 Session 的 Turn，默认按 TurnID，也支持 UpdatedAt；不要求对话已打开。
@@ -172,6 +206,11 @@ type runtimeImpl struct {
 
 // RuntimeOpt 保存全部对话共享的依赖，构造后只读。
 type RuntimeOpt struct {
+	ServerURL string
+	// DataDirectory 是本机保存对话数据及附件的根目录。
+	DataDirectory string
+	// SessionTokenSecret 是签发会话 Token 使用的 serve 令牌。
+	SessionTokenSecret *sessiontoken.Secret
 	// ModelClient 是全部对话共用的模型客户端，须支持并发调用；nil 时每个对话创建默认客户端。
 	ModelClient llmkit.Client
 	// Records、Logs 是共用库的记录和日志存储；Runtime 用它们建共用的 DAO，也用作新对话暂存记录的目标。
@@ -302,6 +341,8 @@ func (r *runtimeImpl) Run(ctx context.Context) error {
 				r.handleConversationCloseRequested(ctx, request)
 			case *runningConversationsRequested:
 				r.handleRunningConversationsRequested(request)
+			case *optionsProbeRequested:
+				r.handleOptionsProbeRequested(ctx, request)
 			case *definitionsChangeRequested:
 				r.handleDefinitionsChangeRequested(request)
 			case *runningSubscribeRequested:
@@ -346,49 +387,80 @@ func (r *runtimeImpl) CreateConversation(ctx context.Context, request *CreateCon
 
 // createConversation 打开内存库，装配新对话并登记运行实例；storedSettings 是校验用的原设置，分叉时传来源的设置，新建时为零值。
 func (r *runtimeImpl) createConversation(ctx context.Context, request *CreateConversationRequest, storedSettings defs.ExecutorSettings) (defs.Conversation, error) {
-	// 1. 读取当前定义，模型目录为空时返回 ErrNoModelConfigured。
+	// 1. 读取当前定义并打开新对话的内存库。
 	definitions := r.definitions.Load()
-	if len(definitions.conversationDefinitions.Models) == 0 {
-		return defs.Conversation{}, ErrNoModelConfigured
-	}
-	// 2. 打开新对话的内存库。
+	resolved := resolveCreateModel(*request, definitions.conversationDefinitions.Agents)
 	store, err := r.openUnsavedConversationStore(request.Ephemeral)
 	if err != nil {
 		return defs.Conversation{}, err
 	}
-	// 3. 按环境变量、Executor 设置和原设置装配对话；设置无效时返回 conversation.ErrInvalidExecutorSettings，装配失败时关闭内存库。
+	// 2. 按环境变量、Executor 设置和原设置装配对话；装配失败时关闭内存库。
 	opt := &conversation.ConversationOpt{
-		ModelClient:      r.opt.ModelClient,
-		Query:            store.query,
-		Mutation:         store.mutation,
-		Definitions:      definitions.conversationDefinitions,
-		Environment:      request.Environment,
-		MaxImageBytes:    r.opt.MaxImageBytes,
-		WithoutExecutors: request.WithoutExecutors,
+		DetachedConversations: r.query,
+		SessionTokenSecret:    r.opt.SessionTokenSecret,
+		ServerURL:             r.opt.ServerURL,
+		DataDirectory:         r.opt.DataDirectory,
+		InitialOptions:        resolved.InitialOptions,
+		Ephemeral:             request.Ephemeral,
+		ForkSummary:           request.forkSummary,
+		ForkedFromID:          request.forkedFromID,
+		ModelClient:           r.opt.ModelClient,
+		Query:                 store.query,
+		Mutation:              store.mutation,
+		Definitions:           definitions.conversationDefinitions,
+		Environment:           request.Environment,
+		MaxImageBytes:         r.opt.MaxImageBytes,
+		WithoutExecutors:      request.WithoutExecutors,
 	}
-	instance, err := conversation.CreateConversation(ctx, cmp.Or(request.ConversationID, defs.NewConversationID()), request.AgentName, request.Model, request.ExecutorSettings, storedSettings, opt)
+	instance, err := conversation.CreateConversation(ctx, cmp.Or(request.ConversationID, defs.NewConversationID()), resolved.AgentName, resolved.Model, request.ExecutorSettings, storedSettings, opt)
 	if err != nil {
 		return defs.Conversation{}, errors.Join(err, store.database.Close())
 	}
-	// 4. 登记并启动实例，登记失败时关闭内存库。
-	result := r.startConversation(ctx, instance, store, nil)
+	// 3. 只有新建外部根会话需要等首次绑定持久化；冷开订阅仍能立即取得恢复中快照。
+	var rootCreated chan error
+	if slices.ContainsFunc(definitions.conversationDefinitions.Agents, func(d *agent.AgentDefinition) bool {
+		return d.Name == resolved.AgentName && d.Type.IsExternal()
+	}) {
+		rootCreated = make(chan error, 1)
+	}
+	result := r.startConversation(ctx, instance, store, nil, rootCreated)
 	if result.err != nil {
 		return defs.Conversation{}, errors.Join(result.err, store.database.Close())
+	}
+	if rootCreated != nil {
+		select {
+		case err = <-rootCreated:
+		case <-ctx.Done():
+			result.runningConversation.cancel()
+			err = <-rootCreated
+		}
+		if err != nil {
+			result.runningConversation.cancel()
+			<-result.runningConversation.stopped
+			if r.unsavedConversationStores.DeleteIf(result.record.ID, func(registered *unsavedConversationStore) bool { return registered == store }) {
+				err = errors.Join(err, store.database.Close())
+			}
+			return defs.Conversation{}, err
+		}
 	}
 	return result.record, nil
 }
 
 // OpenConversation 返回已打开对话的记录，或装配并启动已有对话。
 func (r *runtimeImpl) OpenConversation(ctx context.Context, request *OpenConversationRequest) (defs.Conversation, error) {
-	// 1. 查找运行实例，已有实例时返回最新记录并忽略请求环境变量。
-	running, err := r.getRunningConversation(ctx, request.ConversationID)
-	if err == nil {
-		return running.getRecord(ctx)
-	}
-	if !errors.Is(err, ErrConversationNotOpen) {
+	running, err := r.getOrOpenConversation(ctx, request)
+	if err != nil {
 		return defs.Conversation{}, err
 	}
-	// 2. 同一对话共用一次装配结果；登记时已有实例则改取它的记录。
+	return running.getRecord(ctx)
+}
+
+// getOrOpenConversation 让冷开订阅、历史读取和显式打开共用同一次装配，返回登记的实例。
+func (r *runtimeImpl) getOrOpenConversation(ctx context.Context, request *OpenConversationRequest) (*runtimeConversation, error) {
+	running, err := r.getRunningConversation(ctx, request.ConversationID)
+	if !errors.Is(err, ErrConversationNotOpen) {
+		return running, err
+	}
 	opened, err, _ := r.openGroup.Do(string(request.ConversationID), func() (any, error) {
 		record, err := r.GetConversation(ctx, &GetConversationRequest{ConversationID: request.ConversationID})
 		if err != nil {
@@ -396,14 +468,14 @@ func (r *runtimeImpl) OpenConversation(ctx context.Context, request *OpenConvers
 		}
 		result := r.openConversation(ctx, record, record.ExecutorSettings, request.Environment, false)
 		if errors.Is(result.err, errConversationAlreadyOpen) {
-			return result.runningConversation.getRecord(ctx)
+			return result.runningConversation, nil
 		}
-		return result.record, result.err
+		return result.runningConversation, result.err
 	})
 	if err != nil {
-		return defs.Conversation{}, err
+		return nil, err
 	}
-	return opened.(defs.Conversation), nil
+	return opened.(*runtimeConversation), nil
 }
 
 // IsConversationOpen 对话是否有尚未退出的运行实例？
@@ -727,14 +799,60 @@ func (r *runtimeImpl) ForkConversation(ctx context.Context, request *ForkConvers
 		return defs.Conversation{}, err
 	}
 	definitions := r.definitions.Load()
-	if len(definitions.conversationDefinitions.Models) == 0 {
-		return defs.Conversation{}, ErrNoModelConfigured
+	sourceSession, err := r.GetSession(ctx, source.ID, cmp.Or(request.SourceSessionID, source.RootSessionID))
+	if err != nil {
+		return defs.Conversation{}, err
+	}
+	if sourceSession.External != nil {
+		if request.Ephemeral && !slices.ContainsFunc(definitions.conversationDefinitions.Agents, func(d *agent.AgentDefinition) bool {
+			return d.Name == sourceSession.AgentName && d.ACP != nil && len(d.ACP.EphemeralParamOverwrite) > 0
+		}) {
+			return defs.Conversation{}, fmt.Errorf("agent %s does not support temporary sessions", sourceSession.AgentName)
+		}
+		if ref := request.Model.Ref; ref != (defs.ModelRef{}) && ref.ProviderID != sourceSession.AgentName {
+			return defs.Conversation{}, errors.New("cannot switch agent in an existing session")
+		}
+		running, err := r.getOrOpenConversation(ctx, &OpenConversationRequest{ConversationID: source.ID})
+		if err != nil {
+			return defs.Conversation{}, err
+		}
+		query, _, err := running.conversation.GetSessionHistoryDAO(ctx, sourceSession.ID, true)
+		if err != nil {
+			return defs.Conversation{}, err
+		}
+		model := request.Model
+		if model.Ref == (defs.ModelRef{}) {
+			options, _ := running.conversation.GetLiveExternalOptions(sourceSession.ID)
+			if options.Model != nil {
+				model.Ref = defs.ModelRef{ProviderID: sourceSession.AgentName, ModelID: options.Model.CurrentValue}
+			}
+		}
+		summary, err := conversation.GetForkHistorySummary(ctx, query, sourceSession, request.BeforeTurnID, request.LastTurnID)
+		if err != nil && !errors.Is(err, conversation.ErrNothingToFork) {
+			return defs.Conversation{}, err
+		}
+		settings := request.ExecutorSettings
+		if settings.DefaultExecutorID == "" {
+			settings.DefaultExecutorID = sourceSession.External.ExecutorID
+			settings.WorkspaceDirectories = maps.Clone(settings.WorkspaceDirectories)
+			if settings.WorkspaceDirectories == nil {
+				settings.WorkspaceDirectories = map[string]string{}
+			}
+			if settings.WorkspaceDirectories[sourceSession.External.ExecutorID] == "" {
+				settings.WorkspaceDirectories[sourceSession.External.ExecutorID] = sourceSession.External.Cwd
+			}
+		}
+		return r.createConversation(ctx, &CreateConversationRequest{
+			ConversationID: request.ForkedConversationID, AgentName: sourceSession.AgentName, Model: model, Environment: request.Environment,
+			ExecutorSettings: settings, Ephemeral: request.Ephemeral, forkSummary: summary, forkedFromID: source.ID,
+		}, source.ExecutorSettings)
 	}
 	// 2. 选择分叉写到哪里：临时分叉打开独立内存库，普通分叉写共享库。
 	target := &conversation.ConversationOpt{
-		Query:       r.query,
-		Mutation:    r.mutation,
-		Definitions: definitions.conversationDefinitions,
+		DetachedConversations: r.query,
+		Query:                 r.query,
+		Mutation:              r.mutation,
+		Definitions:           definitions.conversationDefinitions,
 	}
 	var store *unsavedConversationStore
 	if request.Ephemeral {
@@ -743,10 +861,11 @@ func (r *runtimeImpl) ForkConversation(ctx context.Context, request *ForkConvers
 		}
 		target.Query, target.Mutation = store.query, store.mutation
 	}
-	// 3. 按请求截取点复制来源根 Session，来源固定从共享库读；失败时关闭临时分叉的内存库。
+	// 3. 按请求截取点复制来源 Session，来源固定从共享库读；失败时关闭临时分叉的内存库。
 	forked, err := conversation.ForkConversation(ctx, &conversation.ForkConversationRequest{
 		Source:               source,
 		SourceQuery:          r.query,
+		SourceSession:        sourceSession,
 		ForkedConversationID: request.ForkedConversationID,
 		BeforeTurnID:         request.BeforeTurnID,
 		LastTurnID:           request.LastTurnID,
@@ -756,19 +875,15 @@ func (r *runtimeImpl) ForkConversation(ctx context.Context, request *ForkConvers
 	if err != nil && store != nil {
 		err = errors.Join(err, store.database.Close())
 	}
-	// 4. 截取点之前没有轮次时，沿用来源根 Agent 和模型创建未保存对话；新对话是否临时跟着请求走。
+	// 4. 截取点之前没有轮次时，沿用来源 Agent 和模型创建未保存对话；新对话是否临时跟着请求走。
 	if errors.Is(err, conversation.ErrNothingToFork) {
-		root, err := r.getSession(ctx, source.ID, source.RootSessionID)
-		if err != nil {
-			return defs.Conversation{}, err
-		}
 		model := request.Model
 		if model == (defs.ModelSelection{}) {
-			model = root.Model
+			model = sourceSession.Model
 		}
 		return r.createConversation(ctx, &CreateConversationRequest{
 			ConversationID:   request.ForkedConversationID,
-			AgentName:        root.AgentName,
+			AgentName:        sourceSession.AgentName,
 			Model:            model,
 			ExecutorSettings: request.ExecutorSettings,
 			Environment:      request.Environment,
@@ -781,19 +896,24 @@ func (r *runtimeImpl) ForkConversation(ctx context.Context, request *ForkConvers
 	// 5. 临时分叉用自己的内存库装配并登记，写入补齐的设置；任一步失败都关闭内存库。
 	if request.Ephemeral {
 		opt := &conversation.ConversationOpt{
-			ModelClient:   r.opt.ModelClient,
-			Query:         store.query,
-			Mutation:      store.mutation,
-			Definitions:   definitions.conversationDefinitions,
-			Environment:   request.Environment,
-			MaxImageBytes: r.opt.MaxImageBytes,
+			Ephemeral:             true,
+			DetachedConversations: r.query,
+			SessionTokenSecret:    r.opt.SessionTokenSecret,
+			ServerURL:             r.opt.ServerURL,
+			DataDirectory:         r.opt.DataDirectory,
+			ModelClient:           r.opt.ModelClient,
+			Query:                 store.query,
+			Mutation:              store.mutation,
+			Definitions:           definitions.conversationDefinitions,
+			Environment:           request.Environment,
+			MaxImageBytes:         r.opt.MaxImageBytes,
 		}
 		instance, err := conversation.GetConversation(ctx, forked, source.ExecutorSettings, opt)
 		if err != nil {
 			return defs.Conversation{}, errors.Join(err, store.database.Close())
 		}
 		settings := instance.GetExecutorSettings()
-		result := r.startConversation(ctx, instance, store, &settings)
+		result := r.startConversation(ctx, instance, store, &settings, nil)
 		if result.err != nil {
 			return defs.Conversation{}, errors.Join(result.err, store.database.Close())
 		}
@@ -956,22 +1076,156 @@ func (r *runtimeImpl) handleConversationDeleteRequested(ctx context.Context, req
 		running.cancel()
 		<-running.stopped
 	}
-	// 3. 删除记录和日志；删除成功后在 r.tasks 里结束这个对话打开的终端，再回复删除结果。
+	// 3. 删除记录和日志；删除成功后在 r.tasks 里结束终端并清理附件。
 	err := r.mutation.DeleteConversation(ctx, conversationID)
 	if err == nil {
 		r.tasks.Go(func() { r.stopConversationTerminals(ctx, conversationID) })
+		r.tasks.Go(func() { r.removeConversationAttachments(ctx, conversationID) })
 	}
 	request.reply <- err
+}
+
+// UploadAttachment 将文件写到指定 Executor 上该对话的附件目录。
+func (r *runtimeImpl) UploadAttachment(ctx context.Context, request *UploadAttachmentRequest) (*defs.FileRef, error) {
+	// 1. 校验文件名、原始字节数和对话内可用的 Executor。
+	name := request.Name
+	if !filepath.IsLocal(name) || name == "." || name == ".." || strings.ContainsAny(name, "/\\\x00") {
+		return nil, errors.New("invalid attachment name")
+	}
+	if len(request.Data) > 10<<20 {
+		return nil, errors.New("attachment exceeds 10 MB")
+	}
+	executorID := request.ExecutorID
+	if executorID == "" {
+		return nil, fmt.Errorf("%w: attachment upload requires executor_id", conversation.ErrInvalidExecutorSettings)
+	}
+	record, err := r.GetConversation(ctx, &GetConversationRequest{ConversationID: request.ConversationID})
+	if err != nil {
+		return nil, err
+	}
+	executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, record.ID)
+	if err != nil {
+		return nil, err
+	}
+	index := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == executorID })
+	if index < 0 || !record.ExecutorSettings.IsExecutorAvailable(executorID) {
+		return nil, fmt.Errorf("%w: unavailable executor %q", conversation.ErrInvalidExecutorSettings, executorID)
+	}
+	// 2. 打开选定的 Workspace，为本次上传创建独立目录并写入文件。
+	work, directory, err := r.openAttachmentWorkspace(ctx, executors[index], record.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer work.Close()
+	directory = filepath.Join(directory, string(defs.NewItemID()))
+	filePath := filepath.Join(directory, name)
+	writer, err := work.CreateFileWriter(ctx, filePath, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	_, err = writer.Write(request.Data)
+	if err := errors.Join(err, writer.Close()); err != nil {
+		_ = removeAttachmentDirectory(context.WithoutCancel(ctx), work, directory)
+		return nil, err
+	}
+	return &defs.FileRef{Name: name, MIME: request.MIME, Size: int64(len(request.Data)), Path: filePath}, nil
+}
+
+// openAttachmentWorkspace 打开附件所在 Executor 的工作区并返回对话附件目录。
+func (r *runtimeImpl) openAttachmentWorkspace(ctx context.Context, selected executor.Executor, conversationID defs.ConversationID) (workspace.Workspace, string, error) {
+	// 1. SSH 需先打开工作区，才能从目标机解析登录用户的附件目录。
+	definition := selected.GetDefinition()
+	var work workspace.Workspace
+	var err error
+	if definition.Kind == defs.ExecutorKindSSH {
+		work, err = selected.NewWorkspace(ctx, &executor.NewWorkspaceRequest{RootDirectory: "/"})
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	directory, err := executor.GetConversationAttachmentDirectory(ctx, work, definition, r.opt.DataDirectory, conversationID)
+	if err != nil {
+		if work != nil {
+			_ = work.Close()
+		}
+		return nil, "", err
+	}
+	// 2. 本机在确认数据目录和 Executor 支持附件后打开。
+	if work == nil {
+		work, err = selected.NewWorkspace(ctx, &executor.NewWorkspaceRequest{RootDirectory: r.opt.DataDirectory})
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	return work, directory, nil
+}
+
+// removeConversationAttachments 清理对话在本机和已配置 SSH Executor 上的附件目录。
+func (r *runtimeImpl) removeConversationAttachments(ctx context.Context, conversationID defs.ConversationID) {
+	// 1. 清理本机附件，并读取该对话的 Executor 列表。
+	logger := telemetry.GetLogger(defs.ContextWithSessionCtxMeta(ctx, defs.SessionCtxMeta{ConversationID: conversationID}))
+	if filepath.IsAbs(r.opt.DataDirectory) {
+		if err := os.RemoveAll(filepath.Join(r.opt.DataDirectory, "attachments", string(conversationID))); err != nil {
+			logger.Warn("remove local attachments failed", "error", err)
+		}
+	}
+	executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, conversationID)
+	if err != nil {
+		logger.Warn("list attachment executors failed", "error", err)
+		return
+	}
+	// 2. 通过 SSH Workspace 清理各远端目录，记录失败后继续。
+	for _, selected := range executors {
+		definition := selected.GetDefinition()
+		if definition.Kind != defs.ExecutorKindSSH {
+			continue
+		}
+		work, directory, err := r.openAttachmentWorkspace(ctx, selected, conversationID)
+		if err == nil {
+			err = errors.Join(removeAttachmentDirectory(ctx, work, directory), work.Close())
+		}
+		if err != nil {
+			logger.Warn("remove SSH attachments failed", "executor", definition.ID, "error", err)
+		}
+	}
+}
+
+// removeAttachmentDirectory 删除附件目录中的文件和子目录。
+func removeAttachmentDirectory(ctx context.Context, work workspace.Workspace, directory string) error {
+	// 1. 依次清理目录项，再删除目录。
+	entries, err := work.ReadDirectory(ctx, directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		path := filepath.Join(directory, entry.Name)
+		if entry.IsDirectory {
+			err = removeAttachmentDirectory(ctx, work, path)
+		} else {
+			err = work.Remove(ctx, path)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return work.Remove(ctx, directory)
 }
 
 // SubscribeSession 登记已打开对话中一个 Session 的内容订阅。
 func (r *runtimeImpl) SubscribeSession(ctx context.Context, request *SubscribeSessionRequest) (*SessionSubscription, error) {
 	// 1. 确认 Session 属于对话并取得运行实例。
-	if _, err := r.getSession(ctx, request.ConversationID, request.SessionID); err != nil {
+	record, err := r.GetSession(ctx, request.ConversationID, request.SessionID)
+	if err != nil {
 		return nil, err
 	}
-	running, err := r.getRunningConversation(ctx, request.ConversationID)
+	running, err := r.getOrOpenConversation(ctx, &OpenConversationRequest{ConversationID: record.ConversationID})
 	if err != nil {
+		return nil, err
+	}
+	if _, _, err = running.conversation.GetSessionHistoryDAO(ctx, record.ID, false); err != nil {
 		return nil, err
 	}
 	// 2. 登记订阅，取得日志续传位置和生成中 Item。
@@ -981,6 +1235,8 @@ func (r *runtimeImpl) SubscribeSession(ctx context.Context, request *SubscribeSe
 	}
 	// 3. 返回初始信息和后续事件通道。
 	return &SessionSubscription{
+		Restoring:        reply.restoring,
+		ExternalState:    reply.externalState,
 		LastSavedOrdinal: reply.lastSavedOrdinal,
 		StreamingItems:   reply.streamingItems,
 		PendingInputs:    reply.pendingInputs,
@@ -1011,7 +1267,7 @@ func (r *runtimeImpl) GetSessionContextUsage(ctx context.Context, request *GetSe
 // GetSessionDetails 读取 Session 的完整配置。
 func (r *runtimeImpl) GetSessionDetails(ctx context.Context, request *GetSessionDetailsRequest) (conversation.SessionDetails, error) {
 	// 1. 取得运行实例并读取 Session 配置。
-	running, err := r.getRunningConversation(ctx, request.ConversationID)
+	running, err := r.getSessionConversation(ctx, request.ConversationID, request.SessionID)
 	if err != nil {
 		return conversation.SessionDetails{}, err
 	}
@@ -1039,48 +1295,74 @@ func (r *runtimeImpl) GetMCPServers(ctx context.Context, request *GetConversatio
 	return running.conversation.GetMCPServers(), nil
 }
 
-// GetSkills 返回已打开对话或草稿 Agent 的可用 Skill 目录。
+// GetSkills 返回调用范围内的 Skill，按名称或说明搜索。
 func (r *runtimeImpl) GetSkills(ctx context.Context, request *GetSkillsRequest) ([]skill.SkillInfo, error) {
-	// 1. 指定对话时读取它已经加载的 Skill。
-	if request.ConversationID != "" {
-		running, err := r.getRunningConversation(ctx, request.ConversationID)
-		if err != nil {
-			return nil, err
-		}
-		return running.conversation.GetSkills(), nil
-	}
-	// 2. 草稿按 Agent 名称查定义，不存在时返回错误。
-	definitions := r.definitions.Load().conversationDefinitions
-	index := slices.IndexFunc(definitions.Agents, func(definition *agent.AgentDefinition) bool { return definition.Name == request.AgentName })
-	if index < 0 {
-		return nil, fmt.Errorf("agent %q is not configured", request.AgentName)
-	}
-	// 3. 按草稿 Executor 设置扫描 Skill（默认 Executor 的工作区建不起来时返回错误），筛出 Agent 可用的，返回展示字段。
-	skills, err := conversation.LoadDraftSkills(ctx, request.ExecutorSettings, definitions)
+	catalog, release, err := r.getSkillCatalog(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-	return newSkillInfos(skill.GetSkillsByNames(definitions.Agents[index].SkillNames, skills)), nil
+	defer release()
+	query := strings.ToLower(strings.TrimSpace(request.Query))
+	infos := newSkillInfos(catalog)
+	return slices.DeleteFunc(infos, func(info skill.SkillInfo) bool {
+		return !strings.Contains(strings.ToLower(info.Name), query) &&
+			!strings.Contains(strings.ToLower(info.Description), query)
+	}), nil
 }
 
-// ListModels 返回公开模型目录和指定 Agent 的默认模型。
-func (r *runtimeImpl) ListModels(_ context.Context, request *ListModelsRequest) (ModelList, error) {
-	// 1. 读取当前定义，指定 Agent 时检查名称并填入默认模型。
-	definitions := r.definitions.Load()
-	models := definitions.conversationDefinitions.Models
-	list := ModelList{Models: make([]*defs.ModelDefinition, 0, len(models))}
-	if request.AgentName != "" {
-		ref, found := definitions.agentDefaultModels[request.AgentName]
-		if !found {
-			return ModelList{}, fmt.Errorf("agent %q is not configured", request.AgentName)
+// GetSkill 读取目录中指定 Skill 的文件，默认读取正文。
+func (r *runtimeImpl) GetSkill(ctx context.Context, request *GetSkillsRequest, name, file string) (string, error) {
+	catalog, release, err := r.getSkillCatalog(ctx, request)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	for _, listed := range catalog {
+		if listed.Name == name {
+			return listed.GetFileContent(ctx, file)
 		}
-		list.AgentDefaultModel = ref
 	}
-	// 2. 复制各模型的公开字段并返回。
-	for _, model := range models {
-		list.Models = append(list.Models, model.ClonePublic())
+	return "", fmt.Errorf("skill %q is not available", name)
+}
+
+// getSkillCatalog 按对话会话、草稿 Agent 或内置范围装配目录。
+func (r *runtimeImpl) getSkillCatalog(ctx context.Context, request *GetSkillsRequest) ([]*skill.Skill, func(), error) {
+	release := func() {}
+	if request.ConversationID != "" {
+		if request.SourceSessionID != "" {
+			instance, err := r.GetCollaborationConversation(ctx, request.ConversationID)
+			if err != nil {
+				return nil, nil, err
+			}
+			catalog, err := instance.GetSessionSkills(request.SourceSessionID)
+			return catalog, release, err
+		}
+		running, err := r.getRunningConversation(ctx, request.ConversationID)
+		if err != nil {
+			return nil, nil, err
+		}
+		catalog, err := running.conversation.GetSessionSkills("")
+		return catalog, release, err
 	}
-	return list, nil
+	if request.AgentName == "" {
+		catalog, err := skill.WithBuiltinSkill(nil)
+		return catalog, release, err
+	}
+	definitions := r.definitions.Load().conversationDefinitions
+	index := slices.IndexFunc(definitions.Agents, func(definition *agent.AgentDefinition) bool { return definition.Name == request.AgentName })
+	if index < 0 {
+		return nil, nil, fmt.Errorf("agent %q is not configured", request.AgentName)
+	}
+	catalog, release, err := conversation.LoadDraftSkills(ctx, request.ExecutorSettings, definitions)
+	if err != nil {
+		return nil, nil, err
+	}
+	selected, err := skill.WithBuiltinSkill(skill.GetSkillsByNames(definitions.Agents[index].SkillNames, catalog))
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return selected, release, nil
 }
 
 // GetHooks 返回当前配置中的 Hook 说明。
@@ -1147,19 +1429,32 @@ func (r *runtimeImpl) OpenTerminal(ctx context.Context, request *OpenTerminalReq
 	}
 }
 
-// newTerminalRequest 向 ExecutorProvider 要终端所属对话的列表，为一个终端打开独占的工作区，返回启动 shell 要的完整请求。
+// newTerminalRequest 选择 Executor，为终端打开独占的工作区，返回启动 shell 要的完整请求。
 func (r *runtimeImpl) newTerminalRequest(ctx context.Context, request *OpenTerminalRequest) (*terminal.TerminalRequest, error) {
-	// 1. 向 ExecutorProvider 要所属对话的列表，ExecutorID 为空时用 local；未知 ID 和 memory 返回 ErrInvalidExecutorSettings，virtual 返回 ErrTTYUnsupported。
-	executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, request.ConversationID)
-	if err != nil {
-		return nil, err
-	}
+	// 1. ExecutorID 为空时用 local；会话调用按所属对话已装配的执行环境选 Executor。
 	executorID := cmp.Or(request.ExecutorID, defs.LocalExecutorID)
-	index := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == executorID })
-	if index < 0 {
-		return nil, fmt.Errorf("%w: unknown executor %q", conversation.ErrInvalidExecutorSettings, executorID)
+	var selected executor.Executor
+	if request.UseConversationExecutor {
+		instance, err := r.GetCollaborationConversation(ctx, request.ConversationID)
+		if err != nil {
+			return nil, err
+		}
+		selected, err = instance.GetExecutor(executorID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, request.ConversationID)
+		if err != nil {
+			return nil, err
+		}
+		index := slices.IndexFunc(executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == executorID })
+		if index < 0 {
+			return nil, fmt.Errorf("%w: unknown executor %q", conversation.ErrInvalidExecutorSettings, executorID)
+		}
+		selected = executors[index]
 	}
-	definition := executors[index].GetDefinition()
+	definition := selected.GetDefinition()
 	if definition.Kind == defs.ExecutorKindVirtual {
 		return nil, workspace.ErrTTYUnsupported
 	}
@@ -1169,14 +1464,14 @@ func (r *runtimeImpl) newTerminalRequest(ctx context.Context, request *OpenTermi
 	// 2. 目录为空时用默认工作目录，否则在临时工作区上解析并检查它是目录。
 	directory := definition.WorkspaceDirectory
 	if request.Directory != "" {
-		resolved, err := conversation.ResolveWorkspaceDirectory(ctx, executors, executorID, request.Directory, "")
+		resolved, err := conversation.ResolveWorkspaceDirectory(ctx, []executor.Executor{selected}, executorID, request.Directory, "")
 		if err != nil {
 			return nil, err
 		}
 		directory = resolved
 	}
 	// 3. 以起始目录为根打开这个终端独占的工作区。
-	terminalWorkspace, err := executors[index].NewWorkspace(ctx, &executor.NewWorkspaceRequest{RootDirectory: directory, Environment: request.Environment})
+	terminalWorkspace, err := selected.NewWorkspace(ctx, &executor.NewWorkspaceRequest{RootDirectory: directory, Environment: request.Environment})
 	if err != nil {
 		return nil, err
 	}
@@ -1222,6 +1517,14 @@ func (r *runtimeImpl) handleTerminalOpenRequested(request *terminalOpenRequested
 func (r *runtimeImpl) GetTerminal(_ context.Context, terminalID string) (terminal.Terminal, error) {
 	// 1. 在交互终端里查，找不到时返回 terminal.ErrTerminalNotFound。
 	return r.interactiveTerminals.GetTerminalByID(terminalID)
+}
+
+// GetConversationTerminal 检查终端实际所属对话后返回终端。
+func (r *runtimeImpl) GetConversationTerminal(ctx context.Context, conversationID defs.ConversationID, terminalID string) (terminal.Terminal, error) {
+	if registered, found := r.terminalConversations.Load(terminalID); !found || registered != conversationID {
+		return nil, errors.New("permission denied")
+	}
+	return r.GetTerminal(ctx, terminalID)
 }
 
 // SubscribeTerminals 经 Runtime 事件循环登记运行中终端的订阅。
@@ -1382,13 +1685,13 @@ func (r *runtimeImpl) SetDefinitions(ctx context.Context, request *Definitions) 
 // SetSessionModel 保存 Session 所选模型并更新运行信息。
 func (r *runtimeImpl) SetSessionModel(ctx context.Context, request *SetSessionModelRequest) (defs.Session, error) {
 	// 1. 取得运行实例并保存所选模型；没保存成功时直接返回错误。
-	running, err := r.getRunningConversation(ctx, request.ConversationID)
+	running, err := r.getSessionConversation(ctx, request.ConversationID, request.SessionID)
 	if err != nil {
 		return defs.Session{}, err
 	}
 	record, err := running.conversation.SetSessionModel(ctx, request.SessionID, request.Model)
-	if record.ID == "" {
-		return defs.Session{}, err
+	if record.ID == "" || record.External != nil {
+		return record, err
 	}
 	// 2. 记录已保存：请求对话更新 Session 运行信息，对话已经退出时忽略；通知 Session 失败的错误随记录一起返回。
 	_ = running.sendRequest(ctx, &sessionRecordReplaceRequested{record: record})
@@ -1403,6 +1706,29 @@ func (r *runtimeImpl) ListSessions(
 	// 1. 选择对话存储并查询一页记录。
 	query, _, _ := r.getConversationDAO(request.ConversationID)
 	return query.ListSessions(ctx, *request)
+}
+
+// IsSessionDescendant 目标是否是同一对话里来源 Session 的后代？
+func (r *runtimeImpl) IsSessionDescendant(ctx context.Context, conversationID defs.ConversationID, source, target defs.SessionID) (bool, error) {
+	// 1. 读取目标记录，再检查它的父链。
+	record, err := r.GetSession(ctx, conversationID, target)
+	if errors.Is(err, ErrSessionNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return r.IsSessionRecordDescendant(ctx, source, record)
+}
+
+// IsSessionRecordDescendant 已读的目标记录是否是同一对话里来源 Session 的后代？
+func (r *runtimeImpl) IsSessionRecordDescendant(ctx context.Context, source defs.SessionID, target defs.Session) (bool, error) {
+	// 1. 从目标的父 Session 开始查询对话自己的 DAO。
+	conversationID := target.ConversationID
+	query, _, _ := r.getConversationDAO(conversationID)
+	return conversation.IsSessionDescendant(source, target, func(id defs.SessionID) (defs.Session, bool, error) {
+		return query.GetSession(ctx, conversationID, id)
+	})
 }
 
 // GetSessionByID 从共享库按 SessionID 读取记录；普通新对话的 Session 要等对话保存后才查得到，临时对话的 Session 查不到。
@@ -1428,7 +1754,10 @@ func (r *runtimeImpl) ListTurns(
 		return storage.Page[defs.Turn, dao.RecordCursor[defs.TurnID]]{}, errors.New("list Turns requires a conversation ID")
 	}
 	// 2. 选择对话存储并按请求排序和游标查询。
-	query, _, _ := r.getConversationDAO(request.ConversationID)
+	query, err := r.getSessionDAO(ctx, request.ConversationID, request.SessionID)
+	if err != nil {
+		return storage.Page[defs.Turn, dao.RecordCursor[defs.TurnID]]{}, err
+	}
 	return query.ListTurns(ctx, dao.ListTurnsRequest{
 		SessionID: request.SessionID,
 		Order:     request.Order,
@@ -1444,15 +1773,21 @@ func (r *runtimeImpl) GetTurns(ctx context.Context, request *GetTurnsRequest) ([
 		return nil, errors.New("get Turns requires a conversation ID")
 	}
 	// 2. 选择对话存储并批量查询，跳过不存在的 Turn。
-	query, _, _ := r.getConversationDAO(request.ConversationID)
+	query, err := r.getSessionDAO(ctx, request.ConversationID, request.SessionID)
+	if err != nil {
+		return nil, err
+	}
 	return query.GetTurns(ctx, request.SessionID, request.TurnIDs)
 }
 
 // ListItems 分页读取对话内一个 Session 的日志。
 func (r *runtimeImpl) ListItems(ctx context.Context, request *ListItemsRequest) (storage.Page[dao.LoggedItem, storage.Ordinal], error) {
 	// 1. 选择对话存储，确认 Session 属于对话。
-	query, _, _ := r.getConversationDAO(request.ConversationID)
-	if _, err := r.getSession(ctx, request.ConversationID, request.SessionID); err != nil {
+	if request.SessionID == "" {
+		return storage.Page[dao.LoggedItem, storage.Ordinal]{}, ErrSessionNotFound
+	}
+	query, err := r.getSessionDAO(ctx, request.ConversationID, request.SessionID)
+	if err != nil {
 		return storage.Page[dao.LoggedItem, storage.Ordinal]{}, err
 	}
 	// 2. 按方向、游标和条数读取日志。
@@ -1531,39 +1866,40 @@ func (r *runtimeImpl) handleRunningConversationRequested(request *runningConvers
 // openConversation 按记录和当前定义装配对话，并登记运行实例。
 func (r *runtimeImpl) openConversation(ctx context.Context, record defs.Conversation, storedSettings defs.ExecutorSettings,
 	environment []string, isSettingsChanged bool) conversationReply {
-	// 1. 读取当前定义，模型目录为空时返回 ErrNoModelConfigured。
+	// 1. 读取当前定义，选择对话存储，按记录设置、原存储设置和客户端环境装配实例。
 	definitions := r.definitions.Load()
-	if len(definitions.conversationDefinitions.Models) == 0 {
-		return conversationReply{err: ErrNoModelConfigured}
-	}
-	// 2. 选择对话存储，按记录设置、原存储设置和客户端环境装配实例。
 	query, mutation, unsavedStore := r.getConversationDAO(record.ID)
 	opt := &conversation.ConversationOpt{
-		ModelClient:   r.opt.ModelClient,
-		Query:         query,
-		Mutation:      mutation,
-		Definitions:   definitions.conversationDefinitions,
-		Environment:   environment,
-		MaxImageBytes: r.opt.MaxImageBytes,
+		DetachedConversations: r.query,
+		SessionTokenSecret:    r.opt.SessionTokenSecret,
+		ServerURL:             r.opt.ServerURL,
+		DataDirectory:         r.opt.DataDirectory,
+		ModelClient:           r.opt.ModelClient,
+		Query:                 query,
+		Mutation:              mutation,
+		Definitions:           definitions.conversationDefinitions,
+		Environment:           environment,
+		MaxImageBytes:         r.opt.MaxImageBytes,
 	}
 	instance, err := conversation.GetConversation(ctx, record, storedSettings, opt)
 	if err != nil {
 		return conversationReply{err: err}
 	}
-	// 3. 设置有变更时取出补齐后的设置，随实例交给事件循环保存并启动。
+	// 2. 设置有变更时取出补齐后的设置，随实例交给事件循环保存并启动。
 	var executorSettings *defs.ExecutorSettings
 	if isSettingsChanged {
 		settings := instance.GetExecutorSettings()
 		executorSettings = &settings
 	}
-	return r.startConversation(ctx, instance, unsavedStore, executorSettings)
+	return r.startConversation(ctx, instance, unsavedStore, executorSettings, nil)
 }
 
 // startConversation 登记并启动已装配实例。
 func (r *runtimeImpl) startConversation(ctx context.Context, instance conversation.Conversation, unsavedStore *unsavedConversationStore,
-	executorSettings *defs.ExecutorSettings) conversationReply {
+	executorSettings *defs.ExecutorSettings, rootCreated chan<- error) conversationReply {
 	// 1. 提交实例、内存库和待保存的 Executor 设置。
 	request := &conversationStartRequested{
+		rootCreated:      rootCreated,
 		instance:         instance,
 		unsavedStore:     unsavedStore,
 		executorSettings: executorSettings,
@@ -1609,6 +1945,7 @@ func (r *runtimeImpl) handleConversationStartRequested(ctx context.Context, requ
 	running := newRuntimeConversation(
 		request.instance, cancel, record, query, mutation, r.definitions.Load(), request.unsavedStore, r.opt.UnsavedConversationIdleTimeout, r.opt.SavedConversationIdleTimeout, r.runningChanged,
 	)
+	running.runtime, running.rootCreated = r, request.rootCreated
 	if request.executorSettings != nil {
 		record.ExecutorSettings = *request.executorSettings
 		if err := running.saveRecord(ctx, record); err != nil {
@@ -1624,6 +1961,7 @@ func (r *runtimeImpl) handleConversationStartRequested(ctx context.Context, requ
 	r.runningConversations[conversationID] = running
 	signalChanged(r.runningChanged)
 	telemetry.AddActiveConversations(ctx, 1)
+	record = running.record
 	r.tasks.Go(func() {
 		defer telemetry.AddActiveConversations(ctx, -1)
 		running.Run(runCtx)
@@ -1634,7 +1972,6 @@ func (r *runtimeImpl) handleConversationStartRequested(ctx context.Context, requ
 		}
 	})
 	// 5. 回复登记后的记录，标题按长度上限截取。
-	record = running.record
 	record.Title = defs.TruncateConversationTitle(record.Title)
 	request.reply <- conversationReply{
 		runningConversation: running,
@@ -1706,6 +2043,19 @@ func (r *runtimeImpl) saveConversation(ctx context.Context, conversationID defs.
 	return nil
 }
 
+// saveExternalRootBinding 保存新建外部根会话的首次绑定。对话索引最后提交，失败时撤销已搬入共享库的根 Session 和 metadata。
+func (r *runtimeImpl) saveExternalRootBinding(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) error {
+	err := r.saveConversation(ctx, conversationID)
+	if err == nil {
+		return nil
+	}
+	ctx = context.WithoutCancel(ctx)
+	if cleanupErr := r.mutation.DeleteSession(ctx, conversationID, sessionID); cleanupErr != nil {
+		return errors.Join(err, cleanupErr)
+	}
+	return errors.Join(err, r.opt.Logs.Delete(ctx, storage.StreamPath(conversationID), dao.MetadataStreamID))
+}
+
 // discardUnsavedConversationStore 丢弃对话的内存库。
 func (r *runtimeImpl) discardUnsavedConversationStore(ctx context.Context, conversationID defs.ConversationID) {
 	// 1. 取出并移除登记，不存在时返回。
@@ -1724,6 +2074,44 @@ func (r *runtimeImpl) discardUnsavedConversationStore(ctx context.Context, conve
 func (r *runtimeImpl) handleRunningConversationsRequested(request *runningConversationsRequested) {
 	// 1. 复制运行表的实例列表并回复。
 	request.reply <- slices.Collect(maps.Values(r.runningConversations))
+}
+
+// getSessionConversation 为详情和换模型取得实例，只有外部目标需要触发冷恢复。
+func (r *runtimeImpl) getSessionConversation(ctx context.Context, conversationID defs.ConversationID, id defs.SessionID) (*runtimeConversation, error) {
+	running, err := r.getRunningConversation(ctx, conversationID)
+	if !errors.Is(err, ErrConversationNotOpen) {
+		return running, err
+	}
+	record, lookupErr := r.GetSession(ctx, conversationID, id)
+	if lookupErr != nil && !errors.Is(lookupErr, ErrSessionNotFound) {
+		return nil, lookupErr
+	}
+	if lookupErr != nil || record.External == nil {
+		return nil, err
+	}
+	return r.getOrOpenConversation(ctx, &OpenConversationRequest{ConversationID: record.ConversationID})
+}
+
+// getSessionDAO 在完整历史读取前选择目标 Session 的历史库；外部首次回放失败直接返回后端原因。
+func (r *runtimeImpl) getSessionDAO(ctx context.Context, conversationID defs.ConversationID, id defs.SessionID) (dao.Query, error) {
+	if id == "" {
+		query, _, _ := r.getConversationDAO(conversationID)
+		return query, nil
+	}
+	record, err := r.GetSession(ctx, conversationID, id)
+	if err != nil {
+		return nil, err
+	}
+	if record.External == nil {
+		query, _, _ := r.getConversationDAO(conversationID)
+		return query, nil
+	}
+	running, err := r.getOrOpenConversation(ctx, &OpenConversationRequest{ConversationID: record.ConversationID})
+	if err != nil {
+		return nil, err
+	}
+	query, _, err := running.conversation.GetSessionHistoryDAO(ctx, id, true)
+	return query, err
 }
 
 // getConversationDAO 返回对话使用的 DAO 及仍登记的内存库。
@@ -1748,8 +2136,8 @@ func (r *runtimeImpl) getSavedConversation(ctx context.Context, conversationID d
 	return record, nil
 }
 
-// getSession 读取属于指定对话的 Session 记录。
-func (r *runtimeImpl) getSession(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) (defs.Session, error) {
+// GetSession 读取属于指定对话的 Session 记录。
+func (r *runtimeImpl) GetSession(ctx context.Context, conversationID defs.ConversationID, sessionID defs.SessionID) (defs.Session, error) {
 	// 1. 选择对话存储并查询 Session；不属于该对话时返回 ErrSessionNotFound。
 	query, _, _ := r.getConversationDAO(conversationID)
 	record, found, err := query.GetSession(ctx, conversationID, sessionID)
@@ -1804,4 +2192,86 @@ func (r *runtimeImpl) AppendContextItems(ctx context.Context, request *AppendCon
 	}
 	// 2. 将 Item 交给对话根 Session。
 	return running.conversation.AppendContextItems(ctx, request.Items)
+}
+
+// GetCollaborationConversation 复用显式打开和冷开历史的装配路径。
+func (r *runtimeImpl) GetCollaborationConversation(ctx context.Context, id defs.ConversationID) (conversation.Conversation, error) {
+	run, err := r.getOrOpenConversation(ctx, &OpenConversationRequest{ConversationID: id})
+	if err != nil {
+		return nil, err
+	}
+	return run.conversation, nil
+}
+
+func (r *runtimeImpl) UpdateSession(ctx context.Context, cid defs.ConversationID, id defs.SessionID, params conversation.SessionUpdate) (defs.Session, error) {
+	run, err := r.getOrOpenConversation(ctx, &OpenConversationRequest{ConversationID: cid})
+	if err != nil {
+		return defs.Session{}, err
+	}
+	record, err := run.conversation.UpdateSession(ctx, id, params)
+	if err == nil {
+		_ = run.sendRequest(ctx, &sessionRecordReplaceRequested{record: record})
+	}
+	return record, err
+}
+
+// Exec 使用当前对话可用的 Executor 与工作目录。独立调用按 Executor 定义开工作区。
+func (r *runtimeImpl) Exec(ctx context.Context, p *ExecutorExecRequest) (ExecutorExecResult, error) {
+	var result ExecutorExecResult
+	if p.Command == "" || p.ExecutorID == "" {
+		return result, errors.New("executor/exec requires executor_id and command")
+	}
+	// 1. 借用对话已装配的工作区，独立执行时创建并关闭临时工作区。
+	var ws workspace.Workspace
+	if p.ConversationID != "" {
+		run, err := r.getOrOpenConversation(ctx, &OpenConversationRequest{ConversationID: p.ConversationID})
+		if err != nil {
+			return result, err
+		}
+		var release func()
+		ws, ctx, release, err = run.conversation.BorrowExecutorWorkspace(ctx, p.ExecutorID)
+		if err != nil {
+			return result, err
+		}
+		defer release()
+	} else {
+		executors, err := r.definitions.Load().conversationDefinitions.Executors.GetExecutors(ctx, "")
+		if err != nil {
+			return result, err
+		}
+		i := slices.IndexFunc(executors, func(e executor.Executor) bool { return e.GetDefinition().ID == p.ExecutorID })
+		if i < 0 {
+			return result, fmt.Errorf("unavailable executor %q", p.ExecutorID)
+		}
+		selected := executors[i]
+		ws, err = selected.NewWorkspace(ctx, &executor.NewWorkspaceRequest{RootDirectory: selected.GetDefinition().WorkspaceDirectory})
+		if err != nil {
+			return result, err
+		}
+		defer ws.Close()
+	}
+	// 2. 以工作区根目录解析相对路径，逐项引用命令参数并启动进程。
+	directory := p.Cwd
+	if !filepath.IsAbs(directory) {
+		directory = filepath.Join(ws.GetRootDirectory(), directory)
+	}
+	words := []string{workspace.QuoteShellWord(p.Command)}
+	for _, arg := range p.Args {
+		words = append(words, workspace.QuoteShellWord(arg))
+	}
+	var stdout, stderr bytes.Buffer
+	proc, err := ws.StartProcess(ctx, &workspace.ProcessRequest{Command: strings.Join(words, " "), Directory: directory, Stdout: &stdout, Stderr: &stderr})
+	if err != nil {
+		return result, err
+	}
+	terminated := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { defer close(terminated); _ = proc.Terminate() })
+	code, err := proc.Wait()
+	if !stop() {
+		<-terminated
+	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+	return ExecutorExecResult{ExitCode: code, Stdout: stdout.String(), Stderr: stderr.String()}, err
 }

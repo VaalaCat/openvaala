@@ -3,15 +3,18 @@ package conversation
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
+	"github.com/VaalaCat/openvaala/pkg/externalagent"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/session"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
+
 	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -32,6 +35,9 @@ var (
 // ErrInvalidExecutorSettings 是 Executor 设置或目录不合法时返回的错误：设置里新加了配置中没有的 Executor、
 // 默认 Executor 不在 executor_ids 里、解析出的目录不存在或不是目录、要给 virtual Executor 换目录。
 var ErrInvalidExecutorSettings = errors.New("invalid executor settings")
+
+// ErrNoModelConfigured 是原生会话没有可选本机模型时返回的错误。
+var ErrNoModelConfigured = errors.New("no model is configured; run openvaala to set up a model provider")
 
 // ── Conversation 换配置错误 ──
 
@@ -100,7 +106,8 @@ type ConversationEvent interface{ isConversationEvent() }
 // ConversationSessionStarted 由 Conversation 在启动一个 Session 实例前发出：Run 启动根 Session、换配置后重启根 Session、
 // spawn_agent 创建子 Session，或向已停止的 Session 投递消息时重启它。同一 Session 的其他事件都在它之后。
 type ConversationSessionStarted struct {
-	Session defs.Session
+	Restoring bool
+	Session   defs.Session
 	// LastSavedOrdinal 是启动前读到的这个 Session 日志的最新序号，之后写入的 Item 都以 SessionItemsSaved 到达。
 	LastSavedOrdinal storage.Ordinal
 }
@@ -136,7 +143,32 @@ type ConversationReconfigured struct {
 
 func (*ConversationReconfigured) isConversationEvent() {}
 
+// ── Conversation 会话打开请求 ──
+
+// sessionOpenRequested 由派活、投递或首次读取历史的调用方提交，让对话循环在当前配置下启动会话。
+type sessionOpenRequested struct {
+	record defs.Session
+	spawn  *SpawnAgentParam
+	reply  chan sessionOpenReply
+}
+type sessionOpenReply struct {
+	instance session.Session
+	err      error
+}
+
 // ── Conversation 运行状态 ──
+
+// conversationExternalSession 随驱动实例持有首次恢复结果和已上报的详情；ready 由事件转发任务关闭。
+type conversationExternalSession struct {
+	// detaching 在取消单个驱动前设置；stopped 在两条父回报路径都已退出后关闭。
+	detaching atomic.Bool
+	cancel    context.CancelFunc
+	stopped   chan struct{}
+	externalagent.ExternalSession
+	ready      chan struct{}
+	restoreErr error
+	state      atomic.Pointer[session.SessionExternalStateUpdated]
+}
 
 // conversationConfig 保存一套对话设置、定义、执行环境和 Skill，替换配置时整份换掉。
 // Run 在启动这套配置的 Session 前填写 sessionsCtx、stopSessions，之后由 Run 和 Session 任务读取。
@@ -169,6 +201,17 @@ type conversationConfig struct {
 }
 
 // ── Conversation Run 请求 ──
+
+// executorWorkspaceBorrowRequested 由 Executor 命令调用方提交，登记命令并借用当前配置的工作区。
+type executorWorkspaceBorrowRequested struct {
+	executorID string
+	reply      chan executorWorkspaceBorrowReply
+}
+
+type executorWorkspaceBorrowReply struct {
+	work workspace.Workspace
+	err  error
+}
 
 // configBaseRequested 由配置 setter 查询下一次装配使用的配置。
 type configBaseRequested struct {
@@ -210,12 +253,18 @@ type clientExecutorRun struct {
 
 // SpawnAgentParam 是 spawn_agent 的模型参数，创建一个直接子 Agent 并提交首个任务。
 type SpawnAgentParam struct {
-	TaskName        string `json:"task_name" jsonschema:"description=用于识别子任务的简短名称,minLength=1"`
-	Message         string `json:"message" jsonschema:"description=子任务目标、必要背景和预期交付物；父方活动 Turn 不会被继承，所需材料应写在这里,minLength=1"`
-	ForkTurns       string `json:"fork_turns,omitempty" jsonschema:"description=继承已结束历史的范围：none 不继承；all 继承有效历史；正整数字符串最多选择最近 n 个 Turn。达到 n 后停止；先遇摘要则带上整份摘要并停止,default=none"`
-	AgentName       string `json:"agent_name,omitempty" jsonschema:"description=子 Agent 使用的 Agent 名称，可选值见工具说明；省略时与当前 Agent 相同"`
-	Model           string `json:"model,omitempty" jsonschema:"description=子 Agent 使用的模型，格式 provider_id/model_id，可选值见工具说明；省略时同一 Agent 继承你当前的模型，不同 Agent 使用它的默认模型"`
-	ReasoningEffort string `json:"reasoning_effort,omitempty" jsonschema:"description=推理强度，必须是所选模型支持的取值；省略时沿用继承的强度或模型默认值"`
+	InitialOptions  []defs.ExternalOptionSelection `json:"initial_options,omitempty" jsonschema_description:"外部子会话首次启动时选择的选项"`
+	Labels          map[string]string              `json:"labels,omitempty" jsonschema_description:"会话标签的键值对"`
+	Background      bool                           `json:"background,omitempty" jsonschema_description:"是否在默认会话列表中隐藏"`
+	ExecutorID      string                         `json:"executor_id,omitempty" jsonschema_description:"外部子会话的执行位置"`
+	Cwd             string                         `json:"cwd,omitempty" jsonschema_description:"外部子会话的工作目录"`
+	NotifyOnFinish  *bool                          `json:"notify_on_finish,omitempty" jsonschema_description:"结束时是否通知父会话，默认为 true"`
+	TaskName        string                         `json:"task_name" jsonschema:"description=用于识别子任务的简短名称,minLength=1"`
+	Message         string                         `json:"message" jsonschema:"description=子任务目标、必要背景和预期交付物；父方活动 Turn 不会被继承，所需材料应写在这里,minLength=1"`
+	ForkTurns       string                         `json:"fork_turns,omitempty" jsonschema:"description=继承已结束历史的范围：none 不继承；all 继承有效历史；正整数字符串最多选择最近 n 个 Turn。达到 n 后停止；先遇摘要则带上整份摘要并停止,default=none"`
+	AgentName       string                         `json:"agent_name,omitempty" jsonschema:"description=子 Agent 使用的 Agent 名称，可选值见工具说明；省略时与当前 Agent 相同"`
+	Model           string                         `json:"model,omitempty" jsonschema:"description=子 Agent 使用的模型，格式 provider_id/model_id，可选值见工具说明；省略时同一 Agent 继承你当前的模型，不同 Agent 使用它的默认模型"`
+	ReasoningEffort string                         `json:"reasoning_effort,omitempty" jsonschema:"description=推理强度，必须是所选模型支持的取值；省略时沿用继承的强度或模型默认值"`
 }
 
 // SendMessageParam 是 send_message 的模型参数，向后代或直接父方提交一次输入。
@@ -240,8 +289,24 @@ type interruptAgentParam struct {
 	SessionID defs.SessionID `json:"session_id" jsonschema:"description=要中断当前 Turn 的后代 SessionID,minLength=1"`
 }
 
-// listAgentsParam 是 list_agents 的模型参数，没有字段。
-type listAgentsParam struct{}
+// ListAgentsParam 指定会话列表过滤；SinceHours 为零时包括全部时间。
+type ListAgentsParam struct {
+	SessionID  defs.SessionID         `json:"session_id,omitempty" jsonschema_description:"指定会话 ID"`
+	Statuses   []session.SessionState `json:"statuses,omitempty" jsonschema_description:"会话运行状态"`
+	Cwd        string                 `json:"cwd,omitempty" jsonschema_description:"会话工作目录；列表过滤时 * 表示全部目录"`
+	SinceHours *int                   `json:"since_hours,omitempty" jsonschema_description:"最近更新的小时数，省略为 24，0 表示不限"`
+	Labels     map[string]string      `json:"labels,omitempty" jsonschema_description:"会话标签的键值对"`
+	All        bool                   `json:"all,omitempty" jsonschema_description:"是否包括后台会话"`
+	Limit      int                    `json:"limit,omitempty" jsonschema_description:"返回条数，默认 20，最多 100"`
+}
+
+// SessionUpdate 指定要替换的会话元数据；省略的字段保留原值。
+type SessionUpdate struct {
+	detachedConversationID defs.ConversationID
+	TaskName               *string           `json:"task_name,omitempty"`
+	Labels                 map[string]string `json:"labels,omitempty" jsonschema_description:"会话标签的键值对"`
+	Background             *bool             `json:"background,omitempty" jsonschema_description:"是否在默认会话列表中隐藏"`
+}
 
 // SessionHistoryParam 是 read_session_history 的模型参数，从新到旧分页读取后代 fork 之后的历史。
 type SessionHistoryParam struct {
@@ -249,6 +314,9 @@ type SessionHistoryParam struct {
 	Cursor    storage.Ordinal `json:"cursor,omitempty" jsonschema:"description=省略或 0 从最新历史开始；读取更早一页使用返回的非零 next_cursor，不能越过 fork 分界,minimum=0"`
 	Limit     int             `json:"limit,omitempty" jsonschema:"description=每页最多读取的 Item 数量；默认 20，范围 1–100,minimum=1,maximum=100,default=20"`
 }
+
+// ErrSendPermissionDenied 表示发送目标或发送动作超出来源会话的权限。
+var ErrSendPermissionDenied = errors.New("permission denied")
 
 // ── 协作工具唤醒原因 ──
 
@@ -260,27 +328,33 @@ const (
 	waitReasonAgentMessage       = "agent_message"
 	waitReasonTimeout            = "timeout"
 	waitReasonNoRunningSubagents = "no_running_subagents"
+	waitReasonNoActiveTurn       = "no_active_turn"
 )
 
 // ── 协作工具结果 ──
 
-// spawnAgentResult 是 spawn_agent 的结果：Status 为 accepted 表示子 Session 已创建、首个任务已放进它的收件箱，子任务还没做完；
+// SpawnAgentResult 是 spawn_agent 的结果：Status 为 accepted 表示子 Session 已创建、首个任务已放进它的收件箱，子任务还没做完；
 // Session 已保存但首个任务没被接收时，工具返回错误，SessionID 写在错误消息里。
-type spawnAgentResult struct {
-	SessionID defs.SessionID `json:"session_id"`
-	TaskName  string         `json:"task_name"`
-	Status    string         `json:"status"`
+type SpawnAgentResult struct {
+	InputItemID defs.ItemID    `json:"input_item_id"`
+	SessionID   defs.SessionID `json:"session_id"`
+	TaskName    string         `json:"task_name"`
+	Status      string         `json:"status"`
 }
 
 // sendMessageResult 是 send_message 的结果：Status 为 accepted 表示消息已放进目标收件箱，Mode 原样返回调用参数里的提交方式。
 type sendMessageResult struct {
-	SessionID defs.SessionID           `json:"session_id"`
-	Mode      session.SessionInputMode `json:"mode"`
-	Status    string                   `json:"status"`
+	InputItemID defs.ItemID              `json:"input_item_id"`
+	SessionID   defs.SessionID           `json:"session_id"`
+	Mode        session.SessionInputMode `json:"mode"`
+	Status      string                   `json:"status"`
 }
 
-// waitAgentResult 只说明唤醒原因与 Agent 发送方；消息正文在下一次模型请求前经收件箱读入。
-type waitAgentResult struct {
+// WaitAgentResult 说明唤醒原因与 Agent 发送方，并携带已完成子任务的最终正文。
+type WaitAgentResult struct {
+	DetachedSessionID      defs.SessionID      `json:"detached_session_id,omitempty"`
+	Text                   string              `json:"text,omitempty"`
+	DetachedConversationID defs.ConversationID `json:"detached_conversation_id,omitempty"`
 	// Hint 在没有运行后代时提示如何查阅现状；其他原因时为空。
 	Hint   string           `json:"hint,omitempty"`
 	Reason string           `json:"reason"`
@@ -306,9 +380,13 @@ type SessionInfo struct {
 	ContextWindow int `json:"context_window"`
 }
 
-// listAgentsResult 是 list_agents 的结果：来源 Session 的全部后代，按 SessionID 排序。
-type listAgentsResult struct {
-	Sessions []SessionInfo `json:"sessions"`
+// ListAgentsResult 包含本页后代、实际过滤条件和截断前的匹配数。
+type ListAgentsResult struct {
+	Agents        []SessionInfo   `json:"agents"`
+	AppliedFilter ListAgentsParam `json:"applied_filter"`
+	TotalMatched  int             `json:"total_matched"`
+	Truncated     bool            `json:"truncated"`
+	Hint          string          `json:"hint"`
 }
 
 // sessionHistoryResult 是 read_session_history 返回的一页历史。
@@ -330,7 +408,9 @@ type WorkspaceDirectories struct {
 
 // SessionDetails 保存对话里一个 Session 的记录、模型、Executor、Skill 和工具信息。
 type SessionDetails struct {
-	ConversationID defs.ConversationID `json:"conversation_id"`
+	MCPServers     []string                   `json:"mcp_servers,omitempty"`
+	Capabilities   *defs.ExternalCapabilities `json:"capabilities,omitempty"`
+	ConversationID defs.ConversationID        `json:"conversation_id"`
 	// Title 由 Runtime 按已保存的对话记录填写，GetSessionDetails 留空。
 	Title   string       `json:"title"`
 	Session defs.Session `json:"session"`

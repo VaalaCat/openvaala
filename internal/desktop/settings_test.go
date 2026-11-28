@@ -354,3 +354,46 @@ func TestExecutorSettingsSSHForm(t *testing.T) {
 		t.Fatalf("delete button missing in edit mode: %q", tester.Texts())
 	}
 }
+
+// TestKeyValueRowDeletion 删除中间行后继续输入，应修改下一行并保留其值。
+func TestKeyValueRowDeletion(t *testing.T) {
+	for _, tt := range []struct{ page, addLabel string }{{"agents", "agent.add.env"}, {"providers", "add.header"}} {
+		t.Run(tt.page, func(t *testing.T) {
+			d := testDesktop()
+			d.navigate(tt.page)
+			values := map[string]string{"alpha": "1", "bravo": "2", "charlie": "3"}
+			if tt.page == "agents" {
+				d.setAgentDraft(defs.AgentConfig{Name: "external", Type: defs.AgentTypeACP, ACP: &defs.ACPCommand{Env: values}}, "external")
+			} else {
+				d.providerDraft = providerToDraft(defs.ProviderConfig{ID: "test", Headers: values})
+			}
+			tester := ui.NewTester(d.view, 1280, 1600)
+			if err := tester.Click(d.t("header.value")); err != nil {
+				t.Fatal(err)
+			}
+			// 从第一行的值移到第二行的删除按钮，再直接键入新名称。
+			for range 4 {
+				tester.Key(0, ui.KeyTab)
+			}
+			tester.Key(0, ui.KeyEnter)
+			tester.Key(ui.Cmd, ui.KeyA)
+			tester.Type("renamed")
+			var rows []*keyValueDraft
+			if tt.page == "agents" {
+				rows = d.agentDraft.env
+			} else {
+				rows = d.providerDraft.Headers
+			}
+			if got := keyValueMap(rows); len(rows) != 2 || got["alpha"] != "1" || got["renamed"] != "3" {
+				t.Fatalf("rows after deleting bravo: %+v", got)
+			}
+			// 删掉现在的末行，焦点应落在添加按钮上。
+			tester.Key(0, ui.KeyTab)
+			tester.Key(0, ui.KeyTab)
+			tester.Key(0, ui.KeyEnter)
+			if !tester.Focused(d.t(tt.addLabel)) {
+				t.Fatalf("expected focus on %s after removing the last row", d.t(tt.addLabel))
+			}
+		})
+	}
+}

@@ -438,39 +438,8 @@ func closeWorkspace(ctx context.Context, usedWorkspace workspace.Workspace) {
 	}
 }
 
-// Clone 复制 Agent 配置。
-func (definition *AgentConfig) Clone() *AgentConfig {
-	// 1. nil 原样返回，否则复制模型引用和工具、skill、MCP server 列表。
-	if definition == nil {
-		return nil
-	}
-	return &AgentConfig{
-		Name:         definition.Name,
-		Description:  definition.Description,
-		Instructions: definition.Instructions,
-		Model:        definition.Model.Clone(),
-		CompactModel: definition.CompactModel.Clone(),
-		Tools:        slices.Clone(definition.Tools),
-		Skills:       slices.Clone(definition.Skills),
-		MCPServers:   slices.Clone(definition.MCPServers),
-		MaxSteps:     definition.MaxSteps,
-	}
-}
-
-// Clone 复制 Agent 的模型引用。
-func (reference *AgentModelConfig) Clone() *AgentModelConfig {
-	// 1. nil 原样返回，否则复制 Provider 和模型名。
-	if reference == nil {
-		return nil
-	}
-	return &AgentModelConfig{
-		Provider: reference.Provider,
-		Model:    reference.Model,
-	}
-}
-
 // getModelRef 把 Agent 的模型配置转成模型目录里的引用。
-func getModelRef(reference *AgentModelConfig) defs.ModelRef {
+func getModelRef(reference *defs.AgentModelConfig) defs.ModelRef {
 	// 1. 没配时返回零值，否则填入 Provider ID 和模型 ID。
 	if reference == nil {
 		return defs.ModelRef{}

@@ -1259,7 +1259,13 @@ type threadNameSetRequested struct {
 type threadStatusRequested struct {
 	sessionID defs.SessionID
 	// reply 容量为 1。
-	reply chan codexThreadStatus
+	reply chan threadLiveInfo
+}
+
+// threadLiveInfo 是已跟随 Thread 最近报告的状态和模型。
+type threadLiveInfo struct {
+	status codexThreadStatus
+	model  defs.ModelSelection
 }
 
 // threadHistoryEndRequested 由连接在用起点游标翻页读本连接跟随着的 Thread 的历史（thread/turns/list、thread/items/list）时交给 connectionThread：

@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react"
 import { MessageSquare } from "lucide"
 import { CollapsibleMessageBody } from "@/components/base/collapsible-message-body"
+import { AttachmentStrip } from "../attachment-strip"
 import { ImagePreview } from "@/components/base/image-preview"
 import type { ParseKeys } from "i18next"
 import { useTranslation } from "react-i18next"
@@ -248,7 +249,11 @@ function UserMessage({
     <div className="ml-auto flex max-w-[85%] min-w-0 flex-col gap-2 bg-muted px-3 py-2">
       <CollapsibleMessageBody
         viewStateKey={"user-message:" + viewStateKey}
-        afterBody={<MessageImages contents={typed} />}
+        afterBody={
+          typed.some((item) => item.file || item.image) && (
+            <AttachmentStrip contents={typed} />
+          )
+        }
       >
         {typedText}
       </CollapsibleMessageBody>

@@ -137,6 +137,8 @@ func (*SessionHookRunEvent) isSessionEvent() {}
 
 // SessionTurnFinished 由 Turn 执行任务在 Turn 终态保存成功后发出；正常结束、失败、被中断都会发。
 type SessionTurnFinished struct {
+	// Usage 是后端在轮结束时报告的总用量；原生会话逐次发布模型调用用量。
+	Usage  defs.TokenUsage
 	TurnID defs.TurnID
 	// InputItemIDs 是本轮读入的全部输入，包括补充输入。
 	InputItemIDs []defs.ItemID
@@ -151,6 +153,39 @@ type SessionTurnFinished struct {
 }
 
 func (*SessionTurnFinished) isSessionEvent() {}
+
+// ── 外部 Session 对外事件 ──
+
+// SessionExternalBindingUpdated 由外部 Session 在首次就绪或后端更换绑定时发给 Conversation 保存。
+type SessionExternalBindingUpdated struct{ Binding defs.ExternalSession }
+
+func (*SessionExternalBindingUpdated) isSessionEvent() {}
+
+// SessionExternalStateUpdated 由外部 Session 在就绪、选项或命令变化时发布实际可用的配置。
+type SessionExternalStateUpdated struct {
+	Capabilities defs.ExternalCapabilities
+	Options      defs.ExternalOptions
+	Commands     []defs.ExternalCommand
+	MCPServers   []string
+}
+
+func (*SessionExternalStateUpdated) isSessionEvent() {}
+
+// SessionHistoryRestored 由外部 Session 在首次回放结束时发出，供 Runtime 在关闭恢复订阅前同步游标、最近轮次和累计用量，失败时携带原因。
+type SessionHistoryRestored struct {
+	LastTurnID       defs.TurnID
+	LastTurnStatus   defs.TurnStatus
+	Usage            defs.TokenUsage
+	LastSavedOrdinal int64
+	Err              error
+}
+
+func (*SessionHistoryRestored) isSessionEvent() {}
+
+// SessionExternalReloaded 由外部 Session 在新驱动重连且状态已发布后发出，订阅方可重新获取快照。
+type SessionExternalReloaded struct{}
+
+func (*SessionExternalReloaded) isSessionEvent() {}
 
 // ── Session 事件循环请求 ──
 

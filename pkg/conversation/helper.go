@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -49,15 +50,18 @@ func validateConversationDependencies(opt *ConversationOpt) error {
 	return nil
 }
 
-// validateConversationDefinitions 检查定义里至少有一个 Agent 和一个模型，且每个 Agent 都有名字。
+// validateConversationDefinitions 检查 Agent 定义的名称和执行配置。
 func validateConversationDefinitions(definitions *ConversationDefinitions) error {
-	// 1. 没有 Agent 或模型、有 Agent 定义为空或名字为空白时返回错误。
-	if definitions == nil || len(definitions.Agents) == 0 || len(definitions.Models) == 0 {
-		return errors.New("Conversation requires at least one agent definition and at least one model")
+	// 1. 检查至少有一个 Agent，且每个 Agent 的名称和类型有效。
+	if definitions == nil || len(definitions.Agents) == 0 {
+		return errors.New("Conversation requires at least one agent definition")
 	}
 	for _, definition := range definitions.Agents {
 		if definition == nil || strings.TrimSpace(definition.Name) == "" {
 			return errors.New("agent definition requires a name")
+		}
+		if err := definition.ValidateExecutionType(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -175,15 +179,9 @@ func validateConversationConfig(
 		}
 		models[model.Ref] = model
 	}
-	// 2. 校验 Agent 的模型引用和名称重复情况，建立 Agent 名称索引。
+	// 2. 校验 Agent 名称没有重复，建立名称索引。
 	agentDefinitions := make(map[string]*agent.AgentDefinition, len(definitions.Agents))
 	for _, definition := range definitions.Agents {
-		if _, found := models[definition.Model]; !found {
-			return nil, nil, fmt.Errorf("agent %q uses model %s, which is not configured", definition.Name, definition.Model)
-		}
-		if _, found := models[definition.CompactModel]; definition.CompactModel != (defs.ModelRef{}) && !found {
-			return nil, nil, fmt.Errorf("agent %q uses compact model %s, which is not configured", definition.Name, definition.CompactModel)
-		}
 		if _, found := agentDefinitions[definition.Name]; found {
 			return nil, nil, fmt.Errorf("agent %q is defined more than once", definition.Name)
 		}
@@ -223,7 +221,7 @@ func validateConversationConfig(
 				}
 			}
 			for _, skillName := range definition.SkillNames {
-				if !slices.ContainsFunc(skills, func(listed *skill.Skill) bool { return listed.Name == skillName }) {
+				if skillName != skill.BuiltinSkillName && !slices.ContainsFunc(skills, func(listed *skill.Skill) bool { return listed.Name == skillName }) {
 					return nil, nil, fmt.Errorf("agent %q uses skill %q, which is not configured", definition.Name, skillName)
 				}
 			}
@@ -278,6 +276,12 @@ func newClientMCPConnections(servers []ClientMCPServer) ([]mcpclient.Connection,
 	return connections, nil
 }
 
+// newSpawnAgentNotConfiguredError 列出可用于创建会话的 Agent。
+func newSpawnAgentNotConfiguredError(name string, definitions map[string]*agent.AgentDefinition) error {
+	return fmt.Errorf("agent %q is not configured. Configured agents: %s. To change the model, use --model / model",
+		name, strings.Join(slices.Sorted(maps.Keys(definitions)), ", "))
+}
+
 // newAgentNotConfiguredError 创建 Session 用的 Agent 不在目录里的错误。
 func newAgentNotConfiguredError(record defs.Session) error {
 	// 1. 错误里带上 Session ID 和记录里保存的 Agent 名。
@@ -304,18 +308,53 @@ func newModelSelection(model *defs.ModelDefinition, requestedEffort, carriedEffo
 	return selection, nil
 }
 
-// getRequestedModelSelection 校验创建或分叉对话时请求的模型，返回带推理强度的选择。
-func getRequestedModelSelection(models map[defs.ModelRef]*defs.ModelDefinition, requested defs.ModelSelection, agentModel defs.ModelRef) (defs.ModelSelection, error) {
-	// 1. 没给模型时用 Agent 默认模型，模型不在目录里时返回错误，再选出推理强度。
-	ref := requested.Ref
-	if ref == (defs.ModelRef{}) {
-		ref = agentModel
+// getRequestedModelSelection 为原生会话解析指定模型或默认模型及其推理强度。
+func getRequestedModelSelection(models map[defs.ModelRef]*defs.ModelDefinition, requested defs.ModelSelection, definition *agent.AgentDefinition) (defs.ModelSelection, error) {
+	// 1. 外部 Agent 没有本机模型选择；原生 Agent 取指定模型或默认模型。
+	if definition.Type.IsExternal() {
+		return defs.ModelSelection{}, nil
 	}
+	model, err := getAgentModel(models, definition, cmp.Or(requested.Ref, definition.Model))
+	if err != nil {
+		return defs.ModelSelection{}, err
+	}
+	// 2. 选择推理强度。
+	return newModelSelection(model, requested.ReasoningEffort, "")
+}
+
+// getAgentModel 校验 Agent 的默认模型和摘要模型，再返回选中的本机模型。
+func getAgentModel(models map[defs.ModelRef]*defs.ModelDefinition, definition *agent.AgentDefinition, ref defs.ModelRef) (*defs.ModelDefinition, error) {
+	// 1. 校验默认模型引用；选的是默认模型时直接返回。
+	defaultModel, err := getAgentDefaultModel(models, definition)
+	if err != nil || ref == definition.Model {
+		return defaultModel, err
+	}
+	// 2. 取显式选中的模型。
 	model, found := models[ref]
 	if !found {
-		return defs.ModelSelection{}, fmt.Errorf("model %s is not configured", ref)
+		return nil, fmt.Errorf("model %s is not configured", ref)
 	}
-	return newModelSelection(model, requested.ReasoningEffort, "")
+	return model, nil
+}
+
+// getAgentDefaultModel 校验原生 Agent 的默认模型和摘要模型，返回默认模型。
+func getAgentDefaultModel(models map[defs.ModelRef]*defs.ModelDefinition, definition *agent.AgentDefinition) (*defs.ModelDefinition, error) {
+	// 1. 原生 Agent 的默认模型必须在目录里。
+	if definition.Type.IsExternal() {
+		return nil, nil
+	}
+	if len(models) == 0 {
+		return nil, ErrNoModelConfigured
+	}
+	model, found := models[definition.Model]
+	if !found {
+		return nil, fmt.Errorf("agent %q uses model %s, which is not configured", definition.Name, definition.Model)
+	}
+	// 2. Agent 指定摘要模型时检查它也在目录里。
+	if _, found := models[definition.CompactModel]; definition.CompactModel != (defs.ModelRef{}) && !found {
+		return nil, fmt.Errorf("agent %q uses compact model %s, which is not configured", definition.Name, definition.CompactModel)
+	}
+	return model, nil
 }
 
 // getExecutorToolNames 汇总各执行环境的内置工具名，不含 MCP 工具。
@@ -416,6 +455,19 @@ func getEnvironmentToolNames(environment executor.ExecutionEnvironment, servers 
 	return names
 }
 
+// validateSessionAgentType 检查新定义是否仍能打开这条记录原有的历史。
+func validateSessionAgentType(record defs.Session, definition *agent.AgentDefinition) error {
+	stored := defs.AgentTypeNative
+	if record.External != nil {
+		stored = record.External.AgentType
+	}
+	configured := cmp.Or(definition.Type, defs.AgentTypeNative)
+	if stored != configured {
+		return fmt.Errorf("agent %s type changed from %s to %s", record.AgentName, stored, configured)
+	}
+	return nil
+}
+
 // validateSessionTree 校验各 Session 都属于这个对话，子 Session 的父 Session 存在、创建它的 Turn 和工具调用都有记录。
 func validateSessionTree(record defs.Conversation, records []defs.Session) error {
 	// 1. 检查各 Session 的 ID 非空且属于这个对话，建立 ID 索引。
@@ -434,7 +486,7 @@ func validateSessionTree(record defs.Conversation, records []defs.Session) error
 			}
 			continue
 		}
-		if s.ParentTurnID == "" || s.ParentCallID == "" {
+		if s.ParentTurnID == "" {
 			return errors.New("incomplete Session creation relationship")
 		}
 		if _, found := byID[s.ParentSessionID]; !found {
@@ -520,10 +572,11 @@ func finalContent(finished *session.SessionTurnFinished) []*defs.Content {
 }
 
 // newWaitAgentResult 汇总唤醒原因和去重后的 Agent 发送方。
-func newWaitAgentResult(items []*defs.Item) waitAgentResult {
+func newWaitAgentResult(items []*defs.Item) WaitAgentResult {
 	// 1. 扫描消息来源，记下有没有用户输入、子任务通知，以及去重后的 Agent SessionID。
-	result := waitAgentResult{Reason: waitReasonAgentMessage}
+	result := WaitAgentResult{Reason: waitReasonAgentMessage}
 	hasUser, hasNotification := false, false
+	var texts []string
 	for _, item := range items {
 		if item.Message == nil || item.Message.From == nil {
 			continue
@@ -532,12 +585,26 @@ func newWaitAgentResult(items []*defs.Item) waitAgentResult {
 		case defs.IdentityUser:
 			hasUser = true
 		case defs.IdentityAgent:
-			hasNotification = hasNotification || item.Message.SubagentNotification != nil
+			if sender := item.Message.AgentSender; sender != nil && sender.DetachedConversationID != "" {
+				result.DetachedConversationID = sender.DetachedConversationID
+				result.DetachedSessionID = sender.DetachedSessionID
+			}
+			if n := item.Message.SubagentNotification; n != nil {
+				hasNotification = true
+				if n.Status == defs.TurnStatusCompleted {
+					for _, block := range item.Message.Content {
+						if block.Text != nil {
+							texts = append(texts, block.Text.Text)
+						}
+					}
+				}
+			}
 			if from := defs.SessionID(item.Message.From.ID); !slices.Contains(result.From, from) {
 				result.From = append(result.From, from)
 			}
 		}
 	}
+	result.Text = strings.Join(texts, "\n")
 	// 2. 按用户输入、子任务通知、其他 Agent 消息的顺序选择唤醒原因。
 	switch {
 	case hasUser:
@@ -608,33 +675,28 @@ func getSummaryBoundaryIndex(items []dao.LoggedItem) int {
 	return -1
 }
 
-// transformHistoryItems 复制 read_session_history 要返回的历史，去掉加密推理、provider 原始数据和内嵌图片。
-func transformHistoryItems(items []dao.LoggedItem) []*defs.Item {
-	// 1. 逐条复制，清空加密推理和 RawJSON，去掉消息和工具结果里 data: 开头的图片地址，保留 Alt。
-	result := make([]*defs.Item, len(items))
-	for i, logged := range items {
-		transformed := logged.Item.Clone()
-		if transformed.Reasoning != nil {
-			transformed.Reasoning.Encrypted = ""
-			transformed.Reasoning.RawJSON = nil
-		}
-		if transformed.Message != nil {
-			for _, content := range transformed.Message.Content {
-				if content != nil && content.Image != nil && strings.HasPrefix(content.Image.DataURL, "data:") {
-					content.Image.DataURL = ""
-				}
-			}
-		}
-		if transformed.ToolResult != nil {
-			for _, image := range transformed.ToolResult.Images {
-				if image != nil && strings.HasPrefix(image.DataURL, "data:") {
-					image.DataURL = ""
-				}
-			}
-		}
-		result[i] = transformed
+// transformHistoryItem 移除协作历史中的加密推理和内联图片数据。
+func transformHistoryItem(item *defs.Item) *defs.Item {
+	transformed := item.Clone()
+	if transformed.Reasoning != nil {
+		transformed.Reasoning.Encrypted = ""
+		transformed.Reasoning.RawJSON = nil
 	}
-	return result
+	if transformed.Message != nil {
+		for _, content := range transformed.Message.Content {
+			if content != nil && content.Image != nil && strings.HasPrefix(content.Image.DataURL, "data:") {
+				content.Image.DataURL = ""
+			}
+		}
+	}
+	if transformed.ToolResult != nil {
+		for _, image := range transformed.ToolResult.Images {
+			if image != nil && strings.HasPrefix(image.DataURL, "data:") {
+				image.DataURL = ""
+			}
+		}
+	}
+	return transformed
 }
 
 // encodeToolResult 把协作操作的返回值和错误编码成工具结果。
@@ -712,4 +774,58 @@ func newAgentPromptEntries(agents []*agent.AgentDefinition) []prompt.AgentEntry 
 		}
 	}
 	return entries
+}
+
+// hasSessionLabels 会话是否包含全部指定标签，包括值为空字符串的标签？
+func hasSessionLabels(labels, required map[string]string) bool {
+	for k, v := range required {
+		if value, exists := labels[k]; !exists || value != v {
+			return false
+		}
+	}
+	return true
+}
+
+// renderChatHistorySummary 将选中轮次的消息及工具结果转换成另一后端可读的文本。
+func renderChatHistorySummary(items []*defs.Item) string {
+	var lines []string
+	names := make(map[string]string)
+	for _, item := range items {
+		switch item.Kind {
+		case defs.ItemMessage:
+			label := "User"
+			if item.ModelCallID != "" {
+				label = "Assistant"
+			}
+			for _, c := range item.Message.Content {
+				if c.Text != nil {
+					lines = append(lines, "["+label+"] "+c.Text.Text)
+				}
+				if c.File != nil {
+					lines = append(lines, "["+label+"] "+c.File.Path)
+				}
+			}
+		case defs.ItemContextSummary:
+			lines = append(lines, item.ContextSummary.Text)
+		case defs.ItemToolCall:
+			names[item.ToolCall.CallID] = item.ToolCall.Name
+			lines = append(lines, "["+item.ToolCall.Name+"] "+item.ToolCall.Arguments)
+		case defs.ItemToolResult:
+			result := item.ToolResult
+			text := string(result.Content)
+			if result.Error != nil {
+				text = result.Error.Message
+			}
+			lines = append(lines, "["+cmp.Or(names[result.CallID], "Tool")+"] "+text)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return prompt.FormatChatHistorySummary(strings.Join(lines, "\n"))
+}
+
+// NewSessionDetachedError 告知调用方转出后的对话和新根会话 ID。
+func NewSessionDetachedError(target defs.Conversation) error {
+	return fmt.Errorf("session detached to conversation %s, new session %s. This session has left the conversation. You can no longer operate on it here. To continue, use the new conversation.", target.ID, target.RootSessionID)
 }

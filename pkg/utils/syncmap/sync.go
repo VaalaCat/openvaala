@@ -71,6 +71,16 @@ func (s *SyncMap[K, V]) Store(key K, value V) {
 	s.m[key] = value
 }
 
+// Swap 替换键对应的值，返回原值及其是否存在。
+func (s *SyncMap[K, V]) Swap(key K, value V) (previous V, loaded bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.grow()
+	previous, loaded = s.m[key]
+	s.m[key] = value
+	return
+}
+
 // LoadOrStore 键已存在时返回已有值，否则保存并返回传入值；loaded 说明返回的是不是已有值。
 func (s *SyncMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
 	// 1. 持锁查找键，不存在时初始化映射并写入传入值。

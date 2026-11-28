@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -413,7 +414,7 @@ func TestRuntimeConversationSubscription(t *testing.T) {
 				})
 				latest := infos[len(infos)-1]
 				late := h.subscribeConversation(t, conv.ID)
-				if len(late.Sessions) != 1 || late.Sessions[0] != latest || latest.ActiveTurnID == "" {
+				if len(late.Sessions) != 1 || !runtime.IsSameSessionRuntimeInfo(late.Sessions[0], latest) || latest.ActiveTurnID == "" {
 					t.Fatalf("late Sessions = %+v, want [%+v] with an active Turn", late.Sessions, latest)
 				}
 			},
@@ -455,6 +456,71 @@ func TestRuntimeConversationSubscription(t *testing.T) {
 				t.Fatalf("Sessions = %+v, want the root Session with unknown context usage", subscription.Sessions)
 			}
 			tt.run(t, h, conv, subscription)
+		})
+	}
+}
+
+// TestExternalSessionRecordLabels 检查重开对话后订阅读取更新的标签，切换模型后推送保留标签的记录。
+func TestExternalSessionRecordLabels(t *testing.T) {
+	store, model := openRuntimeStore(t), newRuntimeModel(t)
+	record := defs.Session{ID: defs.NewSessionID(), ConversationID: defs.NewConversationID(), AgentName: "assistant"}
+	if err := store.mutation.SetConversation(t.Context(), defs.Conversation{ID: record.ConversationID, RootSessionID: record.ID}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name   string
+		labels map[string]string
+	}{
+		{name: "assigned", labels: map[string]string{"project": "first"}},
+		{name: "replaced", labels: map[string]string{"project": "second"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			record.Labels = tt.labels
+			if err := store.mutation.SetSession(t.Context(), record); err != nil {
+				t.Fatal(err)
+			}
+			h := startTestRuntime(t, store, model)
+			if _, err := h.rt.OpenConversation(t.Context(), &runtime.OpenConversationRequest{ConversationID: record.ConversationID}); err != nil {
+				t.Fatal(err)
+			}
+			subscription := h.subscribeConversation(t, record.ConversationID)
+			if len(subscription.Sessions) != 1 || !maps.Equal(subscription.Sessions[0].Session.Labels, tt.labels) {
+				t.Fatalf("initial Sessions = %+v, want labels %v", subscription.Sessions, tt.labels)
+			}
+			selection := defs.ModelSelection{Ref: defs.ModelRef{ProviderID: "test", ModelID: "b"}}
+			if _, err := h.rt.SetSessionModel(t.Context(), &runtime.SetSessionModelRequest{
+				ConversationID: record.ConversationID, SessionID: record.ID, Model: selection,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			updated := getLastInfo(collectUntil(t, subscription.Events, func(info runtime.SessionRuntimeInfo) bool {
+				return info.Session.Model.Ref == selection.Ref
+			}))
+			if !maps.Equal(updated.Session.Labels, tt.labels) {
+				t.Fatalf("updated labels = %v, want %v", updated.Session.Labels, tt.labels)
+			}
+		})
+	}
+}
+
+// TestExternalSessionRecordLabelComparison 检查只有标签内容变化时，运行信息是否被判定为变化。
+func TestExternalSessionRecordLabelComparison(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		before, after map[string]string
+		wantSame      bool
+	}{
+		{name: "changed", before: map[string]string{"project": "first"}, after: map[string]string{"project": "second"}},
+		{name: "same_content", before: map[string]string{"project": "first"}, after: map[string]string{"project": "first"}, wantSame: true},
+		{name: "empty", after: map[string]string{}, wantSame: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := runtime.SessionRuntimeInfo{Session: defs.Session{ID: "session", Labels: tt.before}}
+			after := before
+			after.Session.Labels = tt.after
+			if same := runtime.IsSameSessionRuntimeInfo(before, after); same != tt.wantSame {
+				t.Fatalf("IsSameSessionRuntimeInfo() = %v, want %v", same, tt.wantSame)
+			}
 		})
 	}
 }
@@ -756,7 +822,7 @@ func TestRuntimeSessionRuntimeInfo(t *testing.T) {
 				}
 				infos := collectUntil(t, events, isTurnCompletedInfo)
 				for index := 1; index < len(infos); index++ {
-					if infos[index] == infos[index-1] {
+					if runtime.IsSameSessionRuntimeInfo(infos[index], infos[index-1]) {
 						t.Fatalf("info #%d repeats the previous push: %+v", index, infos[index])
 					}
 				}

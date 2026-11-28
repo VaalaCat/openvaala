@@ -3,12 +3,12 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"github.com/VaalaCat/openvaala/pkg/defs"
-	acp "github.com/coder/acp-go-sdk"
 	"io"
 	"time"
 
 	"github.com/VaalaCat/openvaala/internal/config"
+	"github.com/VaalaCat/openvaala/pkg/defs"
+	acp "github.com/coder/acp-go-sdk"
 )
 
 // ── CLI 命令行参数 ──
@@ -26,9 +26,11 @@ type CLIFlags struct {
 
 // AppArgs 保存已加载的配置、命令参数、标准流和版本。
 type AppArgs struct {
-	Config *config.Config
-	Stdin  io.Reader
-	Stdout io.Writer
+	RuntimeToken   string
+	ConversationID defs.ConversationID
+	Config         *config.Config
+	Stdin          io.Reader
+	Stdout         io.Writer
 	// RuntimeURL 是 --url 指定的 Runtime Server 地址；为空时 getRuntimeConnection 依次用 client.url、本机 serve（没有就自动拉起）。
 	RuntimeURL string
 	// Stderr 接收 serve、acp 和 app-server 的文本日志，以及客户端的旧 serve 提示；codex 子进程使用它，正常退出后追加重连提示。TUI 不使用。
@@ -66,8 +68,9 @@ type AppArgs struct {
 
 // RuntimeServerConnection 是 serve 启动后写入 ~/.local/state/openvaala/runtime-server.yaml 的连接信息，本机客户端读它来连接。
 type RuntimeServerConnection struct {
-	URL   string `yaml:"url"`
-	Token string `yaml:"token"`
+	ResetFor string `yaml:"reset_for,omitempty"`
+	URL      string `yaml:"url"`
+	Token    string `yaml:"token"`
 	// Executable 是 serve 的可执行文件路径（软链接已解析），取不到时为空；客户端拿它和自己的可执行文件比较，发现升级或重新编译前的旧 serve。
 	Executable string `yaml:"executable"`
 	// ExecutableModifiedAt 是 serve 启动时 Executable 的修改时间，取不到时为零值。
@@ -80,7 +83,9 @@ type RuntimeServerConnection struct {
 
 // runtimeConnection 是客户端命令（TUI、acp、app-server、codex、web）要连的 serve，由 getRuntimeConnection 决定。
 type runtimeConnection struct {
-	URL string
+	ConversationID defs.ConversationID
+	SessionID      defs.SessionID
+	URL            string
 	// Token 为空时沿用 URL 里的 ?token=。
 	Token string
 	// Source 是地址的来源：--url、client.url，还是本机 runtime-server.yaml。
@@ -99,7 +104,8 @@ const (
 	// runtimeConnectionSourceFlag 地址来自命令行 --url。
 	runtimeConnectionSourceFlag runtimeConnectionSource = "--url"
 	// runtimeConnectionSourceConfig 地址来自配置 client.url（含 OPENVAALA_CLIENT_URL）。
-	runtimeConnectionSourceConfig runtimeConnectionSource = "client.url"
+	runtimeConnectionSourceConfig      runtimeConnectionSource = "client.url"
+	runtimeConnectionSourceEnvironment runtimeConnectionSource = "OPENVAALA_URL"
 	// runtimeConnectionSourceLocal 地址来自本机 runtime-server.yaml，serve 没在跑时已经拉起。
 	runtimeConnectionSourceLocal runtimeConnectionSource = "local"
 )

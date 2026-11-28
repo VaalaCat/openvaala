@@ -6,18 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/defs"
 	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/executor/tools"
+	"github.com/VaalaCat/openvaala/pkg/externalagent"
+	"github.com/VaalaCat/openvaala/pkg/externalagent/acp"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/prompt"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
 	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/telemetry"
 	"github.com/VaalaCat/openvaala/pkg/workspace"
@@ -25,23 +30,93 @@ import (
 
 // newConversationConfig 装配一套对话配置。
 func newConversationConfig(ctx context.Context, conversationID defs.ConversationID, settings, storedSettings defs.ExecutorSettings, opt *ConversationOpt,
-	definitions *ConversationDefinitions, sessionRecords []defs.Session) (*conversationConfig, error) {
+	definitions *ConversationDefinitions, rootSessionID defs.SessionID, sessionRecords []defs.Session) (*conversationConfig, error) {
 	// 1. 保存设置和定义，装配配置；失败时关闭已经建好的工作区。
 	config := &conversationConfig{
 		hooks:       hook.NewHooks(hook.NewHooksOpt(definitions.Hooks)),
 		settings:    settings,
 		definitions: definitions,
 	}
-	if err := assembleConversationConfig(ctx, conversationID, config, storedSettings, opt, sessionRecords); err != nil {
+	if err := assembleConversationConfig(ctx, conversationID, config, storedSettings, opt, rootSessionID, sessionRecords); err != nil {
 		closeWorkspaces(ctx, config.workspaces)
 		return nil, err
 	}
 	return config, nil
 }
 
+// BorrowExecutorWorkspace 经对话循环登记命令，返回工作区和随对话停止的命令上下文。
+func (c *conversationImpl) BorrowExecutorWorkspace(ctx context.Context, executorID string) (workspace.Workspace, context.Context, func(), error) {
+	// 1. 提交借用请求并接收结果。
+	request := executorWorkspaceBorrowRequested{executorID: executorID, reply: make(chan executorWorkspaceBorrowReply, 1)}
+	select {
+	case c.workspaceBorrows <- request:
+	case <-c.stopped:
+		return nil, nil, nil, context.Cause(c.runCtx)
+	case <-ctx.Done():
+		return nil, nil, nil, ctx.Err()
+	}
+	reply := <-request.reply
+	if reply.err != nil {
+		return nil, nil, nil, reply.err
+	}
+	// 2. 对话停止时取消命令，命令返回后注销登记。
+	commandCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(c.runCtx, cancel)
+	return reply.work, commandCtx, func() {
+		stop()
+		cancel()
+		c.executorCommands.Add(-1)
+		c.tasks.Done()
+	}, nil
+}
+
+// handleExecutorWorkspaceBorrow 在当前配置中查找工作区并登记命令。
+func (c *conversationImpl) handleExecutorWorkspaceBorrow(request executorWorkspaceBorrowRequested) {
+	work, err := c.config.Load().getExecutorWorkspace(request.executorID)
+	if err == nil {
+		c.tasks.Add(1)
+		c.executorCommands.Add(1)
+	}
+	request.reply <- executorWorkspaceBorrowReply{work: work, err: err}
+}
+
+// IsExecutorCommandRunning 对话是否有尚未结束的 Executor 命令？
+func (c *conversationImpl) IsExecutorCommandRunning() bool {
+	return c.executorCommands.Load() > 0
+}
+
+// GetExecutorDetails 返回对话中已装配的执行环境和默认项。
+func (c *conversationImpl) GetExecutorDetails() ([]ExecutorDetails, string) {
+	environments, defaultID := c.environmentsManager.GetEnvironments()
+	return newExecutorDetails(environments, c.config.Load().executors), defaultID
+}
+
+// GetExecutor 按借用工作区时的规则校验 Executor，再从同一份配置返回 Executor。
+func (c *conversationImpl) GetExecutor(executorID string) (executor.Executor, error) {
+	config := c.config.Load()
+	if _, err := config.getExecutorWorkspace(executorID); err != nil {
+		return nil, err
+	}
+	index := slices.IndexFunc(config.executors, func(listed executor.Executor) bool { return listed.GetDefinition().ID == executorID })
+	return config.executors[index], nil
+}
+
+// getExecutorWorkspace 返回对话中可用 Executor 已装配的工作区。
+func (config *conversationConfig) getExecutorWorkspace(executorID string) (workspace.Workspace, error) {
+	// 1. 在同一套对话配置中检查可用名单并查找工作区。
+	if config.settings.IsExecutorAvailable(executorID) {
+		for _, environment := range config.environments {
+			if environment.GetID() == executorID {
+				return environment.GetWorkspace(), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("unavailable executor %q", executorID)
+}
+
 // assembleConversationConfig 装配执行环境、Skill 和附加工具，校验对话配置与已有 Session 的 Agent。
 func assembleConversationConfig(ctx context.Context, conversationID defs.ConversationID, config *conversationConfig, storedSettings defs.ExecutorSettings,
-	opt *ConversationOpt, sessionRecords []defs.Session) error {
+	opt *ConversationOpt, rootSessionID defs.SessionID, sessionRecords []defs.Session) error {
 	// 1. 校验定义；需要 Executor 的对话继续装配执行环境和 Skill。
 	if err := validateConversationDefinitions(config.definitions); err != nil {
 		return err
@@ -73,10 +148,19 @@ func assembleConversationConfig(ctx context.Context, conversationID defs.Convers
 	if err != nil {
 		return err
 	}
-	// 3. 确认每个 Session 用的 Agent 都在目录里，保存已校验的配置。
+	// 3. 校验已保存 Session 的 Agent 和根 Session 的原生模型，保存配置。
 	for _, sessionRecord := range sessionRecords {
-		if _, found := agentDefinitions[sessionRecord.AgentName]; !found {
+		definition, found := agentDefinitions[sessionRecord.AgentName]
+		if !found {
 			return newAgentNotConfiguredError(sessionRecord)
+		}
+		if sessionRecord.ID == rootSessionID {
+			if err := validateSessionAgentType(sessionRecord, definition); err != nil {
+				return err
+			}
+			if _, err := getAgentDefaultModel(models, definition); err != nil {
+				return err
+			}
 		}
 	}
 	config.agentDefinitions, config.models = agentDefinitions, models
@@ -103,7 +187,8 @@ func assembleExecutors(ctx context.Context, conversationID defs.ConversationID, 
 		return err
 	}
 	// 2. 按可用 Executor 的顺序打开工作区并创建执行环境，默认 Executor 排在最前；每个工作区另记一份；memory 要用到默认 Executor，留到第 3 步。
-	usedServers := getUsedMCPServers(config.definitions.Agents, config.definitions.MCPServers)
+	nativeAgents := slices.DeleteFunc(slices.Clone(config.definitions.Agents), func(d *agent.AgentDefinition) bool { return d.Type.IsExternal() })
+	usedServers := getUsedMCPServers(nativeAgents, config.definitions.MCPServers)
 	for _, availableExecutor := range getAvailableExecutors(config.settings, executors) {
 		definition := availableExecutor.GetDefinition()
 		if definition.Kind == defs.ExecutorKindMemory {
@@ -275,19 +360,19 @@ func loadSkills(ctx context.Context, defaultExecutorID string, defaultWorkspace 
 	return mergeSkills(projectSkills, shared, homeSkills), nil
 }
 
-// LoadDraftSkills 为还没创建的草稿对话读取可用的 Skill：按设置建临时的默认工作区，读完关闭。
-func LoadDraftSkills(ctx context.Context, settings defs.ExecutorSettings, definitions *ConversationDefinitions) ([]*skill.Skill, error) {
+// LoadDraftSkills 为还没创建的草稿对话读取可用的 Skill：按设置建临时的默认工作区，调用方读取完后关闭。
+func LoadDraftSkills(ctx context.Context, settings defs.ExecutorSettings, definitions *ConversationDefinitions) ([]*skill.Skill, func(), error) {
 	// 1. 向 ExecutorProvider 要没有对话时的列表，补上 local 目录，选出默认 Executor（memory 不算）；没有可用 Executor 时只返回共享 Skill。
 	executors, err := definitions.Executors.GetExecutors(ctx, "")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	settings = getFilledExecutorSettings(settings, executors)
 	available := slices.DeleteFunc(getAvailableExecutors(settings, executors), func(listed executor.Executor) bool {
 		return listed.GetDefinition().Kind == defs.ExecutorKindMemory
 	})
 	if len(available) == 0 {
-		return mergeSkills(definitions.Skills), nil
+		return mergeSkills(definitions.Skills), func() {}, nil
 	}
 	// 2. 打开默认工作区读取 Skill，返回时关闭。
 	defaultExecutor := available[0]
@@ -296,10 +381,14 @@ func LoadDraftSkills(ctx context.Context, settings defs.ExecutorSettings, defini
 		RootDirectory: cmp.Or(settings.WorkspaceDirectories[definition.ID], definition.WorkspaceDirectory),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("executor %q: %w", definition.ID, err)
+		return nil, nil, fmt.Errorf("executor %q: %w", definition.ID, err)
 	}
-	defer closeWorkspace(ctx, defaultWorkspace)
-	return loadSkills(ctx, definition.ID, defaultWorkspace, definitions.Skills)
+	skills, err := loadSkills(ctx, definition.ID, defaultWorkspace, definitions.Skills)
+	if err != nil {
+		closeWorkspace(ctx, defaultWorkspace)
+		return nil, nil, err
+	}
+	return skills, func() { closeWorkspace(ctx, defaultWorkspace) }, nil
 }
 
 // ResolveWorkspaceDirectory 解析 Executor 所在机器上的工作区目录。
@@ -414,5 +503,117 @@ func closeWorkspaces(ctx context.Context, workspaces []workspace.Workspace) {
 // closeWorkspace 关闭一个临时工作区。
 func closeWorkspace(ctx context.Context, temporaryWorkspace workspace.Workspace) {
 	// 1. 关闭工作区，记录关闭错误。
-	closeWorkspaces(ctx, []workspace.Workspace{temporaryWorkspace})
+	if temporaryWorkspace != nil {
+		closeWorkspaces(ctx, []workspace.Workspace{temporaryWorkspace})
+	}
 }
+
+// NewExternalAgentProvider 按定义的类型选择协议驱动。
+func NewExternalAgentProvider(definition agent.AgentDefinition) (externalagent.ExternalAgentProvider, error) {
+	switch definition.Type {
+	case defs.AgentTypeACP:
+		if definition.ACP == nil {
+			return nil, errors.New("missing ACP command")
+		}
+		return acp.NewACPAgentProvider(*definition.ACP), nil
+	default:
+		return nil, fmt.Errorf("unsupported external agent type %q", definition.Type)
+	}
+}
+
+// newExternalSessionLaunch 按同一套定义、工作位置和会话身份装配驱动；Skill 工作区随本次运行关闭。
+func (c *conversationImpl) newExternalSessionLaunch(ctx context.Context, config *conversationConfig, record defs.Session, definition *agent.AgentDefinition, spawn *SpawnAgentParam) (externalagent.ExternalSessionLaunch, error) {
+	var launch externalagent.ExternalSessionLaunch
+	provider, err := NewExternalAgentProvider(*definition)
+	if err != nil {
+		return launch, err
+	}
+	location := record.External
+	if (location == nil || location.ExecutorID == "") && record.ParentSessionID != "" {
+		parent, _ := c.sessionRecords.Load(record.ParentSessionID)
+		location = parent.External
+	}
+	executorID, cwd, ws, err := resolveExternalSessionWorkspace(config, location, nil)
+	if err != nil {
+		return launch, err
+	}
+	selected := config.executors[slices.IndexFunc(config.executors, func(e executor.Executor) bool { return e.GetDefinition().ID == executorID })]
+	executorDefinition := selected.GetDefinition()
+	directory, err := executor.GetConversationAttachmentDirectory(ctx, ws, executorDefinition, c.opt.DataDirectory, c.id)
+	if err != nil {
+		return launch, err
+	}
+	launch = externalagent.ExternalSessionLaunch{
+		Ephemeral:           c.opt.Ephemeral,
+		Provider:            provider,
+		Workspace:           ws,
+		ExecutorID:          executorID,
+		ExecutorKind:        executorDefinition.Kind,
+		Cwd:                 cwd,
+		AttachmentDirectory: directory,
+		LaunchEnv: map[string]string{
+			"OPENVAALA_URL":             c.opt.ServerURL,
+			"OPENVAALA_TOKEN":           sessiontoken.Issue(c.opt.SessionTokenSecret.GetToken(), c.id, record.ID),
+			"OPENVAALA_CONVERSATION_ID": string(c.id),
+			"OPENVAALA_SESSION_ID":      string(record.ID),
+		},
+	}
+	if c.opt.ServerURL != "" {
+		endpoint, err := url.Parse(c.opt.ServerURL)
+		if err != nil {
+			return launch, err
+		}
+		switch endpoint.Scheme {
+		case "ws":
+			endpoint.Scheme = "http"
+		case "wss":
+			endpoint.Scheme = "https"
+		}
+		endpoint.Path, endpoint.RawPath, endpoint.RawQuery, endpoint.Fragment = CollaborationMCPPath, "", "", ""
+		launch.LocalMCPURL = endpoint.String()
+	}
+	if record.ID == c.rootSessionID {
+		launch.InitialOptions = c.opt.InitialOptions
+	} else if spawn != nil {
+		launch.InitialOptions = spawn.InitialOptions
+	}
+	for _, server := range getUsedMCPServers([]*agent.AgentDefinition{definition}, config.definitions.MCPServers) {
+		if slices.Contains(server.ExecutorIDs, executorID) {
+			launch.MCPServers = append(launch.MCPServers, server)
+		}
+	}
+	home, err := ws.GetHomeDirectory(ctx)
+	if err == nil {
+		launch.SkillWorkspace, err = selected.NewWorkspace(ctx, &executor.NewWorkspaceRequest{RootDirectory: home, Environment: c.opt.Environment})
+	}
+	if err != nil {
+		telemetry.GetLogger(ctx).Warn("external skill workspace unavailable", "error", err)
+	}
+	return launch, nil
+}
+
+// resolveExternalSessionWorkspace 按显式派活位置、继承位置和默认环境选定执行器与目录。
+func resolveExternalSessionWorkspace(config *conversationConfig, location *defs.ExternalSession, spawn *SpawnAgentParam) (string, string, workspace.Workspace, error) {
+	executorID := getDefaultExecutorID(config.environments)
+	var cwd string
+	if location != nil {
+		executorID = cmp.Or(location.ExecutorID, executorID)
+		cwd = location.Cwd
+	}
+	if spawn != nil {
+		if spawn.ExecutorID != "" && spawn.ExecutorID != executorID {
+			executorID = spawn.ExecutorID
+			cwd = ""
+		}
+		cwd = cmp.Or(spawn.Cwd, cwd)
+	}
+	i := slices.IndexFunc(config.environments, func(e executor.ExecutionEnvironment) bool { return e.GetID() == executorID })
+	if i < 0 {
+		return "", "", nil, fmt.Errorf("external session requires an available executor %q", executorID)
+	}
+	ws := config.environments[i].GetWorkspace()
+	return executorID, cmp.Or(cwd, ws.GetRootDirectory()), ws, nil
+}
+
+// CollaborationMCPPath 是会话级协作工具的 HTTP 入口。
+const CollaborationMCPPath = "/api/v1/mcp"

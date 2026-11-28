@@ -4,12 +4,14 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip"
 import { useMemo } from "react"
+import { MailIcon } from "lucide-react"
 import { computed } from "nanostores"
 import { useStore } from "@nanostores/react"
 import { StatusDot } from "@/components/base/status-dot"
 import { OverflowTooltip } from "@/components/base/overflow-tooltip"
 import { useTranslation } from "react-i18next"
-import { Link, useLocation, useMatch } from "react-router"
+import { useLocation, useMatch } from "react-router"
+import { NavigationButton } from "@/components/base/navigation-button"
 import { ConversationActions } from "@/components/conversation-list/conversation-actions"
 import {
   useRunningConversationsSync,
@@ -22,6 +24,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 import type { Conversation } from "@/lib/api/protocol.gen"
+import { getWorldSenderLabel, type WorldThreadBinding } from "@/lib/api/world"
 import { getConversationListSearch, getConversationPath } from "@/lib/paths"
 import { formatRelativeTime } from "@/lib/relative-time"
 import {
@@ -45,8 +48,12 @@ const conversationStatuses = {
 // 对话列表的一行显示标题和更新时间，点击打开对话。
 export function ConversationListItem({
   conversation,
+  threadBinding,
+  localDomain,
 }: {
   conversation: Conversation
+  threadBinding?: WorldThreadBinding
+  localDomain?: string
 }) {
   const { t, i18n } = useTranslation()
   const connection = useServerConnection()
@@ -74,12 +81,12 @@ export function ConversationListItem({
     conversation.id
   const name = conversation.title || t("conversationList.untitled")
   return (
-    <SidebarMenuItem>
+    <SidebarMenuItem data-conversation-id={conversation.id}>
       <SidebarMenuButton
         isActive={isOpened}
         className="conversation-list-button h-auto py-1 text-ui group-has-data-[sidebar=menu-action]/menu-item:pr-10"
         render={
-          <Link
+          <NavigationButton
             to={{
               pathname: getConversationPath(
                 connection.getServerID(),
@@ -119,13 +126,32 @@ export function ConversationListItem({
                 {statusLabel}
               </TooltipContent>
             </Tooltip>
+            {threadBinding && (
+              <Tooltip>
+                <TooltipTrigger
+                  delay={600}
+                  closeOnClick
+                  render={
+                    <span className="inline-flex min-w-0 items-center gap-1 text-caption color-subtle" />
+                  }
+                >
+                  <MailIcon className="size-3 shrink-0" aria-hidden />
+                  <span className="truncate">
+                    {getWorldSenderLabel(threadBinding.peer_addr, localDomain)}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="text-caption wrap-anywhere">
+                  {threadBinding.peer_addr}
+                </TooltipContent>
+              </Tooltip>
+            )}
             {conversation.updated_at !== undefined && (
               <Tooltip>
                 <TooltipTrigger
                   delay={600}
                   closeOnClick
                   render={
-                    <span className="max-w-full self-start truncate text-caption color-muted" />
+                    <span className="max-w-full shrink-0 self-start truncate text-caption color-muted" />
                   }
                 >
                   {formatRelativeTime(conversation.updated_at, i18n.language)}

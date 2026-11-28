@@ -4,6 +4,10 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/VaalaCat/openvaala/internal/config"
+	"github.com/VaalaCat/openvaala/pkg/world"
+	"github.com/VaalaCat/openvaala/pkg/worldserver"
 )
 
 // TestTUIRequiresTerminal 检查 TUI 拒绝非终端输入。
@@ -88,6 +92,36 @@ func TestGetConnectURL(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := getConnectURL(tt.url, tt.configToken); got != tt.want {
 				t.Fatalf("getConnectURL(%q, %q) = %q, want %q", tt.url, tt.configToken, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorldTUILink(t *testing.T) {
+	for _, base := range []string{"", "https://page.test"} {
+		t.Run(base, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("OPENVAALA_TOKEN", "world-secret")
+			cfg, err := config.LoadConfig(&config.LoadConfigOpt{Path: writeTestConfig(t, "http://127.0.0.1:1", "assistant")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			link, err := world.FormatRemoteAccessURL(base, world.RemoteAccessTarget{Node: "b", Domain: "home", PublicKey: make([]byte, 32), Entries: worldserver.PeerEntries{Relays: []string{"wss://relay.test"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := newTUICommand()
+			if err := cmd.ParseFlags([]string{"--url", link}); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := cmd.Flags().GetString("url")
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := getRuntimeConnection(t.Context(), &AppArgs{Config: cfg, RuntimeURL: raw}, 0)
+			web, webErr := GetWebUIURL(raw, conn.Token)
+			if err != nil || webErr != nil || conn.URL != link || conn.Token != "world-secret" || getConnectURL(conn.URL, conn.Token) != link || web != link {
+				t.Fatal("World URL or separate Token lost")
 			}
 		})
 	}

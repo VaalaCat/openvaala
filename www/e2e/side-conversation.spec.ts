@@ -1,5 +1,6 @@
 import type { Locator, Page } from "@playwright/test"
 import {
+  chooseExternalModel,
   expandTurnProcess,
   expect,
   getComposer,
@@ -110,6 +111,33 @@ test.describe("desktop", () => {
     )
     await expect(page).toHaveURL(sourceURL)
     await expect(getPanelMessages(source)).not.toContainText("旁支回复")
+  })
+
+  test("external_btw_offers_a_side_tab_and_displays_its_first_turn", async ({
+    page,
+    fixture,
+  }) => {
+    await fixture.withExternalAgent(
+      [],
+      async () => {
+        await fixture.openApp(page)
+        await chooseExternalModel(page)
+        await startConversation(page, "外部主问题")
+        const source = getTabPanels(page).first()
+        await expect(getPanelMessages(source)).toContainText("OK")
+        await getPanelComposer(source).fill("/")
+        await expect(page.getByRole("option", { name: /\/btw/ })).toBeVisible()
+        await sendBtw(source, "/btw 外部旁支问题")
+        const side = getTabPanels(page).last()
+        await expect(getTabButtons(page).last()).toHaveText("旁支 · 外部旁支问题")
+        await expect(getPanelMessages(side)).toContainText("外部旁支问题")
+        await expect(getPanelMessages(side)).toContainText("OK")
+        await expect(getPanelMessages(source)).not.toContainText("外部旁支问题")
+      },
+      false,
+      "codex-acp",
+      { ephemeral_param_overwrite: { "session/new": { _meta: { save: false } } } }
+    )
   })
 
   test("btw_session_names_are_plain_text_not_links", async ({

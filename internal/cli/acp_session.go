@@ -58,6 +58,8 @@ type acpSession struct {
 	models []*defs.ModelDefinition
 	// selectedModel 是根 Session 当前选的模型和推理强度。
 	selectedModel defs.ModelSelection
+	// externalAgent 是根会话绑定的外部 Agent 名，原生时为空。
+	externalAgent string
 	// pendingPromptID、pendingInputID 是编辑器还没结束的 prompt 请求 ID 和它的输入 Item；期间新 prompt 返回 session is busy。
 	// 其他客户端或子代理消息发起的 Turn 不记在这里，新 prompt 插队时会中断这些 Turn。
 	pendingPromptID json.RawMessage
@@ -136,7 +138,7 @@ func (s *acpSession) Run(ctx context.Context) (err error) {
 
 	// 3. 打开对话（返回前完整历史和生成中的内容已进入 queuedClientEvents），登记编辑器的 MCP，读取会话详情和模型目录。
 	record, err := callClient(ctx, s, func(ctx context.Context) (defs.Conversation, error) {
-		return s.client.OpenConversation(ctx, &runtimeclient.OpenConversationRequest{ConversationID: s.record.ID})
+		return s.client.OpenConversation(ctx, &runtimeclient.OpenConversationRequest{ConversationID: s.record.ID, WaitForHistory: true})
 	})
 	if err != nil {
 		return err
@@ -147,7 +149,7 @@ func (s *acpSession) Run(ctx context.Context) (err error) {
 	}
 	s.refreshSessionDetails(ctx)
 	catalog, err := callClient(ctx, s, func(ctx context.Context) (runtime.ModelList, error) {
-		return s.client.ListModels(ctx, "")
+		return s.client.ListModels(ctx, &runtime.ListModelsRequest{ConversationID: s.record.ID, SessionID: s.record.RootSessionID})
 	})
 	if err != nil {
 		return err
@@ -157,11 +159,11 @@ func (s *acpSession) Run(ctx context.Context) (err error) {
 	if err := s.handleQueuedClientEvents(ctx); err != nil {
 		return err
 	}
-	var result any = acp.LoadSessionResponse{ConfigOptions: getACPConfigOptions(s.models, s.selectedModel, s.executors)}
+	var result any = acp.LoadSessionResponse{ConfigOptions: s.getConfigOptions()}
 	if s.initialRequest.Method == "session/new" {
 		result = acp.NewSessionResponse{
 			SessionId:     acp.SessionId(s.record.ID),
-			ConfigOptions: getACPConfigOptions(s.models, s.selectedModel, s.executors),
+			ConfigOptions: s.getConfigOptions(),
 		}
 	}
 	delivered := make(chan struct{})
@@ -225,6 +227,10 @@ func callClient[T any](ctx context.Context, s *acpSession, call func(context.Con
 	for {
 		select {
 		case err := <-callDone:
+			// Client 在回复打开请求前已经入队的同步事件必须先于 session/load 响应交付。
+			for range len(events) {
+				s.queuedClientEvents = append(s.queuedClientEvents, <-events)
+			}
 			if err != nil && ctx.Err() != nil {
 				err = context.Cause(ctx)
 			}
@@ -315,7 +321,7 @@ func (s *acpSession) handleRequest(ctx context.Context, request acpMessage) {
 		if s.record.Title != "" {
 			s.updateSessionTitle(s.record.Title)
 		}
-		result = acp.LoadSessionResponse{ConfigOptions: getACPConfigOptions(s.models, s.selectedModel, s.executors)}
+		result = acp.LoadSessionResponse{ConfigOptions: s.getConfigOptions()}
 	case "session/set_config_option":
 		var params acp.SetSessionConfigOptionRequest
 		if err = decodeACPParams(request.Params, &params); err != nil {
@@ -333,7 +339,7 @@ func (s *acpSession) handleRequest(ctx context.Context, request acpMessage) {
 			if err = s.setDefaultExecutor(ctx, string(params.ValueId.Value)); err != nil {
 				break
 			}
-			s.respond(s.executorOptionRequestID, acp.SetSessionConfigOptionResponse{ConfigOptions: getACPConfigOptions(s.models, s.selectedModel, s.executors)}, nil)
+			s.respond(s.executorOptionRequestID, acp.SetSessionConfigOptionResponse{ConfigOptions: s.getConfigOptions()}, nil)
 			s.executorOptionRequestID = request.ID
 			return
 		}
@@ -341,16 +347,8 @@ func (s *acpSession) handleRequest(ctx context.Context, request acpMessage) {
 		selection := s.selectedModel
 		switch params.ValueId.ConfigId {
 		case "model":
-			ref := string(params.ValueId.Value)
-			index := slices.IndexFunc(s.models, func(model *defs.ModelDefinition) bool { return model.Ref.String() == ref })
-			if index < 0 {
-				err = &acpError{
-					-32602,
-					"unknown model",
-				}
-				break
-			}
-			selection = defs.ModelSelection{Ref: s.models[index].Ref}
+			selection.Ref, err = s.getRequestedModel(ctx, string(params.ValueId.Value))
+			selection.ReasoningEffort = ""
 		case "reasoning_effort":
 			selection.ReasoningEffort = string(params.ValueId.Value)
 		default:
@@ -373,16 +371,40 @@ func (s *acpSession) handleRequest(ctx context.Context, request acpMessage) {
 		if err != nil {
 			break
 		}
-		s.selectedModel = record.Model
-		options := getACPConfigOptions(s.models, s.selectedModel, s.executors)
-		s.update(acp.SessionUpdate{ConfigOptionUpdate: &acp.SessionConfigOptionUpdate{
-			SessionUpdate: "config_option_update",
-			ConfigOptions: options,
-		}})
-		result = acp.SetSessionConfigOptionResponse{ConfigOptions: options}
+		if record.External == nil {
+			s.selectedModel = record.Model
+		} else {
+			s.selectedModel = selection
+		}
+		result = acp.SetSessionConfigOptionResponse{ConfigOptions: s.publishConfigOptions()}
 	}
 	// 8. 回复已完成的请求或错误。
 	s.respond(request.ID, result, err)
+}
+
+// getRequestedModel 保留目录内的选择以及应交给 Runtime 判定的跨 Agent 请求。
+func (s *acpSession) getRequestedModel(ctx context.Context, value string) (defs.ModelRef, error) {
+	ref, err := defs.ParseModelRef(value)
+	if err == nil {
+		if slices.ContainsFunc(s.models, func(m *defs.ModelDefinition) bool { return m.Ref == ref }) {
+			return ref, nil
+		}
+		if s.externalAgent != "" && s.externalAgent != ref.ProviderID {
+			return ref, nil
+		}
+		if s.externalAgent == "" {
+			external, err := callClient(ctx, s, func(ctx context.Context) (bool, error) {
+				return runtimeclient.IsExternalModelProvider(ctx, s.client, ref.ProviderID)
+			})
+			if err != nil {
+				return defs.ModelRef{}, err
+			}
+			if external {
+				return ref, nil
+			}
+		}
+	}
+	return defs.ModelRef{}, &acpError{-32602, "unknown model"}
 }
 
 // handleClientEvent 处理一条 Client 事件：更新编辑器显示、回复 prompt 或处理 MCP 转发。
@@ -413,7 +435,12 @@ func (s *acpSession) handleClientEvent(ctx context.Context, event runtimeclient.
 	case *runtimeclient.SessionStatusChanged:
 		s.handleStatus(event.Info)
 	case *runtimeclient.SessionSynced:
+		if event.External && !event.Restoring {
+			s.handleExternalOptions(event.Options)
+		}
 		s.handleSessionSynced(event)
+	case *runtimeclient.SessionExternalStateChanged:
+		s.handleExternalOptions(&event.Options)
 	case *runtimeclient.TurnStarted:
 		clear(s.streamingItems)
 		clear(s.displayedItems)
@@ -588,16 +615,14 @@ func (s *acpSession) handleConversationSynced(ctx context.Context, event *runtim
 	}
 	s.record = event.Conversation
 	s.refreshSessionDetails(ctx)
-	s.refreshModels(ctx)
-	options := getACPConfigOptions(s.models, s.selectedModel, s.executors)
-	s.update(acp.SessionUpdate{ConfigOptionUpdate: &acp.SessionConfigOptionUpdate{
-		SessionUpdate: "config_option_update",
-		ConfigOptions: options,
-	}})
+	if s.externalAgent == "" {
+		s.refreshModels(ctx)
+		s.publishConfigOptions()
+	}
 	// 3. 刷新命令列表（默认 Executor 的项目和主目录 Skills），再用新设置回复等待中的 executor 设置请求。
 	s.refreshAvailableCommands(ctx)
 	if s.executorOptionRequestID != nil {
-		s.respond(s.executorOptionRequestID, acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil)
+		s.respond(s.executorOptionRequestID, acp.SetSessionConfigOptionResponse{ConfigOptions: s.getConfigOptions()}, nil)
 		s.executorOptionRequestID = nil
 	}
 }
@@ -624,7 +649,7 @@ func (s *acpSession) setDefaultExecutor(ctx context.Context, executorID string) 
 func (s *acpSession) openDroppedConversation(ctx context.Context) error {
 	// 1. 请求重新打开对话，失败时保留放弃标记并返回错误。
 	_, err := callClient(ctx, s, func(ctx context.Context) (defs.Conversation, error) {
-		return s.client.OpenConversation(ctx, &runtimeclient.OpenConversationRequest{ConversationID: s.record.ID})
+		return s.client.OpenConversation(ctx, &runtimeclient.OpenConversationRequest{ConversationID: s.record.ID, WaitForHistory: true})
 	})
 	if err != nil {
 		return err
@@ -648,14 +673,40 @@ func (s *acpSession) refreshSessionDetails(ctx context.Context) {
 		return
 	}
 	// 2. 更新 Executor 和模型选择。
-	s.executors, s.selectedModel = details.Executors, details.Session.Model
+	s.executors = details.Executors
+	if details.Session.External != nil {
+		s.externalAgent = details.Session.AgentName
+	} else {
+		s.selectedModel = details.Session.Model
+	}
+}
+
+// handleExternalOptions 将驱动报告的模型组和当前值交付给编辑器。
+func (s *acpSession) handleExternalOptions(options *defs.ExternalOptions) {
+	s.selectedModel = defs.ModelSelection{Ref: runtimeclient.GetExternalModelRef(s.externalAgent, options)}
+	s.models = nil
+	if options != nil && options.Model != nil {
+		for _, choice := range options.Model.Options {
+			s.models = append(s.models, &defs.ModelDefinition{Ref: defs.ModelRef{ProviderID: s.externalAgent, ModelID: choice.Value}, DisplayName: choice.Label})
+		}
+	}
+	if s.isOpenDelivered {
+		s.publishConfigOptions()
+	}
+}
+
+// publishConfigOptions 把当前设置发给编辑器，并供正在处理的请求返回同一组选项。
+func (s *acpSession) publishConfigOptions() []acp.SessionConfigOption {
+	opts := s.getConfigOptions()
+	s.update(acp.SessionUpdate{ConfigOptionUpdate: &acp.SessionConfigOptionUpdate{SessionUpdate: "config_option_update", ConfigOptions: opts}})
+	return opts
 }
 
 // refreshModels 重新读取模型目录。
 func (s *acpSession) refreshModels(ctx context.Context) {
 	// 1. 查询模型列表，失败时记录警告，保留原列表。
 	catalog, err := callClient(ctx, s, func(ctx context.Context) (runtime.ModelList, error) {
-		return s.client.ListModels(ctx, "")
+		return s.client.ListModels(ctx, &runtime.ListModelsRequest{ConversationID: s.record.ID, SessionID: s.record.RootSessionID})
 	})
 	if err != nil {
 		telemetry.GetLogger(ctx).Warn("ACP model list refresh skipped", "error", err)

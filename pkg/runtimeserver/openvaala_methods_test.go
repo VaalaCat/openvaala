@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -17,19 +21,162 @@ import (
 	"time"
 
 	"github.com/VaalaCat/llmkit"
+	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
 	"github.com/VaalaCat/openvaala/pkg/defs"
+	"github.com/VaalaCat/openvaala/pkg/executor"
 	"github.com/VaalaCat/openvaala/pkg/hook"
 	"github.com/VaalaCat/openvaala/pkg/mcpclient"
 	"github.com/VaalaCat/openvaala/pkg/runtime"
 	"github.com/VaalaCat/openvaala/pkg/runtimeprotocol"
 	"github.com/VaalaCat/openvaala/pkg/runtimeserver"
+	"github.com/VaalaCat/openvaala/pkg/sessiontoken"
+	"github.com/VaalaCat/openvaala/pkg/skill"
 	"github.com/VaalaCat/openvaala/pkg/storage"
 	"github.com/VaalaCat/openvaala/pkg/telemetry/telemetrytest"
+	"github.com/VaalaCat/openvaala/pkg/workspace"
 	"github.com/google/uuid"
 )
+
+// TestAttachmentUpload 检查上传路径、边界和删除对话时的清理。
+func TestAttachmentUpload(t *testing.T) {
+	h := startTestServer(t)
+	remoteHome := t.TempDir()
+	definitions := newTestRuntimeOpt(h.store, h.model, h.defaultDirectory).Definitions
+	executors, err := definitions.Executors.GetExecutors(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions.Executors = executor.NewConfigExecutorProvider(append(executors, &attachmentSSHExecutor{
+		definition: defs.ExecutorDefinition{ID: "remote", Kind: defs.ExecutorKindSSH, WorkspaceDirectory: h.defaultDirectory},
+		home:       remoteHome,
+	}))
+	if _, err := h.runtime.SetDefinitions(t.Context(), definitions); err != nil {
+		t.Fatal(err)
+	}
+	operator := h.dial(t)
+	operator.initialize(t)
+	record := operator.createConversation(t)
+	token := sessiontoken.Issue(testToken, record.ID, record.RootSessionID)
+	conn, _, err := h.dialWith(t, "/api/v1/openvaala", http.Header{"Authorization": {"Bearer " + token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := newTestClient(t, conn)
+	scoped.initialize(t)
+	const name, mime = "report 1.pdf", "application/pdf"
+	const maxBytes = 10 << 20
+	var paths []string
+	for _, test := range []struct {
+		name, executorID, fileName, directory, wantError string
+		size                                             int
+		scoped, otherConversation, invalidBase64         bool
+	}{
+		{name: "local_at_limit", executorID: "local", fileName: name, directory: h.dataDirectory, size: maxBytes},
+		{name: "same_name", executorID: "local", fileName: name, directory: h.dataDirectory, size: 2},
+		{name: "ssh_home", executorID: "remote", fileName: name, directory: filepath.Join(remoteHome, ".cache", "openvaala"), size: 2, scoped: true},
+		{name: "empty_file", executorID: "local", fileName: "empty", directory: h.dataDirectory},
+		{name: "over_limit", executorID: "local", fileName: name, size: maxBytes + 1, wantError: "attachment exceeds 10 MB"},
+		{name: "invalid_base64", executorID: "local", fileName: name, invalidBase64: true, wantError: "invalid attachment base64 data"},
+		{name: "missing_executor", fileName: name, wantError: "invalid executor settings: attachment upload requires executor_id"},
+		{name: "empty_name", executorID: "local", wantError: "invalid attachment name"},
+		{name: "dot", executorID: "local", fileName: ".", wantError: "invalid attachment name"},
+		{name: "dot_dot", executorID: "local", fileName: "..", wantError: "invalid attachment name"},
+		{name: "slash", executorID: "local", fileName: "dir/file", wantError: "invalid attachment name"},
+		{name: "backslash", executorID: "local", fileName: `dir\file`, wantError: "invalid attachment name"},
+		{name: "outside_conversation", executorID: "local", fileName: name, scoped: true, otherConversation: true, wantError: "permission denied"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := bytes.Repeat([]byte("x"), test.size)
+			cid := record.ID
+			if test.otherConversation {
+				cid = defs.NewConversationID()
+			}
+			params := map[string]any{"conversation_id": cid, "executor_id": test.executorID, "name": test.fileName, "mime": mime, "data": data}
+			if test.name == "missing_executor" {
+				delete(params, "executor_id")
+			}
+			if test.invalidBase64 {
+				params["data"] = "!!"
+			}
+			client := operator
+			if test.scoped {
+				client = scoped
+			}
+			if test.wantError != "" {
+				response := client.call(t, "attachment/upload", params)
+				if response.Error == nil || response.Error.Message != test.wantError {
+					t.Fatalf("attachment/upload = %+v, want %q", response.Error, test.wantError)
+				}
+				if test.name == "missing_executor" && response.Error.Code != runtimeprotocol.ErrorCodeInvalidParams {
+					t.Fatalf("attachment/upload error code = %d, want %d", response.Error.Code, runtimeprotocol.ErrorCodeInvalidParams)
+				}
+				return
+			}
+			var ref defs.FileRef
+			client.callResult(t, "attachment/upload", params, &ref)
+			expectedRoot := filepath.Join(test.directory, "attachments", string(cid))
+			relative, err := filepath.Rel(expectedRoot, ref.Path)
+			if err != nil || !filepath.IsAbs(ref.Path) || filepath.Base(relative) != test.fileName ||
+				uuid.Validate(filepath.Dir(relative)) != nil || ref.Name != test.fileName || ref.MIME != mime || ref.Size != int64(test.size) {
+				t.Fatalf("attachment = %+v, expected underneath %q", ref, expectedRoot)
+			}
+			written, err := os.ReadFile(ref.Path)
+			if err != nil || !bytes.Equal(written, data) {
+				t.Fatalf("attachment bytes = %d, %v", len(written), err)
+			}
+			if slices.Contains(paths, ref.Path) {
+				t.Fatalf("upload reused %s", ref.Path)
+			}
+			paths = append(paths, ref.Path)
+		})
+	}
+	completeFirstRound(t, h, operator, record)
+	operator.callResult(t, "conversation/delete", map[string]any{"conversation_id": record.ID}, nil)
+	for _, directory := range []string{h.dataDirectory, filepath.Join(remoteHome, ".cache", "openvaala")} {
+		target := filepath.Join(directory, "attachments", string(record.ID))
+		for deadline := time.Now().Add(5 * time.Second); ; {
+			_, err := os.Stat(target)
+			if errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			if err != nil || time.Now().After(deadline) {
+				t.Fatalf("attachment directory %s was not removed: %v", target, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// attachmentSSHExecutor 提供使用独立主目录的 SSH Executor 测试替身。
+type attachmentSSHExecutor struct {
+	definition defs.ExecutorDefinition
+	home       string
+}
+
+// GetDefinition 返回远端 Executor 的定义。
+func (e *attachmentSSHExecutor) GetDefinition() *defs.ExecutorDefinition { return &e.definition }
+
+// NewWorkspace 用本机文件操作模拟远端文件操作。
+func (e *attachmentSSHExecutor) NewWorkspace(_ context.Context, request *executor.NewWorkspaceRequest) (workspace.Workspace, error) {
+	work, err := workspace.NewLocalWorkspace(workspace.NewLocalWorkspaceOpt(request.RootDirectory))
+	if err != nil {
+		return nil, err
+	}
+	return &attachmentSSHWorkspace{Workspace: work, home: e.home}, nil
+}
+
+type attachmentSSHWorkspace struct {
+	workspace.Workspace
+	home string
+}
+
+// GetHomeDirectory 返回测试指定的远端主目录。
+func (w *attachmentSSHWorkspace) GetHomeDirectory(context.Context) (string, error) {
+	return w.home, nil
+}
 
 // TestOpenVaalaMethods 检查对话与 Session 查询、输入、压缩和模型选择。
 func TestOpenVaalaMethods(t *testing.T) {
@@ -147,10 +294,6 @@ func TestOpenVaalaMethods(t *testing.T) {
 					{
 						method: "conversation/list",
 						params: map[string]any{"order": map[string]any{"by": "title"}},
-					},
-					{
-						method: "skill/list",
-						params: map[string]any{},
 					},
 					{
 						method: "conversation/list",
@@ -698,7 +841,7 @@ func TestOpenVaalaMethods(t *testing.T) {
 			name: "agent_list_hides_instructions",
 			run: func(t *testing.T, h *serverHarness, client *testClient) {
 				response := client.callResult(t, "agent/list", nil, nil)
-				const want = `{"agents":[{"name":"assistant","description":"主 Agent","default_model":{"provider_id":"test","model_id":"test"}}]}`
+				const want = `{"agents":[{"name":"assistant","type":"native","description":"主 Agent","default_model":{"provider_id":"test","model_id":"test"}}]}`
 				if string(response.Result) != want {
 					t.Fatalf("agent/list = %s, want %s", response.Result, want)
 				}
@@ -1256,13 +1399,15 @@ func TestOpenVaalaExecutorSettings(t *testing.T) {
 						want:   filepath.Base(h.defaultDirectory),
 					},
 				} {
-					var skills []struct {
-						Name     string `json:"name"`
-						Executor string `json:"executor"`
-					}
+					var skills []skill.SkillInfo
 					client.callResult(t, "skill/list", tt.params, &skills)
-					if len(skills) != 1 || skills[0].Name != tt.want || skills[0].Executor != defs.LocalExecutorID {
-						t.Fatalf("%s skills = %+v, want [%s on local]", tt.name, skills, tt.want)
+					wantNames := []string{"openvaala", tt.want}
+					slices.Sort(wantNames)
+					if len(skills) != 2 || skills[0].Name != wantNames[0] || skills[1].Name != wantNames[1] ||
+						!slices.ContainsFunc(skills, func(info skill.SkillInfo) bool {
+							return info.Name == tt.want && info.Executor == defs.LocalExecutorID
+						}) {
+						t.Fatalf("%s skills = %+v, want %v with %s on local", tt.name, skills, wantNames, tt.want)
 					}
 				}
 			},
@@ -3870,4 +4015,655 @@ func (c *testClient) waitTerminalExited(t *testing.T, terminalID string) runtime
 		return exited.TerminalID == terminalID
 	})
 	return exited
+}
+
+func TestSessionUpdate(t *testing.T) {
+	h := startTestServer(t)
+	client := h.dial(t)
+	client.initialize(t)
+	c := client.createConversation(t)
+	for _, task := range []string{"triage", "finished"} {
+		client.callResult(t, "session/update", map[string]any{"conversation_id": c.ID, "session_id": c.RootSessionID, "task_name": task, "labels": map[string]string{"team": "qa"}, "background": true}, nil)
+		var page runtimeprotocol.ListSessionsResult
+		client.callResult(t, "session/list", map[string]any{"conversation_id": c.ID}, &page)
+		if len(page.Sessions) != 1 || page.Sessions[0].TaskName != task || !page.Sessions[0].Background || page.Sessions[0].Labels["team"] != "qa" {
+			t.Fatal(page)
+		}
+	}
+}
+
+// TestSessionTerminalExecutorSettings 检查会话令牌打开终端与执行命令共用 Executor 限制。
+func TestSessionTerminalExecutorSettings(t *testing.T) {
+	t.Setenv("SHELL", "/bin/bash")
+	h := startTestServer(t)
+	record := saveStoredConversation(t, h, defs.ExecutorSettings{ExecutorIDs: []string{"a"}})
+	client := newSessionRPCClient(t, h, record)
+	for _, tc := range []struct {
+		name   string
+		method string
+		params map[string]any
+	}{
+		{"explicit terminal executor", "terminal/open", map[string]any{"executor_id": "local"}},
+		{"default terminal executor", "terminal/open", map[string]any{}},
+		{"exec", "executor/exec", map[string]any{"executor_id": "local", "command": "printf"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := client.call(t, tc.method, tc.params)
+			if res.Error == nil || res.Error.Message != `unavailable executor "local"` {
+				t.Fatalf("response = %+v, want unavailable executor local", res)
+			}
+		})
+	}
+}
+
+func TestExecutorExec(t *testing.T) {
+	h := startTestServer(t)
+	client := h.dial(t)
+	client.initialize(t)
+	c := createConversationWith(t, client, map[string]any{"environment": []string{"OPENVAALA_EXEC_FIXTURE=from-conversation"}})
+	token := sessiontoken.Issue(testToken, c.ID, c.RootSessionID)
+	conn, _, err := h.dialWith(t, "/api/v1/openvaala", http.Header{"Authorization": {"Bearer " + token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := newTestClient(t, conn)
+	scoped.initialize(t)
+	for _, tc := range []struct {
+		name           string
+		client         *testClient
+		conversationID defs.ConversationID
+		denied         bool
+	}{
+		{"operator default", client, "", false}, {"operator conversation", client, c.ID, false},
+		{"session default", scoped, "", false}, {"session bound", scoped, c.ID, false}, {"cross conversation", scoped, defs.NewConversationID(), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			params := map[string]any{"executor_id": "local", "command": "printf", "args": []string{"%s", "one two"}}
+			if tc.conversationID != "" {
+				params["conversation_id"] = tc.conversationID
+			}
+			res := tc.client.call(t, "executor/exec", params)
+			if tc.denied {
+				if res.Error == nil || res.Error.Message != "permission denied" {
+					t.Fatalf("cross-conversation exec: %+v", res)
+				}
+				return
+			}
+			var result runtime.ExecutorExecResult
+			if err := json.Unmarshal(res.Result, &result); res.Error != nil || err != nil || result.Stdout != "one two" || result.ExitCode != 0 {
+				t.Fatalf("exec %+v, RPC error %v, decode %v", result, res.Error, err)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"virtual workspace persists across calls", func(t *testing.T) {
+			params := runtime.ExecutorExecRequest{ExecutorID: "a", Command: "bash", Args: []string{"-c", "printf virtual > marker.txt"}}
+			var result runtime.ExecutorExecResult
+			scoped.callResult(t, "executor/exec", params, &result)
+			if result.ExitCode != 0 {
+				t.Fatal(result)
+			}
+			params.Command, params.Args = "cat", []string{"marker.txt"}
+			scoped.callResult(t, "executor/exec", params, &result)
+			if result.ExitCode != 0 || result.Stdout != "virtual" {
+				t.Fatal(result)
+			}
+		}},
+		{"local conversation environment", func(t *testing.T) {
+			var result runtime.ExecutorExecResult
+			scoped.callResult(t, "executor/exec", runtime.ExecutorExecRequest{
+				ExecutorID: "local", Command: "printenv", Args: []string{"OPENVAALA_EXEC_FIXTURE"},
+			}, &result)
+			if result.ExitCode != 0 || result.Stdout != "from-conversation\n" {
+				t.Fatal(result)
+			}
+		}},
+		{"relative working directory", func(t *testing.T) {
+			directory := filepath.Join(h.defaultDirectory, "exec-subdir")
+			if err := os.Mkdir(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			var result runtime.ExecutorExecResult
+			scoped.callResult(t, "executor/exec", runtime.ExecutorExecRequest{ExecutorID: "local", Cwd: "exec-subdir", Command: "pwd"}, &result)
+			if result.ExitCode != 0 || strings.TrimSpace(result.Stdout) != directory {
+				t.Fatal(result)
+			}
+		}},
+	} {
+		t.Run(tc.name, tc.run)
+	}
+}
+
+// buildServerFakeACP 编译服务端协议测试使用的 stdio 后端。
+func buildServerFakeACP(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fakeacp")
+	if output, err := exec.Command("go", "build", "-o", path, "../../internal/e2e/fakeacp").CombinedOutput(); err != nil {
+		t.Fatalf("build fakeacp: %v: %s", err, output)
+	}
+	return path
+}
+
+// startExternalSpawnTest 保持父会话的派活轮运行，让子会话经真实 RPC 和本地 Executor 启动。
+func startExternalSpawnTest(t *testing.T, command defs.ACPCommand) (*serverHarness, *testClient, defs.Conversation) {
+	t.Helper()
+	h := startTestServer(t)
+	definitions := newTestRuntimeOpt(h.store, h.model, h.defaultDirectory).Definitions
+	definitions.Agents = append(definitions.Agents, &agent.AgentDefinition{Name: "external", Type: defs.AgentTypeACP, ACP: &command})
+	if _, err := h.runtime.SetDefinitions(t.Context(), definitions); err != nil {
+		t.Fatal(err)
+	}
+	operator := h.dial(t)
+	operator.initialize(t)
+	record := operator.createConversation(t)
+	submitText(t, operator, record, "delegate")
+	parent := h.model.receive(t)
+	t.Cleanup(func() { parent.reply <- serverModelResponse{chunks: []string{"done"}} })
+	return h, operator, record
+}
+
+func TestExternalSpawnRequiresReady(t *testing.T) {
+	peer := buildServerFakeACP(t)
+	for _, tc := range []struct {
+		name    string
+		command defs.ACPCommand
+		want    string
+	}{
+		{"command not installed", defs.ACPCommand{Command: filepath.Join(t.TempDir(), "missing-agent")}, "external session cannot be restored"},
+		{"session new rejected", defs.ACPCommand{Command: peer, Args: []string{"-fail-new"}}, "fixture rejected new session"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, operator, record := startExternalSpawnTest(t, tc.command)
+			response := operator.call(t, "session/spawn", map[string]any{
+				"conversation_id": record.ID, "agent_name": "external", "task_name": "check", "message": "work", "notify_on_finish": false,
+			})
+			if response.Error == nil || !strings.Contains(response.Error.Message, tc.want) || len(response.Result) != 0 {
+				t.Fatalf("spawn returned result %s, error %+v; want %q", response.Result, response.Error, tc.want)
+			}
+		})
+	}
+}
+
+// TestSessionCollaborationRPC 检查没有活动轮的等待和发送权限错误。
+func TestSessionCollaborationRPC(t *testing.T) {
+	h := startTestServer(t)
+	operator := h.dial(t)
+	operator.initialize(t)
+	record := defs.Conversation{ID: defs.NewConversationID(), RootSessionID: defs.NewSessionID()}
+	child, sibling := defs.NewSessionID(), defs.NewSessionID()
+	if err := h.store.mutation.SetConversation(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []defs.Session{
+		{ID: record.RootSessionID, ConversationID: record.ID, AgentName: "assistant"},
+		{ID: child, ConversationID: record.ID, AgentName: "assistant", ParentSessionID: record.RootSessionID, ParentTurnID: "parent-turn"},
+		{ID: sibling, ConversationID: record.ID, AgentName: "assistant", ParentSessionID: record.RootSessionID, ParentTurnID: "parent-turn"},
+	} {
+		if err := h.store.mutation.SetSession(t.Context(), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token := sessiontoken.Issue(testToken, record.ID, child)
+	conn, _, err := h.dialWith(t, "/api/v1/openvaala", http.Header{"Authorization": {"Bearer " + token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := newTestClient(t, conn)
+	scoped.initialize(t)
+	operator.callResult(t, "session/subscribe", sessionTarget(record, record.RootSessionID), nil)
+	submitText(t, operator, record, "start root")
+	h.model.receive(t).reply <- serverModelResponse{chunks: []string{"done"}}
+	operator.collectNotifications(t, isMethod("turn/finished"))
+	for _, tc := range []struct {
+		name   string
+		client *testClient
+		method string
+		params map[string]any
+	}{
+		{"wait on idle root", operator, "session/wait", map[string]any{}},
+		{"send to sibling", scoped, "session/send", map[string]any{"session_id": sibling, "message": "work"}},
+		{"interrupt direct parent", scoped, "session/send", map[string]any{"session_id": record.RootSessionID, "message": "work", "interrupt": true}},
+		{"operator sending as child to sibling", operator, "session/send", map[string]any{"source_session_id": child, "session_id": sibling, "message": "work"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.params["conversation_id"] = record.ID
+			response := tc.client.call(t, tc.method, tc.params)
+			if tc.method == "session/wait" {
+				var result conversation.WaitAgentResult
+				if err := json.Unmarshal(response.Result, &result); response.Error != nil || err != nil || result.Reason != "no_active_turn" || len(result.From) != 0 {
+					t.Fatalf("wait = %+v, RPC error %v, decode %v", result, response.Error, err)
+				}
+				return
+			}
+			if response.Error == nil || response.Error.Message != "permission denied" {
+				t.Fatalf("send error = %+v", response.Error)
+			}
+		})
+	}
+}
+
+// TestAgentListFiltersRPC 同一棵持久化会话树在显式过滤与普通分页两条入口上各自使用约定的默认条件。
+func TestAgentListFiltersRPC(t *testing.T) {
+	h := startTestServer(t)
+	client := h.dial(t)
+	client.initialize(t)
+	t.Run("new root matches default filter", func(t *testing.T) {
+		record := client.createConversation(t)
+		var page runtimeprotocol.ListSessionsResult
+		client.callResult(t, "session/list", runtimeprotocol.ListSessionsParams{ConversationID: record.ID, Filter: &conversation.ListAgentsParam{}}, &page)
+		var unfiltered runtimeprotocol.ListSessionsResult
+		client.callResult(t, "session/list", runtimeprotocol.ListSessionsParams{ConversationID: record.ID}, &unfiltered)
+		if len(page.Sessions) != 1 || len(unfiltered.Sessions) != 1 || page.Sessions[0].ID != record.RootSessionID ||
+			page.Sessions[0].UpdatedAt == 0 || page.Sessions[0].UpdatedAt != unfiltered.Sessions[0].UpdatedAt {
+			t.Fatalf("filtered sessions = %+v, stored sessions = %+v", page.Sessions, unfiltered.Sessions)
+		}
+	})
+	c := defs.Conversation{ID: defs.NewConversationID(), RootSessionID: defs.NewSessionID()}
+	if err := h.store.mutation.SetConversation(t.Context(), c); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 26 {
+		r := defs.Session{ID: defs.NewSessionID(), ConversationID: c.ID, AgentName: "assistant", ParentSessionID: c.RootSessionID, ParentTurnID: "turn", Background: i == 1}
+		if i == 0 {
+			r.ID = c.RootSessionID
+			r.ParentTurnID = ""
+			r.ParentSessionID = ""
+		}
+		if err := h.store.mutation.SetSession(t.Context(), r); err != nil {
+			t.Fatal(err)
+		}
+		if i == 2 {
+			key := storage.RecordKey(string(c.ID) + "/" + string(r.ID))
+			row, found, err := h.store.records.Get(t.Context(), dao.SessionNamespace, key)
+			if err != nil || !found {
+				t.Fatalf("seed record: %v %v", found, err)
+			}
+			row.UpdatedAt = time.Now().Add(-48 * time.Hour).UnixMilli()
+			if err := h.store.records.Set(t.Context(), dao.SessionNamespace, row); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		filter *conversation.ListAgentsParam
+		want   int
+	}{
+		{"web and tui", nil, 26}, {"explicit filter", &conversation.ListAgentsParam{}, 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var page runtimeprotocol.ListSessionsResult
+			client.callResult(t, "session/list", runtimeprotocol.ListSessionsParams{ConversationID: c.ID, Filter: tc.filter}, &page)
+			if len(page.Sessions) != tc.want {
+				t.Fatalf("returned %d sessions: %+v", len(page.Sessions), page)
+			}
+			if tc.filter != nil && (!page.Truncated || page.TotalMatched == nil || *page.TotalMatched != 24) {
+				t.Fatal(page)
+			}
+			if tc.filter == nil && !slices.ContainsFunc(page.Sessions, func(r defs.Session) bool { return r.Background }) {
+				t.Fatal("background session missing")
+			}
+		})
+	}
+}
+
+// TestExternalSkillScope 检查操作者和会话令牌共用的 Skill 搜索与正文范围。
+func TestExternalSkillScope(t *testing.T) {
+	h := startTestServer(t)
+	project := filepath.Join(h.defaultDirectory, ".agents", "skills")
+	writeTestSkill(t, project, "approved")
+	writeTestSkill(t, project, "private")
+	definitions := newTestRuntimeOpt(h.store, h.model, h.defaultDirectory).Definitions
+	worker := definitions.Agents[0].Clone()
+	worker.Name, worker.SkillNames = "worker", []string{"approved"}
+	definitions.Agents = append(definitions.Agents, worker)
+	if _, err := h.runtime.SetDefinitions(t.Context(), definitions); err != nil {
+		t.Fatal(err)
+	}
+	operator := h.dial(t)
+	operator.initialize(t)
+	record := operator.createConversation(t)
+	childID := defs.NewSessionID()
+	if err := h.runtime.CloseConversation(t.Context(), &runtime.CloseConversationRequest{ConversationID: record.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.mutation.SetConversation(t.Context(), record); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []defs.Session{
+		{ID: record.RootSessionID, ConversationID: record.ID, AgentName: "assistant"},
+		{ID: childID, ConversationID: record.ID, AgentName: worker.Name, ParentSessionID: record.RootSessionID, ParentTurnID: "turn"},
+	} {
+		if err := h.store.mutation.SetSession(t.Context(), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	operator.callResult(t, "conversation/open", map[string]any{"conversation_id": record.ID}, nil)
+	token := sessiontoken.Issue(testToken, record.ID, childID)
+	conn, _, err := h.dialWith(t, "/api/v1/openvaala", http.Header{"Authorization": {"Bearer " + token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := newTestClient(t, conn)
+	scoped.initialize(t)
+	for _, tc := range []struct {
+		name   string
+		client *testClient
+		params map[string]any
+		want   []string
+	}{
+		{"builtin only", operator, map[string]any{}, []string{"openvaala"}},
+		{"named agent", operator, map[string]any{"agent_name": "worker"}, []string{"approved", "openvaala"}},
+		{"draft", operator, map[string]any{"agent_name": "assistant"}, []string{"approved", filepath.Base(h.defaultDirectory), "openvaala", "private"}},
+		{"conversation", operator, map[string]any{"conversation_id": record.ID}, []string{"approved", filepath.Base(h.defaultDirectory), "openvaala", "private"}},
+		{"scoped", scoped, map[string]any{"agent_name": "assistant"}, []string{"approved", "openvaala"}},
+		{"query", scoped, map[string]any{"query": "APPROVED"}, []string{"approved"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var list []struct{ Name string }
+			tc.client.callResult(t, "skill/list", tc.params, &list)
+			names := make([]string, 0, len(list))
+			for _, info := range list {
+				names = append(names, info.Name)
+			}
+			slices.Sort(names)
+			slices.Sort(tc.want)
+			if !slices.Equal(names, tc.want) {
+				t.Fatalf("skills = %v, want %v", names, tc.want)
+			}
+		})
+	}
+	var content struct{ Content string }
+	scoped.callResult(t, "skill/get", map[string]any{"name": "openvaala"}, &content)
+	if !strings.Contains(content.Content, "从外部 Agent 协作") {
+		t.Fatalf("built-in content = %q", content.Content)
+	}
+	if response := scoped.call(t, "skill/get", map[string]any{"name": "private"}); response.Error == nil {
+		t.Fatal("session token read an unlisted skill")
+	}
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+		want string
+	}{
+		{"list_skills", map[string]any{}, "openvaala"},
+		{"search_skills", map[string]any{"query": "approved"}, "approved"},
+		{"get_skill", map[string]any{"name": "approved"}, "approved"},
+	} {
+		t.Run(tc.tool, func(t *testing.T) {
+			result := callSessionMCPTool(t, h, token, tc.tool, tc.args)
+			if result.IsError || len(result.Content) != 1 {
+				t.Fatalf("result = %+v", result)
+			}
+			data, err := json.Marshal(result.Content[0])
+			if err != nil || !bytes.Contains(data, []byte(tc.want)) || bytes.Contains(data, []byte("private")) {
+				t.Fatalf("skill result = %s, %v", data, err)
+			}
+		})
+	}
+}
+
+// TestNativeSkillCompletion 检查补全列出的内置 Skill 能用两种斜杠写法发给模型。
+func TestNativeSkillCompletion(t *testing.T) {
+	h := startTestServer(t)
+	writeTestSkill(t, filepath.Join(h.defaultDirectory, ".agents", "skills"), "approved")
+	definitions := newTestRuntimeOpt(h.store, h.model, h.defaultDirectory).Definitions
+	definitions.Agents[0].SkillNames = []string{"approved"}
+	if _, err := h.runtime.SetDefinitions(t.Context(), definitions); err != nil {
+		t.Fatal(err)
+	}
+	client := h.dial(t)
+	client.initialize(t)
+	for _, input := range []string{"/openvaala", "/skill:openvaala"} {
+		t.Run(input, func(t *testing.T) {
+			record := client.createConversation(t)
+			params := map[string]any{"conversation_id": record.ID}
+			var list []skill.SkillInfo
+			client.callResult(t, "skill/list", params, &list)
+			if len(list) != 2 || list[0].Name != "approved" || list[1].Name != "openvaala" {
+				t.Fatalf("skills = %+v, want [approved openvaala]", list)
+			}
+			submitText(t, client, record, input)
+			request := h.model.receive(t)
+			request.reply <- serverModelResponse{chunks: []string{"好"}}
+			body, err := json.Marshal(request.body["messages"])
+			if err != nil || !bytes.Contains(body, []byte("从外部 Agent 协作")) {
+				t.Fatalf("model did not receive the openvaala skill body: %v", err)
+			}
+		})
+	}
+}
+
+// TestOperatorSkillPrecedence 检查草稿和对话查询保留已有 Skill 的顺序和同名优先级。
+func TestOperatorSkillPrecedence(t *testing.T) {
+	h := startTestServer(t)
+	projectDir := filepath.Join(h.defaultDirectory, ".agents", "skills")
+	privateDir := filepath.Join(os.Getenv("HOME"), ".agents", "skills")
+	writeTestSkill(t, projectDir, "alpha")
+	writeTestSkill(t, projectDir, "zulu")
+	writeTestSkill(t, projectDir, "openvaala")
+	writeTestSkill(t, privateDir, "openvaala")
+	projectSkill := filepath.Join(projectDir, "openvaala", "SKILL.md")
+	privateSkill := filepath.Join(privateDir, "openvaala", "SKILL.md")
+	const projectBody = "---\nname: openvaala\ndescription: Project skill\n---\nProject instructions\n"
+	const privateBody = "---\nname: openvaala\ndescription: Private skill\n---\nPrivate instructions\n"
+	for path, body := range map[string]string{projectSkill: projectBody, privateSkill: privateBody} {
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	definitions := newTestRuntimeOpt(h.store, h.model, h.defaultDirectory).Definitions
+	definitions.Agents[0].SkillNames = []string{"zulu", "openvaala", "alpha"}
+	if _, err := h.runtime.SetDefinitions(t.Context(), definitions); err != nil {
+		t.Fatal(err)
+	}
+	operator := h.dial(t)
+	operator.initialize(t)
+	record := operator.createConversation(t)
+	for _, tc := range []struct {
+		name   string
+		params map[string]any
+	}{
+		{"draft", map[string]any{"agent_name": "assistant", "executor_settings": defs.ExecutorSettings{}}},
+		{"conversation", map[string]any{"conversation_id": record.ID}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var list []skill.SkillInfo
+			operator.callResult(t, "skill/list", tc.params, &list)
+			params := maps.Clone(tc.params)
+			params["name"] = "openvaala"
+			var result runtimeprotocol.GetSkillResult
+			operator.callResult(t, "skill/get", params, &result)
+			if len(list) != 3 || list[0].Name != "alpha" || list[1].Path != projectSkill || list[2].Name != "zulu" || result.Content != projectBody {
+				t.Fatalf("skills = %+v, project body = %t", list, result.Content == projectBody)
+			}
+		})
+	}
+}
+
+// TestSessionSkillsColdOpen 检查两个 Skill RPC 都能独立打开已保存的对话。
+func TestSessionSkillsColdOpen(t *testing.T) {
+	h := startTestServer(t)
+	for _, tc := range []struct {
+		method string
+		params map[string]any
+	}{
+		{"skill/list", map[string]any{"query": "openvaala"}},
+		{"skill/get", map[string]any{"name": "openvaala"}},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			record := saveStoredConversation(t, h, defs.ExecutorSettings{})
+			client := newSessionRPCClient(t, h, record)
+			var result json.RawMessage
+			client.callResult(t, tc.method, tc.params, &result)
+			if !bytes.Contains(result, []byte("openvaala")) {
+				t.Fatalf("result = %s, want openvaala", result)
+			}
+		})
+	}
+}
+
+// newSessionRPCClient 使用指定对话的根会话令牌连接并完成协议初始化。
+func newSessionRPCClient(t *testing.T, h *serverHarness, record defs.Conversation) *testClient {
+	t.Helper()
+	token := sessiontoken.Issue(testToken, record.ID, record.RootSessionID)
+	conn, _, err := h.dialWith(t, "/api/v1/openvaala", http.Header{"Authorization": {"Bearer " + token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := newTestClient(t, conn)
+	client.initialize(t)
+	return client
+}
+
+func TestAgentConfigurationMethods(t *testing.T) {
+	files := config.NewConfigFiles(&config.LoadConfigOpt{Home: t.TempDir()})
+	h := startTestServer(t, func(opt *runtimeserver.RuntimeServerOpt) { opt.Configuration = files })
+	client := h.dial(t)
+	client.initialize(t)
+	name := runtimeprotocol.AgentNameParams{Name: "codex"}
+	for _, tc := range []struct {
+		description string
+	}{
+		{"created"},
+		{"replaced"},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			definition := defs.AgentConfig{Name: name.Name, Type: defs.AgentTypeACP, Description: tc.description, ACP: &defs.ACPCommand{Command: "codex-acp", Env: map[string]string{"SECRET": "test"},
+				ParamOverwrite:          map[string]map[string]any{"session/load": {"cwd": "/test"}},
+				EphemeralParamOverwrite: map[string]map[string]any{"session/new": {"_meta": map[string]any{"save": false}}}}}
+			client.callResult(t, "agent/set", &runtimeprotocol.SetAgentParams{Definition: definition}, nil)
+			var got defs.AgentConfig
+			client.callResult(t, "agent/get", name, &got)
+			if !reflect.DeepEqual(got, definition) {
+				t.Fatalf("agent/get = %+v, want %+v", got, definition)
+			}
+			var list runtimeprotocol.ListAgentsResult
+			response := client.callResult(t, "agent/list", nil, &list)
+			if strings.Contains(string(response.Result), "SECRET") || !slices.ContainsFunc(list.Agents, func(info runtime.AgentInfo) bool {
+				return info.Name == name.Name && info.Description == tc.description && info.Icon == "codex"
+			}) {
+				t.Fatalf("agent/list = %s", response.Result)
+			}
+			var models runtime.ModelList
+			client.callResult(t, "model/list", nil, &models)
+			if !slices.ContainsFunc(models.Models, func(model *defs.ModelDefinition) bool {
+				return model.Ref.ProviderID == name.Name && model.Icon == "codex"
+			}) {
+				t.Fatalf("model/list = %+v", models)
+			}
+		})
+	}
+	requireErrorCode(t, client.call(t, "agent/set", map[string]any{"definition": map[string]any{
+		"name": name.Name, "type": "acp", "acp": map[string]string{"command": "codex-acp"}, "max_steps": 0,
+	}}), -32000, "acp agent must not configure max_steps")
+	requireErrorCode(t, client.call(t, "agent/delete", runtimeprotocol.AgentNameParams{Name: "default"}), -32000, "agent default cannot be deleted")
+	client.callResult(t, "agent/delete", name, nil)
+	requireErrorCode(t, client.call(t, "agent/get", name), -32000, "not configured")
+}
+
+func TestWorldSettingsRPC(t *testing.T) {
+	for _, scenario := range []string{"operator", "session token", "bad target", "invalid invite", "invalid join settings", "rename"} {
+		t.Run(scenario, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "config.yaml")
+			original := "world:\n  node:\n    enabled: true\n    name: one\n    domain: team\n    server_url: https://team\n  server:\n    domain: team\n"
+			if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+				t.Fatal(err)
+			}
+			files := config.NewConfigFiles(&config.LoadConfigOpt{Home: home, Path: path})
+			if scenario == "rename" {
+				dir := filepath.Join(config.GetDataDirectory(home), "worldserver")
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "world.db"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			restart := make(chan runtimeserver.ServeRestartRequest, 1)
+			h := startTestServer(t, func(o *runtimeserver.RuntimeServerOpt) {
+				o.Configuration = files
+				o.WorldIdentityPath = filepath.Join(home, "identity", "identity.json")
+				o.WorldRunning.ServerEnabled = true
+				o.RestartRequests = restart
+			})
+			client := h.dial(t)
+			client.initialize(t)
+			if scenario == "session token" {
+				scoped := newSessionRPCClient(t, h, client.createConversation(t))
+				for _, m := range []string{"config/getWorld", "config/setWorld"} {
+					r := scoped.call(t, m, map[string]any{})
+					if r.Error == nil || r.Error.Message != "world settings require operator token" {
+						t.Fatal(m, r.Error)
+					}
+				}
+				return
+			}
+			var result runtimeprotocol.GetWorldResult
+			client.callResult(t, "config/getWorld", map[string]any{}, &result)
+			if !result.Settings.Node.Enabled || result.Running.NodeEnabled || !result.Running.ServerEnabled {
+				t.Fatal(result)
+			}
+			if scenario == "bad target" || scenario == "invalid invite" || scenario == "invalid join settings" {
+				params := map[string]any{"settings": result.Settings}
+				want := "unknown agent absent in world settings"
+				if scenario != "bad target" {
+					control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if scenario == "invalid join settings" {
+							t.Error("registration requested with invalid settings")
+						}
+						http.Error(w, "invalid invite code", http.StatusForbidden)
+					}))
+					defer control.Close()
+					params["join"] = runtimeprotocol.WorldJoinParams{InviteCode: control.URL + "#invalid"}
+					want = "world request: 403 Forbidden invalid invite code"
+					if scenario == "invalid join settings" {
+						invalid := result.Settings
+						invalid.Relays = []string{"file:///bad"}
+						params["settings"] = invalid
+						want = `invalid world.relays URL "file:///bad"`
+					}
+				} else {
+					invalid := result.Settings
+					invalid.Node.DefaultTarget = "absent"
+					params["settings"] = invalid
+				}
+				r := client.call(t, "config/setWorld", params)
+				if r.Error == nil || r.Error.Message != want {
+					t.Fatal(r.Error)
+				}
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != original {
+					t.Fatal(string(data), err)
+				}
+				select {
+				case <-restart:
+					t.Fatal("restarted after error")
+				default:
+				}
+			}
+			result.Settings.Server.Domain = "team2"
+			var response runtimeprotocol.SetWorldResult
+			client.callResult(t, "config/setWorld", map[string]any{"settings": result.Settings}, &response)
+			if !response.Restarting {
+				t.Fatal(response)
+			}
+			select {
+			case r := <-restart:
+				if r.ArchiveWorldServer != (scenario == "rename") {
+					t.Fatal(r)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("missing restart")
+			}
+			got, err := files.GetWorldSettings()
+			if err != nil || got.Node.Enabled == (scenario == "rename") {
+				t.Fatal(got, err)
+			}
+		})
+	}
 }

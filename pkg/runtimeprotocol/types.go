@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/VaalaCat/openvaala/internal/config"
 	"github.com/VaalaCat/openvaala/pkg/agent"
 	"github.com/VaalaCat/openvaala/pkg/conversation"
 	"github.com/VaalaCat/openvaala/pkg/dao"
@@ -35,8 +36,14 @@ type JSONRPCMessage struct {
 
 // JSONRPCError 是响应中的错误；方法处理函数返回它时保留错误码，返回其他错误时由服务端按错误种类换成对应错误码。
 type JSONRPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int               `json:"code"`
+	Message string            `json:"message"`
+	Data    *JSONRPCErrorData `json:"data,omitempty"`
+}
+
+// JSONRPCErrorData 保存业务错误码。
+type JSONRPCErrorData struct {
+	Code string `json:"code"`
 }
 
 // Error 返回协议错误文本。
@@ -77,8 +84,9 @@ type ClientInfo struct {
 
 // CreateConversationParams 是 conversation/create 的参数。
 type CreateConversationParams struct {
-	AgentName string              `json:"agent_name"`
-	Model     defs.ModelSelection `json:"model,omitzero"`
+	InitialOptions []defs.ExternalOptionSelection `json:"initial_options,omitempty"`
+	AgentName      string                         `json:"agent_name"`
+	Model          defs.ModelSelection            `json:"model,omitzero"`
 	// ExecutorSettings 里没有 local 目录时使用 local 的默认目录（server.workspace_directory，没配时是 serve 的工作目录）。
 	ExecutorSettings defs.ExecutorSettings `json:"executor_settings"`
 	// Environment 为空时本机命令继承 serve 进程的环境。
@@ -112,18 +120,41 @@ type SetClientExecutorParams struct {
 
 // ListSkillsParams 是 skill/list 的参数；没有 conversation_id 时按 agent_name 和 executor_settings 查草稿 Skills。
 type ListSkillsParams struct {
+	Query            string                `json:"query,omitempty"`
 	ConversationID   defs.ConversationID   `json:"conversation_id,omitempty"`
 	AgentName        string                `json:"agent_name,omitempty"`
 	ExecutorSettings defs.ExecutorSettings `json:"executor_settings,omitzero"`
 }
 
-// ListModelsParams 是 model/list 的参数；agent_name 为空时不返回 Agent 默认模型。
-type ListModelsParams struct {
-	AgentName string `json:"agent_name"`
+// GetSkillParams 指定 Skill、相对文件路径和操作者查询范围。
+type GetSkillParams struct {
+	File             string                `json:"file,omitempty"`
+	Name             string                `json:"name"`
+	ConversationID   defs.ConversationID   `json:"conversation_id,omitempty"`
+	AgentName        string                `json:"agent_name,omitempty"`
+	ExecutorSettings defs.ExecutorSettings `json:"executor_settings,omitzero"`
 }
+
+// GetSkillResult 返回所选文件的正文，默认读取 SKILL.md。
+type GetSkillResult struct {
+	Content string `json:"content"`
+}
+
+// ListModelsParams 是 model/list 的参数；agent_name 为空时不返回 Agent 默认模型。
+type ListModelsParams runtime.ListModelsRequest
 
 // EmptyParams 用于无参数的方法，包括全局运行订阅和退订。
 type EmptyParams struct{}
+
+// AgentNameParams 指定 Agent 定义的文件名。
+type AgentNameParams struct {
+	Name string `json:"name"`
+}
+
+// SetAgentParams 保存整份 Agent 定义。
+type SetAgentParams struct {
+	Definition defs.AgentConfig `json:"definition"`
+}
 
 // ProviderParams 是 provider/fetchModels 的参数：完整的 Provider。
 type ProviderParams struct {
@@ -215,7 +246,8 @@ type ListConversationsParams struct {
 
 // ForkConversationParams 是 conversation/fork 的参数。
 type ForkConversationParams struct {
-	ConversationID defs.ConversationID `json:"conversation_id"`
+	SourceSessionID defs.SessionID      `json:"source_session_id,omitempty"`
+	ConversationID  defs.ConversationID `json:"conversation_id"`
 	// BeforeTurnID 复制到这一轮之前（不含），LastTurnID 复制到这一轮（含）；最多给一个，都不给时复制到最后一条已保存的 Item，包括还在运行的轮次已保存的部分。
 	BeforeTurnID defs.TurnID `json:"before_turn_id,omitempty"`
 	LastTurnID   defs.TurnID `json:"last_turn_id,omitempty"`
@@ -248,6 +280,16 @@ type SubmitInputParams struct {
 	Mode session.SessionInputMode `json:"mode,omitempty"`
 	// Content 原样交给 Runtime；Session 拒绝空内容、空条目、未知类型和缺少载荷的内容，图片的 data URL 格式不检查。
 	Content []*defs.Content `json:"content"`
+}
+
+// UploadAttachmentParams 是 attachment/upload 的参数。
+type UploadAttachmentParams struct {
+	ConversationID defs.ConversationID `json:"conversation_id"`
+	ExecutorID     string              `json:"executor_id"`
+	Name           string              `json:"name"`
+	MIME           string              `json:"mime"`
+	// Data 在线上以 base64 字符串传输。
+	Data string `json:"data"`
 }
 
 // SteerInputParams 是 conversation/steerInput 的参数。
@@ -291,10 +333,12 @@ type GetSessionParams struct {
 
 // ListSessionsParams 是 session/list 的参数。
 type ListSessionsParams struct {
-	ConversationID defs.ConversationID              `json:"conversation_id"`
-	Order          storage.Order                    `json:"order,omitzero"`
-	Cursor         dao.RecordCursor[defs.SessionID] `json:"cursor,omitzero"`
-	Limit          int                              `json:"limit,omitempty"`
+	SourceSessionID defs.SessionID                   `json:"source_session_id,omitempty"`
+	Filter          *conversation.ListAgentsParam    `json:"filter,omitempty"`
+	ConversationID  defs.ConversationID              `json:"conversation_id"`
+	Order           storage.Order                    `json:"order,omitzero"`
+	Cursor          dao.RecordCursor[defs.SessionID] `json:"cursor,omitzero"`
+	Limit           int                              `json:"limit,omitempty"`
 }
 
 // ListTurnsParams 是 session/turns/list 的参数；conversation_id 选这个对话的存储，Turn 记录的读取不要求对话已打开。
@@ -349,6 +393,17 @@ type TerminalParams struct {
 	TerminalID string `json:"terminal_id"`
 }
 
+// TerminalCaptureParams 指定终端和要读取的最近行数。
+type TerminalCaptureParams struct {
+	TerminalParams
+	Lines int `json:"lines,omitempty"`
+}
+
+// TerminalCaptureResult 返回去除 ANSI 控制序列的终端输出。
+type TerminalCaptureResult struct {
+	Text string `json:"text"`
+}
+
 // ── OpenVaala 请求结果 ──
 
 // InitializeResult 是 initialize 的结果。
@@ -383,9 +438,17 @@ type ListAgentsResult struct {
 	Agents []runtime.AgentInfo `json:"agents"`
 }
 
-// ListExecutorsResult 是 executor/list 的结果：全部 Executor 和它们的默认根目录。
+// ListExecutorsParams 指定要列出执行环境的对话。
+type ListExecutorsParams struct {
+	// RefreshTools 只在原生模型调用工具时生效。
+	RefreshTools   bool                `json:"refresh_tools,omitempty"`
+	ConversationID defs.ConversationID `json:"conversation_id,omitempty"`
+}
+
+// ListExecutorsResult 返回全局 Executor 或对话中的执行环境和默认项。
 type ListExecutorsResult struct {
-	Executors []conversation.ExecutorDetails `json:"executors"`
+	DefaultExecutorID string                         `json:"default_executor_id,omitempty"`
+	Executors         []conversation.ExecutorDetails `json:"executors"`
 }
 
 // ListProvidersResult 是 provider/list 的结果：配置里的全部 Provider，带 API key 原文；DefaultModel 是模型配置的默认模型
@@ -399,6 +462,11 @@ type ListProvidersResult struct {
 // ListCatalogProvidersResult 是 catalog/providers/list 的结果：模型目录里能对应上协议和 base_url 的服务。
 type ListCatalogProvidersResult struct {
 	Providers []defs.CatalogProvider `json:"providers"`
+}
+
+// ListAgentPresetsResult 是 catalog/agents/list 返回的 ACP Agent 预设。
+type ListAgentPresetsResult struct {
+	Presets []agent.AgentPreset `json:"presets"`
 }
 
 // ProviderModelsResult 是 catalog/models/list、provider/fetchModels 的结果：模型 id 到模型配置。
@@ -479,8 +547,12 @@ type SessionResult struct {
 
 // ListSessionsResult 是 session/list 的结果：一页 Session 和下一页游标。
 type ListSessionsResult struct {
-	Sessions   []defs.Session                   `json:"sessions"`
-	NextCursor dao.RecordCursor[defs.SessionID] `json:"next_cursor,omitzero"`
+	AppliedFilter *conversation.ListAgentsParam    `json:"applied_filter,omitempty"`
+	TotalMatched  *int                             `json:"total_matched,omitempty"`
+	Truncated     bool                             `json:"truncated,omitempty"`
+	Hint          string                           `json:"hint,omitempty"`
+	Sessions      []defs.Session                   `json:"sessions"`
+	NextCursor    dao.RecordCursor[defs.SessionID] `json:"next_cursor,omitzero"`
 }
 
 // ListTurnsResult 是 session/turns/list 的结果：一页 Turn 和下一页游标。
@@ -514,11 +586,23 @@ type SubscribeConversationResult struct {
 
 // SubscribeSessionResult 是 Session 内容订阅的初始信息。
 type SubscribeSessionResult struct {
+	Restoring    bool                       `json:"restoring,omitempty"`
+	Options      *defs.ExternalOptions      `json:"options,omitempty"`
+	Capabilities *defs.ExternalCapabilities `json:"capabilities,omitempty"`
+	Commands     []defs.ExternalCommand     `json:"commands,omitempty"`
 	// LastSavedOrdinal 及之前的日志用 session/items/list 补齐。
 	LastSavedOrdinal storage.Ordinal `json:"last_saved_ordinal"`
 	// StreamingItems 是正在生成的 Item，后续 item/delta 按 item_index 接上。
 	StreamingItems []StreamingItem              `json:"streaming_items"`
 	PendingInputs  session.SessionPendingInputs `json:"pending_inputs"`
+}
+
+// SessionExternalStateUpdatedParams 由外部驱动就绪或选项、能力、命令发生变化时发给订阅方。
+type SessionExternalStateUpdatedParams struct {
+	NotificationTarget
+	Options      defs.ExternalOptions      `json:"options"`
+	Capabilities defs.ExternalCapabilities `json:"capabilities"`
+	Commands     []defs.ExternalCommand    `json:"commands"`
 }
 
 // StreamingItem 是一个生成中的 Item 及它在本轮 Agent 输出中的位置，与通知的 item_index 对应。
@@ -698,4 +782,119 @@ type TerminalExitedParams struct {
 // TerminalsClosedParams 是 serve 发给订阅了终端列表的连接的 terminal/listClosed 的参数：订阅被 serve 关闭的原因，主动退订和断线不发。
 type TerminalsClosedParams struct {
 	Reason string `json:"reason"`
+}
+
+// ── Session 协作请求与结果 ──
+
+// CollaborationSource 指定操作来源，使用会话令牌时由连接身份确定。
+type CollaborationSource struct {
+	ConversationID  defs.ConversationID `json:"conversation_id"`
+	SourceSessionID defs.SessionID      `json:"source_session_id,omitempty"`
+}
+
+// ReadSessionHistoryParams 指定来源、目标和本地历史游标。
+type ReadSessionHistoryParams struct {
+	CollaborationSource
+	conversation.SessionHistoryParam
+}
+
+// CallExecutorToolParams 在来源会话的执行环境中调用工具。
+type CallExecutorToolParams struct {
+	CollaborationSource
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
+}
+
+type SpawnSessionParams struct {
+	CollaborationSource
+	conversation.SpawnAgentParam
+}
+type SendSessionParams struct {
+	CollaborationSource
+	conversation.SendMessageParam
+	Interrupt bool `json:"interrupt,omitempty"`
+}
+type SendSessionResult struct {
+	InputItemID defs.ItemID `json:"input_item_id"`
+}
+type WaitSessionParams struct {
+	CollaborationSource
+	conversation.WaitAgentParam
+}
+type StopSessionParams struct {
+	CollaborationSource
+	SessionID defs.SessionID `json:"session_id"`
+}
+type StopSessionResult struct {
+	TurnID defs.TurnID `json:"turn_id,omitempty"`
+}
+type UpdateSessionParams struct {
+	SessionParams
+	conversation.SessionUpdate
+}
+
+// SetSessionOptionParams 指定目标会话以及需要交给后端的选择。
+type SetSessionOptionParams struct {
+	SessionParams
+	defs.ExternalOptionSelection
+}
+
+// ── World 设置请求和结果 ──
+
+// ResetTokenResult 供发起重置的客户端重新认证。
+type ResetTokenResult struct {
+	Token string `json:"token"`
+}
+
+type WorldRunning struct {
+	RemoteAccessEnabled bool `json:"remote_access_enabled,omitempty"`
+	NodeEnabled         bool `json:"node_enabled"`
+	ServerEnabled       bool `json:"server_enabled"`
+}
+
+type GetWorldResult struct {
+	Settings config.WorldSettings `json:"settings"`
+	Running  WorldRunning         `json:"running"`
+}
+
+type WorldJoinParams struct {
+	InviteCode string `json:"invite_code"`
+}
+
+type SetWorldParams struct {
+	Settings config.WorldSettings `json:"settings"`
+	Join     *WorldJoinParams     `json:"join,omitempty"`
+}
+
+type SetWorldResult struct {
+	Restarting bool `json:"restarting"`
+}
+
+// ── World 通知参数 ──
+
+// WorldMessageUpdatedClosedParams 是节点关闭消息事件订阅时的通知。
+type WorldMessageUpdatedClosedParams struct {
+	Reason string `json:"reason"`
+}
+
+// ── World 请求参数 ──
+
+type WorldMessageParams struct {
+	MessageID string `json:"message_id"`
+}
+
+type WorldNodeParams struct {
+	NodeID string `json:"node_id"`
+}
+
+type WorldOwnerParams struct {
+	Owner string `json:"owner"`
+}
+
+type WorldTokenParams struct {
+	ID string `json:"id"`
+}
+
+type WorldDomainParams struct {
+	Domain string `json:"domain"`
 }
